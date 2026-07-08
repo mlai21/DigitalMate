@@ -8,10 +8,12 @@ DigitalMate（数字伙伴）：一个有稳定人设、能自我进化的私人
 
 **完整需求以 [docs/prd.md](docs/prd.md) 为准。** 开始任何功能开发前先读它，功能编号（P0-x / P1-x / P2-x）在沟通和 commit 中直接引用。
 
-## 当前状态
+## 当前状态（2026-07-08 更新）
 
-- 项目处于文档阶段，尚无代码。
-- 已有产出：`docs/prd.md`（需求文档 v0.1）、`DESIGN.md`（设计系统，构建任何 UI 前必读）。
+- 已有一套覆盖面较广的实现：Next.js Web/后台（`src/app`）、常驻 Agent 服务（`src/agent-service`）、四渠道 webhook 与群聊插话（`src/server/channels`）、任务能力（`src/server/tasks`，沙箱/CSV/PPT）、进化模块（`src/server/evolution`），以及约 50 个单测。
+- **重要警示：多数"智能"能力当前是规则/模板占位实现，不代表最终形态**——记忆抽取是正则、embedding 是本地 hash 伪向量、每日反思输出固定模板、插话相关度是 n-gram 重叠、tool call 靠解析整段 JSON 文本。当前主线是把这些占位换成真实实现（LLM + 真检索 + 原生 tool-calling），见 README"实现状态"。
+- P2 范畴的代码（沙箱、CSV、PPT、工具注册/MCP）已存在但**冻结**：不再扩展，待 P0/P1 核心换真后再回头验收。
+- 文档产出：`docs/prd.md`（需求文档 v0.2）、`DESIGN.md`（设计系统，构建任何 UI 前必读）。
 
 ## 关键决策（不要偏离）
 
