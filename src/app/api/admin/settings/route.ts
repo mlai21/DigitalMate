@@ -10,5 +10,7 @@ export async function POST(request: Request) {
   const repositories = createRepositories();
   const current = await repositories.settings.get(user.id);
   await repositories.settings.update(user.id, buildSettingsUpdate(current, form));
-  return NextResponse.redirect(redirectUrl(request, "/admin/settings"), { status: 303 });
+  const requested = String(form.get("redirectTo") ?? "");
+  const target = requested === "/admin/models" ? requested : "/admin/settings";
+  return NextResponse.redirect(redirectUrl(request, target), { status: 303 });
 }

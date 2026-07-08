@@ -7,14 +7,28 @@ CREATE TABLE IF NOT EXISTS users (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   channel text NOT NULL DEFAULT 'web',
   title text NOT NULL DEFAULT '新的对话',
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
+  pinned boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -216,6 +230,8 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_user_active ON memory_entries(user_id, created_at DESC) WHERE deleted_at IS NULL;

@@ -7,6 +7,7 @@ import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
+import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
 import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
 import { getLlmClient } from "@/server/llm/router";
 
@@ -35,6 +36,7 @@ async function tick(repositories: ReturnType<typeof createRepositories>) {
     sendChannel: (target, text) => sendChannelMessage(env, target, text),
   });
   await processMemoryMessages(repositories);
+  await processMemoryConsolidation(repositories);
   await processConversationCompaction(repositories);
   await processDailyReflection(repositories);
   await processProactiveShares(repositories);
@@ -107,6 +109,28 @@ async function processMemoryMessages(repositories: ReturnType<typeof createRepos
     await repositories.memories.createMany(message.userId, message.id, memories);
   }
   await repositories.messages.markMemoryProcessed(messages.map((message) => message.id));
+}
+
+async function processMemoryConsolidation(repositories: ReturnType<typeof createRepositories>) {
+  const env = readEnv();
+  const user = await repositories.users.ensureDefault();
+  const settings = await repositories.settings.get(user.id);
+  const { client, model } = getLlmClient("light", env, settings.modelRouting);
+
+  for (const kind of Object.keys(MEMORY_CAPACITY_LIMITS) as Array<keyof typeof MEMORY_CAPACITY_LIMITS>) {
+    const outcome = await consolidateMemoryKind({
+      repositories,
+      llm: client,
+      model,
+      userId: user.id,
+      kind,
+    }).catch(() => null);
+    if (outcome) {
+      console.log(
+        `Memory consolidation (${outcome.kind}): ${outcome.strategy}, removed ${outcome.removedCount}, merged into ${outcome.mergedCount}.`,
+      );
+    }
+  }
 }
 
 async function processConversationCompaction(repositories: ReturnType<typeof createRepositories>) {

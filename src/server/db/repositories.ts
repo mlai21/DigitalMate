@@ -31,7 +31,22 @@ export type DbConversation = {
   userId: string;
   channel: string;
   title: string;
+  projectId: string | null;
+  pinned: boolean;
   updatedAt: Date;
+};
+
+export type DbProject = {
+  id: string;
+  userId: string;
+  name: string;
+  description: string;
+  updatedAt: Date;
+};
+
+export type DbConversationSummaryRow = DbConversation & {
+  messageCount: number;
+  lastMessageAt: Date | null;
 };
 
 export type DbMessage = {
@@ -90,6 +105,13 @@ export function createRepositories(pool: Pool = getPool()) {
         ]);
         return mapConversation(created.rows[0]);
       },
+      async create(userId: string, input?: { title?: string; projectId?: string | null }): Promise<DbConversation> {
+        const created = await pool.query(
+          "INSERT INTO conversations (user_id, title, project_id) VALUES ($1, $2, $3) RETURNING *",
+          [userId, input?.title?.trim() || "新的对话", input?.projectId ?? null],
+        );
+        return mapConversation(created.rows[0]);
+      },
       async getForUser(userId: string, conversationId: string): Promise<DbConversation | null> {
         const result = await pool.query("SELECT * FROM conversations WHERE user_id = $1 AND id = $2", [
           userId,
@@ -100,6 +122,91 @@ export function createRepositories(pool: Pool = getPool()) {
       async list(userId: string): Promise<DbConversation[]> {
         const result = await pool.query("SELECT * FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC", [userId]);
         return result.rows.map(mapConversation);
+      },
+      async listWithStats(userId: string): Promise<DbConversationSummaryRow[]> {
+        const result = await pool.query(
+          `SELECT c.*,
+                  count(m.id) FILTER (WHERE m.visible_to_user = true)::int AS message_count,
+                  max(m.created_at) AS last_message_at
+           FROM conversations c
+           LEFT JOIN messages m ON m.conversation_id = c.id
+           WHERE c.user_id = $1
+           GROUP BY c.id
+           ORDER BY c.pinned DESC, c.updated_at DESC`,
+          [userId],
+        );
+        return result.rows.map((row) => ({
+          ...mapConversation(row),
+          messageCount: Number(row.message_count ?? 0),
+          lastMessageAt: (row.last_message_at as Date | null) ?? null,
+        }));
+      },
+      async update(
+        userId: string,
+        conversationId: string,
+        input: { title?: string; pinned?: boolean; projectId?: string | null },
+      ): Promise<DbConversation | null> {
+        const result = await pool.query(
+          `UPDATE conversations SET
+             title = COALESCE($3, title),
+             pinned = COALESCE($4, pinned),
+             project_id = CASE WHEN $5 THEN $6::uuid ELSE project_id END,
+             updated_at = now()
+           WHERE user_id = $1 AND id = $2
+           RETURNING *`,
+          [
+            userId,
+            conversationId,
+            input.title?.trim() || null,
+            input.pinned ?? null,
+            input.projectId !== undefined,
+            input.projectId ?? null,
+          ],
+        );
+        return result.rows[0] ? mapConversation(result.rows[0]) : null;
+      },
+      async setTitleIfDefault(conversationId: string, title: string): Promise<void> {
+        const trimmed = title.trim();
+        if (!trimmed) return;
+        await pool.query("UPDATE conversations SET title = $2 WHERE id = $1 AND title IN ('新的对话', '和 DigitalMate 的对话')", [
+          conversationId,
+          trimmed.slice(0, 60),
+        ]);
+      },
+      async delete(userId: string, conversationId: string): Promise<void> {
+        await pool.query("DELETE FROM conversations WHERE user_id = $1 AND id = $2", [userId, conversationId]);
+      },
+    },
+    projects: {
+      async create(userId: string, input: { name: string; description?: string }): Promise<DbProject> {
+        const result = await pool.query(
+          "INSERT INTO projects (user_id, name, description) VALUES ($1, $2, $3) RETURNING *",
+          [userId, input.name.trim(), input.description?.trim() ?? ""],
+        );
+        return mapProject(result.rows[0]);
+      },
+      async list(userId: string): Promise<DbProject[]> {
+        const result = await pool.query("SELECT * FROM projects WHERE user_id = $1 ORDER BY updated_at DESC", [userId]);
+        return result.rows.map(mapProject);
+      },
+      async getForUser(userId: string, projectId: string): Promise<DbProject | null> {
+        const result = await pool.query("SELECT * FROM projects WHERE user_id = $1 AND id = $2", [userId, projectId]);
+        return result.rows[0] ? mapProject(result.rows[0]) : null;
+      },
+      async update(userId: string, projectId: string, input: { name?: string; description?: string }): Promise<DbProject | null> {
+        const result = await pool.query(
+          `UPDATE projects SET
+             name = COALESCE($3, name),
+             description = COALESCE($4, description),
+             updated_at = now()
+           WHERE user_id = $1 AND id = $2
+           RETURNING *`,
+          [userId, projectId, input.name?.trim() || null, input.description?.trim() ?? null],
+        );
+        return result.rows[0] ? mapProject(result.rows[0]) : null;
+      },
+      async delete(userId: string, projectId: string): Promise<void> {
+        await pool.query("DELETE FROM projects WHERE user_id = $1 AND id = $2", [userId, projectId]);
       },
     },
     messages: {
@@ -133,6 +240,12 @@ export function createRepositories(pool: Pool = getPool()) {
           [conversationId],
         );
         return result.rows.map(mapMessage);
+      },
+      async listAllForAudit(conversationId: string): Promise<Array<DbMessage & { visibleToUser: boolean }>> {
+        const result = await pool.query("SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC", [
+          conversationId,
+        ]);
+        return result.rows.map((row) => ({ ...mapMessage(row), visibleToUser: Boolean(row.visible_to_user) }));
       },
       async recentHistory(conversationId: string, limit = 12) {
         const result = await pool.query(
@@ -196,7 +309,10 @@ export function createRepositories(pool: Pool = getPool()) {
         );
       },
       async createMany(userId: string, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void> {
-        for (const memory of memories) {
+        for (const entry of memories) {
+          const safeContent = redactSensitiveMemory(entry.content);
+          if (!safeContent) continue;
+          const memory = { ...entry, content: safeContent };
           const embedding = formatPgVector(await embedText(memory.content));
           const expiresAt = memoryExpiresAt(memory);
           await pool.query(
@@ -209,6 +325,29 @@ export function createRepositories(pool: Pool = getPool()) {
             [userId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
           );
         }
+      },
+      async listActiveByKind(userId: string, kind: MemoryKind): Promise<DbMemoryEntry[]> {
+        const result = await pool.query(
+          `SELECT id, kind, content, confidence, created_at
+           FROM memory_entries
+           WHERE user_id = $1 AND kind = $2 AND ${ACTIVE_MEMORY_CONDITION}
+           ORDER BY created_at ASC`,
+          [userId, kind],
+        );
+        return result.rows.map((row) => ({
+          id: row.id,
+          kind: row.kind,
+          content: row.content,
+          confidence: Number(row.confidence),
+          createdAt: row.created_at,
+        }));
+      },
+      async softDeleteMany(userId: string, memoryIds: string[]): Promise<void> {
+        if (memoryIds.length === 0) return;
+        await pool.query("UPDATE memory_entries SET deleted_at = now() WHERE user_id = $1 AND id = ANY($2::uuid[])", [
+          userId,
+          memoryIds,
+        ]);
       },
       async list(userId: string): Promise<DbMemoryEntry[]> {
         const result = await pool.query(
@@ -288,6 +427,13 @@ export function createRepositories(pool: Pool = getPool()) {
         const result = await pool.query("SELECT * FROM tool_call_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100", [
           userId,
         ]);
+        return result.rows;
+      },
+      async listByConversation(userId: string, conversationId: string) {
+        const result = await pool.query(
+          "SELECT * FROM tool_call_logs WHERE user_id = $1 AND conversation_id = $2 ORDER BY created_at ASC LIMIT 200",
+          [userId, conversationId],
+        );
         return result.rows;
       },
     },
@@ -733,6 +879,7 @@ export function createRepositories(pool: Pool = getPool()) {
     personalData: {
       async export(userId: string) {
         const tables = [
+          "projects",
           "conversations",
           "messages",
           "conversation_summaries",
@@ -775,6 +922,7 @@ export function createRepositories(pool: Pool = getPool()) {
           "memory_entries",
           "messages",
           "conversations",
+          "projects",
         ];
         for (const table of tables) {
           await pool.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
@@ -878,6 +1026,18 @@ function mapConversation(row: Record<string, unknown>): DbConversation {
     userId: String(row.user_id),
     channel: String(row.channel),
     title: String(row.title),
+    projectId: row.project_id ? String(row.project_id) : null,
+    pinned: Boolean(row.pinned),
+    updatedAt: row.updated_at as Date,
+  };
+}
+
+function mapProject(row: Record<string, unknown>): DbProject {
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    name: String(row.name),
+    description: String(row.description ?? ""),
     updatedAt: row.updated_at as Date,
   };
 }

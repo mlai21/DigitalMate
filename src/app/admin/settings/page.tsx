@@ -12,7 +12,12 @@ export default async function SettingsPage() {
   const settings = await createRepositories().settings.get(user.id);
 
   return (
-    <section className="admin-list">
+    <>
+      <header className="admin-page-header">
+        <h2>设置</h2>
+        <p>人设、主动性边界与拟人节奏参数。</p>
+      </header>
+      <section className="admin-list">
       <form className="admin-card admin-form" action="/api/admin/settings" method="post">
         <label>
           名字
@@ -80,14 +85,9 @@ export default async function SettingsPage() {
           单次最多分段
           <input name="maxSegments" type="number" min="1" max="20" defaultValue={settings.cadence.maxSegments ?? 5} />
         </label>
-        <label>
-          主对话模型
-          <input name="modelMain" defaultValue={settings.modelRouting.main} />
-        </label>
-        <label>
-          轻量任务模型
-          <input name="modelLight" defaultValue={settings.modelRouting.light} />
-        </label>
+        <p className="model-picker-hint">
+          模型路由已移到<a href="/admin/models">「模型」页</a>选择。
+        </p>
         <button className="primary-button" type="submit">
           保存
         </button>
@@ -105,6 +105,7 @@ export default async function SettingsPage() {
           </ConfirmSubmitButton>
         </form>
       </article>
-    </section>
+      </section>
+    </>
   );
 }

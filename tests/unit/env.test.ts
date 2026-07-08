@@ -9,6 +9,7 @@ describe("readEnv", () => {
     expect(env.llmModelMain).toBe("claude-opus-4-8");
     expect(env.llmModelLight).toBe("gemini-3-5-flash-openai");
     expect(env.proactiveMaxPerDay).toBe(3);
+    expect(env.aliyunIqsBaseUrl).toBe("https://cloud-iqs.aliyuncs.com");
   });
 
   it("reads optional channel credentials", () => {
@@ -31,5 +32,17 @@ describe("readEnv", () => {
     expect(env.feishuAppSecret).toBe("feishu-secret");
     expect(env.feishuVerificationToken).toBe("feishu-token");
     expect(env.dingTalkRobotCode).toBe("ding-robot");
+  });
+
+  it("reads aliyun iqs search credentials", () => {
+    const env = readEnv({
+      SEARCH_PROVIDER: "iqs",
+      ALIYUN_IQS_API_KEY: "iqs-key",
+      ALIYUN_IQS_BASE_URL: "https://cloud-iqs.aliyuncs.com",
+    });
+
+    expect(env.searchProvider).toBe("iqs");
+    expect(env.aliyunIqsApiKey).toBe("iqs-key");
+    expect(env.aliyunIqsBaseUrl).toBe("https://cloud-iqs.aliyuncs.com");
   });
 });

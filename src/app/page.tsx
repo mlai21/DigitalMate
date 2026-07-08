@@ -1,4 +1,5 @@
 import { ChatShell, type ChatMessage } from "@/components/chat/chat-shell";
+import type { ConversationItem, ProjectItem } from "@/components/chat/chat-sidebar";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -11,6 +12,8 @@ export default async function Home() {
     <ChatShell
       conversationId={data.conversationId}
       initialMessages={data.initialMessages}
+      initialConversations={data.initialConversations}
+      initialProjects={data.initialProjects}
       setupNotice={data.setupNotice}
     />
   );
@@ -19,17 +22,51 @@ export default async function Home() {
 async function loadChatPageData(): Promise<{
   conversationId?: string;
   initialMessages: ChatMessage[];
+  initialConversations: ConversationItem[];
+  initialProjects: ProjectItem[];
   setupNotice?: string;
 }> {
   try {
     const user = await getCurrentUser();
     if (!user) {
-      return { initialMessages: [], setupNotice: "需要先登录后才能继续聊天。" };
+      return {
+        initialMessages: [],
+        initialConversations: [],
+        initialProjects: [],
+        setupNotice: "需要先登录后才能继续聊天。",
+      };
     }
 
     const repositories = createRepositories();
-    const conversation = await repositories.conversations.getOrCreateDefault(user.id);
-    const messages = await repositories.messages.list(conversation.id);
+    const [conversations, projects] = await Promise.all([
+      repositories.conversations.listWithStats(user.id),
+      repositories.projects.list(user.id),
+    ]);
+
+    const initialConversations: ConversationItem[] = conversations.map((conversation) => ({
+      id: conversation.id,
+      title: conversation.title,
+      channel: conversation.channel,
+      projectId: conversation.projectId,
+      pinned: conversation.pinned,
+      updatedAt: conversation.updatedAt.toISOString(),
+      messageCount: conversation.messageCount,
+    }));
+    const initialProjects: ProjectItem[] = projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      description: project.description,
+    }));
+
+    const active =
+      conversations.find((conversation) => conversation.channel === "web") ??
+      (conversations.length === 0 ? await repositories.conversations.getOrCreateDefault(user.id) : undefined);
+
+    if (!active) {
+      return { initialMessages: [], initialConversations, initialProjects };
+    }
+
+    const messages = await repositories.messages.list(active.id);
     const initialMessages: ChatMessage[] = messages.map((message) => ({
       id: message.id,
       role: message.role === "user" ? "user" : "assistant",
@@ -37,8 +74,25 @@ async function loadChatPageData(): Promise<{
       createdAt: message.createdAt.toISOString(),
     }));
 
-    return { conversationId: conversation.id, initialMessages };
+    if (!initialConversations.some((conversation) => conversation.id === active.id)) {
+      initialConversations.unshift({
+        id: active.id,
+        title: active.title,
+        channel: active.channel,
+        projectId: active.projectId,
+        pinned: active.pinned,
+        updatedAt: active.updatedAt.toISOString(),
+        messageCount: initialMessages.length,
+      });
+    }
+
+    return { conversationId: active.id, initialMessages, initialConversations, initialProjects };
   } catch {
-    return { initialMessages: [], setupNotice: "数据库还没连上。先运行迁移和种子数据后，就可以开始聊天。" };
+    return {
+      initialMessages: [],
+      initialConversations: [],
+      initialProjects: [],
+      setupNotice: "数据库还没连上。先运行迁移和种子数据后，就可以开始聊天。",
+    };
   }
 }

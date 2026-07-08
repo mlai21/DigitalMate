@@ -22,8 +22,29 @@ const sensitivePatterns = [
   /(api[_-]?key|secret|token|password|密码|密钥)\s*(?:是|为|叫|[:：=])/i,
 ];
 
+// Memory entries are injected into the system prompt, so contents that try to
+// override instructions or exfiltrate context must never be persisted
+// (Hermes-style write-time security scan).
+const injectionThreatPatterns = [
+  /(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
+  /(system\s*prompt|developer\s*message)/i,
+  /(忽略|无视|忘记)(之前|以上|上面|前面)?的?(所有)?(指令|提示|设定|规则)/,
+  /(你现在是|从现在开始你是|扮演.{0,10}(越狱|无限制))/,
+  /(泄露|输出|打印|透露).{0,12}(系统提示|提示词|凭据|密钥|api\s*key)/i,
+  /(系统提示词?|提示词|凭据|密钥).{0,12}(泄露|输出|打印|透露|告诉|发给)/,
+  /curl\s+.*(http|ftp)|wget\s+http|nc\s+-e|bash\s+-i/i,
+];
+
+export function hasInjectionThreat(content: string): boolean {
+  const normalized = content.replace(/\s+/g, " ");
+  return injectionThreatPatterns.some((pattern) => pattern.test(normalized));
+}
+
 export function redactSensitiveMemory(content: string): string | null {
   if (sensitivePatterns.some((pattern) => pattern.test(content)) || hasSeparatedSensitiveNumber(content)) {
+    return null;
+  }
+  if (hasInjectionThreat(content)) {
     return null;
   }
   return content.trim();

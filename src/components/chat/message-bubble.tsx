@@ -8,6 +8,8 @@ export type MessageBubbleProps = {
 export function MessageBubble({ role, content }: MessageBubbleProps) {
   const visibleContent = role === "assistant" ? sanitizeAssistantText(content) : content;
 
+  if (role === "assistant" && visibleContent.trim().length === 0) return null;
+
   return (
     <div className={`message-row ${role === "user" ? "message-row-user" : "message-row-assistant"}`}>
       {role === "assistant" ? <div className="mate-avatar" aria-hidden="true">D</div> : null}

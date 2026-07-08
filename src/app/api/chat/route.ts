@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { generateConversationTitle } from "@/server/agent/conversation-title";
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
@@ -7,6 +8,7 @@ import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
+import { recordTurnReview } from "@/server/evolution/turn-review";
 import { getLlmClient } from "@/server/llm/router";
 
 export const runtime = "nodejs";
@@ -116,6 +118,23 @@ export async function POST(request: Request) {
 
         controller.enqueue(encoder.encode(toSse({ type: "done", conversationId })));
         controller.close();
+
+        // Post-turn background work on the light model: auto-title new
+        // conversations and run the Hermes-style per-turn review. Neither may
+        // block or fail the reply.
+        const light = getLlmClient("light", env, settings.modelRouting);
+        setTimeout(() => {
+          void runPostTurnTasks({
+            repositories,
+            userId: user.id,
+            conversationId,
+            conversationTitle: conversation.title,
+            userText: body.data.message,
+            assistantText,
+            llm: light.client,
+            model: light.model,
+          });
+        }, 0);
       } catch (error) {
         const content = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
         await repositories.messages.create({ userId: user.id, conversationId, role: "assistant", content });
@@ -144,4 +163,36 @@ export async function POST(request: Request) {
 
 function toSse(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+async function runPostTurnTasks(input: {
+  repositories: ReturnType<typeof createRepositories>;
+  userId: string;
+  conversationId: string;
+  conversationTitle: string;
+  userText: string;
+  assistantText: string;
+  llm: ReturnType<typeof getLlmClient>["client"];
+  model: string;
+}): Promise<void> {
+  const isDefaultTitle = input.conversationTitle === "新的对话" || input.conversationTitle === "和 DigitalMate 的对话";
+  if (isDefaultTitle) {
+    await generateConversationTitle({
+      llm: input.llm,
+      model: input.model,
+      userText: input.userText,
+      assistantText: input.assistantText,
+    })
+      .then((title) => input.repositories.conversations.setTitleIfDefault(input.conversationId, title))
+      .catch(() => undefined);
+  }
+
+  await recordTurnReview(input.repositories, {
+    userId: input.userId,
+    conversationId: input.conversationId,
+    llm: input.llm,
+    model: input.model,
+    userText: input.userText,
+    assistantText: input.assistantText,
+  }).catch(() => undefined);
 }

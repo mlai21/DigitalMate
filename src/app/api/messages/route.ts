@@ -13,9 +13,16 @@ export async function GET(request: Request) {
   }
 
   const url = new URL(request.url);
-  const conversation = await createRepositories().conversations.getOrCreateDefault(user.id);
+  const repositories = createRepositories();
+  const conversationIdParam = url.searchParams.get("conversationId");
+  const conversation = conversationIdParam
+    ? await repositories.conversations.getForUser(user.id, conversationIdParam)
+    : await repositories.conversations.getOrCreateDefault(user.id);
+  if (!conversation) {
+    return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
+  }
   const after = url.searchParams.get("after") ? new Date(url.searchParams.get("after") as string) : new Date(0);
-  const messages = await createRepositories().messages.listAfter(conversation.id, after);
+  const messages = await repositories.messages.listAfter(conversation.id, after);
 
   return NextResponse.json({ messages });
 }
