@@ -1,14 +1,13 @@
 import type { Pool } from "pg";
 import {
-  buildLocalMemoryEmbedding,
-  extractRuleBasedMemories,
   formatPgVector,
-  rankMemories,
+  lexicalRelevanceScore,
   redactSensitiveMemory,
   type ExtractedMemory,
   type MemoryKind,
   type RankableMemory,
 } from "@/server/agent/memory";
+import { embedText } from "@/server/llm/embeddings";
 import type { EnabledToolContext, SkillContext, ToolLogInput } from "@/server/agent/run-agent";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
@@ -169,9 +168,9 @@ export function createRepositories(pool: Pool = getPool()) {
     },
     memories: {
       async findRelevant(userId: string, query: string): Promise<RankableMemory[]> {
-        const queryEmbedding = formatPgVector(buildLocalMemoryEmbedding(query));
+        const queryEmbedding = formatPgVector(await embedText(query));
         const semanticResult = await pool.query(
-          `SELECT id, content, created_at
+          `SELECT id, content, created_at, 1 - (embedding <=> $2::vector) AS similarity
            FROM memory_entries
            WHERE user_id = $1 AND ${ACTIVE_MEMORY_CONDITION} AND embedding IS NOT NULL
            ORDER BY embedding <=> $2::vector
@@ -188,12 +187,17 @@ export function createRepositories(pool: Pool = getPool()) {
         return mergeMemoryCandidates(
           query,
           lexicalResult.rows.map((row) => ({ id: row.id, content: row.content, createdAt: row.created_at })),
-          semanticResult.rows.map((row) => ({ id: row.id, content: row.content, createdAt: row.created_at })),
+          semanticResult.rows.map((row) => ({
+            id: row.id,
+            content: row.content,
+            createdAt: row.created_at,
+            similarity: Number(row.similarity ?? 0),
+          })),
         );
       },
       async createMany(userId: string, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void> {
         for (const memory of memories) {
-          const embedding = formatPgVector(buildLocalMemoryEmbedding(memory.content));
+          const embedding = formatPgVector(await embedText(memory.content));
           const expiresAt = memoryExpiresAt(memory);
           await pool.query(
             `INSERT INTO memory_entries (user_id, kind, content, confidence, source_message_id, embedding, expires_at)
@@ -205,10 +209,6 @@ export function createRepositories(pool: Pool = getPool()) {
             [userId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
           );
         }
-      },
-      async extractAndSaveFromMessage(message: DbMessage): Promise<void> {
-        const memories = extractRuleBasedMemories(message.content);
-        await this.createMany(message.userId, message.id, memories);
       },
       async list(userId: string): Promise<DbMemoryEntry[]> {
         const result = await pool.query(
@@ -233,7 +233,7 @@ export function createRepositories(pool: Pool = getPool()) {
       ): Promise<void> {
         const content = redactSensitiveMemory(input.content);
         if (!content) return;
-        const embedding = formatPgVector(buildLocalMemoryEmbedding(content));
+        const embedding = formatPgVector(await embedText(content));
         await pool.query(
           `UPDATE memory_entries
            SET kind = $3, content = $4, confidence = $5, embedding = $6::vector
@@ -801,15 +801,42 @@ function channelConversationTitle(message: NormalizedChannelMessage): string {
   return `${message.channel}:${message.externalConversationId}`;
 }
 
-function mergeMemoryCandidates(query: string, lexicalCandidates: RankableMemory[], semanticCandidates: RankableMemory[]): RankableMemory[] {
-  const merged = new Map<string, RankableMemory>();
-  for (const memory of rankMemories(query, lexicalCandidates)) {
-    merged.set(memory.id, memory);
+const SEMANTIC_WEIGHT = 0.7;
+const LEXICAL_WEIGHT = 0.3;
+
+function mergeMemoryCandidates(
+  query: string,
+  lexicalCandidates: RankableMemory[],
+  semanticCandidates: Array<RankableMemory & { similarity: number }>,
+): RankableMemory[] {
+  const scored = new Map<string, { memory: RankableMemory; score: number }>();
+  const now = Date.now();
+
+  for (const candidate of semanticCandidates) {
+    scored.set(candidate.id, {
+      memory: { id: candidate.id, content: candidate.content, createdAt: candidate.createdAt },
+      score: SEMANTIC_WEIGHT * Math.max(0, candidate.similarity),
+    });
   }
-  for (const memory of semanticCandidates) {
-    if (!merged.has(memory.id)) merged.set(memory.id, memory);
+  for (const memory of lexicalCandidates) {
+    const lexical = LEXICAL_WEIGHT * lexicalRelevanceScore(query, memory.content);
+    const existing = scored.get(memory.id);
+    if (existing) {
+      existing.score += lexical;
+    } else {
+      scored.set(memory.id, { memory, score: lexical });
+    }
   }
-  return [...merged.values()].slice(0, 8);
+
+  return [...scored.values()]
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || recencyValue(b.memory, now) - recencyValue(a.memory, now))
+    .slice(0, 8)
+    .map((entry) => entry.memory);
+}
+
+function recencyValue(memory: RankableMemory, now: number): number {
+  return -(now - memory.createdAt.getTime());
 }
 
 function memoryExpiresAt(memory: ExtractedMemory): Date | null {

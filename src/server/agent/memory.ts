@@ -64,6 +64,15 @@ export function rankMemories(query: string, memories: RankableMemory[]): Rankabl
   });
 }
 
+/** Fraction of query n-gram tokens present in the content, in [0, 1]. */
+export function lexicalRelevanceScore(query: string, content: string): number {
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) return 0;
+  const normalized = content.toLowerCase();
+  const hits = queryTokens.reduce((count, token) => count + (normalized.includes(token) ? 1 : 0), 0);
+  return hits / queryTokens.length;
+}
+
 export function buildLocalMemoryEmbedding(text: string): number[] {
   const vector = Array.from({ length: MEMORY_EMBEDDING_DIMENSIONS }, () => 0);
   const tokens = tokenizeForEmbedding(text);

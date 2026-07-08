@@ -137,6 +137,19 @@ curl -X POST "${KIE_AI_BASE_URL}${CLAUDE_MESSAGES_ENDPOINT}" \
 
 ---
 
+## 记忆向量 Embedding（可选）
+
+记忆召回使用 pgvector 语义检索 + 词面相关度加权融合。配置任意 OpenAI 兼容的 `/embeddings` 接口即可启用真实语义向量；**不配置时自动降级为本地哈希伪向量**（功能可用，语义召回质量下降）。
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `EMBEDDING_BASE_URL` | 否 | OpenAI 兼容 API base URL（如 `https://api.openai.com/v1`），请求发往 `{BASE_URL}/embeddings` |
+| `EMBEDDING_API_KEY` | 否 | Embedding 服务的 API Key |
+| `EMBEDDING_MODEL` | 否 | 如 `text-embedding-3-small`；与 `EMBEDDING_BASE_URL` 同时配置才启用 |
+| `EMBEDDING_DIMENSIONS` | 否 | 默认 `1536`，必须与 `schema.sql` 中 `vector(1536)` 一致 |
+
+---
+
 ## 常见问题
 
 **401 Invalid or missing API key**

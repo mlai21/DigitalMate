@@ -9,13 +9,13 @@ describe("chooseLlmClientName", () => {
         main: "claude-opus-4-8",
         light: "gemini-3-5-flash-openai",
       }),
-    ).toBe("claude");
+    ).toBe("anthropic");
     expect(
       chooseLlmClientName("light", {
         main: "claude-opus-4-8",
         light: "gemini-3-5-flash-openai",
       }),
-    ).toBe("gemini");
+    ).toBe("openai");
   });
 
   it("uses explicit route config ahead of environment model defaults", () => {
@@ -30,6 +30,13 @@ describe("chooseLlmClientName", () => {
     );
 
     expect(routed.model).toBe("gemini-3-5-flash-openai");
-    expect(routed.client.constructor.name).toBe("KieGeminiClient");
+    expect(routed.client.constructor.name).toBe("OpenAiCompatClient");
+  });
+
+  it("falls back to the mock client without an API key", () => {
+    const routed = getLlmClient("light", readEnv({}));
+
+    expect(routed.client.constructor.name).toBe("MockLlmClient");
+    expect(routed.model).toBe("mock-light");
   });
 });

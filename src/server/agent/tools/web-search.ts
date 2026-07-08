@@ -6,25 +6,6 @@ export type WebSearchResult = {
   snippet: string;
 };
 
-const realtimePatterns = [
-  /查一下/,
-  /搜索/,
-  /联网/,
-  /实时/,
-  /最新/,
-  /今天/,
-  /明天/,
-  /天气/,
-  /新闻/,
-  /价格/,
-  /汇率/,
-  /\b(current|latest|today|tomorrow|weather|news|price)\b/i,
-];
-
-export function shouldSearchWeb(text: string): boolean {
-  return realtimePatterns.some((pattern) => pattern.test(text));
-}
-
 export async function searchWeb(query: string): Promise<WebSearchResult[]> {
   const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   const response = await fetch(url, {

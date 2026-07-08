@@ -1,8 +1,7 @@
 import { buildPersonaPrompt, type PersonaConfig } from "@/server/agent/persona";
 import { sanitizeAssistantText } from "@/server/agent/streaming";
-import { shouldSearchWeb } from "@/server/agent/tools/web-search";
 import type { RankableMemory } from "@/server/agent/memory";
-import type { LlmClient, LlmMessage, LlmPurpose } from "@/server/llm/types";
+import type { LlmClient, LlmMessage, LlmPurpose, LlmTool, LlmToolCall } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount, type LlmUsageLogInput } from "@/server/llm/usage";
 import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/server/tasks/tools";
 
@@ -27,11 +26,6 @@ export type EnabledToolContext = {
   name: string;
   description: string;
   command: string;
-};
-
-export type PrivateToolCall = {
-  name: string;
-  input: string;
 };
 
 export type RunAgentInput = {
@@ -74,7 +68,19 @@ export type RunAgentInput = {
   purpose?: LlmPurpose;
 };
 
-const maxPrivateToolCalls = 2;
+const maxToolIterations = 4;
+
+const webSearchTool: LlmTool = {
+  name: "web_search",
+  description: "联网搜索实时信息（天气、新闻、事实核查等）。只有当回答需要最新外部信息时才调用。",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "搜索查询词" },
+    },
+    required: ["query"],
+  },
+};
 
 export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   const [memories, skills, reflectionSuggestions, enabledTools] = await Promise.all([
@@ -84,48 +90,37 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     input.repositories.toolRegistrations?.listEnabled(input.userId) ?? Promise.resolve([]),
   ]);
   const conversationSummary = await input.repositories.conversationSummaries?.latest(input.conversationId);
-  const searchSummary = await maybeSearch(input);
-  const messages = buildMessages({
+  const tools = buildTools(enabledTools);
+  let activeMessages = buildMessages({
     persona: input.persona,
     conversationSummary,
     memories,
     skills,
     reflectionSuggestions,
     enabledTools,
-    searchSummary,
     history: input.history,
     userText: input.message,
   });
-  const inputTokens = estimateMessagesTokenUsage(messages);
   let outputTokens = 0;
-  let activeMessages = messages;
 
-  for (let iteration = 0; iteration <= maxPrivateToolCalls; iteration += 1) {
-    const rawText = await collectText(input.llm.streamText({ messages: activeMessages, model: input.model }));
-    const toolCall = parsePrivateToolCall(rawText);
-    if (toolCall) {
-      const result = await executePrivateToolCall({
-        input,
-        toolCall,
-        enabledTools,
-      });
-      activeMessages = [
-        ...activeMessages,
-        { role: "assistant", content: `工具调用请求：${toolCall.name}` },
-        {
-          role: "user",
-          content: `工具 ${toolCall.name} 返回：\n${result}\n\n请基于这个结果自然回复用户，不要暴露工具调用细节。`,
-        },
-      ];
-      continue;
+  for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
+    const { text, toolCalls } = await collectTurn(input.llm.stream({ messages: activeMessages, model: input.model, tools }));
+
+    if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
+      const visible = sanitizeAssistantText(text);
+      if (visible) {
+        outputTokens += estimateTokenCount(visible);
+        yield visible;
+      }
+      break;
     }
 
-    const visible = sanitizeAssistantText(rawText);
-    if (visible) {
-      outputTokens += estimateTokenCount(visible);
-      yield visible;
+    const toolMessages: LlmMessage[] = [];
+    for (const toolCall of toolCalls) {
+      const result = await executeToolCall({ input, toolCall, enabledTools });
+      toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }
-    break;
+    activeMessages = [...activeMessages, { role: "assistant", content: text, toolCalls }, ...toolMessages];
   }
 
   await input.repositories.llmUsage?.create({
@@ -133,47 +128,86 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     conversationId: input.conversationId,
     purpose: input.purpose ?? "main",
     model: input.model,
-    inputTokens,
+    inputTokens: estimateMessagesTokenUsage(activeMessages),
     outputTokens,
-    totalTokens: inputTokens + outputTokens,
+    totalTokens: estimateMessagesTokenUsage(activeMessages) + outputTokens,
   });
 }
 
-export function parsePrivateToolCall(text: string): PrivateToolCall | null {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
-
-  try {
-    const parsed = JSON.parse(trimmed) as {
-      tool_call?: { name?: unknown; input?: unknown; arguments?: unknown };
-    };
-    const call = parsed.tool_call;
-    if (!call || typeof call.name !== "string") return null;
-    const input =
-      typeof call.input === "string"
-        ? call.input
-        : call.arguments === undefined
-          ? ""
-          : JSON.stringify(call.arguments);
-    return { name: call.name, input };
-  } catch {
-    return null;
-  }
+function buildTools(enabledTools: EnabledToolContext[]): LlmTool[] {
+  return [
+    webSearchTool,
+    ...enabledTools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: {
+        type: "object",
+        properties: {
+          input: { type: "string", description: "工具输入" },
+        },
+        required: ["input"],
+      },
+    })),
+  ];
 }
 
-async function executePrivateToolCall(input: {
+async function collectTurn(stream: AsyncIterable<{ type: "text"; text: string } | { type: "tool_call"; toolCall: LlmToolCall }>) {
+  const chunks: string[] = [];
+  const toolCalls: LlmToolCall[] = [];
+  for await (const event of stream) {
+    if (event.type === "text") chunks.push(event.text);
+    else toolCalls.push(event.toolCall);
+  }
+  return { text: chunks.join(""), toolCalls };
+}
+
+async function executeToolCall(context: {
   input: RunAgentInput;
-  toolCall: PrivateToolCall;
+  toolCall: LlmToolCall;
   enabledTools: EnabledToolContext[];
 }): Promise<string> {
-  const tool = input.enabledTools.find((item) => item.name === input.toolCall.name);
+  const { input, toolCall } = context;
   const startedAt = Date.now();
+  const args = safeParseArguments(toolCall.arguments);
+
+  if (toolCall.name === "web_search") {
+    const query = typeof args.query === "string" && args.query.trim() ? args.query : input.message;
+    try {
+      const result = await input.search.run(query);
+      await input.repositories.toolLogs.create({
+        userId: input.userId,
+        conversationId: input.conversationId,
+        toolName: "web_search",
+        inputSummary: query,
+        outputSummary: result.summary.slice(0, 500),
+        status: "success",
+        durationMs: Date.now() - startedAt,
+      });
+      return result.summary;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await input.repositories.toolLogs.create({
+        userId: input.userId,
+        conversationId: input.conversationId,
+        toolName: "web_search",
+        inputSummary: query,
+        outputSummary: "搜索失败",
+        status: "error",
+        durationMs: Date.now() - startedAt,
+        error: message,
+      });
+      return "搜索暂时不可用，请基于已有知识谨慎回答，并说明信息可能不是最新的。";
+    }
+  }
+
+  const tool = context.enabledTools.find((item) => item.name === toolCall.name);
+  const toolInput = typeof args.input === "string" ? args.input : toolCall.arguments;
   if (!tool) {
-    await input.input.repositories.toolLogs.create({
-      userId: input.input.userId,
-      conversationId: input.input.conversationId,
-      toolName: `registered_tool:${input.toolCall.name}`,
-      inputSummary: input.toolCall.input,
+    await input.repositories.toolLogs.create({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      toolName: `registered_tool:${toolCall.name}`,
+      inputSummary: toolInput,
       outputSummary: "工具未启用或不存在",
       status: "error",
       durationMs: Date.now() - startedAt,
@@ -183,13 +217,12 @@ async function executePrivateToolCall(input: {
   }
 
   try {
-    const result = await (input.input.toolExecutor?.run(tool, input.toolCall.input) ??
-      executeRegisteredTool(tool, input.toolCall.input));
-    await input.input.repositories.toolLogs.create({
-      userId: input.input.userId,
-      conversationId: input.input.conversationId,
+    const result = await (input.toolExecutor?.run(tool, toolInput) ?? executeRegisteredTool(tool, toolInput));
+    await input.repositories.toolLogs.create({
+      userId: input.userId,
+      conversationId: input.conversationId,
       toolName: `registered_tool:${tool.name}`,
-      inputSummary: input.toolCall.input,
+      inputSummary: toolInput,
       outputSummary: result.output.slice(0, 500),
       status: "success",
       durationMs: Date.now() - startedAt,
@@ -197,11 +230,11 @@ async function executePrivateToolCall(input: {
     return result.output;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await input.input.repositories.toolLogs.create({
-      userId: input.input.userId,
-      conversationId: input.input.conversationId,
+    await input.repositories.toolLogs.create({
+      userId: input.userId,
+      conversationId: input.conversationId,
       toolName: `registered_tool:${tool.name}`,
-      inputSummary: input.toolCall.input,
+      inputSummary: toolInput,
       outputSummary: "工具执行失败",
       status: "error",
       durationMs: Date.now() - startedAt,
@@ -211,10 +244,13 @@ async function executePrivateToolCall(input: {
   }
 }
 
-async function collectText(stream: AsyncIterable<string>): Promise<string> {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return chunks.join("");
+function safeParseArguments(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw || "{}");
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 export function buildMessages(input: {
@@ -224,12 +260,12 @@ export function buildMessages(input: {
   skills?: SkillContext[];
   reflectionSuggestions?: string[];
   enabledTools?: EnabledToolContext[];
-  searchSummary?: string;
   history: LlmMessage[];
   userText: string;
 }): LlmMessage[] {
   const contextParts = [
     buildPersonaPrompt(input.persona),
+    "工具使用规则：需要实时信息时调用 web_search；工具结果只作为你回答的依据，绝不向用户暴露工具调用过程。",
     input.conversationSummary ? `压缩后的会话摘要（内部上下文，不要向用户暴露）：\n${input.conversationSummary}` : "",
     input.memories.length > 0 ? `可参考的长期记忆：\n${input.memories.map((memory) => `- ${memory.content}`).join("\n")}` : "",
     input.skills && input.skills.length > 0
@@ -247,7 +283,6 @@ export function buildMessages(input: {
           .map((tool) => `- ${tool.name}：${tool.description}`)
           .join("\n")}`
       : "",
-    input.searchSummary ? `联网搜索摘要：\n${input.searchSummary}` : "",
   ].filter(Boolean);
 
   return [
@@ -255,35 +290,4 @@ export function buildMessages(input: {
     ...input.history,
     { role: "user", content: input.userText },
   ];
-}
-
-async function maybeSearch(input: RunAgentInput): Promise<string | undefined> {
-  if (!shouldSearchWeb(input.message)) return undefined;
-
-  const startedAt = Date.now();
-  try {
-    const result = await input.search.run(input.message);
-    await input.repositories.toolLogs.create({
-      userId: input.userId,
-      conversationId: input.conversationId,
-      toolName: "web_search",
-      inputSummary: input.message,
-      outputSummary: result.summary,
-      status: "success",
-      durationMs: Date.now() - startedAt,
-    });
-    return result.summary;
-  } catch (error) {
-    await input.repositories.toolLogs.create({
-      userId: input.userId,
-      conversationId: input.conversationId,
-      toolName: "web_search",
-      inputSummary: input.message,
-      outputSummary: "搜索失败",
-      status: "error",
-      durationMs: Date.now() - startedAt,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return "我这边刚才没查到可靠结果。";
-  }
 }

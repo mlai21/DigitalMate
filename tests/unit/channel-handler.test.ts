@@ -3,6 +3,17 @@ import { handleChannelMessage } from "@/server/channels/handler";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { LlmClient } from "@/server/llm/types";
 
+function textLlm(reply: string): LlmClient {
+  return {
+    async *stream() {
+      yield { type: "text", text: reply };
+    },
+    async completeText() {
+      return reply;
+    },
+  };
+}
+
 const directMessage: NormalizedChannelMessage = {
   channel: "telegram",
   externalConversationId: "123",
@@ -20,14 +31,7 @@ describe("handleChannelMessage", () => {
     const createChannelMessage = vi.fn((input: unknown) => {
       void input;
     });
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "我在。";
-      },
-      async completeText() {
-        return "我在。";
-      },
-    };
+    const llm = textLlm("我在。");
 
     await handleChannelMessage({
       message: directMessage,
@@ -45,14 +49,7 @@ describe("handleChannelMessage", () => {
 
   it("splits long channel replies into natural message segments", async () => {
     const send = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "我在。可以先把事情拆小！然后我们一步一步来？";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("我在。可以先把事情拆小！然后我们一步一步来？");
 
     await handleChannelMessage({
       message: directMessage,
@@ -72,14 +69,7 @@ describe("handleChannelMessage", () => {
   it("applies configured channel cadence between message segments", async () => {
     const send = vi.fn();
     const delay = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "第一句。第二句。第三句。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("第一句。第二句。第三句。");
 
     await handleChannelMessage({
       message: directMessage,
@@ -101,14 +91,7 @@ describe("handleChannelMessage", () => {
   it("applies a configured first-response delay before sending channel replies", async () => {
     const send = vi.fn();
     const delay = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "第一句。第二句。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("第一句。第二句。");
 
     await handleChannelMessage({
       message: directMessage,
@@ -128,14 +111,7 @@ describe("handleChannelMessage", () => {
 
   it("creates reminder tasks from direct channel messages", async () => {
     const createTask = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "好，我帮你记下。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("好，我帮你记下。");
 
     await handleChannelMessage({
       message: { ...directMessage, text: "10 分钟后提醒我喝水" },
@@ -160,14 +136,7 @@ describe("handleChannelMessage", () => {
 
   it("creates urgent reminder tasks from direct channel messages", async () => {
     const createTask = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "好，我会及时提醒你。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("好，我会及时提醒你。");
 
     await handleChannelMessage({
       message: { ...directMessage, text: "10 分钟后紧急提醒我吃药" },
@@ -194,14 +163,7 @@ describe("handleChannelMessage", () => {
 
   it("creates follow-up tasks from direct channel messages", async () => {
     const createTask = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "记下了，明天我来问问进展。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("记下了，明天我来问问进展。");
 
     await handleChannelMessage({
       message: { ...directMessage, text: "我在准备一个演讲" },
@@ -226,14 +188,7 @@ describe("handleChannelMessage", () => {
 
   it("records user dissatisfaction from channel messages as private reflections", async () => {
     const createReflection = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "我重新按你的意思来。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("我重新按你的意思来。");
 
     await handleChannelMessage({
       message: { ...directMessage, text: "你刚才理解错了，不是这个意思" },
@@ -261,14 +216,7 @@ describe("handleChannelMessage", () => {
     const createDecision = vi.fn((input: unknown) => {
       void input;
     });
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "上次你说想爬山，周末可以看看天气。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("上次你说想爬山，周末可以看看天气。");
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "周末去哪爬山？" },
@@ -286,14 +234,7 @@ describe("handleChannelMessage", () => {
 
   it("keeps group chatter out of long-term memory extraction", async () => {
     const createMessage = vi.fn();
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "上次你说想爬山，周末可以看看天气。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("上次你说想爬山，周末可以看看天气。");
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "我朋友小李的身份证是 110101199003071234" },
@@ -319,14 +260,7 @@ describe("handleChannelMessage", () => {
     const createDecision = vi.fn((input: unknown) => {
       void input;
     });
-    const llm: LlmClient = {
-      async *streamText() {
-        yield "上次你说想爬山，周末可以看看天气。";
-      },
-      async completeText() {
-        return "";
-      },
-    };
+    const llm = textLlm("上次你说想爬山，周末可以看看天气。");
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "周末去哪爬山？" },

@@ -1,18 +1,16 @@
-import type { LlmClient } from "@/server/llm/types";
+import type { LlmClient, LlmStreamEvent, LlmStreamInput } from "@/server/llm/types";
+import { collectStreamText } from "@/server/llm/types";
 
 export class MockLlmClient implements LlmClient {
-  async *streamText(input: Parameters<LlmClient["streamText"]>[0]): AsyncIterable<string> {
+  async *stream(input: LlmStreamInput): AsyncIterable<LlmStreamEvent> {
     const lastUser = [...input.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const system = input.messages.find((message) => message.role === "system")?.content ?? "";
     const memoryHint = system.includes("可参考的长期记忆") ? "我还记得之前聊到的一些事。" : "";
-    const searchHint = system.includes("联网搜索摘要") ? "我刚查了一下，" : "";
-    yield `${searchHint}${memoryHint}${buildLocalReply(lastUser)}`;
+    yield { type: "text", text: `${memoryHint}${buildLocalReply(lastUser)}` };
   }
 
   async completeText(input: Parameters<LlmClient["completeText"]>[0]): Promise<string> {
-    const chunks = [];
-    for await (const chunk of this.streamText(input)) chunks.push(chunk);
-    return chunks.join("");
+    return collectStreamText(this.stream(input));
   }
 }
 

@@ -39,16 +39,17 @@ describe("memory repository", () => {
     expect((params as unknown[])[6]).toBeNull();
   });
 
-  it("uses pgvector retrieval before lexical fallback", async () => {
+  it("fuses vector similarity with lexical relevance for recall", async () => {
     const query = vi
       .fn()
       .mockResolvedValueOnce({
-        rows: [{ id: "semantic", content: "用户喜欢户外徒步", created_at: new Date("2026-06-01T00:00:00Z") }],
+        rows: [{ id: "semantic", content: "用户喜欢户外徒步", created_at: new Date("2026-06-01T00:00:00Z"), similarity: 0.9 }],
       })
       .mockResolvedValueOnce({
         rows: [
           { id: "keyword", content: "用户喜欢周末爬山", created_at: new Date("2026-06-02T00:00:00Z") },
           { id: "semantic", content: "用户喜欢户外徒步", created_at: new Date("2026-06-01T00:00:00Z") },
+          { id: "irrelevant", content: "用户喜欢咖啡", created_at: new Date("2026-06-03T00:00:00Z") },
         ],
       });
     const repositories = createRepositories({ query } as unknown as Pool);
@@ -56,8 +57,10 @@ describe("memory repository", () => {
     const memories = await repositories.memories.findRelevant("user-1", "周末去哪爬山");
 
     expect(String(query.mock.calls[0]?.[0])).toContain("embedding <=> $2::vector");
+    expect(String(query.mock.calls[0]?.[0])).toContain("AS similarity");
     expect(String(query.mock.calls[1]?.[0])).toContain("ORDER BY created_at DESC LIMIT 80");
-    expect(memories.map((memory) => memory.id)).toEqual(["keyword", "semantic"]);
+    // High vector similarity outranks a weak lexical hit; zero-score memories are dropped.
+    expect(memories.map((memory) => memory.id)).toEqual(["semantic", "keyword"]);
   });
 
   it("filters expired memories from recall and admin lists", async () => {

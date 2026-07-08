@@ -43,8 +43,8 @@ const mocks = vi.hoisted(() => {
     recordEventReflection: vi.fn(async () => undefined),
     getLlmClient: vi.fn(() => ({
       client: {
-        streamText: async function* () {
-          yield "收到。";
+        stream: async function* () {
+          yield { type: "text", text: "收到。" };
         },
         completeText: vi.fn(async () => "收到。"),
       },

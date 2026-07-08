@@ -1,4 +1,5 @@
 import { buildConversationSummary, shouldCompactConversation } from "@/server/agent/compaction";
+import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
 import { buildProactiveShareContent, shouldCreateProactiveShare } from "@/server/agent/proactive-share";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
@@ -6,7 +7,8 @@ import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
-import { normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
+import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
+import { getLlmClient } from "@/server/llm/router";
 
 const intervalMs = 15_000;
 
@@ -93,8 +95,16 @@ async function processProactiveShares(repositories: ReturnType<typeof createRepo
 
 async function processMemoryMessages(repositories: ReturnType<typeof createRepositories>) {
   const messages = await repositories.messages.unprocessedForMemory();
+  if (messages.length === 0) return;
+
+  const env = readEnv();
+  const user = await repositories.users.ensureDefault();
+  const settings = await repositories.settings.get(user.id);
+  const { client, model } = getLlmClient("light", env, settings.modelRouting);
+
   for (const message of messages) {
-    await repositories.memories.extractAndSaveFromMessage(message);
+    const memories = await extractMemoriesWithLlm({ llm: client, model, text: message.content });
+    await repositories.memories.createMany(message.userId, message.id, memories);
   }
   await repositories.messages.markMemoryProcessed(messages.map((message) => message.id));
 }
@@ -128,11 +138,17 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
   if (!conversation) return;
   const messages = await repositories.messages.list(conversation.id);
   if (messages.length === 0) return;
-  const summary = messages
-    .slice(-8)
-    .map((message) => (message.role === "user" ? "用户" : "助手") + `：${message.content.slice(0, 120)}`)
-    .join("；");
-  const reflection = normalizeReflection(`做得好：保留了最近上下文。需要改进：继续观察用户反馈。建议：下次对话参考 ${summary}。`);
+
+  const digest = messages
+    .slice(-40)
+    .map((message) => (message.role === "user" ? "用户" : "助手") + `：${message.content.slice(0, 200)}`)
+    .join("\n");
+  const env = readEnv();
+  const settings = await repositories.settings.get(user.id);
+  const { client, model } = getLlmClient("light", env, settings.modelRouting);
+  const reflection =
+    (await generateReflectionWithLlm({ llm: client, model, digest })) ??
+    normalizeReflection("做得好：保持了稳定陪伴。需要改进：反思模型暂不可用，本次为降级记录。建议：检查 light 模型配置。");
   await repositories.reflections.create({
     userId: user.id,
     reflection,

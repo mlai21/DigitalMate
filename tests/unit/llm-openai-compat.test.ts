@@ -1,0 +1,114 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { OpenAiCompatClient } from "@/server/llm/openai-compat";
+import type { LlmStreamEvent } from "@/server/llm/types";
+
+describe("OpenAiCompatClient", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("streams text deltas from chat completions SSE", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          'data: {"choices":[{"delta":{"content":"你"}}]}',
+          'data: {"choices":[{"delta":{"content":"好"}}]}',
+          "data: [DONE]",
+          "",
+        ].join("\n"),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new OpenAiCompatClient({ url: "https://api.kie.ai/gemini-3-5-flash-openai/v1/chat/completions", apiKey: "test-key" });
+    const events = await collect(client.stream({ model: "gemini-3-5-flash-openai", messages: [{ role: "user", content: "Hi" }] }));
+
+    expect(events).toEqual([
+      { type: "text", text: "你" },
+      { type: "text", text: "好" },
+    ]);
+    const [, options] = fetchMock.mock.calls[0];
+    expect(options.headers).toMatchObject({ authorization: "Bearer test-key" });
+  });
+
+  it("accumulates streamed tool call deltas into tool_call events", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"web_search","arguments":"{\\"que"}}]}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ry\\":\\"北京天气\\"}"}}]}}]}',
+            "data: [DONE]",
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+    );
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    const events = await collect(
+      client.stream({
+        model: "gemini-3-5-flash-openai",
+        messages: [{ role: "user", content: "查天气" }],
+        tools: [{ name: "web_search", description: "搜索", parameters: { type: "object" } }],
+      }),
+    );
+
+    expect(events).toEqual([
+      { type: "tool_call", toolCall: { id: "call_1", name: "web_search", arguments: '{"query":"北京天气"}' } },
+    ]);
+  });
+
+  it("serializes assistant tool calls and tool results in OpenAI format", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('data: {"choices":[{"delta":{"content":"好"}}]}\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    await collect(
+      client.stream({
+        model: "m",
+        messages: [
+          { role: "user", content: "查天气" },
+          { role: "assistant", content: "", toolCalls: [{ id: "call_1", name: "web_search", arguments: '{"query":"北京"}' }] },
+          { role: "tool", content: "北京晴", toolCallId: "call_1" },
+        ],
+      }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages[1].tool_calls).toEqual([
+      { id: "call_1", type: "function", function: { name: "web_search", arguments: '{"query":"北京"}' } },
+    ]);
+    expect(body.messages[2]).toEqual({ role: "tool", tool_call_id: "call_1", content: "北京晴" });
+  });
+
+  it("throws when the provider returns a JSON error body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: 401, msg: "Unauthorized" }), {
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+
+    await expect(collect(client.stream({ model: "m", messages: [{ role: "user", content: "Hi" }] }))).rejects.toThrow(
+      "LLM request failed",
+    );
+  });
+});
+
+async function collect(stream: AsyncIterable<LlmStreamEvent>): Promise<LlmStreamEvent[]> {
+  const events = [];
+  for await (const event of stream) events.push(event);
+  return events;
+}
