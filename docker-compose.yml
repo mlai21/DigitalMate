@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: digitalmate
+      POSTGRES_USER: digitalmate
+      POSTGRES_PASSWORD: digitalmate
+    ports:
+      - "5432:5432"
+    volumes:
+      - digitalmate-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U digitalmate -d digitalmate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    restart: unless-stopped
+    command: sh -c "npm run db:migrate && npm run db:seed && npm run start"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATABASE_URL: postgres://digitalmate:digitalmate@postgres:5432/digitalmate
+      APP_PASSWORD: ${APP_PASSWORD:-}
+      APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
+      KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
+      KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
+      GEMINI_3_5_FLASH_ENDPOINT: ${GEMINI_3_5_FLASH_ENDPOINT:-/gemini-3-5-flash-openai/v1/chat/completions}
+      CLAUDE_MESSAGES_ENDPOINT: ${CLAUDE_MESSAGES_ENDPOINT:-/claude/v1/messages}
+      ANTHROPIC_API_VERSION: ${ANTHROPIC_API_VERSION:-2023-06-01}
+      LLM_MODEL_MAIN: ${LLM_MODEL_MAIN:-claude-opus-4-8}
+      LLM_MODEL_LIGHT: ${LLM_MODEL_LIGHT:-gemini-3-5-flash-openai}
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-duckduckgo}
+      PROACTIVE_QUIET_START: ${PROACTIVE_QUIET_START:-23:00}
+      PROACTIVE_QUIET_END: ${PROACTIVE_QUIET_END:-08:00}
+      PROACTIVE_MAX_PER_DAY: ${PROACTIVE_MAX_PER_DAY:-3}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+    ports:
+      - "80:3000"
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  agent:
+    build: .
+    command: sh -c "npm run agent"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATABASE_URL: postgres://digitalmate:digitalmate@postgres:5432/digitalmate
+      APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
+      KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
+      KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
+      GEMINI_3_5_FLASH_ENDPOINT: ${GEMINI_3_5_FLASH_ENDPOINT:-/gemini-3-5-flash-openai/v1/chat/completions}
+      CLAUDE_MESSAGES_ENDPOINT: ${CLAUDE_MESSAGES_ENDPOINT:-/claude/v1/messages}
+      ANTHROPIC_API_VERSION: ${ANTHROPIC_API_VERSION:-2023-06-01}
+      LLM_MODEL_MAIN: ${LLM_MODEL_MAIN:-claude-opus-4-8}
+      LLM_MODEL_LIGHT: ${LLM_MODEL_LIGHT:-gemini-3-5-flash-openai}
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-duckduckgo}
+      PROACTIVE_QUIET_START: ${PROACTIVE_QUIET_START:-23:00}
+      PROACTIVE_QUIET_END: ${PROACTIVE_QUIET_END:-08:00}
+      PROACTIVE_MAX_PER_DAY: ${PROACTIVE_MAX_PER_DAY:-3}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      web:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  digitalmate-postgres:
