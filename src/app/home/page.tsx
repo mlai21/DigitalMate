@@ -14,32 +14,32 @@ const GITHUB_URL = "https://github.com/mlai21/DigitalMate";
 
 const FEATURES = [
   {
-    img: "/home/features/persona.png",
+    img: "/home/features/persona.webp",
     title: "稳定人设",
     text: "有名字、有性格、有语气习惯。在所有渠道里，它都是同一个「人」。",
   },
   {
-    img: "/home/features/memory.png",
+    img: "/home/features/memory.webp",
     title: "长期记忆",
     text: "自动记住偏好、事件与关系，越用越懂你。记忆条目可查看、可删除。",
   },
   {
-    img: "/home/features/search.png",
+    img: "/home/features/search.webp",
     title: "联网搜索",
     text: "实时信息随口一问，答案融进它自己的语气，不是甩一堆搜索结果。",
   },
   {
-    img: "/home/features/channels.png",
+    img: "/home/features/channels.webp",
     title: "多渠道同一身份",
     text: "Web、飞书、钉钉、Telegram，同一份记忆、同一个它，跨端续聊。",
   },
   {
-    img: "/home/features/evolve.png",
+    img: "/home/features/evolve.webp",
     title: "自我进化",
     text: "每天复盘对话、整理记忆，把学到的做法沉淀成技能，经你确认后生效。",
   },
   {
-    img: "/home/features/remind.png",
+    img: "/home/features/remind.webp",
     title: "提醒与主动跟进",
     text: "「周五提醒我交报销」，到点就来找你。主动消息有边界，绝不刷屏。",
   },
@@ -198,14 +198,14 @@ export default function HomePage() {
                   <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
                 </div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img className={styles.featuresGif} src="/home/typing.webp" alt="" aria-hidden />
+                <img className={styles.featuresGif} src="/home/typing.webp" alt="" aria-hidden loading="lazy" />
               </div>
             </Reveal>
             <div className={styles.grid}>
               {FEATURES.map((feature, index) => (
                 <Reveal className={styles.card} delay={60 * index} key={feature.title}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img className={styles.cardImg} src={feature.img} alt="" aria-hidden />
+                  <img className={styles.cardImg} src={feature.img} alt="" aria-hidden loading="lazy" />
                   <h3 className={styles.cardTitle}>{feature.title}</h3>
                   <p className={styles.cardText}>{feature.text}</p>
                 </Reveal>
@@ -223,7 +223,7 @@ export default function HomePage() {
                   <h2 className={styles.sectionTitle}>它出现在生活里的样子</h2>
                 </div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img className={styles.scenariosImg} src="/home/mascot-lying.png" alt="" aria-hidden />
+                <img className={styles.scenariosImg} src="/home/mascot-lying.webp" alt="" aria-hidden loading="lazy" />
               </div>
             </Reveal>
             <div className={styles.scenarioGrid}>
@@ -253,7 +253,7 @@ export default function HomePage() {
                   <h2 className={styles.sectionTitle}>为「长期陪伴」设计的底层</h2>
                 </div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img className={styles.techImg} src="/home/mascot-phone.png" alt="" aria-hidden />
+                <img className={styles.techImg} src="/home/mascot-phone.webp" alt="" aria-hidden loading="lazy" />
               </div>
             </Reveal>
             <div className={styles.techGrid}>

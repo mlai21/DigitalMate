@@ -476,7 +476,7 @@
   transition: border-color 200ms ease-out;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
 }
 
 .scenario:hover {
