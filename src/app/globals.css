@@ -520,13 +520,10 @@ input {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  display: grid;
-  place-items: center;
   flex: 0 0 auto;
-  background: var(--accent);
-  color: #fffaf7;
-  font-size: 14px;
-  font-weight: 600;
+  object-fit: cover;
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
 }
 
 .message-bubble {

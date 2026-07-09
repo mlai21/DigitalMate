@@ -1,44 +1,45 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { DraggableMascot } from "./draggable-mascot";
 import styles from "./home.module.css";
 import { Reveal } from "./reveal";
 
 export const metadata: Metadata = {
   title: "DigitalMate — 一个有性格、有记忆的私人数字伙伴",
   description:
-    "平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。自托管部署，数据完全自控。",
+    "平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。",
 };
 
 const GITHUB_URL = "https://github.com/mlai21/DigitalMate";
 
 const FEATURES = [
   {
-    icon: "🙂",
+    img: "/home/features/persona.png",
     title: "稳定人设",
     text: "有名字、有性格、有语气习惯。在所有渠道里，它都是同一个「人」。",
   },
   {
-    icon: "📔",
+    img: "/home/features/memory.png",
     title: "长期记忆",
     text: "自动记住偏好、事件与关系，越用越懂你。记忆条目可查看、可删除。",
   },
   {
-    icon: "🔍",
+    img: "/home/features/search.png",
     title: "联网搜索",
     text: "实时信息随口一问，答案融进它自己的语气，不是甩一堆搜索结果。",
   },
   {
-    icon: "💬",
+    img: "/home/features/channels.png",
     title: "多渠道同一身份",
     text: "Web、飞书、钉钉、Telegram，同一份记忆、同一个它，跨端续聊。",
   },
   {
-    icon: "🌱",
+    img: "/home/features/evolve.png",
     title: "自我进化",
     text: "每天复盘对话、整理记忆，把学到的做法沉淀成技能，经你确认后生效。",
   },
   {
-    icon: "⏰",
+    img: "/home/features/remind.png",
     title: "提醒与主动跟进",
     text: "「周五提醒我交报销」，到点就来找你。主动消息有边界，绝不刷屏。",
   },
@@ -96,17 +97,15 @@ const SCENARIOS = [
 ] as const;
 
 export default function HomePage() {
-  const [featuredFeature, ...restFeatures] = FEATURES;
-  const wideFeature = restFeatures[restFeatures.length - 1];
-  const gridFeatures = restFeatures.slice(0, -1);
-
   return (
     <div className={styles.page}>
       <header className={styles.header}>
         <div className={styles.nav}>
           <div className={styles.logo}>
-            <span className={styles.logoMark}>D</span>
-            DigitalMate
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img alt="DigitalMate" className={`${styles.logoImg} ${styles.logoImgLight}`} src="/home/logo-light.png" />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img alt="DigitalMate" className={`${styles.logoImg} ${styles.logoImgDark}`} src="/home/logo-dark.png" />
           </div>
           <nav className={styles.navLinks}>
             <a className={styles.navLink} href="#features">
@@ -127,7 +126,7 @@ export default function HomePage() {
 
       <main>
         <div className={styles.wrap}>
-          <div className={styles.intro}>
+          <div className={styles.intro} data-mascot-bounds>
             <div className={styles.introGrid}>
               <Reveal>
                 <div className={styles.statusLine}>
@@ -138,7 +137,7 @@ export default function HomePage() {
                   一个有性格、<span className={styles.gradientWord}>有记忆</span>的私人数字伙伴
                 </h1>
                 <p className={styles.introSub}>
-                  平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。自托管部署，数据完全自控。
+                  平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。
                 </p>
                 <Link className={styles.btnPrimary} href="/">
                   开始对话
@@ -150,19 +149,22 @@ export default function HomePage() {
                   <div className={styles.heroCorner} aria-hidden />
                   <div className={styles.heroDots} aria-hidden />
                   <div className={`${styles.chatWindow} ${styles.heroFloat}`}>
+                    <DraggableMascot />
                     <div className={styles.chatDay}>上周三</div>
                     <div className={`${styles.msg} ${styles.msgUser}`}>
                       <div className={`${styles.bubble} ${styles.bubbleUser}`}>最近在准备一个部门演讲，有点紧张</div>
                     </div>
                     <div className={styles.msg}>
-                      <div className={styles.avatar}>D</div>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img className={styles.avatar} src="/mate-avatar.png" alt="" aria-hidden />
                       <div className={`${styles.bubble} ${styles.bubbleMate}`}>
                         紧张说明你在意呀。要不要我帮你过一遍提纲？
                       </div>
                     </div>
                     <div className={styles.chatDay}>今天</div>
                     <div className={styles.msg}>
-                      <div className={styles.avatar}>D</div>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img className={styles.avatar} src="/mate-avatar.png" alt="" aria-hidden />
                       <div className={`${styles.bubble} ${styles.bubbleMate}`}>
                         对了，演讲练得怎么样了？这周就要上场了吧
                       </div>
@@ -171,7 +173,8 @@ export default function HomePage() {
                       <div className={`${styles.bubble} ${styles.bubbleUser}`}>你居然还记得！练了两遍，好多了</div>
                     </div>
                     <div className={styles.msg}>
-                      <div className={styles.avatar}>D</div>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img className={styles.avatar} src="/mate-avatar.png" alt="" aria-hidden />
                       <div className={`${styles.bubble} ${styles.bubbleMate} ${styles.typing}`}>
                         <i />
                         <i />
@@ -188,32 +191,25 @@ export default function HomePage() {
         <section className={styles.features} id="features">
           <div className={styles.wrap}>
             <Reveal>
-              <div className={styles.sectionHead}>
-                <p className={styles.sectionLabel}>特性</p>
-                <h2 className={styles.sectionTitle}>像朋友，更像一位可靠的数字员工</h2>
-                <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
+              <div className={`${styles.sectionHead} ${styles.featuresHead}`}>
+                <div className={styles.featuresHeadText}>
+                  <p className={styles.sectionLabel}>特性</p>
+                  <h2 className={styles.sectionTitle}>像朋友，更像一位可靠的数字员工</h2>
+                  <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
+                </div>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img className={styles.featuresGif} src="/home/typing.gif" alt="" aria-hidden />
               </div>
             </Reveal>
             <div className={styles.grid}>
-              <Reveal className={`${styles.card} ${styles.cardFeatured}`}>
-                <div className={styles.cardIcon}>{featuredFeature.icon}</div>
-                <h3 className={styles.cardTitle}>{featuredFeature.title}</h3>
-                <p className={styles.cardText}>{featuredFeature.text}</p>
-              </Reveal>
-              {gridFeatures.map((feature, index) => (
-                <Reveal className={styles.card} delay={60 * (index + 1)} key={feature.title}>
-                  <div className={styles.cardIcon}>{feature.icon}</div>
+              {FEATURES.map((feature, index) => (
+                <Reveal className={styles.card} delay={60 * index} key={feature.title}>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img className={styles.cardImg} src={feature.img} alt="" aria-hidden />
                   <h3 className={styles.cardTitle}>{feature.title}</h3>
                   <p className={styles.cardText}>{feature.text}</p>
                 </Reveal>
               ))}
-              <Reveal className={`${styles.card} ${styles.cardWide}`} delay={300}>
-                <div className={styles.cardIcon}>{wideFeature.icon}</div>
-                <div>
-                  <h3 className={styles.cardTitle}>{wideFeature.title}</h3>
-                  <p className={styles.cardText}>{wideFeature.text}</p>
-                </div>
-              </Reveal>
             </div>
           </div>
         </section>
@@ -221,18 +217,18 @@ export default function HomePage() {
         <section className={styles.scenarios} id="scenarios">
           <div className={styles.wrap}>
             <Reveal>
-              <div className={styles.sectionHead}>
-                <p className={styles.sectionLabel}>场景</p>
-                <h2 className={styles.sectionTitle}>它出现在生活里的样子</h2>
+              <div className={`${styles.sectionHead} ${styles.scenariosHead}`}>
+                <div className={styles.scenariosHeadText}>
+                  <p className={styles.sectionLabel}>场景</p>
+                  <h2 className={styles.sectionTitle}>它出现在生活里的样子</h2>
+                </div>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img className={styles.scenariosImg} src="/home/mascot-lying.png" alt="" aria-hidden />
               </div>
             </Reveal>
             <div className={styles.scenarioGrid}>
               {SCENARIOS.map((scenario, index) => (
-                <Reveal
-                  className={`${styles.scenario} ${index % 2 === 1 ? styles.scenarioOffset : ""}`}
-                  delay={80 * index}
-                  key={scenario.tag}
-                >
+                <Reveal className={styles.scenario} delay={80 * index} key={scenario.tag}>
                   <span className={styles.scenarioTag}>{scenario.tag}</span>
                   {scenario.messages.map((message) => (
                     <div
@@ -251,9 +247,13 @@ export default function HomePage() {
         <section className={styles.tech} id="tech">
           <div className={styles.wrap}>
             <Reveal>
-              <div className={styles.sectionHead}>
-                <p className={styles.sectionLabel}>技术</p>
-                <h2 className={styles.sectionTitle}>为「长期陪伴」设计的底层</h2>
+              <div className={`${styles.sectionHead} ${styles.techHead}`}>
+                <div className={styles.techHeadText}>
+                  <p className={styles.sectionLabel}>技术</p>
+                  <h2 className={styles.sectionTitle}>为「长期陪伴」设计的底层</h2>
+                </div>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img className={styles.techImg} src="/home/mascot-phone.png" alt="" aria-hidden />
               </div>
             </Reveal>
             <div className={styles.techGrid}>

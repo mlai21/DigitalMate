@@ -12,10 +12,6 @@ export const metadata: Metadata = {
     title: "DigitalMate",
     statusBarStyle: "default",
   },
-  icons: {
-    icon: "/digitalmate-icon.svg",
-    apple: "/digitalmate-icon.svg",
-  },
 };
 
 export const viewport: Viewport = {

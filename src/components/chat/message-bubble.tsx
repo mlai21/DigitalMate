@@ -12,7 +12,10 @@ export function MessageBubble({ role, content }: MessageBubbleProps) {
 
   return (
     <div className={`message-row ${role === "user" ? "message-row-user" : "message-row-assistant"}`}>
-      {role === "assistant" ? <div className="mate-avatar" aria-hidden="true">D</div> : null}
+      {role === "assistant" ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img className="mate-avatar" src="/mate-avatar.png" alt="" aria-hidden="true" />
+      ) : null}
       <div className={`message-bubble ${role === "user" ? "message-bubble-user" : "message-bubble-assistant"}`}>
         {visibleContent}
       </div>

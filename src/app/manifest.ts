@@ -13,15 +13,15 @@ export default function manifest(): MetadataRoute.Manifest {
     orientation: "portrait",
     icons: [
       {
-        src: "/digitalmate-icon.svg",
-        sizes: "any",
-        type: "image/svg+xml",
+        src: "/digitalmate-icon.png",
+        sizes: "512x512",
+        type: "image/png",
         purpose: "any",
       },
       {
-        src: "/digitalmate-icon.svg",
-        sizes: "any",
-        type: "image/svg+xml",
+        src: "/digitalmate-icon.png",
+        sizes: "512x512",
+        type: "image/png",
         purpose: "maskable",
       },
     ],
