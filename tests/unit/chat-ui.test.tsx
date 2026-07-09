@@ -66,6 +66,87 @@ describe("ChatInput", () => {
   });
 });
 
+describe("ChatInput skill picker", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubSkillsApi() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          skills: [{ id: "00000000-0000-4000-8000-000000000001", name: "周报整理", trigger: "整理周报" }],
+        }),
+      })),
+    );
+  }
+
+  it("opens the picker on '/' and submits the selected skill as structured skillIds", async () => {
+    stubSkillsApi();
+    const onSubmit = vi.fn();
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "/" } });
+
+    const option = await screen.findByText("周报整理");
+    expect(screen.getByText("/create-skill")).toBeInTheDocument();
+
+    fireEvent.mouseDown(option);
+
+    // picking a skill turns it into a removable card and clears the slash query
+    expect(textarea.value).toBe("");
+    expect(screen.getByLabelText("移除 Skill 周报整理")).toBeInTheDocument();
+
+    fireEvent.input(textarea, { target: { value: "帮我整理这周的更新" } });
+    fireEvent.submit(textarea.closest("form")!);
+
+    expect(onSubmit).toHaveBeenCalledWith("帮我整理这周的更新", {
+      skillIds: ["00000000-0000-4000-8000-000000000001"],
+    });
+    expect(screen.queryByLabelText("移除 Skill 周报整理")).toBeNull();
+  });
+
+  it("inserts the /create-skill command when the create entry is picked", async () => {
+    stubSkillsApi();
+    render(<ChatInput onSubmit={vi.fn()} />);
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "/" } });
+
+    fireEvent.mouseDown(await screen.findByText("/create-skill"));
+
+    expect(textarea.value).toBe("/create-skill ");
+  });
+
+  it("does not open the picker for plain text", () => {
+    stubSkillsApi();
+    render(<ChatInput onSubmit={vi.fn()} />);
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "随便聊聊" } });
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+});
+
+describe("filterSkillOptions", () => {
+  const options = [
+    { id: "1", name: "周报整理", trigger: "整理周报" },
+    { id: "2", name: "nuwa", trigger: "蒸馏思维方式" },
+  ];
+
+  it("matches by name or trigger, case-insensitively", () => {
+    expect(filterSkillOptions(options, "周报").map((option) => option.id)).toEqual(["1"]);
+    expect(filterSkillOptions(options, "NUWA").map((option) => option.id)).toEqual(["2"]);
+    expect(filterSkillOptions(options, "思维").map((option) => option.id)).toEqual(["2"]);
+    expect(filterSkillOptions(options, "")).toHaveLength(2);
+    expect(filterSkillOptions(options, "没有的")).toHaveLength(0);
+  });
+});
+
 describe("mergeMessages", () => {
   it("replaces optimistic turn messages when polling returns persisted messages", () => {
     const optimisticTime = "2026-07-09T04:00:00.000Z";

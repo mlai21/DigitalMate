@@ -75,14 +75,6 @@ export function ChatInput({
       ]
     : [];
 
-  useEffect(() => {
-    setActiveIndex(0);
-  }, [slashQuery]);
-
-  function resetHeight() {
-    if (ref.current) ref.current.style.height = "";
-  }
-
   function pickItem(item: PickerItem) {
     if (item.kind === "create") {
       setValue(`${CREATE_SKILL_COMMAND} `);
@@ -93,9 +85,8 @@ export function ChatInput({
           : [...current, item.skill],
       );
       setValue("");
-      resetHeight();
     }
-    ref.current?.focus();
+    setActiveIndex(0);
   }
 
   function submit(event: FormEvent) {
@@ -113,7 +104,7 @@ export function ChatInput({
     setValue("");
     setSelectedSkills([]);
     setPickerDismissed(false);
-    resetHeight();
+    if (ref.current) ref.current.style.height = "";
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -131,6 +122,7 @@ export function ChatInput({
       if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
         event.preventDefault();
         pickItem(pickerItems[Math.min(activeIndex, pickerItems.length - 1)]);
+        if (ref.current) ref.current.style.height = "";
         return;
       }
       if (event.key === "Escape") {
@@ -162,6 +154,10 @@ export function ChatInput({
                 onMouseDown={(event) => {
                   event.preventDefault();
                   pickItem(item);
+                  if (ref.current) {
+                    ref.current.style.height = "";
+                    ref.current.focus();
+                  }
                 }}
               >
                 {item.kind === "create" ? (
