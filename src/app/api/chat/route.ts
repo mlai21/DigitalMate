@@ -3,6 +3,8 @@ import { z } from "zod";
 import { generateConversationTitle } from "@/server/agent/conversation-title";
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
+import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
+import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
@@ -17,6 +19,7 @@ export const runtime = "nodejs";
 const requestSchema = z.object({
   message: z.string().min(1).max(8000),
   conversationId: z.string().uuid().optional(),
+  skillIds: z.array(z.string().uuid()).max(3).optional(),
 });
 
 export async function POST(request: Request) {
@@ -56,7 +59,33 @@ export async function POST(request: Request) {
   const history = await repositories.messages.recentHistory(conversationId);
   const env = readEnv();
   const { client, model } = getLlmClient("main", env, settings.modelRouting);
+  const light = getLlmClient("light", env, settings.modelRouting);
   const encoder = new TextEncoder();
+
+  // Explicit skill invocation (P1-11) and the /create-skill flow (P1-12):
+  // skill cards arrive as structured skillIds; typed slash commands are parsed
+  // from the message text so IM-style prefixes also work on the web.
+  let agentMessage = body.data.message;
+  let createSkillMode = false;
+  const explicitSkillIds = [...(body.data.skillIds ?? [])];
+  const command = parseSlashCommand(body.data.message);
+  if (command?.kind === "create_skill") {
+    createSkillMode = true;
+    if (command.rest) agentMessage = command.rest;
+  } else if (command?.kind === "use_skill") {
+    const skill = await repositories.skills.findEnabledByName(user.id, command.name);
+    if (skill) {
+      if (!explicitSkillIds.includes(skill.id)) explicitSkillIds.push(skill.id);
+      agentMessage = command.rest || buildExplicitSkillFallbackMessage(skill.name);
+    }
+  }
+
+  const searchGate = createSearchGate({
+    aggressiveness: normalizeSearchAggressiveness(settings.search?.aggressiveness),
+    userMessage: body.data.message,
+    llm: light.client,
+    model: light.model,
+  });
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -65,12 +94,15 @@ export async function POST(request: Request) {
         for await (const chunk of runAgent({
           userId: user.id,
           conversationId,
-          message: body.data.message,
+          message: agentMessage,
           history,
           persona: settings.persona,
           llm: client,
           model,
           repositories,
+          explicitSkillIds,
+          createSkillMode,
+          searchGate,
           search: {
             run: async (query) => {
               const results = await searchWeb(query);
@@ -78,16 +110,14 @@ export async function POST(request: Request) {
             },
           },
           skillInstaller: {
-            install: (url) => {
-              const light = getLlmClient("light", env, settings.modelRouting);
-              return installSkillsFromGitHub({
+            install: (url) =>
+              installSkillsFromGitHub({
                 url,
                 userId: user.id,
                 repositories,
                 scanner: { llm: light.client, model: light.model },
                 token: env.githubToken,
-              });
-            },
+              }),
           },
         })) {
           assistantText += chunk;
@@ -135,7 +165,6 @@ export async function POST(request: Request) {
         // Post-turn background work on the light model: auto-title new
         // conversations and run the Hermes-style per-turn review. Neither may
         // block or fail the reply.
-        const light = getLlmClient("light", env, settings.modelRouting);
         setTimeout(() => {
           void runPostTurnTasks({
             repositories,

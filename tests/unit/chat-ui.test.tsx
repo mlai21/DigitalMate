@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
-import { ChatInput } from "@/components/chat/chat-input";
+import { ChatInput, filterSkillOptions } from "@/components/chat/chat-input";
 import { MessageBubble } from "@/components/chat/message-bubble";
 
 describe("MessageBubble", () => {

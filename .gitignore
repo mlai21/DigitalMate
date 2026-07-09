@@ -9,6 +9,9 @@ node_modules
 .pnp
 .pnp.*
 
+# Python venv (webp 转换工具)
+.webpvenv/
+
 # Build outputs
 .next
 out

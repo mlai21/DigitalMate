@@ -13,7 +13,7 @@ describe("PWA manifest", () => {
     expect(data.icons).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          src: "/digitalmate-icon.svg",
+          src: "/digitalmate-icon.png",
           purpose: "maskable",
         }),
       ]),
@@ -23,7 +23,7 @@ describe("PWA manifest", () => {
   it("ships a service worker for the installable shell", async () => {
     const worker = await readFile(path.join(process.cwd(), "public/service-worker.js"), "utf8");
 
-    expect(worker).toContain("digitalmate-shell");
+    expect(worker).toContain("digitalmate-v2");
     expect(worker).toContain('self.addEventListener("install"');
     expect(worker).toContain('self.addEventListener("fetch"');
   });

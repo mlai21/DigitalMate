@@ -15,10 +15,12 @@ describe("docker deployment config", () => {
     expect(compose).toContain("/var/run/docker.sock:/var/run/docker.sock");
   });
 
-  it("publishes the web app on the default HTTP port", async () => {
+  it("fronts the web app with Caddy on the public HTTP/HTTPS ports", async () => {
     const compose = await readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8");
 
-    expect(compose).toContain('"80:3000"');
+    expect(compose).toContain('"80:80"');
+    expect(compose).toContain('"443:443"');
+    expect(compose).toMatch(/expose:\s*\n\s*- "3000"/);
   });
 
   it("sets the app runtime timezone for local reminder scheduling", async () => {

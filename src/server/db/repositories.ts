@@ -958,11 +958,29 @@ export function createRepositories(pool: Pool = getPool()) {
           "SELECT id, name, trigger, content FROM skills WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 50",
           [userId],
         );
+        // Auto-matching is deliberately strict (PRD 6.3: prefer no skill over a
+        // wrong skill) — only inject when the name or trigger clearly matches.
         return result.rows
           .map((row) => ({ ...row, score: scoreSkill(query, row) }))
+          .filter((row) => row.score >= AUTO_MATCH_MIN_SCORE)
           .sort((left, right) => right.score - left.score)
-          .slice(0, 6)
+          .slice(0, 3)
           .map(({ id, name, trigger, content }) => ({ id, name, trigger, content }));
+      },
+      async findByIds(userId: string, skillIds: string[]): Promise<SkillContext[]> {
+        if (skillIds.length === 0) return [];
+        const result = await pool.query<{ id: string; name: string; trigger: string; content: string }>(
+          "SELECT id, name, trigger, content FROM skills WHERE user_id = $1 AND id = ANY($2::uuid[]) AND status = 'enabled'",
+          [userId, skillIds],
+        );
+        return result.rows;
+      },
+      async findEnabledByName(userId: string, name: string): Promise<{ id: string; name: string } | null> {
+        const result = await pool.query<{ id: string; name: string }>(
+          "SELECT id, name FROM skills WHERE user_id = $1 AND lower(name) = lower($2) AND status = 'enabled' LIMIT 1",
+          [userId, name],
+        );
+        return result.rows[0] ?? null;
       },
       async setStatus(userId: string, skillId: string, status: "enabled" | "disabled" | "rejected"): Promise<void> {
         await pool.query("UPDATE skills SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
@@ -971,18 +989,22 @@ export function createRepositories(pool: Pool = getPool()) {
           status,
         ]);
       },
-      async recordUsage(userId: string, skillIds: string[], conversationId: string | null): Promise<void> {
+      async recordUsage(
+        userId: string,
+        skillIds: string[],
+        conversationId: string | null,
+        triggeredBy: "auto" | "explicit" = "auto",
+      ): Promise<void> {
         if (skillIds.length === 0) return;
         await pool.query(
           "UPDATE skills SET usage_count = usage_count + 1, last_used_at = now() WHERE user_id = $1 AND id = ANY($2::uuid[])",
           [userId, skillIds],
         );
         for (const skillId of skillIds) {
-          await pool.query("INSERT INTO skill_usage_logs (user_id, skill_id, conversation_id) VALUES ($1, $2, $3)", [
-            userId,
-            skillId,
-            conversationId,
-          ]);
+          await pool.query(
+            "INSERT INTO skill_usage_logs (user_id, skill_id, conversation_id, triggered_by) VALUES ($1, $2, $3, $4)",
+            [userId, skillId, conversationId, triggeredBy],
+          );
         }
       },
       async applyRevision(userId: string, skillId: string, content: string): Promise<void> {
@@ -1182,19 +1204,21 @@ export function createRepositories(pool: Pool = getPool()) {
           proactivity: row.proactivity ?? defaultSettings.proactivity,
           modelRouting: row.model_routing ?? defaultSettings.modelRouting,
           cadence: row.cadence ?? defaultSettings.cadence,
+          search: row.search?.aggressiveness ? row.search : defaultSettings.search,
         };
       },
       async update(userId: string, settings: typeof defaultSettings): Promise<void> {
         await pool.query(
-          `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (user_id) DO UPDATE SET
              persona = EXCLUDED.persona,
              proactivity = EXCLUDED.proactivity,
              model_routing = EXCLUDED.model_routing,
              cadence = EXCLUDED.cadence,
+             search = EXCLUDED.search,
              updated_at = now()`,
-          [userId, settings.persona, settings.proactivity, settings.modelRouting, settings.cadence],
+          [userId, settings.persona, settings.proactivity, settings.modelRouting, settings.cadence, settings.search],
         );
       },
     },
@@ -1254,7 +1278,7 @@ export function createRepositories(pool: Pool = getPool()) {
         await ensureSettings(pool, userId);
         await pool.query(
           `UPDATE settings
-           SET persona = $2, proactivity = $3, model_routing = $4, cadence = $5, updated_at = now()
+           SET persona = $2, proactivity = $3, model_routing = $4, cadence = $5, search = $6, updated_at = now()
            WHERE user_id = $1`,
           [
             userId,
@@ -1262,6 +1286,7 @@ export function createRepositories(pool: Pool = getPool()) {
             defaultSettings.proactivity,
             defaultSettings.modelRouting,
             defaultSettings.cadence,
+            defaultSettings.search,
           ],
         );
       },
@@ -1349,6 +1374,9 @@ function mapSkillRevisionRow(row: Record<string, unknown>): DbSkillRevision {
   };
 }
 
+/** Requires at least a trigger/name-level match (weights: name 4, trigger 3, content 1). */
+const AUTO_MATCH_MIN_SCORE = 3;
+
 function scoreSkill(query: string, skill: { name: string; trigger: string; content: string }): number {
   const normalizedQuery = query.toLowerCase();
   const fields = [
@@ -1366,10 +1394,17 @@ function scoreSkill(query: string, skill: { name: string; trigger: string; conte
 
 async function ensureSettings(pool: Pool, userId: string): Promise<void> {
   await pool.query(
-    `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (user_id) DO NOTHING`,
-    [userId, defaultSettings.persona, defaultSettings.proactivity, defaultSettings.modelRouting, defaultSettings.cadence],
+    [
+      userId,
+      defaultSettings.persona,
+      defaultSettings.proactivity,
+      defaultSettings.modelRouting,
+      defaultSettings.cadence,
+      defaultSettings.search,
+    ],
   );
 }
 

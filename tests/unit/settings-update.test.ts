@@ -14,6 +14,7 @@ describe("buildSettingsUpdate", () => {
       },
       modelRouting: { main: "custom-main", light: "custom-light" },
       cadence: { responseDelayMs: 400, segmentDelayMs: 120, maxSegments: 4 },
+      search: { aggressiveness: "conservative" as const },
     };
     const form = new FormData();
     form.set("proactivityPreset", "low");
@@ -26,6 +27,9 @@ describe("buildSettingsUpdate", () => {
         maxPerDay: 1,
         maxPerHour: 1,
         minIntervalMinutes: 180,
+      },
+      search: {
+        aggressiveness: "conservative",
       },
     });
   });
@@ -42,6 +46,7 @@ describe("buildSettingsUpdate", () => {
       },
       modelRouting: { main: "custom-main", light: "custom-light" },
       cadence: { responseDelayMs: 400, segmentDelayMs: 120, maxSegments: 4 },
+      search: { aggressiveness: "conservative" as const },
     };
     const form = new FormData();
     form.set("responseDelayMs", "650");
@@ -53,5 +58,29 @@ describe("buildSettingsUpdate", () => {
       segmentDelayMs: 180,
       maxSegments: 3,
     });
+  });
+
+  it("updates the search aggressiveness tier and rejects unknown values", () => {
+    const current = {
+      persona: { name: "Mate", style: "自然", emojiHabit: "少量" },
+      proactivity: {
+        quietStart: "23:00",
+        quietEnd: "08:00",
+        maxPerDay: 5,
+        maxPerHour: 3,
+        minIntervalMinutes: 30,
+      },
+      modelRouting: { main: "custom-main", light: "custom-light" },
+      cadence: { responseDelayMs: 400, segmentDelayMs: 120, maxSegments: 4 },
+      search: { aggressiveness: "conservative" as const },
+    };
+
+    const offForm = new FormData();
+    offForm.set("searchAggressiveness", "off");
+    expect(buildSettingsUpdate(current, offForm).search).toEqual({ aggressiveness: "off" });
+
+    const bogusForm = new FormData();
+    bogusForm.set("searchAggressiveness", "yolo");
+    expect(buildSettingsUpdate(current, bogusForm).search).toEqual({ aggressiveness: "conservative" });
   });
 });

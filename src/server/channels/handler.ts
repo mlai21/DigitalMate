@@ -1,5 +1,7 @@
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
+import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
+import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
 import { splitAssistantText } from "@/server/agent/streaming";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
 import { shouldInterject } from "@/server/channels/interjection";
@@ -50,12 +52,16 @@ type ChannelRepositories = {
       memoryProcessed?: boolean;
     }): Promise<unknown> | unknown;
   };
+  skills?: {
+    findEnabledByName?(userId: string, name: string): Promise<{ id: string; name: string } | null>;
+  };
   settings: {
     get(userId: string): Promise<{
       persona: { name: string; style: string; emojiHabit?: string };
       proactivity: { quietStart: string; quietEnd: string; maxPerDay: number; minIntervalMinutes?: number; maxPerHour?: number };
       modelRouting: { main: string; light: string };
       cadence: unknown;
+      search?: { aggressiveness?: string };
     }>;
   };
 };
@@ -68,6 +74,8 @@ export async function handleChannelMessage(input: {
   model: string;
   send(message: NormalizedChannelMessage, text: string): Promise<unknown> | unknown;
   skillInstaller?: { install(url: string): Promise<SkillInstallOutcome> };
+  /** Light-model client used for the web_search hard gate (PRD 5.4). */
+  lightLlm?: { client: LlmClient; model: string };
   delay?(ms: number): Promise<unknown> | unknown;
   now?: Date;
 }): Promise<void> {
@@ -135,16 +143,47 @@ export async function handleChannelMessage(input: {
 
   const settings = await input.repositories.settings.get(input.userId);
   const history = await input.repositories.messages.recentHistory(conversation.id);
+
+  // IM channels cannot render skill cards, so slash prefixes are the explicit
+  // invocation path here: "/skill-name ..." and "/create-skill ..." (P1-11/12).
+  let agentMessage = input.message.text;
+  let createSkillMode = false;
+  const explicitSkillIds: string[] = [];
+  const command = parseSlashCommand(input.message.text);
+  if (command?.kind === "create_skill") {
+    createSkillMode = true;
+    if (command.rest) agentMessage = command.rest;
+  } else if (command?.kind === "use_skill" && input.repositories.skills?.findEnabledByName) {
+    const skill = await input.repositories.skills.findEnabledByName(input.userId, command.name);
+    if (skill) {
+      explicitSkillIds.push(skill.id);
+      agentMessage = command.rest || buildExplicitSkillFallbackMessage(skill.name);
+    }
+  }
+
+  const searchGate =
+    settings.search?.aggressiveness || input.lightLlm
+      ? createSearchGate({
+          aggressiveness: normalizeSearchAggressiveness(settings.search?.aggressiveness),
+          userMessage: input.message.text,
+          llm: input.lightLlm?.client,
+          model: input.lightLlm?.model,
+        })
+      : undefined;
+
   let answer = "";
   for await (const chunk of runAgent({
     userId: input.userId,
     conversationId: conversation.id,
-    message: input.message.text,
+    message: agentMessage,
     history,
     persona: settings.persona,
     llm: input.llm,
     model: input.model,
     repositories: input.repositories as Parameters<typeof runAgent>[0]["repositories"],
+    explicitSkillIds,
+    createSkillMode,
+    searchGate,
     search: {
       run: async (query) => {
         const results = await searchWeb(query);

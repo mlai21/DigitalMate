@@ -182,8 +182,11 @@ CREATE TABLE IF NOT EXISTS skill_usage_logs (
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
   conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  triggered_by text NOT NULL DEFAULT 'auto' CHECK (triggered_by IN ('auto', 'explicit')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS skill_usage_logs ADD COLUMN IF NOT EXISTS triggered_by text NOT NULL DEFAULT 'auto';
 
 CREATE TABLE IF NOT EXISTS task_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -246,8 +249,11 @@ CREATE TABLE IF NOT EXISTS settings (
   proactivity jsonb NOT NULL DEFAULT '{}'::jsonb,
   model_routing jsonb NOT NULL DEFAULT '{}'::jsonb,
   cadence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  search jsonb NOT NULL DEFAULT '{}'::jsonb,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS search jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS memory_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

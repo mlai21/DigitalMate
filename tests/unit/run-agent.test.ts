@@ -336,7 +336,170 @@ describe("runAgent", () => {
       void chunk;
     }
 
-    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-1", "skill-2"], "conversation-1");
+    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-1", "skill-2"], "conversation-1", "auto");
+  });
+
+  it("loads explicitly selected skills unconditionally and skips auto-matching", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const recordUsage = vi.fn();
+    const findEnabled = vi.fn(async () => []);
+    const findByIds = vi.fn(async () => [
+      { id: "skill-9", name: "女娲", trigger: "蒸馏思维方式", content: "# 女娲\n\n## 步骤\n1. 收集素材" },
+    ]);
+    const llm = scriptedLlm([[{ type: "text", text: "按女娲的方式来。" }]], seenInputs);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "帮我分析这个人",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled, findByIds, recordUsage },
+      },
+      search: { run: vi.fn() },
+      explicitSkillIds: ["skill-9"],
+    })) {
+      void chunk;
+    }
+
+    expect(findByIds).toHaveBeenCalledWith("user-1", ["skill-9"]);
+    expect(findEnabled).not.toHaveBeenCalled();
+    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-9"], "conversation-1", "explicit");
+    const systemPrompt = seenInputs[0]?.messages[0]?.content ?? "";
+    expect(systemPrompt).toContain("用户显式指定了以下 Skill");
+    expect(systemPrompt).toContain("女娲");
+  });
+
+  it("blocks web_search when the search gate denies and logs the decision", async () => {
+    const logTool = vi.fn();
+    const searchRun = vi.fn();
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"人生的意义"}' } }],
+      [{ type: "text", text: "这个我们直接聊聊就好。" }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "你觉得人生的意义是什么",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
+      search: { run: searchRun },
+      searchGate: {
+        evaluate: async () => ({ allowed: false, method: "llm_gate", reason: "观点讨论不需要实时信息" }),
+      },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(searchRun).not.toHaveBeenCalled();
+    expect(chunks.join("")).toBe("这个我们直接聊聊就好。");
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "web_search_gate",
+        status: "success",
+        outputSummary: expect.stringContaining("拦截"),
+      }),
+    );
+  });
+
+  it("runs web_search when the search gate allows and logs the pass decision", async () => {
+    const logTool = vi.fn();
+    const searchRun = vi.fn(async () => ({
+      summary: "明天有雨。",
+      results: [{ title: "天气", url: "https://example.com", snippet: "有雨" }],
+    }));
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"北京天气"}' } }],
+      [{ type: "text", text: "明天有雨，记得带伞。" }],
+    ]);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "帮我查一下北京天气",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
+      search: { run: searchRun },
+      searchGate: {
+        evaluate: async () => ({ allowed: true, method: "explicit", reason: "用户显式要求搜索" }),
+      },
+    })) {
+      void chunk;
+    }
+
+    expect(searchRun).toHaveBeenCalledWith("北京天气");
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: "web_search_gate", outputSummary: expect.stringContaining("放行") }),
+    );
+    expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "web_search", status: "success" }));
+  });
+
+  it("creates an enabled skill through create_skill in the /create-skill flow", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const createSkill = vi.fn();
+    const logTool = vi.fn();
+    const llm = scriptedLlm(
+      [
+        [
+          {
+            type: "tool_call",
+            toolCall: {
+              id: "call-1",
+              name: "create_skill",
+              arguments: JSON.stringify({
+                name: "会议纪要整理",
+                description: "把口述记录整理成结构化会议纪要",
+                steps: ["提取决议与待办", "按主题分组", "输出纪要"],
+              }),
+            },
+          },
+        ],
+        [{ type: "text", text: "建好了，之后我就按这套来。" }],
+      ],
+      seenInputs,
+    );
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "确认，就按这个建",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+        toolLogs: { create: logTool },
+      },
+      search: { run: vi.fn() },
+      createSkillMode: true,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(seenInputs[0]?.tools?.some((tool) => tool.name === "create_skill")).toBe(true);
+    const systemPrompt = seenInputs[0]?.messages[0]?.content ?? "";
+    expect(systemPrompt).toContain("/create-skill");
+    expect(createSkill).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ name: "会议纪要整理", status: "enabled", source: "manual" }),
+    );
+    expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "create_skill", status: "success" }));
+    expect(chunks.join("")).toBe("建好了，之后我就按这套来。");
   });
 
   it("exposes save_skill and persists a pending draft when the model calls it", async () => {

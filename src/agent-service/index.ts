@@ -11,7 +11,9 @@ import { createSkillDraft } from "@/server/evolution/skills";
 import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
 import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
 import { processSkillImprovement } from "@/server/evolution/skill-improvement";
+import { executeGoalStep } from "@/server/goals/executor";
 import { processGoalLoops } from "@/server/goals/orchestrator";
+import { verifyGoalStep } from "@/server/goals/verifier";
 import { getLlmClient } from "@/server/llm/router";
 
 const intervalMs = 15_000;
@@ -50,9 +52,65 @@ async function tick(repositories: ReturnType<typeof createRepositories>) {
 }
 
 async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>) {
-  const outcome = await processGoalLoops({ repositories }).catch(() => null);
-  if (outcome && (outcome.pickedUp > 0 || outcome.deferred > 0)) {
-    console.log(`Goal loops: picked up ${outcome.pickedUp}, advanced ${outcome.deferred} round(s).`);
+  const env = readEnv();
+  const user = await repositories.users.ensureDefault();
+  const settings = await repositories.settings.get(user.id);
+  const main = getLlmClient("main", env, settings.modelRouting);
+  const light = getLlmClient("light", env, settings.modelRouting);
+
+  const outcome = await processGoalLoops({
+    repositories,
+    services: {
+      executeStep: async (goal, recentSteps) => {
+        const candidate = await executeGoalStep({
+          goal,
+          recentSteps,
+          llm: main.client,
+          model: main.model,
+          search: {
+            run: async (query) => {
+              const results = await searchWeb(query);
+              return { summary: summarizeSearchResults(results) };
+            },
+          },
+          memories: repositories.memories,
+          toolLogs: repositories.toolLogs,
+        });
+        await repositories.llmUsage
+          .create({
+            userId: goal.userId,
+            conversationId: goal.conversationId,
+            purpose: "main",
+            model: main.model,
+            inputTokens: candidate.tokensUsed,
+            outputTokens: 0,
+            totalTokens: candidate.tokensUsed,
+          })
+          .catch(() => undefined);
+        return candidate;
+      },
+      verifyStep: async (goal, candidate, priorEvidence) => {
+        const verify = await verifyGoalStep({ goal, candidate, priorEvidence, llm: light.client, model: light.model });
+        await repositories.llmUsage
+          .create({
+            userId: goal.userId,
+            conversationId: goal.conversationId,
+            purpose: "light",
+            model: light.model,
+            inputTokens: verify.tokensUsed,
+            outputTokens: 0,
+            totalTokens: verify.tokensUsed,
+          })
+          .catch(() => undefined);
+        return verify;
+      },
+    },
+  }).catch(() => null);
+
+  if (outcome && (outcome.pickedUp > 0 || outcome.rounds > 0)) {
+    console.log(
+      `Goal loops: picked up ${outcome.pickedUp}, ran ${outcome.rounds} round(s), succeeded ${outcome.succeeded}, stopped ${outcome.stopped}.`,
+    );
   }
 }
 

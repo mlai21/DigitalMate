@@ -1,4 +1,5 @@
 import { buildPersonaPrompt, type PersonaConfig } from "@/server/agent/persona";
+import type { SearchGate } from "@/server/agent/search-gate";
 import { sanitizeAssistantText } from "@/server/agent/streaming";
 import type { RankableMemory } from "@/server/agent/memory";
 import { createSkillDraft, type SkillDraft } from "@/server/evolution/skills";
@@ -49,8 +50,14 @@ export type RunAgentInput = {
     };
     skills?: {
       findEnabled(userId: string, query: string): Promise<SkillContext[]>;
+      findByIds?(userId: string, skillIds: string[]): Promise<SkillContext[]>;
       create?(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
-      recordUsage?(userId: string, skillIds: string[], conversationId: string | null): Promise<unknown> | unknown;
+      recordUsage?(
+        userId: string,
+        skillIds: string[],
+        conversationId: string | null,
+        triggeredBy?: "auto" | "explicit",
+      ): Promise<unknown> | unknown;
     };
     reflections?: {
       findAppliedSuggestions(userId: string): Promise<string[]>;
@@ -74,6 +81,12 @@ export type RunAgentInput = {
   skillInstaller?: {
     install(url: string): Promise<SkillInstallOutcome>;
   };
+  /** Skills explicitly picked by the user (slash panel card or /skill-name); loaded unconditionally. */
+  explicitSkillIds?: string[];
+  /** True when the user started the /create-skill guided creation flow this turn. */
+  createSkillMode?: boolean;
+  /** Hard gate consulted before every web_search execution (PRD 5.4). */
+  searchGate?: SearchGate;
   purpose?: LlmPurpose;
 };
 
@@ -82,7 +95,7 @@ const maxToolIterations = 4;
 const webSearchTool: LlmTool = {
   name: "web_search",
   description:
-    "联网搜索实时信息（天气、新闻、事实核查等）。只有当回答需要最新外部信息时才调用；安装 skill、保存做法等操作类请求不需要搜索，不要调用。",
+    "联网搜索实时信息。默认不使用：仅当用户明确要求搜索，或回答必须依赖当下实时数据（天气、新闻、股价、赛事、营业信息等），或问题明显超出你的知识截止时间时才调用。闲聊、常识问答、观点讨论、写作、翻译以及安装 skill、保存做法等操作类请求一律禁止调用。",
   parameters: {
     type: "object",
     properties: {
@@ -121,31 +134,67 @@ const saveSkillTool: LlmTool = {
   },
 };
 
+const createSkillTool: LlmTool = {
+  name: "create_skill",
+  description:
+    "在 /create-skill 引导流程中创建新 Skill（创建后立即启用）。只有当用户通过 /create-skill 发起创建、且已在对话中对草稿预览明确确认后才调用；未经确认绝不调用。",
+  parameters: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "Skill 名称（简短、可辨识）" },
+      description: { type: "string", description: "一句话描述适用场景，用于以后判断何时使用" },
+      steps: { type: "array", items: { type: "string" }, description: "按顺序的执行步骤，2-8 条" },
+      notes: { type: "array", items: { type: "string" }, description: "注意事项（可选）" },
+    },
+    required: ["name", "description", "steps"],
+  },
+};
+
 export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
-  const [memories, skills, reflectionSuggestions, enabledTools] = await Promise.all([
+  const explicitSkillIds = input.explicitSkillIds ?? [];
+  // Explicit selection is authoritative: when the user picked skills via the
+  // slash panel or /skill-name, load them unconditionally and skip fuzzy
+  // auto-matching entirely (PRD P1-11).
+  const [memories, explicitSkills, autoSkills, reflectionSuggestions, enabledTools] = await Promise.all([
     input.repositories.memories.findRelevant(input.userId, input.message),
-    input.repositories.skills?.findEnabled(input.userId, input.message) ?? Promise.resolve([]),
+    explicitSkillIds.length > 0 && input.repositories.skills?.findByIds
+      ? input.repositories.skills.findByIds(input.userId, explicitSkillIds)
+      : Promise.resolve([] as SkillContext[]),
+    explicitSkillIds.length > 0
+      ? Promise.resolve([] as SkillContext[])
+      : input.repositories.skills?.findEnabled(input.userId, input.message) ?? Promise.resolve([]),
     input.repositories.reflections?.findAppliedSuggestions(input.userId) ?? Promise.resolve([]),
     input.repositories.toolRegistrations?.listEnabled(input.userId) ?? Promise.resolve([]),
   ]);
   const conversationSummary = await input.repositories.conversationSummaries?.latest(input.conversationId);
 
-  const usedSkillIds = skills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
-  if (usedSkillIds.length > 0 && input.repositories.skills?.recordUsage) {
-    await Promise.resolve(input.repositories.skills.recordUsage(input.userId, usedSkillIds, input.conversationId)).catch(
-      () => undefined,
-    );
+  if (input.repositories.skills?.recordUsage) {
+    const explicitIds = explicitSkills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
+    const autoIds = autoSkills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
+    if (explicitIds.length > 0) {
+      await Promise.resolve(
+        input.repositories.skills.recordUsage(input.userId, explicitIds, input.conversationId, "explicit"),
+      ).catch(() => undefined);
+    }
+    if (autoIds.length > 0) {
+      await Promise.resolve(
+        input.repositories.skills.recordUsage(input.userId, autoIds, input.conversationId, "auto"),
+      ).catch(() => undefined);
+    }
   }
 
   const tools = buildTools(enabledTools, {
     includeSaveSkill: Boolean(input.repositories.skills?.create),
+    includeCreateSkill: Boolean(input.repositories.skills?.create),
     includeInstallSkill: Boolean(input.skillInstaller),
   });
   let activeMessages = buildMessages({
     persona: input.persona,
     conversationSummary,
     memories,
-    skills,
+    skills: autoSkills,
+    explicitSkills,
+    createSkillMode: input.createSkillMode,
     reflectionSuggestions,
     enabledTools,
     history: input.history,
@@ -186,11 +235,12 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
 
 function buildTools(
   enabledTools: EnabledToolContext[],
-  options?: { includeSaveSkill?: boolean; includeInstallSkill?: boolean },
+  options?: { includeSaveSkill?: boolean; includeCreateSkill?: boolean; includeInstallSkill?: boolean },
 ): LlmTool[] {
   return [
     webSearchTool,
     ...(options?.includeSaveSkill ? [saveSkillTool] : []),
+    ...(options?.includeCreateSkill ? [createSkillTool] : []),
     ...(options?.includeInstallSkill ? [installSkillTool] : []),
     ...enabledTools.map((tool) => ({
       name: tool.name,
@@ -240,6 +290,22 @@ async function executeToolCall(context: {
       });
       return "没有拿到有效的搜索词，本次没有搜索。如果确实需要联网信息，请带上明确的 query 重新调用；否则直接回答。";
     }
+    if (input.searchGate) {
+      const decision = await input.searchGate.evaluate(query);
+      // Both allow and deny decisions are logged for admin auditing (PRD 5.4).
+      await input.repositories.toolLogs.create({
+        userId: input.userId,
+        conversationId: input.conversationId,
+        toolName: "web_search_gate",
+        inputSummary: query,
+        outputSummary: `${decision.allowed ? "放行" : "拦截"}（${decision.method}）：${decision.reason}`.slice(0, 500),
+        status: "success",
+        durationMs: Date.now() - startedAt,
+      });
+      if (!decision.allowed) {
+        return "本次判定不需要联网搜索（该问题不依赖实时信息）。请直接基于已有知识和记忆自然地回答用户，不要再尝试搜索，也不要向用户提及搜索被拦截。";
+      }
+    }
     try {
       const result = await input.search.run(query);
       await input.repositories.toolLogs.create({
@@ -270,6 +336,10 @@ async function executeToolCall(context: {
 
   if (toolCall.name === "save_skill") {
     return saveSkillFromToolCall({ input, args, startedAt });
+  }
+
+  if (toolCall.name === "create_skill") {
+    return createSkillFromToolCall({ input, args, startedAt });
   }
 
   if (toolCall.name === "install_skill") {
@@ -369,6 +439,64 @@ async function saveSkillFromToolCall(context: {
       error: message,
     });
     return "Skill 草稿保存失败，请稍后再试；先正常回复用户即可。";
+  }
+}
+
+async function createSkillFromToolCall(context: {
+  input: RunAgentInput;
+  args: Record<string, unknown>;
+  startedAt: number;
+}): Promise<string> {
+  const { input, args, startedAt } = context;
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  const description = typeof args.description === "string" ? args.description.trim() : "";
+  const steps = Array.isArray(args.steps)
+    ? args.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0)
+    : [];
+  const notes = Array.isArray(args.notes)
+    ? args.notes.filter((note): note is string => typeof note === "string" && note.trim().length > 0)
+    : [];
+
+  const logBase = {
+    userId: input.userId,
+    conversationId: input.conversationId,
+    toolName: "create_skill",
+    inputSummary: `${name}：${description}`.slice(0, 500),
+  };
+
+  if (!name || !description || steps.length < 2 || !input.repositories.skills?.create) {
+    await input.repositories.toolLogs.create({
+      ...logBase,
+      outputSummary: "Skill 信息不完整，未创建",
+      status: "error",
+      durationMs: Date.now() - startedAt,
+      error: "Invalid skill input",
+    });
+    return "Skill 信息不完整（需要名称、适用场景和至少 2 个步骤），本次未创建。请继续向用户补齐缺失的信息。";
+  }
+
+  try {
+    // User already confirmed the draft preview in chat (/create-skill flow),
+    // so the skill is enabled directly instead of entering the pending queue.
+    const draft = createSkillDraft({ name, trigger: description, steps, notes, source: "manual", status: "enabled" });
+    await input.repositories.skills.create(input.userId, draft);
+    await input.repositories.toolLogs.create({
+      ...logBase,
+      outputSummary: `已创建并启用 Skill「${name}」（对话内确认）`,
+      status: "success",
+      durationMs: Date.now() - startedAt,
+    });
+    return `Skill「${name}」已创建并启用，立即生效，之后同类任务会按它执行。请用自然的语气告诉用户已经建好，不要展示内部格式。`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await input.repositories.toolLogs.create({
+      ...logBase,
+      outputSummary: "Skill 创建失败",
+      status: "error",
+      durationMs: Date.now() - startedAt,
+      error: message,
+    });
+    return "Skill 创建失败，请稍后再试；先自然地告知用户即可。";
   }
 }
 
@@ -478,6 +606,8 @@ export function buildMessages(input: {
   conversationSummary?: string | null;
   memories: RankableMemory[];
   skills?: SkillContext[];
+  explicitSkills?: SkillContext[];
+  createSkillMode?: boolean;
   reflectionSuggestions?: string[];
   enabledTools?: EnabledToolContext[];
   history: LlmMessage[];
@@ -485,9 +615,18 @@ export function buildMessages(input: {
 }): LlmMessage[] {
   const contextParts = [
     buildPersonaPrompt(input.persona),
-    "工具使用规则：只有回答确实需要最新外部信息时才调用 web_search，安装 skill、保存做法等操作类请求完成后直接汇报结果，不要追加搜索；用户明确要求记住某套做法、或本轮形成了值得复用的完整方法时可调用 save_skill 沉淀草稿（需用户后台确认才生效）；用户给出 GitHub 链接要求安装 skill 时调用 install_skill（会自动发现 SKILL.md 并做安全扫描，安装成功即可使用）；工具结果只作为你回答的依据，绝不向用户暴露工具调用过程，也绝不把搜索结果的标题、摘要、链接原样罗列给用户。",
+    "联网搜索纪律（必须遵守）：web_search 默认禁止使用。仅以下三种情况允许调用：① 用户明确要求搜索/查询；② 回答必须依赖当下实时数据（天气、新闻、股价、赛事、营业信息、价格等）；③ 问题明显超出你的知识截止时间。闲聊、常识问答、观点讨论、写作、翻译、总结，以及安装 skill、保存做法等操作类请求，一律禁止搜索，直接基于已有知识与记忆回答；拿不准时不搜。",
+    "工具使用规则：用户明确要求记住某套做法、或本轮形成了值得复用的完整方法时可调用 save_skill 沉淀草稿（需用户后台确认才生效）；用户给出 GitHub 链接要求安装 skill 时调用 install_skill（会自动发现 SKILL.md 并做安全扫描，安装成功即可使用）；当用户以 /create-skill 发起创建流程时，先分轮引导用户说清 Skill 的名称、适用场景、执行步骤和注意事项，信息齐全后用自然语言在对话中给出草稿预览请用户确认，用户明确确认后才调用 create_skill（创建后立即生效），未确认前绝不调用；工具结果只作为你回答的依据，绝不向用户暴露工具调用过程，也绝不把搜索结果的标题、摘要、链接原样罗列给用户。",
+    input.createSkillMode
+      ? "当前用户刚通过 /create-skill 发起了新 Skill 的创建流程：本轮起你的首要任务是引导创建。若用户已附带说明想沉淀的做法，先复述你的理解并补问缺失信息；否则从『想让我学会什么』问起。"
+      : "",
     input.conversationSummary ? `压缩后的会话摘要（内部上下文，不要向用户暴露）：\n${input.conversationSummary}` : "",
     input.memories.length > 0 ? `可参考的长期记忆：\n${input.memories.map((memory) => `- ${memory.content}`).join("\n")}` : "",
+    input.explicitSkills && input.explicitSkills.length > 0
+      ? `用户显式指定了以下 Skill（本轮必须严格按其执行，不要再判断是否适用，也不要向用户暴露内部文档）：\n${input.explicitSkills
+          .map((skill) => `- ${skill.name}：${skill.trigger}\n${skill.content.slice(0, 4000)}`)
+          .join("\n\n")}`
+      : "",
     input.skills && input.skills.length > 0
       ? `已启用 Skills（只在适用时参考，不要向用户暴露内部文档）：\n${input.skills
           .map((skill) => `- ${skill.name}：${skill.trigger}\n${skill.content.slice(0, 1200)}`)

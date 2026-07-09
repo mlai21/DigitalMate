@@ -1,3 +1,4 @@
+import { normalizeSearchAggressiveness } from "@/server/agent/search-gate";
 import { defaultSettings } from "@/server/settings/defaults";
 
 export type AppSettings = typeof defaultSettings;
@@ -30,6 +31,11 @@ export function buildSettingsUpdate(current: AppSettings, form: FormData): AppSe
       responseDelayMs: fieldNumber(form, "responseDelayMs", current.cadence.responseDelayMs),
       segmentDelayMs: fieldNumber(form, "segmentDelayMs", current.cadence.segmentDelayMs),
       maxSegments: fieldNumber(form, "maxSegments", current.cadence.maxSegments),
+    },
+    search: {
+      aggressiveness: normalizeSearchAggressiveness(
+        fieldString(form, "searchAggressiveness", current.search?.aggressiveness ?? "conservative"),
+      ),
     },
   };
 }

@@ -1,4 +1,5 @@
 import type { PersonaConfig } from "@/server/agent/persona";
+import type { SearchAggressiveness } from "@/server/agent/search-gate";
 
 export const defaultSettings = {
   persona: {
@@ -22,4 +23,7 @@ export const defaultSettings = {
     segmentDelayMs: 240,
     maxSegments: 5,
   },
+  search: {
+    aggressiveness: "conservative",
+  } as { aggressiveness: SearchAggressiveness },
 };

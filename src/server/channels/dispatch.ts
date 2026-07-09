@@ -27,6 +27,7 @@ async function processChannelMessage(input: { env: AppEnv; message: NormalizedCh
   const user = await repositories.users.ensureDefault();
   const settings = await repositories.settings.get(user.id);
   const { client, model } = getLlmClient("main", input.env, settings.modelRouting);
+  const light = getLlmClient("light", input.env, settings.modelRouting);
 
   await handleChannelMessage({
     message: input.message,
@@ -34,18 +35,17 @@ async function processChannelMessage(input: { env: AppEnv; message: NormalizedCh
     repositories,
     llm: client,
     model,
+    lightLlm: { client: light.client, model: light.model },
     send: (normalized, text) => sendChannelMessage(input.env, normalized, text),
     skillInstaller: {
-      install: (url) => {
-        const light = getLlmClient("light", input.env, settings.modelRouting);
-        return installSkillsFromGitHub({
+      install: (url) =>
+        installSkillsFromGitHub({
           url,
           userId: user.id,
           repositories,
           scanner: { llm: light.client, model: light.model },
           token: input.env.githubToken,
-        });
-      },
+        }),
     },
   });
 }

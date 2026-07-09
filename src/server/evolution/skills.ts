@@ -8,6 +8,8 @@ export type SkillDraftInput = {
   steps: string[];
   notes?: string[];
   source?: SkillSource;
+  /** Defaults to pending; chat-confirmed creation (/create-skill) enables directly. */
+  status?: "pending" | "enabled";
 };
 
 export type SkillDraft = {
@@ -31,7 +33,7 @@ export function createSkillDraft(input: SkillDraftInput): SkillDraft {
   return {
     name: input.name,
     trigger: input.trigger,
-    status: "pending",
+    status: input.status ?? "pending",
     source: input.source ?? "manual",
     content: serializeSkillMd({
       name: input.name,

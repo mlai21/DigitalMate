@@ -208,7 +208,7 @@ export function ChatShell({
     if (response.ok) await refreshSidebar();
   }
 
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, options?: { skillIds?: string[] }) {
     let targetConversationId = activeConversationId;
     if (!targetConversationId) {
       try {
@@ -241,7 +241,11 @@ export function ChatShell({
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: content, conversationId: targetConversationId }),
+        body: JSON.stringify({
+          message: content,
+          conversationId: targetConversationId,
+          ...(options?.skillIds?.length ? { skillIds: options.skillIds } : {}),
+        }),
       });
       if (!response.ok || !response.body) throw new Error("chat_request_failed");
 
