@@ -275,6 +275,8 @@ export default function HomePage() {
             <div className={styles.cta}>
               <h2 className={styles.ctaTitle}>今天想聊点什么？</h2>
               <p className={styles.ctaSub}>它已经在这里等你了。</p>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img className={styles.ctaGif} src="/home/join.webp" alt="" aria-hidden loading="lazy" />
               <Link className={styles.btnPrimary} href="/">
                 开始对话
               </Link>

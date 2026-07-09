@@ -622,8 +622,16 @@
 }
 
 .ctaSub {
-  margin: 0 0 28px;
+  margin: 0 0 8px;
   color: var(--ink-secondary);
+}
+
+.ctaGif {
+  display: block;
+  width: 240px;
+  height: auto;
+  margin: 0 auto 4px;
+  pointer-events: none;
 }
 
 /* ===== 页脚 ===== */
