@@ -64,7 +64,7 @@ export function DraggableMascot() {
       ref={imgRef}
       alt="DigitalMate 眨眼动画"
       className={styles.heroMascot}
-      src="/home/blink.gif"
+      src="/home/blink.webp"
       style={{
         transform: `translate(${mascotPos.x}px, ${mascotPos.y}px)`,
         cursor: isDragging ? "grabbing" : "grab",

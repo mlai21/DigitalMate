@@ -198,7 +198,7 @@ export default function HomePage() {
                   <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
                 </div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img className={styles.featuresGif} src="/home/typing.gif" alt="" aria-hidden />
+                <img className={styles.featuresGif} src="/home/typing.webp" alt="" aria-hidden />
               </div>
             </Reveal>
             <div className={styles.grid}>
