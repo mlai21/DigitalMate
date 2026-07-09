@@ -1,12 +1,15 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import styles from "./home.module.css";
+import { Reveal } from "./reveal";
 
 export const metadata: Metadata = {
   title: "DigitalMate — 一个有性格、有记忆的私人数字伙伴",
   description:
     "平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。自托管部署，数据完全自控。",
 };
+
+const GITHUB_URL = "https://github.com/mlai21/DigitalMate";
 
 const FEATURES = [
   {
@@ -64,7 +67,39 @@ const TECH_ITEMS = [
   },
 ];
 
+const SCENARIOS = [
+  {
+    tag: "日常问答",
+    messages: [
+      { from: "user", text: "明天北京什么天气？要带伞吗" },
+      { from: "mate", text: "明天多云转小雨，下午两点后概率大。你不是三点要出门吗，带把伞稳妥些 ☂️" },
+    ],
+  },
+  {
+    tag: "提醒跟进",
+    messages: [
+      { from: "user", text: "周五之前提醒我交报销" },
+      { from: "mate", text: "好，周五早上我来提醒你。别又拖到最后一天哈" },
+    ],
+  },
+  {
+    tag: "群聊参与",
+    messages: [{ from: "mate", text: "（群里聊到周末去哪玩）上次你说想去爬山，XX山这周末天气不错，可以安排上" }],
+  },
+  {
+    tag: "任务执行",
+    messages: [
+      { from: "user", text: "把这份销售表按区域汇总，做成 5 页汇报 PPT" },
+      { from: "mate", text: "收到，稍等我看看数据。大概十分钟后给你文件" },
+    ],
+  },
+] as const;
+
 export default function HomePage() {
+  const [featuredFeature, ...restFeatures] = FEATURES;
+  const wideFeature = restFeatures[restFeatures.length - 1];
+  const gridFeatures = restFeatures.slice(0, -1);
+
   return (
     <div className={styles.page}>
       <header className={styles.header}>
@@ -94,140 +129,157 @@ export default function HomePage() {
         <div className={styles.wrap}>
           <div className={styles.intro}>
             <div className={styles.introGrid}>
-              <div>
+              <Reveal>
                 <div className={styles.statusLine}>
                   <span className={styles.statusDot} />
                   在线 · 随时可聊
                 </div>
-                <h1 className={styles.introTitle}>一个有性格、有记忆的私人数字伙伴</h1>
+                <h1 className={styles.introTitle}>
+                  一个有性格、<span className={styles.gradientWord}>有记忆</span>的私人数字伙伴
+                </h1>
                 <p className={styles.introSub}>
                   平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。自托管部署，数据完全自控。
                 </p>
                 <Link className={styles.btnPrimary} href="/">
                   开始对话
                 </Link>
-              </div>
-              <div className={styles.chatWindow}>
-                <div className={styles.chatDay}>上周三</div>
-                <div className={`${styles.msg} ${styles.msgUser}`}>
-                  <div className={`${styles.bubble} ${styles.bubbleUser}`}>最近在准备一个部门演讲，有点紧张</div>
-                </div>
-                <div className={styles.msg}>
-                  <div className={styles.avatar}>D</div>
-                  <div className={`${styles.bubble} ${styles.bubbleMate}`}>
-                    紧张说明你在意呀。要不要我帮你过一遍提纲？
+              </Reveal>
+              <Reveal delay={120}>
+                <div className={styles.heroVisual}>
+                  <div className={styles.heroRing} aria-hidden />
+                  <div className={styles.heroCorner} aria-hidden />
+                  <div className={styles.heroDots} aria-hidden />
+                  <div className={`${styles.chatWindow} ${styles.heroFloat}`}>
+                    <div className={styles.chatDay}>上周三</div>
+                    <div className={`${styles.msg} ${styles.msgUser}`}>
+                      <div className={`${styles.bubble} ${styles.bubbleUser}`}>最近在准备一个部门演讲，有点紧张</div>
+                    </div>
+                    <div className={styles.msg}>
+                      <div className={styles.avatar}>D</div>
+                      <div className={`${styles.bubble} ${styles.bubbleMate}`}>
+                        紧张说明你在意呀。要不要我帮你过一遍提纲？
+                      </div>
+                    </div>
+                    <div className={styles.chatDay}>今天</div>
+                    <div className={styles.msg}>
+                      <div className={styles.avatar}>D</div>
+                      <div className={`${styles.bubble} ${styles.bubbleMate}`}>
+                        对了，演讲练得怎么样了？这周就要上场了吧
+                      </div>
+                    </div>
+                    <div className={`${styles.msg} ${styles.msgUser}`}>
+                      <div className={`${styles.bubble} ${styles.bubbleUser}`}>你居然还记得！练了两遍，好多了</div>
+                    </div>
+                    <div className={styles.msg}>
+                      <div className={styles.avatar}>D</div>
+                      <div className={`${styles.bubble} ${styles.bubbleMate} ${styles.typing}`}>
+                        <i />
+                        <i />
+                        <i />
+                      </div>
+                    </div>
                   </div>
                 </div>
-                <div className={styles.chatDay}>今天</div>
-                <div className={styles.msg}>
-                  <div className={styles.avatar}>D</div>
-                  <div className={`${styles.bubble} ${styles.bubbleMate}`}>
-                    对了，演讲练得怎么样了？这周就要上场了吧
-                  </div>
-                </div>
-                <div className={`${styles.msg} ${styles.msgUser}`}>
-                  <div className={`${styles.bubble} ${styles.bubbleUser}`}>你居然还记得！练了两遍，好多了</div>
-                </div>
-                <div className={styles.msg}>
-                  <div className={styles.avatar}>D</div>
-                  <div className={`${styles.bubble} ${styles.bubbleMate} ${styles.typing}`}>
-                    <i />
-                    <i />
-                    <i />
-                  </div>
-                </div>
-              </div>
+              </Reveal>
             </div>
           </div>
         </div>
 
         <section className={styles.features} id="features">
           <div className={styles.wrap}>
-            <div className={styles.sectionHead}>
-              <p className={styles.sectionLabel}>特性</p>
-              <h2 className={styles.sectionTitle}>像朋友，更像一位可靠的数字员工</h2>
-              <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
-            </div>
+            <Reveal>
+              <div className={styles.sectionHead}>
+                <p className={styles.sectionLabel}>特性</p>
+                <h2 className={styles.sectionTitle}>像朋友，更像一位可靠的数字员工</h2>
+                <p className={styles.sectionSub}>不只是问答工具——它有自己的样子，也记得你的样子。</p>
+              </div>
+            </Reveal>
             <div className={styles.grid}>
-              {FEATURES.map((feature) => (
-                <div className={styles.card} key={feature.title}>
+              <Reveal className={`${styles.card} ${styles.cardFeatured}`}>
+                <div className={styles.cardIcon}>{featuredFeature.icon}</div>
+                <h3 className={styles.cardTitle}>{featuredFeature.title}</h3>
+                <p className={styles.cardText}>{featuredFeature.text}</p>
+              </Reveal>
+              {gridFeatures.map((feature, index) => (
+                <Reveal className={styles.card} delay={60 * (index + 1)} key={feature.title}>
                   <div className={styles.cardIcon}>{feature.icon}</div>
                   <h3 className={styles.cardTitle}>{feature.title}</h3>
                   <p className={styles.cardText}>{feature.text}</p>
-                </div>
+                </Reveal>
               ))}
+              <Reveal className={`${styles.card} ${styles.cardWide}`} delay={300}>
+                <div className={styles.cardIcon}>{wideFeature.icon}</div>
+                <div>
+                  <h3 className={styles.cardTitle}>{wideFeature.title}</h3>
+                  <p className={styles.cardText}>{wideFeature.text}</p>
+                </div>
+              </Reveal>
             </div>
           </div>
         </section>
 
         <section className={styles.scenarios} id="scenarios">
           <div className={styles.wrap}>
-            <div className={styles.sectionHead}>
-              <p className={styles.sectionLabel}>场景</p>
-              <h2 className={styles.sectionTitle}>它出现在生活里的样子</h2>
-            </div>
+            <Reveal>
+              <div className={styles.sectionHead}>
+                <p className={styles.sectionLabel}>场景</p>
+                <h2 className={styles.sectionTitle}>它出现在生活里的样子</h2>
+              </div>
+            </Reveal>
             <div className={styles.scenarioGrid}>
-              <div className={styles.scenario}>
-                <span className={styles.scenarioTag}>日常问答</span>
-                <div className={`${styles.miniBubble} ${styles.fromUser}`}>明天北京什么天气？要带伞吗</div>
-                <div className={`${styles.miniBubble} ${styles.fromMate}`}>
-                  明天多云转小雨，下午两点后概率大。你不是三点要出门吗，带把伞稳妥些 ☂️
-                </div>
-              </div>
-              <div className={styles.scenario}>
-                <span className={styles.scenarioTag}>提醒跟进</span>
-                <div className={`${styles.miniBubble} ${styles.fromUser}`}>周五之前提醒我交报销</div>
-                <div className={`${styles.miniBubble} ${styles.fromMate}`}>
-                  好，周五早上我来提醒你。别又拖到最后一天哈
-                </div>
-              </div>
-              <div className={styles.scenario}>
-                <span className={styles.scenarioTag}>群聊参与</span>
-                <div className={`${styles.miniBubble} ${styles.fromMate}`}>
-                  （群里聊到周末去哪玩）上次你说想去爬山，XX山这周末天气不错，可以安排上
-                </div>
-              </div>
-              <div className={styles.scenario}>
-                <span className={styles.scenarioTag}>任务执行</span>
-                <div className={`${styles.miniBubble} ${styles.fromUser}`}>
-                  把这份销售表按区域汇总，做成 5 页汇报 PPT
-                </div>
-                <div className={`${styles.miniBubble} ${styles.fromMate}`}>
-                  收到，稍等我看看数据。大概十分钟后给你文件
-                </div>
-              </div>
+              {SCENARIOS.map((scenario, index) => (
+                <Reveal
+                  className={`${styles.scenario} ${index % 2 === 1 ? styles.scenarioOffset : ""}`}
+                  delay={80 * index}
+                  key={scenario.tag}
+                >
+                  <span className={styles.scenarioTag}>{scenario.tag}</span>
+                  {scenario.messages.map((message) => (
+                    <div
+                      className={`${styles.miniBubble} ${message.from === "user" ? styles.fromUser : styles.fromMate}`}
+                      key={message.text}
+                    >
+                      {message.text}
+                    </div>
+                  ))}
+                </Reveal>
+              ))}
             </div>
           </div>
         </section>
 
         <section className={styles.tech} id="tech">
           <div className={styles.wrap}>
-            <div className={styles.sectionHead}>
-              <p className={styles.sectionLabel}>技术</p>
-              <h2 className={styles.sectionTitle}>为「长期陪伴」设计的底层</h2>
-            </div>
+            <Reveal>
+              <div className={styles.sectionHead}>
+                <p className={styles.sectionLabel}>技术</p>
+                <h2 className={styles.sectionTitle}>为「长期陪伴」设计的底层</h2>
+              </div>
+            </Reveal>
             <div className={styles.techGrid}>
-              {TECH_ITEMS.map((item) => (
-                <div className={styles.techItem} key={item.num}>
+              {TECH_ITEMS.map((item, index) => (
+                <Reveal className={styles.techItem} delay={60 * index} key={item.num}>
                   <span className={styles.techNum}>{item.num}</span>
                   <div>
-                    <h3 className={styles.cardTitle}>{item.title}</h3>
-                    <p className={styles.cardText}>{item.text}</p>
+                    <h3 className={styles.techTitle}>{item.title}</h3>
+                    <p className={styles.techText}>{item.text}</p>
                   </div>
-                </div>
+                </Reveal>
               ))}
             </div>
           </div>
         </section>
 
         <div className={styles.wrap}>
-          <div className={styles.cta}>
-            <h2 className={styles.ctaTitle}>今天想聊点什么？</h2>
-            <p className={styles.ctaSub}>它已经在这里等你了。</p>
-            <Link className={styles.btnPrimary} href="/">
-              开始对话
-            </Link>
-          </div>
+          <Reveal>
+            <div className={styles.cta}>
+              <h2 className={styles.ctaTitle}>今天想聊点什么？</h2>
+              <p className={styles.ctaSub}>它已经在这里等你了。</p>
+              <Link className={styles.btnPrimary} href="/">
+                开始对话
+              </Link>
+            </div>
+          </Reveal>
         </div>
       </main>
 
@@ -235,12 +287,7 @@ export default function HomePage() {
         <div className={styles.footerInner}>
           <p className={styles.footerText}>DigitalMate · 私人数字伙伴 · 自托管部署</p>
           <div className={styles.footerLinks}>
-            <a
-              className={styles.footerLink}
-              href="https://github.com"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
+            <a className={styles.footerLink} href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
               GitHub
             </a>
             <Link className={styles.footerLink} href="/admin">

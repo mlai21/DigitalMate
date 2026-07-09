@@ -477,11 +477,12 @@ export function createRepositories(pool: Pool = getPool()) {
       async create(input: ToolLogInput): Promise<void> {
         await pool.query(
           `INSERT INTO tool_call_logs
-           (user_id, conversation_id, tool_name, input_summary, output_summary, status, duration_ms, error)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+           (user_id, conversation_id, goal_id, tool_name, input_summary, output_summary, status, duration_ms, error)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [
             input.userId,
             input.conversationId,
+            input.goalId ?? null,
             input.toolName,
             input.inputSummary,
             input.outputSummary,

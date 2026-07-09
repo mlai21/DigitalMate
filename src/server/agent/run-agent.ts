@@ -9,7 +9,8 @@ import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/ser
 
 export type ToolLogInput = {
   userId: string;
-  conversationId: string;
+  conversationId: string | null;
+  goalId?: string | null;
   toolName: string;
   inputSummary: string;
   outputSummary: string;
