@@ -42,4 +42,20 @@ describe("database schema", () => {
     expect(schema).toMatch(/llm_usage_logs[\s\S]+total_tokens integer NOT NULL/);
     expect(schema).toMatch(/proactive_tasks[\s\S]+'share'/);
   });
+
+  it("defines goal mode tables for the loop ledger (P3-1)", async () => {
+    const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS goals");
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS goal_steps");
+    expect(schema).toMatch(/goals[\s\S]+user_id uuid NOT NULL/);
+    expect(schema).toMatch(
+      /goals[\s\S]+CHECK \(status IN \('draft', 'confirmed', 'running', 'paused', 'needs_human', 'succeeded', 'failed_budget', 'failed_no_progress', 'cancelled'\)\)/,
+    );
+    expect(schema).toMatch(/goal_steps[\s\S]+goal_id uuid NOT NULL REFERENCES goals\(id\) ON DELETE CASCADE/);
+    expect(schema).toMatch(/goal_steps[\s\S]+CHECK \(phase IN \('collecting', 'drafting', 'verifying', 'committed', 'failed'\)\)/);
+    expect(schema).toContain("ALTER TABLE IF EXISTS tool_call_logs ADD COLUMN IF NOT EXISTS goal_id uuid REFERENCES goals(id)");
+    expect(schema).toContain("CREATE INDEX IF NOT EXISTS idx_goals_due ON goals(next_run_at) WHERE status = 'running'");
+    expect(schema).toContain("idx_goal_steps_goal");
+  });
 });
