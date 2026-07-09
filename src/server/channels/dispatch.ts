@@ -4,6 +4,7 @@ import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { AppEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { getLlmClient } from "@/server/llm/router";
+import { installSkillsFromGitHub } from "@/server/skills/install";
 
 export function scheduleChannelMessageHandling(input: {
   env: AppEnv;
@@ -34,5 +35,17 @@ async function processChannelMessage(input: { env: AppEnv; message: NormalizedCh
     llm: client,
     model,
     send: (normalized, text) => sendChannelMessage(input.env, normalized, text),
+    skillInstaller: {
+      install: (url) => {
+        const light = getLlmClient("light", input.env, settings.modelRouting);
+        return installSkillsFromGitHub({
+          url,
+          userId: user.id,
+          repositories,
+          scanner: { llm: light.client, model: light.model },
+          token: input.env.githubToken,
+        });
+      },
+    },
   });
 }

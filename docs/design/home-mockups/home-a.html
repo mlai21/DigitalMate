@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DigitalMate — 方案 A：单列安静排版</title>
+<style>
+  :root {
+    --canvas: #FAF7F2;
+    --surface: #FFFFFF;
+    --surface-sunken: #F3EEE6;
+    --border: #E9E2D6;
+    --ink: #2D2A26;
+    --ink-secondary: #6E675F;
+    --ink-faint: #A39B90;
+    --accent: #E8684A;
+    --accent-hover: #D6573A;
+    --accent-soft: #FBEAE4;
+    --success: #4E9B6F;
+    --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "HarmonyOS Sans SC", "Noto Sans SC", "Segoe UI", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--canvas);
+    color: var(--ink);
+    line-height: 1.75;
+    font-size: 16px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 0 32px; }
+  @media (max-width: 767px) { .wrap { padding: 0 16px; } }
+
+  /* 顶部导航 */
+  header {
+    border-bottom: 1px solid var(--border);
+    background: var(--canvas);
+  }
+  .nav {
+    max-width: 720px; margin: 0 auto; padding: 16px 32px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 16px; }
+  .logo-mark {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: var(--accent-soft); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent); font-size: 14px; font-weight: 600;
+  }
+  .btn-primary {
+    background: var(--accent); color: #fff; border: none;
+    border-radius: 12px; height: 40px; padding: 0 20px;
+    font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
+    transition: background 250ms ease-out;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+
+  /* 引子 */
+  .intro { padding: 64px 0 48px; }
+  .intro h1 { font-size: 28px; line-height: 1.3; font-weight: 600; margin-bottom: 16px; }
+  .intro p { color: var(--ink-secondary); max-width: 560px; }
+
+  /* 场景演示：聊天窗 */
+  .demo { padding-bottom: 64px; }
+  .chat-window {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 24px; max-width: 640px;
+  }
+  .chat-day {
+    text-align: center; font-size: 12px; color: var(--ink-faint); margin: 12px 0;
+  }
+  .msg { display: flex; gap: 10px; margin-bottom: 20px; }
+  .msg.mate .avatar {
+    width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0;
+    background: var(--accent-soft); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent); font-size: 15px; font-weight: 600;
+  }
+  .bubble {
+    padding: 12px 16px; border-radius: 18px; max-width: 78%; font-size: 16px;
+  }
+  .msg.mate .bubble { background: var(--surface-sunken); border: 1px solid var(--border); }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .bubble {
+    background: var(--accent-soft); border-bottom-right-radius: 6px;
+  }
+  .msg + .msg.same { margin-top: -14px; }
+  .typing { display: inline-flex; gap: 5px; padding: 14px 16px; }
+  .typing i {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint);
+    animation: breathe 1.4s ease-in-out infinite;
+  }
+  .typing i:nth-child(2) { animation-delay: 0.2s; }
+  .typing i:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes breathe { 0%,100% { opacity: .3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-3px); } }
+  .demo-caption { font-size: 12px; color: var(--ink-faint); margin-top: 12px; }
+
+  /* 特性列表：单列逐条 */
+  section { padding: 48px 0; border-top: 1px solid var(--border); }
+  .section-label {
+    font-size: 12px; color: var(--ink-faint); letter-spacing: 2px; margin-bottom: 8px;
+  }
+  h2 { font-size: 20px; font-weight: 600; line-height: 1.4; margin-bottom: 32px; }
+  .feature { display: flex; gap: 16px; padding: 20px 0; border-bottom: 1px solid var(--border); }
+  .feature:last-child { border-bottom: none; }
+  .feature-icon {
+    width: 40px; height: 40px; border-radius: 12px; flex-shrink: 0;
+    background: var(--surface-sunken); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+  }
+  .feature h3 { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .feature p { font-size: 14px; line-height: 1.6; color: var(--ink-secondary); }
+
+  /* 技术亮点 */
+  .tech-list { display: flex; flex-direction: column; gap: 12px; }
+  .tech-item {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 20px;
+  }
+  .tech-item h3 { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .tech-item p { font-size: 14px; line-height: 1.6; color: var(--ink-secondary); }
+
+  /* 页脚 */
+  footer { border-top: 1px solid var(--border); background: var(--surface-sunken); }
+  .footer-inner {
+    max-width: 720px; margin: 0 auto; padding: 32px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
+  }
+  .footer-inner p { font-size: 12px; color: var(--ink-secondary); }
+  .footer-links { display: flex; gap: 20px; font-size: 14px; }
+  .footer-links a { color: var(--ink-secondary); transition: color 200ms ease-out; }
+  .footer-links a:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="nav">
+    <div class="logo"><span class="logo-mark">D</span>DigitalMate</div>
+    <button class="btn-primary">开始对话</button>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="intro">
+      <h1>一个有性格、有记忆的<br>私人数字伙伴</h1>
+      <p>平时像朋友一样陪你聊天、答疑，记得你说过的每件事；逐步成长为能替你完成实际任务的数字员工。部署在你自己的服务器上，数据完全自控。</p>
+    </div>
+
+    <div class="demo">
+      <div class="chat-window">
+        <div class="chat-day">上周三</div>
+        <div class="msg user"><div class="bubble">最近在准备一个部门演讲，有点紧张</div></div>
+        <div class="msg mate">
+          <div class="avatar">D</div>
+          <div class="bubble">紧张说明你在意呀。要不要我帮你过一遍提纲？</div>
+        </div>
+        <div class="chat-day">今天</div>
+        <div class="msg mate">
+          <div class="avatar">D</div>
+          <div class="bubble">对了，演讲练得怎么样了？这周就要上场了吧</div>
+        </div>
+        <div class="msg user"><div class="bubble">你居然还记得！练了两遍，好多了</div></div>
+        <div class="msg mate">
+          <div class="avatar">D</div>
+          <div class="bubble typing"><i></i><i></i><i></i></div>
+        </div>
+      </div>
+      <p class="demo-caption">它会记住重要的事，并在合适的时候主动跟进。</p>
+    </div>
+  </div>
+
+  <section>
+    <div class="wrap">
+      <div class="section-label">特性</div>
+      <h2>像朋友，更像一位可靠的数字员工</h2>
+
+      <div class="feature">
+        <div class="feature-icon">🙂</div>
+        <div>
+          <h3>稳定人设</h3>
+          <p>有名字、有性格、有语气习惯。在所有渠道里，它都是同一个「人」，不是换个皮肤的客服机器人。</p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">📔</div>
+        <div>
+          <h3>长期记忆</h3>
+          <p>自动记住对话中的偏好、事件与关系，越用越懂你。所有记忆条目可随时查看、编辑、删除。</p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🔍</div>
+        <div>
+          <h3>联网搜索</h3>
+          <p>天气、新闻、实时信息随口一问，答案融进它自己的语气里，而不是甩给你一堆搜索结果。</p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">💬</div>
+        <div>
+          <h3>多渠道同一身份</h3>
+          <p>Web、飞书、钉钉、Telegram……在哪里聊都是同一份记忆、同一个它，跨端无缝续聊。</p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🌱</div>
+        <div>
+          <h3>自我进化</h3>
+          <p>每天复盘对话、整理记忆，把学到的做法沉淀成技能。新能力经你确认后才生效。</p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">⏰</div>
+        <div>
+          <h3>提醒与主动跟进</h3>
+          <p>「周五提醒我交报销」，到点就来找你。主动消息有频率上限和静默时段，绝不刷屏。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="section-label">技术</div>
+      <h2>为「长期陪伴」设计的底层</h2>
+      <div class="tech-list">
+        <div class="tech-item">
+          <h3>自研 Agent 内核</h3>
+          <p>循环式工具调用、分层记忆、按需加载的技能库，不依赖现成 Agent 框架，为拟人体验量身定制。</p>
+        </div>
+        <div class="tech-item">
+          <h3>分层记忆架构</h3>
+          <p>会话上下文、全量档案、情景记忆、用户画像四层分工——关键事实永远在场，陈年细节随叫随到。</p>
+        </div>
+        <div class="tech-item">
+          <h3>模型无关</h3>
+          <p>统一适配层接入任意 LLM，按用途路由：主对话用能力优先的模型，高频轻量调用用低成本模型。</p>
+        </div>
+        <div class="tech-item">
+          <h3>数据完全自控</h3>
+          <p>部署在自己的 VPS 上，对话与记忆只存自有 PostgreSQL 数据库，敏感信息不写入长期记忆。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <p>DigitalMate · 私人数字伙伴 · 自托管部署</p>
+    <div class="footer-links">
+      <a href="#">GitHub</a>
+      <a href="#">产品文档</a>
+      <a href="#">开始对话</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

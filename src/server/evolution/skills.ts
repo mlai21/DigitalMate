@@ -1,14 +1,24 @@
+import { buildSkillBody, serializeSkillMd } from "@/server/skills/skill-md";
+
+export type SkillSource = "manual" | "agent" | "task" | "imported";
+
 export type SkillDraftInput = {
   name: string;
   trigger: string;
   steps: string[];
+  notes?: string[];
+  source?: SkillSource;
 };
 
 export type SkillDraft = {
   name: string;
   trigger: string;
   content: string;
-  status: "pending";
+  /** Drafts default to pending; chat-confirmed installs may enable directly. */
+  status: "pending" | "enabled";
+  source: SkillSource;
+  sourceUrl?: string | null;
+  scanReport?: unknown;
 };
 
 export type TaskSkillDraftInput = {
@@ -22,18 +32,17 @@ export function createSkillDraft(input: SkillDraftInput): SkillDraft {
     name: input.name,
     trigger: input.trigger,
     status: "pending",
-    content: [
-      `# ${input.name}`,
-      "",
-      "## 适用场景",
-      input.trigger,
-      "",
-      "## 步骤",
-      ...input.steps.map((step, index) => `${index + 1}. ${step}`),
-      "",
-      "## 注意事项",
-      "启用前需要用户在后台确认。",
-    ].join("\n"),
+    source: input.source ?? "manual",
+    content: serializeSkillMd({
+      name: input.name,
+      description: input.trigger,
+      body: buildSkillBody({
+        name: input.name,
+        scenario: input.trigger,
+        steps: input.steps,
+        notes: input.notes,
+      }),
+    }),
   };
 }
 
@@ -73,5 +82,6 @@ export function createTaskSkillDraft(input: TaskSkillDraftInput): SkillDraft {
     name: config.name,
     trigger: `${config.triggerPrefix}：${input.inputSummary}`,
     steps: [...config.steps, `本次结果参考：${input.outputSummary}`],
+    source: "task",
   });
 }

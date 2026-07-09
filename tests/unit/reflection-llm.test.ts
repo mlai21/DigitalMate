@@ -25,7 +25,38 @@ describe("generateReflectionWithLlm", () => {
       positives: ["回应节奏自然"],
       negatives: ["有一次误解了用户意图"],
       suggestions: ["先复述再给结论"],
+      skill: null,
     });
+  });
+
+  it("parses a recurring task pattern into a skill proposal", async () => {
+    const llm = completeLlm(
+      JSON.stringify({
+        positives: ["帮用户整理了三次日报"],
+        negatives: [],
+        suggestions: [],
+        skill: { name: "日报整理流程", trigger: "用户需要把当天更新整理成日报", steps: ["收集更新", "按项目分组", "输出日报"] },
+      }),
+    );
+
+    const reflection = await generateReflectionWithLlm({ llm, model: "light", digest: "用户：..." });
+
+    expect(reflection?.skill).toEqual({
+      name: "日报整理流程",
+      trigger: "用户需要把当天更新整理成日报",
+      steps: ["收集更新", "按项目分组", "输出日报"],
+    });
+  });
+
+  it("drops malformed skill proposals but keeps the reflection", async () => {
+    const llm = completeLlm(
+      JSON.stringify({ positives: ["ok"], negatives: [], suggestions: [], skill: { name: "太少步骤", trigger: "x", steps: ["只有一步"] } }),
+    );
+
+    const reflection = await generateReflectionWithLlm({ llm, model: "light", digest: "..." });
+
+    expect(reflection?.positives).toEqual(["ok"]);
+    expect(reflection?.skill).toBeNull();
   });
 
   it("returns null on unusable output so callers can fall back", async () => {

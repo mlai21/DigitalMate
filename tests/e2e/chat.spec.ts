@@ -26,6 +26,8 @@ test("chat input is centered in the conversation stage on wide screens", async (
 test("auto-scroll keeps the latest message above the floating input", async ({ page }) => {
   await page.setViewportSize({ width: 1914, height: 683 });
   await page.goto("/");
+  await expect(page.getByRole("textbox", { name: "输入消息" })).toBeVisible();
+  await page.waitForTimeout(500);
 
   await page.evaluate(() => {
     const messages = document.querySelector<HTMLElement>(".messages");
@@ -53,6 +55,13 @@ test("auto-scroll keeps the latest message above the floating input", async ({ p
     });
 
     messages.replaceChildren(...rows, anchor);
+  });
+  await expect(page.locator(".message-bubble")).toHaveCount(10);
+  await page.waitForFunction(() => {
+    const stage = document.querySelector<HTMLElement>(".chat-stage");
+    if (!stage) return false;
+    const clearance = Number.parseFloat(getComputedStyle(stage).getPropertyValue("--chat-input-clearance"));
+    return Number.isFinite(clearance) && clearance >= 200;
   });
 
   await page.waitForTimeout(50);

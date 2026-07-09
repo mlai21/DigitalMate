@@ -14,6 +14,15 @@ describe("summarizeSearchResults", () => {
   it("degrades gracefully with no results", () => {
     expect(summarizeSearchResults([])).toBe("没有找到可靠搜索结果。");
   });
+
+  it("truncates oversized snippets so full-page dumps cannot flood the context", () => {
+    const summary = summarizeSearchResults([
+      { title: "掘金搜索", url: "https://juejin.cn", snippet: "长文".repeat(500) },
+    ]);
+
+    expect(summary.length).toBeLessThan(400);
+    expect(summary).toContain("…");
+  });
 });
 
 describe("mapIqsPageItems", () => {

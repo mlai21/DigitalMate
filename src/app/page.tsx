@@ -15,6 +15,7 @@ export default async function Home() {
       initialConversations={data.initialConversations}
       initialProjects={data.initialProjects}
       setupNotice={data.setupNotice}
+      loginRequired={data.loginRequired}
     />
   );
 }
@@ -25,6 +26,7 @@ async function loadChatPageData(): Promise<{
   initialConversations: ConversationItem[];
   initialProjects: ProjectItem[];
   setupNotice?: string;
+  loginRequired?: boolean;
 }> {
   try {
     const user = await getCurrentUser();
@@ -34,6 +36,7 @@ async function loadChatPageData(): Promise<{
         initialConversations: [],
         initialProjects: [],
         setupNotice: "需要先登录后才能继续聊天。",
+        loginRequired: true,
       };
     }
 

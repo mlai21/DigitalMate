@@ -7,11 +7,16 @@ import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
+import { createSkillDraft } from "@/server/evolution/skills";
 import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
 import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
+import { processSkillImprovement } from "@/server/evolution/skill-improvement";
+import { processGoalLoops } from "@/server/goals/orchestrator";
 import { getLlmClient } from "@/server/llm/router";
 
 const intervalMs = 15_000;
+const skillImprovementIntervalMs = 24 * 60 * 60 * 1000;
+let lastSkillImprovementAt = 0;
 
 async function main() {
   const repositories = createRepositories();
@@ -39,7 +44,38 @@ async function tick(repositories: ReturnType<typeof createRepositories>) {
   await processMemoryConsolidation(repositories);
   await processConversationCompaction(repositories);
   await processDailyReflection(repositories);
+  await processSkillImprovementJob(repositories);
   await processProactiveShares(repositories);
+  await processGoalLoopsJob(repositories);
+}
+
+async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>) {
+  const outcome = await processGoalLoops({ repositories }).catch(() => null);
+  if (outcome && (outcome.pickedUp > 0 || outcome.deferred > 0)) {
+    console.log(`Goal loops: picked up ${outcome.pickedUp}, advanced ${outcome.deferred} round(s).`);
+  }
+}
+
+async function processSkillImprovementJob(repositories: ReturnType<typeof createRepositories>) {
+  // At most once a day: revision proposals ride the same slow cadence as the
+  // daily reflection instead of the 15s tick.
+  if (Date.now() - lastSkillImprovementAt < skillImprovementIntervalMs) return;
+  lastSkillImprovementAt = Date.now();
+
+  const env = readEnv();
+  const user = await repositories.users.ensureDefault();
+  const settings = await repositories.settings.get(user.id);
+  const { client, model } = getLlmClient("light", env, settings.modelRouting);
+
+  const outcome = await processSkillImprovement({
+    repositories,
+    llm: client,
+    model,
+    userId: user.id,
+  }).catch(() => null);
+  if (outcome && outcome.proposed > 0) {
+    console.log(`Skill improvement: proposed ${outcome.proposed} pending revision(s).`);
+  }
 }
 
 async function processProactiveShares(repositories: ReturnType<typeof createRepositories>) {
@@ -170,14 +206,31 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
   const env = readEnv();
   const settings = await repositories.settings.get(user.id);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
+  const generated = await generateReflectionWithLlm({ llm: client, model, digest });
   const reflection =
-    (await generateReflectionWithLlm({ llm: client, model, digest })) ??
+    generated ??
     normalizeReflection("做得好：保持了稳定陪伴。需要改进：反思模型暂不可用，本次为降级记录。建议：检查 light 模型配置。");
   await repositories.reflections.create({
     userId: user.id,
-    reflection,
+    reflection: { positives: reflection.positives, negatives: reflection.negatives, suggestions: reflection.suggestions },
     sourceWindow: { event: "daily", conversationId: conversation.id, messageCount: messages.length },
   });
+
+  // Daily reflection may surface a recurring task pattern worth crystallizing
+  // into a new skill draft (pending user approval, like every other draft).
+  if (generated?.skill) {
+    await repositories.skills
+      .create(
+        user.id,
+        createSkillDraft({
+          name: generated.skill.name,
+          trigger: generated.skill.trigger,
+          steps: generated.skill.steps,
+          source: "agent",
+        }),
+      )
+      .catch(() => undefined);
+  }
 }
 
 function sleep(ms: number): Promise<void> {

@@ -27,9 +27,19 @@ export async function searchWeb(query: string, env: AppEnv = readEnv()): Promise
   return searchWithDuckDuckGo(query);
 }
 
+// IQS may fall back to full-page mainText; cap snippets so a whole search-results
+// page can't flood the LLM context and get parroted back to the user.
+const MAX_SNIPPET_LENGTH = 300;
+
 export function summarizeSearchResults(results: WebSearchResult[]): string {
   if (results.length === 0) return "没有找到可靠搜索结果。";
-  return results.map((result, index) => `${index + 1}. ${result.title}：${result.snippet} (${result.url})`).join("\n");
+  return results
+    .map((result, index) => `${index + 1}. ${result.title}：${truncateSnippet(result.snippet)} (${result.url})`)
+    .join("\n");
+}
+
+function truncateSnippet(snippet: string): string {
+  return snippet.length > MAX_SNIPPET_LENGTH ? `${snippet.slice(0, MAX_SNIPPET_LENGTH)}…` : snippet;
 }
 
 export function mapIqsPageItems(items: IqsPageItem[]): WebSearchResult[] {

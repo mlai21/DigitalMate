@@ -10,6 +10,7 @@ import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { recordTurnReview } from "@/server/evolution/turn-review";
 import { getLlmClient } from "@/server/llm/router";
+import { installSkillsFromGitHub } from "@/server/skills/install";
 
 export const runtime = "nodejs";
 
@@ -74,6 +75,18 @@ export async function POST(request: Request) {
             run: async (query) => {
               const results = await searchWeb(query);
               return { results, summary: summarizeSearchResults(results) };
+            },
+          },
+          skillInstaller: {
+            install: (url) => {
+              const light = getLlmClient("light", env, settings.modelRouting);
+              return installSkillsFromGitHub({
+                url,
+                userId: user.id,
+                repositories,
+                scanner: { llm: light.client, model: light.model },
+                token: env.githubToken,
+              });
             },
           },
         })) {

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -58,5 +59,12 @@ function StatCard({ label, value }: { label: string; value: number }) {
 }
 
 function AdminEmpty({ message }: { message: string }) {
-  return <section className="admin-card">{message}</section>;
+  return (
+    <section className="admin-card admin-empty">
+      <span>{message}</span>
+      <Link className="setup-notice-action" href="/login">
+        去登录
+      </Link>
+    </section>
+  );
 }

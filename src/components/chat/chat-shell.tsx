@@ -26,12 +26,14 @@ export function ChatShell({
   initialConversations = [],
   initialProjects = [],
   setupNotice,
+  loginRequired = false,
 }: {
   conversationId?: string;
   initialMessages: ChatMessage[];
   initialConversations?: ConversationItem[];
   initialProjects?: ProjectItem[];
   setupNotice?: string;
+  loginRequired?: boolean;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [conversations, setConversations] = useState<ConversationItem[]>(initialConversations);
@@ -39,10 +41,34 @@ export function ChatShell({
   const [activeConversationId, setActiveConversationId] = useState(conversationId);
   const [isStreaming, setIsStreaming] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const stageRef = useRef<HTMLElement>(null);
+  const inputShellRef = useRef<HTMLFormElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const latestMessageTime = useMemo(() => messages.at(-1)?.createdAt ?? new Date(0).toISOString(), [messages]);
 
   const activeConversation = conversations.find((conversation) => conversation.id === activeConversationId);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    const input = inputShellRef.current;
+    if (!stage || !input) return;
+
+    const updateInputClearance = () => {
+      const inputBox = input.getBoundingClientRect();
+      const bottom = Number.parseFloat(window.getComputedStyle(input).bottom);
+      const bottomOffset = Number.isFinite(bottom) ? bottom : 0;
+      stage.style.setProperty("--chat-input-clearance", `${Math.ceil(inputBox.height + bottomOffset + 24)}px`);
+    };
+
+    updateInputClearance();
+    const observer = "ResizeObserver" in window ? new ResizeObserver(updateInputClearance) : undefined;
+    observer?.observe(input);
+    window.addEventListener("resize", updateInputClearance);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateInputClearance);
+    };
+  }, []);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -285,7 +311,7 @@ export function ChatShell({
         </div>
       ) : null}
 
-      <section className="chat-stage">
+      <section ref={stageRef} className="chat-stage">
         <header className="mobile-header">
           <button className="icon-button" type="button" aria-label="打开会话列表" onClick={() => setMobileSidebarOpen(true)}>
             <Menu size={18} />
@@ -310,7 +336,16 @@ export function ChatShell({
         )}
 
         <div className="messages">
-          {setupNotice ? <div className="setup-notice">{setupNotice}</div> : null}
+          {setupNotice ? (
+            <div className="setup-notice">
+              <span>{setupNotice}</span>
+              {loginRequired ? (
+                <Link className="setup-notice-action" href="/login">
+                  去登录
+                </Link>
+              ) : null}
+            </div>
+          ) : null}
           {messages.length === 0 ? (
             <div className="empty-state">
               <p>今天想聊点什么？</p>
@@ -321,10 +356,10 @@ export function ChatShell({
             <MessageBubble key={message.id} role={message.role} content={message.content} />
           ))}
           {isStreaming ? <TypingDots /> : null}
-          <div ref={scrollRef} />
+          <div ref={scrollRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
 
-        <ChatInput disabled={Boolean(setupNotice) || isStreaming} onSubmit={sendMessage} />
+        <ChatInput shellRef={inputShellRef} disabled={Boolean(setupNotice) || isStreaming} onSubmit={sendMessage} />
       </section>
     </main>
   );
@@ -349,11 +384,30 @@ async function* readSse(stream: ReadableStream<Uint8Array>): AsyncIterable<SsePa
   }
 }
 
-function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   const seen = new Set(current.map((message) => message.id));
   const next = [...current];
   for (const message of incoming) {
-    if (!seen.has(message.id)) next.push(message);
+    if (seen.has(message.id)) continue;
+    const optimisticIndex = next.findIndex((candidate) => isMatchingOptimisticMessage(candidate, message));
+    if (optimisticIndex >= 0) {
+      seen.delete(next[optimisticIndex].id);
+      next[optimisticIndex] = message;
+      seen.add(message.id);
+      continue;
+    }
+    next.push(message);
+    seen.add(message.id);
   }
   return next;
+}
+
+function isMatchingOptimisticMessage(candidate: ChatMessage, persisted: ChatMessage): boolean {
+  if (!isOptimisticMessage(candidate)) return false;
+  return candidate.role === persisted.role && candidate.content === persisted.content;
+}
+
+function isOptimisticMessage(message: ChatMessage): boolean {
+  if (message.role === "user") return message.id.startsWith("local-user-");
+  return message.id.startsWith("assistant-");
 }

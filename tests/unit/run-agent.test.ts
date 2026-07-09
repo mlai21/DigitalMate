@@ -309,6 +309,253 @@ describe("runAgent", () => {
     expect(seenInputs[1]?.messages.some((message) => message.content.includes("区域 A 销售额最高"))).toBe(true);
   });
 
+  it("records usage for injected skills", async () => {
+    const recordUsage = vi.fn();
+    const llm = scriptedLlm([[{ type: "text", text: "我按老流程来。" }]]);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "整理周报",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: {
+          findEnabled: async () => [
+            { id: "skill-1", name: "周报整理", trigger: "整理周报", content: "# 周报整理" },
+            { id: "skill-2", name: "风险标注", trigger: "标注风险", content: "# 风险标注" },
+          ],
+          recordUsage,
+        },
+      },
+      search: { run: vi.fn() },
+    })) {
+      void chunk;
+    }
+
+    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-1", "skill-2"], "conversation-1");
+  });
+
+  it("exposes save_skill and persists a pending draft when the model calls it", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const createSkill = vi.fn();
+    const logTool = vi.fn();
+    const llm = scriptedLlm(
+      [
+        [
+          {
+            type: "tool_call",
+            toolCall: {
+              id: "call-1",
+              name: "save_skill",
+              arguments: JSON.stringify({
+                name: "周报整理流程",
+                description: "把零散更新整理成周报",
+                steps: ["收集本周更新", "按项目分组", "输出三段式周报"],
+              }),
+            },
+          },
+        ],
+        [{ type: "text", text: "我记下来了，等你在后台确认后就会生效。" }],
+      ],
+      seenInputs,
+    );
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "把这套周报做法记下来",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+        toolLogs: { create: logTool },
+      },
+      search: { run: vi.fn() },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(seenInputs[0]?.tools?.some((tool) => tool.name === "save_skill")).toBe(true);
+    expect(createSkill).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ name: "周报整理流程", status: "pending", source: "agent" }),
+    );
+    expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "save_skill", status: "success" }));
+    expect(chunks.join("")).toBe("我记下来了，等你在后台确认后就会生效。");
+  });
+
+  it("rejects incomplete save_skill drafts without persisting them", async () => {
+    const createSkill = vi.fn();
+    const logTool = vi.fn();
+    const llm = scriptedLlm([
+      [
+        {
+          type: "tool_call",
+          toolCall: {
+            id: "call-1",
+            name: "save_skill",
+            arguments: JSON.stringify({ name: "太简单", description: "", steps: ["只有一步"] }),
+          },
+        },
+      ],
+      [{ type: "text", text: "这次先不存了。" }],
+    ]);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "记住这个",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+        toolLogs: { create: logTool },
+      },
+      search: { run: vi.fn() },
+    })) {
+      void chunk;
+    }
+
+    expect(createSkill).not.toHaveBeenCalled();
+    expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "save_skill", status: "error" }));
+  });
+
+  it("does not expose save_skill when the skills repository cannot persist drafts", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const llm = scriptedLlm([[{ type: "text", text: "好的。" }]], seenInputs);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "你好",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: { run: vi.fn() },
+    })) {
+      void chunk;
+    }
+
+    expect(seenInputs[0]?.tools?.some((tool) => tool.name === "save_skill")).toBe(false);
+  });
+
+  it("installs skills from a GitHub link through install_skill and reports back", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const logTool = vi.fn();
+    const install = vi.fn(async () => ({
+      installed: [
+        {
+          name: "女娲",
+          description: "蒸馏任何人的思维方式",
+          status: "enabled" as const,
+          verdict: "safe" as const,
+          content: "# 女娲\n\n## 步骤\n1. 收集素材",
+        },
+      ],
+      blocked: [],
+      others: [{ name: "费曼视角", path: "examples/feynman/SKILL.md" }],
+    }));
+    const llm = scriptedLlm(
+      [
+        [
+          {
+            type: "tool_call",
+            toolCall: {
+              id: "call-1",
+              name: "install_skill",
+              arguments: JSON.stringify({ url: "https://github.com/alchaincyf/nuwa-skill" }),
+            },
+          },
+        ],
+        [{ type: "text", text: "装好了，「女娲」已经可以用了。" }],
+      ],
+      seenInputs,
+    );
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "安装这个 https://github.com/alchaincyf/nuwa-skill",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
+      search: { run: vi.fn() },
+      skillInstaller: { install },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(seenInputs[0]?.tools?.some((tool) => tool.name === "install_skill")).toBe(true);
+    expect(install).toHaveBeenCalledWith("https://github.com/alchaincyf/nuwa-skill");
+    expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "install_skill", status: "success" }));
+    expect(chunks.join("")).toBe("装好了，「女娲」已经可以用了。");
+    const toolResult = seenInputs[1]?.messages.find((message) => message.role === "tool")?.content ?? "";
+    expect(toolResult).toContain("已安装并启用");
+    expect(toolResult).toContain("费曼视角");
+  });
+
+  it("falls back to the URL in the user message when install_skill arguments omit it", async () => {
+    const install = vi.fn(async () => ({ installed: [], blocked: [], others: [] }));
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "install_skill", arguments: "{}" } }],
+      [{ type: "text", text: "这个链接下没有找到能装的。" }],
+    ]);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "安装这个 https://github.com/owner/repo#安装",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: { run: vi.fn() },
+      skillInstaller: { install },
+    })) {
+      void chunk;
+    }
+
+    expect(install).toHaveBeenCalledWith("https://github.com/owner/repo#安装");
+  });
+
+  it("does not expose install_skill without an installer", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const llm = scriptedLlm([[{ type: "text", text: "好的。" }]], seenInputs);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "你好",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: { run: vi.fn() },
+    })) {
+      void chunk;
+    }
+
+    expect(seenInputs[0]?.tools?.some((tool) => tool.name === "install_skill")).toBe(false);
+  });
+
   it("recovers with a tool failure message when search breaks", async () => {
     const logTool = vi.fn();
     const llm = scriptedLlm([
@@ -337,5 +584,69 @@ describe("runAgent", () => {
 
     expect(chunks.join("")).toBe("我先按已有信息说。");
     expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "web_search", status: "error" }));
+  });
+
+  it("skips searching when web_search is called without a query instead of using the raw user message", async () => {
+    const logTool = vi.fn();
+    const searchRun = vi.fn();
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: "{}" } }],
+      [{ type: "text", text: "装好了。" }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "帮我安装这个 skill https://github.com/example/skills",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
+      search: { run: searchRun },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(searchRun).not.toHaveBeenCalled();
+    expect(chunks.join("")).toBe("装好了。");
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: "web_search", status: "error", error: "Missing search query" }),
+    );
+  });
+
+  it("wraps search results with an internal-use notice before returning them to the model", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const llm = scriptedLlm(
+      [
+        [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"北京天气"}' } }],
+        [{ type: "text", text: "明天有雨。" }],
+      ],
+      seenInputs,
+    );
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "明天北京天气怎么样",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "1. 北京天气：明天小雨 (https://example.com)",
+          results: [{ title: "北京天气", url: "https://example.com", snippet: "明天小雨" }],
+        })),
+      },
+    })) {
+      void chunk;
+    }
+
+    const toolMessage = (seenInputs[1]?.messages ?? []).find((message) => message.role === "tool");
+    expect(toolMessage?.content).toContain("不要原样罗列");
+    expect(toolMessage?.content).toContain("1. 北京天气：明天小雨");
   });
 });

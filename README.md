@@ -61,6 +61,17 @@ Web 地址：[http://localhost:3000](http://localhost:3000)
 npm run agent
 ```
 
+## 生产部署（Docker Compose + HTTPS）
+
+服务器上：
+
+```bash
+cp .env.example .env   # 填入配置，其中 DOMAIN 为解析到本机的域名
+docker compose up -d --build
+```
+
+Caddy 作为反向代理接管 80/443：`.env` 中配置 `DOMAIN`（域名 A 记录需指向服务器 IP，安全组放行 80/443）后自动申请并续期 Let's Encrypt 证书，HTTP 自动跳转 HTTPS；`DOMAIN` 留空则仅提供 80 端口 HTTP。
+
 ## 后台能力
 
 登录后访问 `/admin`（QwenPaw Console 风格分组侧栏）：

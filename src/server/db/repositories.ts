@@ -16,6 +16,8 @@ import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import type { LlmUsageLogInput } from "@/server/llm/usage";
 import type { ToolRegistrationDraft } from "@/server/tasks/tools";
 import { defaultSettings } from "@/server/settings/defaults";
+import { DEFAULT_GOAL_BUDGET_USED, type GoalBudgetUsed, type GoalContract } from "@/server/goals/contract";
+import type { GoalStatus } from "@/server/goals/state-machine";
 import { getPool } from "@/server/db/client";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
@@ -49,6 +51,35 @@ export type DbConversationSummaryRow = DbConversation & {
   lastMessageAt: Date | null;
 };
 
+export type DbSkill = {
+  id: string;
+  userId: string;
+  name: string;
+  trigger: string;
+  content: string;
+  status: "pending" | "enabled" | "disabled" | "rejected";
+  source: "manual" | "agent" | "task" | "imported";
+  sourceUrl: string | null;
+  version: number;
+  scanReport: unknown;
+  usageCount: number;
+  lastUsedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type DbSkillRevision = {
+  id: string;
+  userId: string;
+  skillId: string;
+  skillName: string;
+  currentContent: string;
+  proposedContent: string;
+  reason: string;
+  status: "pending" | "applied" | "rejected";
+  createdAt: Date;
+};
+
 export type DbMessage = {
   id: string;
   userId: string;
@@ -61,6 +92,43 @@ export type DbMessage = {
 export type DbMemoryEntry = RankableMemory & {
   kind: string;
   confidence: number;
+};
+
+export type DbGoal = {
+  id: string;
+  userId: string;
+  title: string;
+  contract: GoalContract;
+  status: GoalStatus;
+  progressSummary: string;
+  reportDraft: string;
+  budgetUsed: GoalBudgetUsed;
+  noProgressRounds: number;
+  runningStep: string | null;
+  needsHumanPrompt: string | null;
+  conversationId: string | null;
+  nextRunAt: Date | null;
+  finishedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type GoalStepPhase = "collecting" | "drafting" | "verifying" | "committed" | "failed";
+
+export type DbGoalStep = {
+  id: string;
+  goalId: string;
+  round: number;
+  phase: GoalStepPhase;
+  intent: string;
+  evidence: unknown[];
+  candidate: string;
+  verifyResult: unknown;
+  failedPaths: unknown[];
+  tokensUsed: number;
+  durationMs: number | null;
+  error: string | null;
+  createdAt: Date;
 };
 
 export type DbProactiveTask = {
@@ -534,6 +602,151 @@ export function createRepositories(pool: Pool = getPool()) {
         return Number(result.rows[0]?.count ?? 0);
       },
     },
+    goals: {
+      async create(input: {
+        userId: string;
+        title: string;
+        contract: GoalContract;
+        conversationId?: string | null;
+      }): Promise<DbGoal> {
+        const result = await pool.query(
+          `INSERT INTO goals (user_id, title, contract, conversation_id)
+           VALUES ($1, $2, $3, $4)
+           RETURNING *`,
+          [input.userId, input.title.trim(), JSON.stringify(input.contract), input.conversationId ?? null],
+        );
+        return mapGoal(result.rows[0]);
+      },
+      async getForUser(userId: string, goalId: string): Promise<DbGoal | null> {
+        const result = await pool.query("SELECT * FROM goals WHERE user_id = $1 AND id = $2", [userId, goalId]);
+        return result.rows[0] ? mapGoal(result.rows[0]) : null;
+      },
+      async list(userId: string): Promise<DbGoal[]> {
+        const result = await pool.query("SELECT * FROM goals WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100", [userId]);
+        return result.rows.map(mapGoal);
+      },
+      async listDue(now = new Date()): Promise<DbGoal[]> {
+        const result = await pool.query(
+          `SELECT * FROM goals
+           WHERE status = 'confirmed'
+              OR (status = 'running' AND next_run_at IS NOT NULL AND next_run_at <= $1)
+           ORDER BY next_run_at ASC NULLS FIRST
+           LIMIT 10`,
+          [now],
+        );
+        return result.rows.map(mapGoal);
+      },
+      async setStatus(
+        goalId: string,
+        status: GoalStatus,
+        options?: { needsHumanPrompt?: string | null; nextRunAt?: Date | null; finished?: boolean },
+      ): Promise<void> {
+        await pool.query(
+          `UPDATE goals SET
+             status = $2,
+             needs_human_prompt = CASE WHEN $3 THEN $4 ELSE needs_human_prompt END,
+             next_run_at = CASE WHEN $5 THEN $6 ELSE next_run_at END,
+             finished_at = CASE WHEN $7 THEN now() ELSE finished_at END,
+             updated_at = now()
+           WHERE id = $1`,
+          [
+            goalId,
+            status,
+            options?.needsHumanPrompt !== undefined,
+            options?.needsHumanPrompt ?? null,
+            options?.nextRunAt !== undefined,
+            options?.nextRunAt ?? null,
+            options?.finished ?? false,
+          ],
+        );
+      },
+      // Marks a goal as executing one round. Returns false when another worker
+      // already holds a fresh claim; claims older than 30 minutes are treated
+      // as interrupted rounds and may be taken over (restart recovery).
+      async claimRunningStep(goalId: string, stepId: string): Promise<boolean> {
+        const result = await pool.query(
+          `UPDATE goals SET running_step = $2, updated_at = now()
+           WHERE id = $1
+             AND (running_step IS NULL OR updated_at < now() - interval '30 minutes')
+           RETURNING id`,
+          [goalId, stepId],
+        );
+        return result.rows.length > 0;
+      },
+      async releaseRunningStep(goalId: string, nextRunAt: Date | null): Promise<void> {
+        await pool.query(
+          "UPDATE goals SET running_step = NULL, next_run_at = $2, updated_at = now() WHERE id = $1",
+          [goalId, nextRunAt],
+        );
+      },
+      async updateProgress(
+        goalId: string,
+        input: { progressSummary?: string; reportDraft?: string; budgetUsed?: GoalBudgetUsed; noProgressRounds?: number },
+      ): Promise<void> {
+        await pool.query(
+          `UPDATE goals SET
+             progress_summary = COALESCE($2, progress_summary),
+             report_draft = COALESCE($3, report_draft),
+             budget_used = COALESCE($4, budget_used),
+             no_progress_rounds = COALESCE($5, no_progress_rounds),
+             updated_at = now()
+           WHERE id = $1`,
+          [
+            goalId,
+            input.progressSummary ?? null,
+            input.reportDraft ?? null,
+            input.budgetUsed ? JSON.stringify(input.budgetUsed) : null,
+            input.noProgressRounds ?? null,
+          ],
+        );
+      },
+    },
+    goalSteps: {
+      async create(input: {
+        goalId: string;
+        round: number;
+        phase: GoalStepPhase;
+        intent?: string;
+        evidence?: unknown[];
+        candidate?: string;
+        verifyResult?: unknown;
+        failedPaths?: unknown[];
+        tokensUsed?: number;
+        durationMs?: number | null;
+        error?: string | null;
+      }): Promise<string> {
+        const result = await pool.query(
+          `INSERT INTO goal_steps
+           (goal_id, round, phase, intent, evidence, candidate, verify_result, failed_paths, tokens_used, duration_ms, error)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           RETURNING id`,
+          [
+            input.goalId,
+            input.round,
+            input.phase,
+            input.intent ?? "",
+            JSON.stringify(input.evidence ?? []),
+            input.candidate ?? "",
+            input.verifyResult !== undefined ? JSON.stringify(input.verifyResult) : null,
+            JSON.stringify(input.failedPaths ?? []),
+            input.tokensUsed ?? 0,
+            input.durationMs ?? null,
+            input.error ?? null,
+          ],
+        );
+        return result.rows[0].id;
+      },
+      async listByGoal(goalId: string): Promise<DbGoalStep[]> {
+        const result = await pool.query("SELECT * FROM goal_steps WHERE goal_id = $1 ORDER BY round ASC, created_at ASC", [
+          goalId,
+        ]);
+        return result.rows.map(mapGoalStep);
+      },
+      async latestRound(goalId: string): Promise<number> {
+        const result = await pool.query("SELECT max(round)::int AS round FROM goal_steps WHERE goal_id = $1", [goalId]);
+        return Number(result.rows[0]?.round ?? 0);
+      },
+    },
     channels: {
       async ensureConversation(userId: string, message: NormalizedChannelMessage): Promise<DbConversation> {
         const existing = await pool.query(
@@ -710,27 +923,45 @@ export function createRepositories(pool: Pool = getPool()) {
       },
     },
     skills: {
-      async create(userId: string, draft: SkillDraft): Promise<void> {
-        await pool.query(
-          `INSERT INTO skills (user_id, name, trigger, content, status)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [userId, draft.name, draft.trigger, draft.content, draft.status],
+      async create(userId: string, draft: SkillDraft): Promise<string> {
+        const result = await pool.query(
+          `INSERT INTO skills (user_id, name, trigger, content, status, source, source_url, scan_report)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING id`,
+          [
+            userId,
+            draft.name,
+            draft.trigger,
+            draft.content,
+            draft.status,
+            draft.source ?? "manual",
+            draft.sourceUrl ?? null,
+            draft.scanReport ? JSON.stringify(draft.scanReport) : null,
+          ],
         );
+        return result.rows[0].id;
       },
-      async list(userId: string) {
+      async list(userId: string): Promise<DbSkill[]> {
         const result = await pool.query("SELECT * FROM skills WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100", [userId]);
-        return result.rows;
+        return result.rows.map(mapSkillRow);
+      },
+      async listEnabled(userId: string): Promise<DbSkill[]> {
+        const result = await pool.query(
+          "SELECT * FROM skills WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 100",
+          [userId],
+        );
+        return result.rows.map(mapSkillRow);
       },
       async findEnabled(userId: string, query: string): Promise<SkillContext[]> {
-        const result = await pool.query<{ name: string; trigger: string; content: string }>(
-          "SELECT name, trigger, content FROM skills WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 50",
+        const result = await pool.query<{ id: string; name: string; trigger: string; content: string }>(
+          "SELECT id, name, trigger, content FROM skills WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 50",
           [userId],
         );
         return result.rows
           .map((row) => ({ ...row, score: scoreSkill(query, row) }))
           .sort((left, right) => right.score - left.score)
           .slice(0, 6)
-          .map(({ name, trigger, content }) => ({ name, trigger, content }));
+          .map(({ id, name, trigger, content }) => ({ id, name, trigger, content }));
       },
       async setStatus(userId: string, skillId: string, status: "enabled" | "disabled" | "rejected"): Promise<void> {
         await pool.query("UPDATE skills SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
@@ -738,6 +969,96 @@ export function createRepositories(pool: Pool = getPool()) {
           skillId,
           status,
         ]);
+      },
+      async recordUsage(userId: string, skillIds: string[], conversationId: string | null): Promise<void> {
+        if (skillIds.length === 0) return;
+        await pool.query(
+          "UPDATE skills SET usage_count = usage_count + 1, last_used_at = now() WHERE user_id = $1 AND id = ANY($2::uuid[])",
+          [userId, skillIds],
+        );
+        for (const skillId of skillIds) {
+          await pool.query("INSERT INTO skill_usage_logs (user_id, skill_id, conversation_id) VALUES ($1, $2, $3)", [
+            userId,
+            skillId,
+            conversationId,
+          ]);
+        }
+      },
+      async applyRevision(userId: string, skillId: string, content: string): Promise<void> {
+        await pool.query(
+          "UPDATE skills SET content = $3, version = version + 1, updated_at = now() WHERE user_id = $1 AND id = $2",
+          [userId, skillId, content],
+        );
+      },
+    },
+    skillRevisions: {
+      async create(input: { userId: string; skillId: string; proposedContent: string; reason: string }): Promise<void> {
+        await pool.query(
+          `INSERT INTO skill_revisions (user_id, skill_id, proposed_content, reason)
+           VALUES ($1, $2, $3, $4)`,
+          [input.userId, input.skillId, input.proposedContent, input.reason],
+        );
+      },
+      async listPending(userId: string): Promise<DbSkillRevision[]> {
+        const result = await pool.query(
+          `SELECT r.*, s.name AS skill_name, s.content AS current_content
+           FROM skill_revisions r JOIN skills s ON s.id = r.skill_id
+           WHERE r.user_id = $1 AND r.status = 'pending'
+           ORDER BY r.created_at DESC LIMIT 50`,
+          [userId],
+        );
+        return result.rows.map(mapSkillRevisionRow);
+      },
+      async hasPendingForSkill(skillId: string): Promise<boolean> {
+        const result = await pool.query("SELECT 1 FROM skill_revisions WHERE skill_id = $1 AND status = 'pending' LIMIT 1", [
+          skillId,
+        ]);
+        return result.rows.length > 0;
+      },
+      async latestForSkill(skillId: string): Promise<{ createdAt: Date } | null> {
+        const result = await pool.query<{ created_at: Date }>(
+          "SELECT created_at FROM skill_revisions WHERE skill_id = $1 ORDER BY created_at DESC LIMIT 1",
+          [skillId],
+        );
+        return result.rows[0] ? { createdAt: result.rows[0].created_at } : null;
+      },
+      async get(userId: string, revisionId: string): Promise<DbSkillRevision | null> {
+        const result = await pool.query(
+          `SELECT r.*, s.name AS skill_name, s.content AS current_content
+           FROM skill_revisions r JOIN skills s ON s.id = r.skill_id
+           WHERE r.user_id = $1 AND r.id = $2`,
+          [userId, revisionId],
+        );
+        return result.rows[0] ? mapSkillRevisionRow(result.rows[0]) : null;
+      },
+      async setStatus(userId: string, revisionId: string, status: "applied" | "rejected"): Promise<void> {
+        await pool.query("UPDATE skill_revisions SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
+          userId,
+          revisionId,
+          status,
+        ]);
+      },
+    },
+    skillUsageLogs: {
+      async countSince(skillId: string, since: Date | null): Promise<number> {
+        const result = since
+          ? await pool.query<{ count: string }>(
+              "SELECT count(*) AS count FROM skill_usage_logs WHERE skill_id = $1 AND created_at > $2",
+              [skillId, since],
+            )
+          : await pool.query<{ count: string }>("SELECT count(*) AS count FROM skill_usage_logs WHERE skill_id = $1", [skillId]);
+        return Number(result.rows[0]?.count ?? 0);
+      },
+      async recentConversationIds(skillId: string, limit: number): Promise<string[]> {
+        const result = await pool.query<{ conversation_id: string }>(
+          `SELECT DISTINCT ON (conversation_id) conversation_id
+           FROM skill_usage_logs
+           WHERE skill_id = $1 AND conversation_id IS NOT NULL
+           ORDER BY conversation_id, created_at DESC
+           LIMIT $2`,
+          [skillId, limit],
+        );
+        return result.rows.map((row) => row.conversation_id);
       },
     },
     taskRuns: {
@@ -895,6 +1216,7 @@ export function createRepositories(pool: Pool = getPool()) {
           "task_artifacts",
           "tool_registrations",
           "llm_usage_logs",
+          "goals",
           "settings",
         ];
         const exported: Record<string, unknown[]> = {};
@@ -906,6 +1228,7 @@ export function createRepositories(pool: Pool = getPool()) {
       },
       async clear(userId: string): Promise<void> {
         const tables = [
+          "goals",
           "task_artifacts",
           "task_runs",
           "tool_registrations",
@@ -992,6 +1315,39 @@ function memoryExpiresAt(memory: ExtractedMemory): Date | null {
   return new Date(Date.now() + EPISODIC_MEMORY_TTL_DAYS * 86_400_000);
 }
 
+function mapSkillRow(row: Record<string, unknown>): DbSkill {
+  return {
+    id: row.id as string,
+    userId: row.user_id as string,
+    name: row.name as string,
+    trigger: row.trigger as string,
+    content: row.content as string,
+    status: row.status as DbSkill["status"],
+    source: (row.source ?? "manual") as DbSkill["source"],
+    sourceUrl: (row.source_url ?? null) as string | null,
+    version: Number(row.version ?? 1),
+    scanReport: row.scan_report ?? null,
+    usageCount: Number(row.usage_count ?? 0),
+    lastUsedAt: (row.last_used_at ?? null) as Date | null,
+    createdAt: row.created_at as Date,
+    updatedAt: row.updated_at as Date,
+  };
+}
+
+function mapSkillRevisionRow(row: Record<string, unknown>): DbSkillRevision {
+  return {
+    id: row.id as string,
+    userId: row.user_id as string,
+    skillId: row.skill_id as string,
+    skillName: (row.skill_name ?? "") as string,
+    currentContent: (row.current_content ?? "") as string,
+    proposedContent: row.proposed_content as string,
+    reason: row.reason as string,
+    status: row.status as DbSkillRevision["status"],
+    createdAt: row.created_at as Date,
+  };
+}
+
 function scoreSkill(query: string, skill: { name: string; trigger: string; content: string }): number {
   const normalizedQuery = query.toLowerCase();
   const fields = [
@@ -1049,6 +1405,45 @@ function mapMessage(row: Record<string, unknown>): DbMessage {
     conversationId: String(row.conversation_id),
     role: row.role as DbMessage["role"],
     content: String(row.content),
+    createdAt: row.created_at as Date,
+  };
+}
+
+function mapGoal(row: Record<string, unknown>): DbGoal {
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    title: String(row.title),
+    contract: (isRecord(row.contract) ? row.contract : {}) as GoalContract,
+    status: row.status as GoalStatus,
+    progressSummary: String(row.progress_summary ?? ""),
+    reportDraft: String(row.report_draft ?? ""),
+    budgetUsed: (isRecord(row.budget_used) ? row.budget_used : { ...DEFAULT_GOAL_BUDGET_USED }) as GoalBudgetUsed,
+    noProgressRounds: Number(row.no_progress_rounds ?? 0),
+    runningStep: row.running_step ? String(row.running_step) : null,
+    needsHumanPrompt: row.needs_human_prompt ? String(row.needs_human_prompt) : null,
+    conversationId: row.conversation_id ? String(row.conversation_id) : null,
+    nextRunAt: (row.next_run_at as Date | null) ?? null,
+    finishedAt: (row.finished_at as Date | null) ?? null,
+    createdAt: row.created_at as Date,
+    updatedAt: row.updated_at as Date,
+  };
+}
+
+function mapGoalStep(row: Record<string, unknown>): DbGoalStep {
+  return {
+    id: String(row.id),
+    goalId: String(row.goal_id),
+    round: Number(row.round),
+    phase: row.phase as GoalStepPhase,
+    intent: String(row.intent ?? ""),
+    evidence: Array.isArray(row.evidence) ? row.evidence : [],
+    candidate: String(row.candidate ?? ""),
+    verifyResult: row.verify_result ?? null,
+    failedPaths: Array.isArray(row.failed_paths) ? row.failed_paths : [],
+    tokensUsed: Number(row.tokens_used ?? 0),
+    durationMs: row.duration_ms === null || row.duration_ms === undefined ? null : Number(row.duration_ms),
+    error: row.error ? String(row.error) : null,
     createdAt: row.created_at as Date,
   };
 }

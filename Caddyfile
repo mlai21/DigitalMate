@@ -1,0 +1,7 @@
+# DOMAIN 在 .env 中配置（如 DOMAIN=mate.example.com）。
+# 多个域名用空格分隔（如 DOMAIN=ginkgo.xin www.ginkgo.xin），Caddy 会各自签发证书。
+# 配置域名后 Caddy 自动向 Let's Encrypt 申请并续期证书，HTTP 自动 301 到 HTTPS。
+# 未配置时 DOMAIN 回退为 ":80"，行为与之前的纯 HTTP 部署一致。
+{$DOMAIN} {
+	reverse_proxy web:3000
+}

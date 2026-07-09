@@ -1,13 +1,32 @@
 services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # DOMAIN 未配置时回退为 ":80"，仅提供 HTTP；配置域名后自动申请 HTTPS 证书
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - digitalmate-caddy-data:/data
+      - digitalmate-caddy-config:/config
+    depends_on:
+      web:
+        condition: service_started
+
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_DB: digitalmate
       POSTGRES_USER: digitalmate
-      POSTGRES_PASSWORD: digitalmate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-digitalmate}
+    # 仅绑定到宿主机回环地址，不向公网暴露 5432；本机调试仍可用 localhost:5432 连接
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - digitalmate-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +41,7 @@ services:
     command: sh -c "npm run db:migrate && npm run db:seed && npm run start"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      DATABASE_URL: postgres://digitalmate:digitalmate@postgres:5432/digitalmate
+      DATABASE_URL: postgres://digitalmate:${POSTGRES_PASSWORD:-digitalmate}@postgres:5432/digitalmate
       APP_PASSWORD: ${APP_PASSWORD:-}
       APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
@@ -43,9 +62,9 @@ services:
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
-    ports:
-      - "80:3000"
-      - "3000:3000"
+    # 不再向宿主机暴露 3000，仅通过 Caddy(443) 对外，防止 HTTP 明文绕过
+    expose:
+      - "3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -57,7 +76,7 @@ services:
     command: sh -c "npm run agent"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      DATABASE_URL: postgres://digitalmate:digitalmate@postgres:5432/digitalmate
+      DATABASE_URL: postgres://digitalmate:${POSTGRES_PASSWORD:-digitalmate}@postgres:5432/digitalmate
       APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
@@ -88,3 +107,5 @@ services:
 
 volumes:
   digitalmate-postgres:
+  digitalmate-caddy-data:
+  digitalmate-caddy-config:

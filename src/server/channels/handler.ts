@@ -6,6 +6,7 @@ import { shouldInterject } from "@/server/channels/interjection";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
+import type { SkillInstallOutcome } from "@/server/skills/install";
 import type { LlmClient } from "@/server/llm/types";
 
 type ChannelRepositories = {
@@ -66,6 +67,7 @@ export async function handleChannelMessage(input: {
   llm: LlmClient;
   model: string;
   send(message: NormalizedChannelMessage, text: string): Promise<unknown> | unknown;
+  skillInstaller?: { install(url: string): Promise<SkillInstallOutcome> };
   delay?(ms: number): Promise<unknown> | unknown;
   now?: Date;
 }): Promise<void> {
@@ -149,6 +151,7 @@ export async function handleChannelMessage(input: {
         return { results, summary: summarizeSearchResults(results) };
       },
     },
+    skillInstaller: input.skillInstaller,
   })) {
     answer += chunk;
   }

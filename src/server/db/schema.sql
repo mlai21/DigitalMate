@@ -149,8 +149,40 @@ CREATE TABLE IF NOT EXISTS skills (
   trigger text NOT NULL,
   content text NOT NULL,
   status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'enabled', 'disabled', 'rejected')),
+  source text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'agent', 'task', 'imported')),
+  source_url text,
+  version integer NOT NULL DEFAULT 1,
+  scan_report jsonb,
+  usage_count integer NOT NULL DEFAULT 0,
+  last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual';
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS source_url text;
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 1;
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS scan_report jsonb;
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS usage_count integer NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS skill_revisions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  proposed_content text NOT NULL,
+  reason text NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'rejected')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS skill_usage_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -229,6 +261,43 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS goals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  contract jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'confirmed', 'running', 'paused', 'needs_human', 'succeeded', 'failed_budget', 'failed_no_progress', 'cancelled')),
+  progress_summary text NOT NULL DEFAULT '',
+  report_draft text NOT NULL DEFAULT '',
+  budget_used jsonb NOT NULL DEFAULT '{"rounds":0,"tokens":0,"costUsd":0}'::jsonb,
+  no_progress_rounds integer NOT NULL DEFAULT 0,
+  running_step uuid,
+  needs_human_prompt text,
+  conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  next_run_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS goal_steps (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  goal_id uuid NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+  round integer NOT NULL,
+  phase text NOT NULL CHECK (phase IN ('collecting', 'drafting', 'verifying', 'committed', 'failed')),
+  intent text NOT NULL DEFAULT '',
+  evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+  candidate text NOT NULL DEFAULT '',
+  verify_result jsonb,
+  failed_paths jsonb NOT NULL DEFAULT '[]'::jsonb,
+  tokens_used integer NOT NULL DEFAULT 0,
+  duration_ms integer,
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE IF EXISTS tool_call_logs ADD COLUMN IF NOT EXISTS goal_id uuid REFERENCES goals(id) ON DELETE SET NULL;
+
 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
@@ -242,7 +311,12 @@ CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_conversation ON channel_
 CREATE INDEX IF NOT EXISTS idx_interjection_decisions_conversation ON interjection_decisions(channel, external_conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reflections_user_created ON reflections(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skills_user_status ON skills(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_revisions_user_status ON skill_revisions(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_usage_logs_skill_created ON skill_usage_logs(skill_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_runs_user_status ON task_runs(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_artifacts_run ON task_artifacts(task_run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_registrations_user_status ON tool_registrations(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_logs_user_created ON llm_usage_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_goals_due ON goals(next_run_at) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_goals_user_status ON goals(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_goal_steps_goal ON goal_steps(goal_id, round);

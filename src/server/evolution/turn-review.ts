@@ -64,7 +64,7 @@ export async function reviewTurnWithLlm(input: {
         ? { positives: parsed.positives, negatives: parsed.negatives, suggestions: parsed.suggestions }
         : null,
       skillDraft: parsed.skill
-        ? createSkillDraft({ name: parsed.skill.name, trigger: parsed.skill.trigger, steps: parsed.skill.steps })
+        ? createSkillDraft({ name: parsed.skill.name, trigger: parsed.skill.trigger, steps: parsed.skill.steps, source: "agent" })
         : null,
     };
   } catch {
