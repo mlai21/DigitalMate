@@ -1,8 +1,210 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
 import { ChatInput, filterSkillOptions } from "@/components/chat/chat-input";
 import { MessageBubble } from "@/components/chat/message-bubble";
+import { useChatScroll } from "@/components/chat/use-chat-scroll";
+
+describe("useChatScroll", () => {
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+  let animationFrames: Map<number, FrameRequestCallback>;
+  let nextAnimationFrameId: number;
+
+  beforeEach(() => {
+    scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+
+    animationFrames = new Map();
+    nextAnimationFrameId = 1;
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextAnimationFrameId++;
+        animationFrames.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal(
+      "cancelAnimationFrame",
+      vi.fn((id: number) => {
+        animationFrames.delete(id);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+    vi.unstubAllGlobals();
+  });
+
+  function flushAnimationFrames() {
+    const pending = [...animationFrames.values()];
+    animationFrames.clear();
+    act(() => {
+      pending.forEach((callback) => callback(0));
+    });
+  }
+
+  function setScrollMetrics(
+    element: HTMLElement,
+    metrics: { scrollHeight: number; scrollTop: number; clientHeight: number },
+  ) {
+    for (const [key, value] of Object.entries(metrics)) {
+      Object.defineProperty(element, key, { configurable: true, value });
+    }
+  }
+
+  it("首次挂载时无动画定位到底部且没有未读消息", () => {
+    render(<ChatScrollHarness conversationId="conversation-a" messageIds={["history-1"]} />);
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "end" });
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+  });
+
+  it("离开底部后只按新增消息 ID 累计未读且不自动滚动", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    scrollIntoView.mockClear();
+
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1", "new-1"]} />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1", "new-1"]} />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    rerender(
+      <ChatScrollHarness
+        conversationId="conversation-a"
+        messageIds={["history-1", "new-1", "new-2"]}
+      />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("2");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("点击到最新时平滑滚动、清空未读并恢复跟随", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1", "new-1"]} />,
+    );
+    scrollIntoView.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "到最新" }));
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+
+    scrollIntoView.mockClear();
+    rerender(
+      <ChatScrollHarness
+        conversationId="conversation-a"
+        messageIds={["history-1", "new-1", "new-2"]}
+      />,
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+  });
+
+  it("用户手动滚回底部附近时清空未读并恢复跟随", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["history-1", "new-1"]} />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 420, clientHeight: 500 });
+    fireEvent.scroll(container);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+
+    scrollIntoView.mockClear();
+    rerender(
+      <ChatScrollHarness
+        conversationId="conversation-a"
+        messageIds={["history-1", "new-1", "new-2"]}
+      />,
+    );
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+  });
+
+  it("切换会话时重置状态、记录已有消息并无动画定位到底部", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["a-history"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["a-history", "a-new"]} />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+    scrollIntoView.mockClear();
+
+    rerender(<ChatScrollHarness conversationId="conversation-b" messageIds={["b-history"]} />);
+
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "end" });
+
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    rerender(<ChatScrollHarness conversationId="conversation-b" messageIds={["b-history"]} />);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+    rerender(
+      <ChatScrollHarness conversationId="conversation-b" messageIds={["b-history", "b-new"]} />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+  });
+
+  it("位于底部附近时在动画帧中持续跟随消息变化且不累计未读", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    scrollIntoView.mockClear();
+
+    rerender(<ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />);
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+
+    scrollIntoView.mockClear();
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1", "new-1"]} />,
+    );
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
+  });
+});
 
 describe("MessageBubble", () => {
   it("does not render internal tool details", () => {
@@ -203,4 +405,27 @@ describe("mergeMessages", () => {
 
 function message(id: string, role: ChatMessage["role"], content: string, createdAt: string): ChatMessage {
   return { id, role, content, createdAt };
+}
+
+function ChatScrollHarness({
+  conversationId,
+  messageIds,
+}: {
+  conversationId?: string;
+  messageIds: string[];
+}) {
+  const { containerRef, endRef, unreadCount, jumpToLatest } = useChatScroll({
+    conversationId,
+    messageIds,
+  });
+
+  return (
+    <div ref={containerRef} data-testid="scroll-container">
+      <span data-testid="unread-count">{unreadCount}</span>
+      <button type="button" onClick={jumpToLatest}>
+        到最新
+      </button>
+      <div ref={endRef} />
+    </div>
+  );
 }
