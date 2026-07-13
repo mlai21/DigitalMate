@@ -408,7 +408,11 @@ git commit -m "feat(P0-10): 统一图片与文档模型输入"
 
 覆盖：`message` 为空但有附件时通过；两者都空返回 400；非法/越权附件在创建消息前失败；成功调用 `createWithAttachments`；当前附件和最近历史附件进入 `runAgent`；图片文件从私有存储读取后转 base64；文档只使用数据库提取文本。
 
-新增确定性安全回归：第一期只要**本轮**含任意附件，传给模型的所有请求都不得包含任何工具声明（包括 `web_search`、注册工具、`save_skill`、`create_skill`、`install_skill`）；即使输入框正文要求调用工具、搜索开关已开启、Skill 已显式指定，或附件文本诱导调用工具，也不得执行搜索、注册工具或 Skill 工具。模型异常返回 `tool_call` 时同样失败关闭，不进入任何执行器。没有附件的消息保持现有工具行为。
+新增确定性安全回归，明确覆盖以下 3 个阶段：
+
+1. 本轮含附件：传给模型的所有请求都不得包含任何工具声明（包括 `web_search`、注册工具、`save_skill`、`create_skill`、`install_skill`）；即使输入框正文要求调用工具、搜索开关已开启、Skill 已显式指定，或附件文本诱导调用工具，也不得执行搜索、注册工具或 Skill 工具。
+2. 后续轮次本轮不含附件，但 `history` 中仍有携带附件的消息：继续传入空工具集合；模型异常返回 `tool_call` 时同样失败关闭，不进入任何执行器。
+3. 携带附件的消息退出 `history` 上下文，且本轮也没有附件：恢复现有工具声明与授权门控行为。测试必须证明工具只在这一阶段重新出现并可按原授权规则执行。
 
 关键断言：
 
@@ -455,7 +459,15 @@ const requestSchema = z.object({
 
 先在创建本轮 user message前读取 recent history，避免现有流程把当前消息同时放进 history 又在 `buildMessages` 末尾追加一次。附件存在时，再用 `supportsImageInput(model)` 检查图片能力；未知或不支持的模型返回 `image_model_not_supported`，且不创建消息、不绑定附件。检查通过后用 `createWithAttachments`，把历史消息对应附件和当前附件分别传给 `runAgent`。`RunAgentInput` 增加 `attachments?: LlmAttachment[]`，`buildMessages` 的最后一条 user message带当前附件；历史附件仍绑定在各自的 `LlmMessage` 上。
 
-第一期采用确定性工具门控：当 `RunAgentInput.attachments` 非空时，`runAgent` 必须向每次 `llm.stream` 传入空工具集合，并拒绝执行模型异常返回的任何 `tool_call`；该门控覆盖注册工具、Skill 工具和 `web_search`，优先级高于正文授权、`webSearchEnabled`、`searchGate` 与显式 Skill。附件本身仍不改变联网授权状态。后续若要支持“正文显式授权 + 附件 + 工具”的组合，必须另开需求和安全评审，不得在本任务中放宽。
+第一期采用确定性工具门控，禁用条件固定为：
+
+```ts
+const hasAttachmentContext =
+  (input.attachments?.length ?? 0) > 0 ||
+  input.history.some((message) => (message.attachments?.length ?? 0) > 0);
+```
+
+只要 `hasAttachmentContext` 为 `true`，`runAgent` 必须向每次 `llm.stream` 传入空工具集合，并拒绝执行模型异常返回的任何 `tool_call`。该门控覆盖注册工具、Skill 工具和 `web_search`，优先级高于正文授权、`webSearchEnabled`、`searchGate` 与显式 Skill。即使当前轮没有新附件，只要携带附件的历史消息仍在本次上下文中，门控就必须保持；只有附件消息退出 `history` 且本轮也无附件后，才恢复正常工具行为。附件本身仍不改变联网授权状态。后续若要支持“正文显式授权 + 附件 + 工具”的组合，必须另开需求和安全评审，不得在本任务中放宽。
 
 - [ ] **步骤 5：运行测试并提交**
 
