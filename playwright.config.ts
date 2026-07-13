@@ -5,14 +5,14 @@ export default defineConfig({
   fullyParallel: true,
   reporter: "list",
   use: {
-    baseURL: "http://127.0.0.1:3000",
+    baseURL: "http://127.0.0.1:4173",
     trace: "on-first-retry",
   },
   webServer: {
-    command: "npm run dev",
-    url: "http://127.0.0.1:3000",
+    command: "node_modules/.bin/vite --config tests/e2e/vite.config.ts",
+    url: "http://127.0.0.1:4173",
     reuseExistingServer: true,
-    timeout: 120_000,
+    timeout: 30_000,
   },
   projects: [
     {

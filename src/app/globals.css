@@ -71,7 +71,9 @@ input {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);
   background: var(--canvas);
@@ -419,7 +421,9 @@ input {
 
 .chat-stage {
   position: relative;
-  min-height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   --chat-input-clearance: 132px;
@@ -427,6 +431,10 @@ input {
 
 .chat-stage .messages {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .mobile-header {
@@ -624,17 +632,51 @@ input {
 }
 
 .chat-input-shell {
-  position: fixed;
-  left: calc(260px + (100vw - 260px) / 2);
+  position: absolute;
+  left: 50%;
   bottom: max(24px, env(safe-area-inset-bottom));
   transform: translateX(-50%);
-  width: min(calc(100vw - 324px), 720px);
+  width: min(calc(100% - 64px), 720px);
   min-height: 56px;
   padding: 8px;
   border: 1px solid var(--border);
   border-radius: 24px;
   background: var(--surface);
   box-shadow: 0 2px 8px rgba(60, 45, 30, 0.06);
+}
+
+.new-message-button {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--chat-input-clearance, 128px) - 12px);
+  z-index: 6;
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transform: translateX(-50%);
+  background: var(--surface);
+  box-shadow: 0 2px 8px rgba(60, 45, 30, 0.06);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  transition: color 200ms ease-out, background-color 200ms ease-out;
+}
+
+.new-message-button:hover {
+  background: var(--surface-sunken);
+  color: var(--ink);
+}
+
+.chat-new-message-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .chat-input-stack {
@@ -1450,7 +1492,7 @@ input {
     right: 16px;
     width: auto;
     transform: none;
-    bottom: max(16px, env(safe-area-inset-bottom));
+    bottom: max(12px, env(safe-area-inset-bottom));
   }
 
   .admin-shell {

@@ -364,6 +364,10 @@ export function ChatShell({
           <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
 
+        <div className="chat-new-message-status" role="status" aria-live="polite" aria-atomic="true">
+          {unreadCount > 0 ? `${unreadCount} 条新消息` : ""}
+        </div>
+
         {unreadCount > 0 ? (
           <button
             className="new-message-button"

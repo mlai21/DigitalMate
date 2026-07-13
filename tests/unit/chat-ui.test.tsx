@@ -375,6 +375,8 @@ describe("ChatShell scroll behavior", () => {
     );
     const container = document.querySelector<HTMLElement>(".messages");
     expect(container).not.toBeNull();
+    const liveStatus = screen.getByRole("status");
+    expect(liveStatus).toBeEmptyDOMElement();
     setElementScrollMetrics(container!, {
       scrollHeight: 1_000,
       scrollTop: 0,
@@ -389,12 +391,15 @@ describe("ChatShell scroll behavior", () => {
 
     expect(screen.getByText("轮询带来的新消息")).toBeInTheDocument();
     const newMessageButton = screen.getByRole("button", { name: "查看 1 条新消息" });
+    expect(liveStatus).toHaveTextContent("1 条新消息");
+    expect(container!.scrollTop).toBe(0);
     expect(scrollIntoView).not.toHaveBeenCalled();
 
     fireEvent.click(newMessageButton);
 
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
     expect(screen.queryByRole("button", { name: "查看 1 条新消息" })).toBeNull();
+    expect(liveStatus).toBeEmptyDOMElement();
   });
 
   it("乐观消息被轮询结果持久化时保持同一气泡且不累计未读", async () => {

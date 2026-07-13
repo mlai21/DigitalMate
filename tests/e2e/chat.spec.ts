@@ -23,40 +23,15 @@ test("chat input is centered in the conversation stage on wide screens", async (
   expect(Math.abs(stageCenter - inputCenter)).toBeLessThanOrEqual(2);
 });
 
-test("auto-scroll keeps the latest message above the floating input", async ({ page }) => {
+test("a taller composer keeps the latest message visible inside an independent scroller", async ({ page }) => {
   await page.setViewportSize({ width: 1914, height: 683 });
   await page.goto("/");
   await expect(page.getByRole("textbox", { name: "输入消息" })).toBeVisible();
-  await page.waitForTimeout(500);
+  await expect(page.locator(".message-bubble")).toHaveCount(18);
 
-  await page.evaluate(() => {
-    const messages = document.querySelector<HTMLElement>(".messages");
-    const input = document.querySelector<HTMLElement>(".chat-input-shell");
-    const anchor = messages?.lastElementChild;
-    if (!messages || !input || !(anchor instanceof HTMLElement)) {
-      throw new Error("chat layout was not rendered");
-    }
-
-    input.style.height = "168px";
-    const rows = Array.from({ length: 10 }, (_, index) => {
-      const row = document.createElement("div");
-      row.className = "message-row message-row-assistant";
-
-      const avatar = document.createElement("div");
-      avatar.className = "mate-avatar";
-      avatar.textContent = "D";
-
-      const bubble = document.createElement("div");
-      bubble.className = "message-bubble message-bubble-assistant";
-      bubble.textContent = `第 ${index + 1} 条消息：这是一段用于撑开聊天列表的内容，底部自动滚动时不能被输入框遮挡。`;
-
-      row.append(avatar, bubble);
-      return row;
-    });
-
-    messages.replaceChildren(...rows, anchor);
+  await page.locator(".chat-input-shell").evaluate((node) => {
+    node.style.height = "168px";
   });
-  await expect(page.locator(".message-bubble")).toHaveCount(10);
   await page.waitForFunction(() => {
     const stage = document.querySelector<HTMLElement>(".chat-stage");
     if (!stage) return false;
@@ -65,14 +40,100 @@ test("auto-scroll keeps the latest message above the floating input", async ({ p
   });
 
   await page.waitForTimeout(50);
-  await page.evaluate(() => {
-    document.querySelector<HTMLElement>(".messages")?.lastElementChild?.scrollIntoView({ block: "end" });
+  await page.locator(".messages").evaluate((node) => {
+    node.scrollTop = node.scrollHeight;
   });
 
   const latestBubbleBox = await page.locator(".message-bubble").last().boundingBox();
   const inputBox = await page.locator(".chat-input-shell").boundingBox();
+  const scrollMetrics = await page.locator(".messages").evaluate((node) => ({
+    clientHeight: node.clientHeight,
+    scrollHeight: node.scrollHeight,
+  }));
   expect(latestBubbleBox).not.toBeNull();
   expect(inputBox).not.toBeNull();
 
+  expect(scrollMetrics.scrollHeight).toBeGreaterThan(scrollMetrics.clientHeight);
   expect(latestBubbleBox!.y + latestBubbleBox!.height).toBeLessThanOrEqual(inputBox!.y - 8);
+});
+
+test("polling preserves history position until the user jumps to the latest message", async ({ page }) => {
+  let releaseNewMessage: (() => void) | undefined;
+  const newMessageReady = new Promise<void>((resolve) => {
+    releaseNewMessage = resolve;
+  });
+
+  await page.route("**/api/messages?**", async (route) => {
+    await newMessageReady;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        messages: [
+          {
+            id: "assistant-polled",
+            role: "assistant",
+            content: "轮询返回的真实组件新消息",
+            createdAt: "2026-07-14T00:01:00.000Z",
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto("/");
+  const messages = page.locator(".messages");
+  await expect(page.locator(".message-bubble")).toHaveCount(18);
+  const beforeScrollTop = await messages.evaluate((node) => {
+    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - 240);
+    node.dispatchEvent(new Event("scroll"));
+    return node.scrollTop;
+  });
+  expect(beforeScrollTop).toBeGreaterThan(0);
+
+  releaseNewMessage?.();
+  await expect(page.getByRole("button", { name: "查看 1 条新消息" })).toBeVisible({ timeout: 7_000 });
+  expect(await messages.evaluate((node) => node.scrollTop)).toBe(beforeScrollTop);
+  await expect(page.getByRole("status")).toHaveText("1 条新消息");
+
+  await page.getByRole("button", { name: "查看 1 条新消息" }).click();
+
+  await expect(page.getByRole("button", { name: "查看 1 条新消息" })).toBeHidden();
+  await expect(page.getByRole("status")).toBeEmpty();
+  await expect
+    .poll(() => messages.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight))
+    .toBeLessThanOrEqual(2);
+});
+
+test("the mobile new-message button keeps a 44px touch target above the safe-area composer", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/messages?**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        messages: [
+          {
+            id: "assistant-mobile-polled",
+            role: "assistant",
+            content: "移动端轮询消息",
+            createdAt: "2026-07-14T00:01:00.000Z",
+          },
+        ],
+      }),
+    });
+  });
+  await page.goto("/");
+  await page.locator(".messages").evaluate((node) => {
+    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - 240);
+    node.dispatchEvent(new Event("scroll"));
+  });
+  await expect(page.getByRole("button", { name: "查看 1 条新消息" })).toBeVisible({ timeout: 7_000 });
+
+  const buttonBox = await page.locator(".new-message-button").boundingBox();
+  const inputBox = await page.locator(".chat-input-shell").boundingBox();
+  expect(buttonBox).not.toBeNull();
+  expect(inputBox).not.toBeNull();
+  expect(buttonBox!.height).toBeGreaterThanOrEqual(44);
+  expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(inputBox!.y);
 });
