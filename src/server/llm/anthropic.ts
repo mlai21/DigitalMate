@@ -1,5 +1,5 @@
 import type { AppEnv } from "@/server/config/env";
-import { formatDocumentAttachment } from "@/server/llm/attachments";
+import { formatDocumentAttachments } from "@/server/llm/attachments";
 import type { LlmClient, LlmMessage, LlmStreamEvent, LlmStreamInput, LlmTool } from "@/server/llm/types";
 import { collectStreamText } from "@/server/llm/types";
 
@@ -130,6 +130,10 @@ function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
       continue;
     }
     if (message.role === "user" && message.attachments && message.attachments.length > 0) {
+      const formattedDocuments = formatDocumentAttachments(
+        message.attachments.filter((attachment) => attachment.kind === "document"),
+      );
+      let documentIndex = 0;
       const blocks: AnthropicContentBlock[] = [];
       if (message.content) blocks.push({ type: "text", text: message.content });
       for (const attachment of message.attachments) {
@@ -139,7 +143,8 @@ function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
             source: { type: "base64", media_type: attachment.mimeType, data: attachment.base64 },
           });
         } else {
-          blocks.push({ type: "text", text: formatDocumentAttachment(attachment) });
+          blocks.push({ type: "text", text: formattedDocuments[documentIndex] });
+          documentIndex += 1;
         }
       }
       result.push({ role: "user", content: blocks });

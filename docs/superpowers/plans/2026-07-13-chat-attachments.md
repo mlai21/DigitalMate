@@ -406,12 +406,12 @@ git commit -m "feat(P0-10): 统一图片与文档模型输入"
 
 - [ ] **步骤 1：编写聊天链路失败测试**
 
-覆盖：`message` 为空但有附件时通过；两者都空返回 400；非法/越权附件在创建消息前失败；成功调用 `createWithAttachments`；当前附件和最近历史附件进入 `runAgent`；图片文件从私有存储读取后转 base64；文档只使用数据库提取文本。
+覆盖：`message` 为空但有附件时通过；两者都空返回 400；非法/越权附件在创建消息前失败；成功调用 `createWithAttachments`；当前附件和最近历史附件进入 `runAgent`；图片文件从私有存储读取后转 base64；文档只使用数据库提取文本。图片上下文遇到不支持图片的模型时，接口必须返回用户可理解的切换模型提示，且不得创建消息或绑定附件。
 
 新增确定性安全回归，明确覆盖以下 3 个阶段：
 
 1. 本轮含附件：传给模型的所有请求都不得包含任何工具声明（包括 `web_search`、注册工具、`save_skill`、`create_skill`、`install_skill`）；即使输入框正文要求调用工具、搜索开关已开启、Skill 已显式指定，或附件文本诱导调用工具，也不得执行搜索、注册工具或 Skill 工具。
-2. 后续轮次本轮不含附件，但 `history` 中仍有携带附件的消息：继续传入空工具集合；模型异常返回 `tool_call` 时同样失败关闭，不进入任何执行器。
+2. 后续轮次本轮不含附件，但 `history` 中仍有携带附件的消息：继续传入空工具集合；模型异常返回 `tool_call` 时同样失败关闭，不进入任何执行器。此时最多进行 1 次仍为空工具集合的内部纠正重试；若重试仍无可见文本，则返回自然语言兜底。测试必须断言响应不为空，且不暴露工具门控、系统规则或内部重试。
 3. 携带附件的消息退出 `history` 上下文，且本轮也没有附件：恢复现有工具声明与授权门控行为。测试必须证明工具只在这一阶段重新出现并可按原授权规则执行。
 
 关键断言：
@@ -457,7 +457,7 @@ const requestSchema = z.object({
 }).refine((value) => value.message.trim().length > 0 || value.attachmentIds.length > 0, "message_or_attachment_required");
 ```
 
-先在创建本轮 user message前读取 recent history，避免现有流程把当前消息同时放进 history 又在 `buildMessages` 末尾追加一次。附件存在时，再用 `supportsImageInput(model)` 检查图片能力；未知或不支持的模型返回 `image_model_not_supported`，且不创建消息、不绑定附件。检查通过后用 `createWithAttachments`，把历史消息对应附件和当前附件分别传给 `runAgent`。`RunAgentInput` 增加 `attachments?: LlmAttachment[]`，`buildMessages` 的最后一条 user message带当前附件；历史附件仍绑定在各自的 `LlmMessage` 上。
+先在创建本轮 user message 前读取 recent history，避免现有流程把当前消息同时放进 history，又在 `buildMessages` 末尾追加一次。当当前附件或待注入的历史上下文中存在图片时，再用 `supportsImageInput(model)` 检查图片能力；未知或不支持的模型返回稳定错误码 `image_model_not_supported` 和用户可理解提示（例如“当前模型暂不支持图片理解，请切换到支持图片的模型后重试”），且必须在 `createWithAttachments` 前返回，不创建消息、不绑定附件。检查通过后用 `createWithAttachments`，把历史消息对应附件和当前附件分别传给 `runAgent`。`RunAgentInput` 增加 `attachments?: LlmAttachment[]`，`buildMessages` 的最后一条 user message 带当前附件；历史附件仍绑定在各自的 `LlmMessage` 上。
 
 第一期采用确定性工具门控，禁用条件固定为：
 
@@ -467,7 +467,11 @@ const hasAttachmentContext =
   input.history.some((message) => (message.attachments?.length ?? 0) > 0);
 ```
 
-只要 `hasAttachmentContext` 为 `true`，`runAgent` 必须向每次 `llm.stream` 传入空工具集合，并拒绝执行模型异常返回的任何 `tool_call`。该门控覆盖注册工具、Skill 工具和 `web_search`，优先级高于正文授权、`webSearchEnabled`、`searchGate` 与显式 Skill。即使当前轮没有新附件，只要携带附件的历史消息仍在本次上下文中，门控就必须保持；只有附件消息退出 `history` 且本轮也无附件后，才恢复正常工具行为。附件本身仍不改变联网授权状态。后续若要支持“正文显式授权 + 附件 + 工具”的组合，必须另开需求和安全评审，不得在本任务中放宽。
+只要 `hasAttachmentContext` 为 `true`，`runAgent` 必须向每次 `llm.stream` 传入空工具集合，并拒绝执行模型异常返回的任何 `tool_call`。该门控覆盖注册工具、Skill 工具和 `web_search`，优先级高于正文授权、`webSearchEnabled`、`searchGate` 与显式 Skill。即使当前轮没有新附件，只要携带附件的历史消息仍在本次上下文中，门控就必须保持；只有附件消息退出 `history` 且本轮也无附件后，才恢复正常工具行为。
+
+异常 `tool_call` 失败关闭时不得直接结束为空回复：最多进行 1 次仍为空工具集合的内部纠正重试，重试不得重新开放任何工具；若仍返回工具调用或没有安全可见文本，则输出自然、简短的兜底回复，引导用户继续询问附件内容。兜底不得提及“门控”“策略”“系统提示”“tool call”或内部重试。附件本身仍不改变联网授权状态。后续若要支持“正文显式授权 + 附件 + 工具”的组合，必须另开需求和安全评审，不得在本任务中放宽。
+
+验收时记录但不在本任务强行扩展以下合同风险：KIE 当前精确页面展示的是 `image_url` 网络 URL，Data URI 是否受支持仍需后续真实端点合同测试；默认 Claude 模型在目录中保持 `supportsImageInput: false`，直到 KIE 为对应精确模型提供图片输入合同。上述风险不得通过猜测放宽能力标记。
 
 - [ ] **步骤 5：运行测试并提交**
 

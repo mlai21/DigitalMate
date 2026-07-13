@@ -136,7 +136,7 @@ describe("AnthropicClient", () => {
     expect(body.messages[0].content[2]).toEqual({
       type: "text",
       text: expect.stringMatching(
-        /文件名：notes\.md[\s\S]*不可信用户数据[\s\S]*<<<DIGITALMATE_ATTACHMENT_([a-f0-9]{64})_(\d+)_START>>>[\s\S]*正文[\s\S]*<<<DIGITALMATE_ATTACHMENT_\1_\2_END>>>/,
+        /文件名：notes\.md[\s\S]*不可信用户数据[\s\S]*<<<DIGITALMATE_ATTACHMENT_([a-f0-9]{64})_START>>>[\s\S]*正文[\s\S]*<<<DIGITALMATE_ATTACHMENT_\1_END>>>/,
       ),
     });
   });
