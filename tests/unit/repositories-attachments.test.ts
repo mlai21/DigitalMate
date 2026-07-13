@@ -468,6 +468,18 @@ async function readAttachmentClaimTokenMigration(): Promise<string> {
   return migration;
 }
 
+async function readClientTurnMigration(): Promise<string> {
+  const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+  const columnMigration = schema.match(
+    /ALTER TABLE IF EXISTS messages\s+ADD COLUMN IF NOT EXISTS client_turn_id uuid;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;/,
+  )?.[0];
+  const uniqueIndex = schema.match(
+    /CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role[\s\S]*?WHERE client_turn_id IS NOT NULL;/,
+  )?.[0];
+  if (!columnMigration || !uniqueIndex) throw new Error("client_turn_migration_missing");
+  return `${columnMigration}\n${uniqueIndex}`;
+}
+
 async function reservePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -493,6 +505,7 @@ describe("message attachment PostgreSQL concurrency", () => {
   let databasePool: Pool;
   let embeddedPostgres: EmbeddedPostgres | null = null;
   let embeddedDatabaseDirectory: string | null = null;
+  let databaseUrl: string;
   let legacyConstraintDefinition: string;
   let migratedConstraintOid: number;
 
@@ -510,7 +523,7 @@ describe("message attachment PostgreSQL concurrency", () => {
   }
 
   beforeAll(async () => {
-    let databaseUrl = process.env.TEST_DATABASE_URL;
+    databaseUrl = process.env.TEST_DATABASE_URL ?? "";
     if (!databaseUrl) {
       const port = await reservePort();
       embeddedDatabaseDirectory = await mkdtemp(path.join(os.tmpdir(), "digitalmate-postgres-"));
@@ -577,6 +590,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     legacyConstraintDefinition = (await readStatusConstraint()).definition;
     await databasePool.query(await readAttachmentClaimTokenMigration());
     await databasePool.query(await readAttachmentStatusMigration());
+    await databasePool.query(await readClientTurnMigration());
     migratedConstraintOid = (await readStatusConstraint()).oid;
   }, 30_000);
 
@@ -633,6 +647,218 @@ describe("message attachment PostgreSQL concurrency", () => {
          AND column_name = 'deletion_claim_token'`,
     );
     expect(tokenColumn.rows).toHaveLength(1);
+  });
+
+  it("migrates client turn columns and its partial role uniqueness idempotently", async () => {
+    await databasePool.query(await readClientTurnMigration());
+    const columns = await databasePool.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = current_schema()
+         AND table_name = 'messages'
+         AND column_name IN ('client_turn_id', 'client_turn_payload_hash')
+       ORDER BY column_name`,
+    );
+    expect(columns.rows.map((row) => row.column_name)).toEqual([
+      "client_turn_id",
+      "client_turn_payload_hash",
+    ]);
+    const index = await databasePool.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+       WHERE schemaname = current_schema() AND indexname = 'idx_messages_client_turn_role'`,
+    );
+    expect(index.rows[0].indexdef).toContain("UNIQUE");
+    expect(index.rows[0].indexdef).toContain("(user_id, client_turn_id, role)");
+    expect(index.rows[0].indexdef).toContain("WHERE (client_turn_id IS NOT NULL)");
+  });
+
+  it("returns the same user turn after an accepted event is lost", async () => {
+    const userId = "50000000-0000-4000-8000-000000000001";
+    const conversationId = "51000000-0000-4000-8000-000000000001";
+    const clientTurnId = "52000000-0000-4000-8000-000000000001";
+    await seedConversation(userId, conversationId);
+    const repositories = createRepositories(databasePool);
+    const input = {
+      userId,
+      conversationId,
+      clientTurnId,
+      payloadHash: "payload-one",
+      content: "accepted 丢失后重试",
+      attachmentIds: [],
+    };
+
+    const first = await repositories.messages.createIdempotentUserTurn(input);
+    const retry = await repositories.messages.createIdempotentUserTurn(input);
+
+    expect(first.created).toBe(true);
+    expect(retry.created).toBe(false);
+    expect(retry.message.id).toBe(first.message.id);
+    const count = await databasePool.query<{ count: string }>(
+      "SELECT count(*) AS count FROM messages WHERE user_id = $1 AND client_turn_id = $2 AND role = 'user'",
+      [userId, clientTurnId],
+    );
+    expect(Number(count.rows[0].count)).toBe(1);
+  });
+
+  it("makes concurrent copies of one turn share a user row and bound attachment", async () => {
+    const userId = "50000000-0000-4000-8000-000000000002";
+    const conversationId = "51000000-0000-4000-8000-000000000002";
+    const clientTurnId = "52000000-0000-4000-8000-000000000002";
+    const attachmentId = "53000000-0000-4000-8000-000000000002";
+    await seedConversation(userId, conversationId);
+    await seedAttachment({ id: attachmentId, userId, storageKey: "turn-concurrent-attachment" });
+    const repositories = createRepositories(databasePool);
+    const input = {
+      userId,
+      conversationId,
+      clientTurnId,
+      payloadHash: "payload-with-attachment",
+      content: "并发相同 turn",
+      attachmentIds: [attachmentId],
+    };
+
+    const [first, second] = await Promise.all([
+      repositories.messages.createIdempotentUserTurn(input),
+      repositories.messages.createIdempotentUserTurn(input),
+    ]);
+    const retryAfterBound = await repositories.messages.createIdempotentUserTurn(input);
+
+    expect(new Set([first.message.id, second.message.id, retryAfterBound.message.id]).size).toBe(1);
+    expect([first.created, second.created].filter(Boolean)).toHaveLength(1);
+    expect(retryAfterBound.created).toBe(false);
+    expect(retryAfterBound.attachments.map((attachment) => attachment.id)).toEqual([attachmentId]);
+    expect(retryAfterBound.attachments[0]).toMatchObject({ status: "bound", messageId: first.message.id });
+  });
+
+  it("rejects a reused client turn with a different payload", async () => {
+    const userId = "50000000-0000-4000-8000-000000000003";
+    const conversationId = "51000000-0000-4000-8000-000000000003";
+    const clientTurnId = "52000000-0000-4000-8000-000000000003";
+    await seedConversation(userId, conversationId);
+    const repositories = createRepositories(databasePool);
+    await repositories.messages.createIdempotentUserTurn({
+      userId,
+      conversationId,
+      clientTurnId,
+      payloadHash: "payload-original",
+      content: "原始正文",
+      attachmentIds: [],
+    });
+
+    await expect(repositories.messages.createIdempotentUserTurn({
+      userId,
+      conversationId,
+      clientTurnId,
+      payloadHash: "payload-changed",
+      content: "修改后的正文",
+      attachmentIds: [],
+    })).rejects.toThrow("client_turn_conflict");
+  });
+
+  it("lets concurrent normal and fallback assistant writes create only one visible row", async () => {
+    const userId = "50000000-0000-4000-8000-000000000004";
+    const conversationId = "51000000-0000-4000-8000-000000000004";
+    const clientTurnId = "52000000-0000-4000-8000-000000000004";
+    await seedConversation(userId, conversationId);
+    const repositories = createRepositories(databasePool);
+
+    const [normal, fallback] = await Promise.all([
+      repositories.messages.createIdempotentAssistantTurn({
+        userId, conversationId, clientTurnId, content: "正常回复",
+      }),
+      repositories.messages.createIdempotentAssistantTurn({
+        userId, conversationId, clientTurnId, content: "降级回复",
+      }),
+    ]);
+
+    expect(normal.message.id).toBe(fallback.message.id);
+    expect([normal.created, fallback.created].filter(Boolean)).toHaveLength(1);
+    expect(normal.message.content).toBe(fallback.message.content);
+    const count = await databasePool.query<{ count: string }>(
+      "SELECT count(*) AS count FROM messages WHERE user_id = $1 AND client_turn_id = $2 AND role = 'assistant'",
+      [userId, clientTurnId],
+    );
+    expect(Number(count.rows[0].count)).toBe(1);
+  });
+
+  it("holds one database execution lock per client turn until the owner releases it", async () => {
+    const repositories = createRepositories(databasePool);
+    const userId = "50000000-0000-4000-8000-000000000005";
+    const clientTurnId = "52000000-0000-4000-8000-000000000005";
+    const releaseFirst = await repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId);
+    let secondAcquired = false;
+    const secondLock = repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId).then((release) => {
+      secondAcquired = true;
+      return release;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(secondAcquired).toBe(false);
+
+    await releaseFirst();
+    const releaseSecond = await secondLock;
+    expect(secondAcquired).toBe(true);
+    await releaseSecond();
+  });
+
+  it("keeps the business pool available while many copies wait for one turn lock", async () => {
+    const repositories = createRepositories(databasePool);
+    const userId = "50000000-0000-4000-8000-000000000006";
+    const clientTurnId = "52000000-0000-4000-8000-000000000006";
+    const releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId);
+    const waiters = Array.from({ length: 12 }, () =>
+      repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId).then(async (release) => {
+        await release();
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    let businessQueryCompleted = false;
+    const businessQuery = databasePool.query("SELECT 1").then(() => {
+      businessQueryCompleted = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const completedBeforeOwnerRelease = businessQueryCompleted;
+
+    await releaseOwner();
+    await Promise.all([...waiters, businessQuery]);
+    expect(completedBeforeOwnerRelease).toBe(true);
+  });
+
+  it("isolates different turn owners from a small business connection pool", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const smallBusinessPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const smallLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const repositories = createRepositories(smallBusinessPool, smallLockPool);
+    let releaseFirst: (() => Promise<void>) | undefined;
+    let releaseSecond: (() => Promise<void>) | undefined;
+    try {
+      releaseFirst = await repositories.messages.acquireClientTurnExecutionLock(
+        "50000000-0000-4000-8000-000000000007",
+        "52000000-0000-4000-8000-000000000007",
+      );
+      releaseSecond = await repositories.messages.acquireClientTurnExecutionLock(
+        "50000000-0000-4000-8000-000000000008",
+        "52000000-0000-4000-8000-000000000008",
+      );
+      let businessQueryCompleted = false;
+      const businessQuery = smallBusinessPool.query("SELECT 1").then(() => {
+        businessQueryCompleted = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const completedWhileBothLocksHeld = businessQueryCompleted;
+
+      await releaseFirst();
+      releaseFirst = undefined;
+      await releaseSecond();
+      releaseSecond = undefined;
+      await businessQuery;
+      expect(completedWhileBothLocksHeld).toBe(true);
+    } finally {
+      await releaseFirst?.();
+      await releaseSecond?.();
+      await smallBusinessPool.end();
+      await smallLockPool.end();
+    }
   });
 
   it("prevents an old deletion token from releasing or deleting a newer claim", async () => {

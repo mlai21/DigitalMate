@@ -896,13 +896,15 @@ input {
 }
 
 .attachment-error,
-.attachment-validation-error {
+.attachment-validation-error,
+.chat-submit-error {
   color: var(--danger);
   font-size: 12px;
   line-height: 1.5;
 }
 
-.attachment-validation-error {
+.attachment-validation-error,
+.chat-submit-error {
   padding: 0 8px;
 }
 

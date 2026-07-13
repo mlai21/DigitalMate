@@ -18,7 +18,7 @@ import type { ToolRegistrationDraft } from "@/server/tasks/tools";
 import { defaultSettings } from "@/server/settings/defaults";
 import { DEFAULT_GOAL_BUDGET_USED, type GoalBudgetUsed, type GoalContract } from "@/server/goals/contract";
 import type { GoalStatus } from "@/server/goals/state-machine";
-import { getPool } from "@/server/db/client";
+import { getPool, getTurnLockPool } from "@/server/db/client";
 import {
   ATTACHMENT_LIMITS,
   type AttachmentKind,
@@ -167,7 +167,9 @@ export type DbProactiveTask = {
   metadata: Record<string, unknown>;
 };
 
-export function createRepositories(pool: Pool = getPool()) {
+export function createRepositories(providedPool?: Pool, providedTurnLockPool?: Pool) {
+  const pool = providedPool ?? getPool();
+  const turnLockPool = providedTurnLockPool ?? (providedPool ? pool : getTurnLockPool());
   return {
     users: {
       async ensureDefault(): Promise<DbUser> {
@@ -426,6 +428,221 @@ export function createRepositories(pool: Pool = getPool()) {
           client.release();
         }
       },
+      async createIdempotentUserTurn(input: {
+        userId: string;
+        conversationId: string;
+        clientTurnId: string;
+        payloadHash: string;
+        content: string;
+        attachmentIds: string[];
+      }): Promise<{ message: DbMessage; attachments: DbMessageAttachment[]; created: boolean }> {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          if (input.attachmentIds.length > ATTACHMENT_LIMITS.maxCount) {
+            throw new Error("attachment_count_exceeded");
+          }
+          if (new Set(input.attachmentIds).size !== input.attachmentIds.length) {
+            throw new Error("attachment_not_bindable");
+          }
+
+          const conversation = await client.query(
+            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+            [input.conversationId, input.userId],
+          );
+          if (!conversation.rows[0]) throw new Error("conversation_not_found");
+
+          const inserted = await client.query(
+            `INSERT INTO messages
+             (user_id, conversation_id, role, content, client_turn_id, client_turn_payload_hash)
+             VALUES ($1, $2, 'user', $3, $4, $5)
+             ON CONFLICT (user_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
+             DO NOTHING
+             RETURNING *`,
+            [input.userId, input.conversationId, input.content, input.clientTurnId, input.payloadHash],
+          );
+          const created = inserted.rows.length > 0;
+          const storedRow = created
+            ? inserted.rows[0]
+            : (await client.query(
+                `SELECT * FROM messages
+                 WHERE user_id = $1 AND client_turn_id = $2 AND role = 'user'
+                 FOR UPDATE`,
+                [input.userId, input.clientTurnId],
+              )).rows[0];
+          if (
+            !storedRow
+            || String(storedRow.conversation_id) !== input.conversationId
+            || String(storedRow.content) !== input.content
+            || String(storedRow.client_turn_payload_hash) !== input.payloadHash
+          ) {
+            throw new Error("client_turn_conflict");
+          }
+          const message = mapMessage(storedRow);
+
+          if (!created) {
+            const existingAttachments = input.attachmentIds.length === 0
+              ? []
+              : (await client.query(
+                  `SELECT * FROM message_attachments
+                   WHERE user_id = $1 AND message_id = $2`,
+                  [input.userId, message.id],
+                )).rows.map(mapMessageAttachment);
+            const byId = new Map(existingAttachments.map((attachment) => [attachment.id, attachment]));
+            if (
+              existingAttachments.length !== input.attachmentIds.length
+              || input.attachmentIds.some((attachmentId) => !byId.has(attachmentId))
+            ) {
+              throw new Error("client_turn_conflict");
+            }
+            await client.query("COMMIT");
+            return {
+              message,
+              attachments: input.attachmentIds.map((attachmentId) => byId.get(attachmentId)!),
+              created: false,
+            };
+          }
+
+          let attachments: DbMessageAttachment[] = [];
+          if (input.attachmentIds.length > 0) {
+            const locked = await client.query(
+              `SELECT * FROM message_attachments
+               WHERE id = ANY($1::uuid[]) AND user_id = $2
+               ORDER BY id
+               FOR UPDATE`,
+              [input.attachmentIds, input.userId],
+            );
+            const lockedAttachments = locked.rows.map(mapMessageAttachment);
+            const allBindable =
+              lockedAttachments.length === input.attachmentIds.length
+              && lockedAttachments.every(
+                (attachment) => attachment.status === "ready" && attachment.messageId === null,
+              );
+            if (!allBindable) throw new Error("attachment_not_bindable");
+            const totalSize = lockedAttachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+            if (totalSize > ATTACHMENT_LIMITS.maxMessageBytes) {
+              throw new Error("attachment_total_size_exceeded");
+            }
+
+            const bound = await client.query(
+              `UPDATE message_attachments
+               SET message_id = $2, status = 'bound', updated_at = now()
+               WHERE id = ANY($1::uuid[])
+                 AND user_id = $3
+                 AND status = 'ready'
+                 AND message_id IS NULL
+               RETURNING *`,
+              [input.attachmentIds, message.id, input.userId],
+            );
+            if (bound.rows.length !== input.attachmentIds.length) {
+              throw new Error("attachment_not_bindable");
+            }
+            const byId = new Map(
+              bound.rows.map((row) => {
+                const attachment = mapMessageAttachment(row);
+                return [attachment.id, attachment] as const;
+              }),
+            );
+            attachments = input.attachmentIds.map((attachmentId) => byId.get(attachmentId)!);
+          }
+
+          await client.query(
+            "UPDATE conversations SET updated_at = now() WHERE id = $1 AND user_id = $2",
+            [input.conversationId, input.userId],
+          );
+          await client.query("COMMIT");
+          return { message, attachments, created: true };
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      async createIdempotentAssistantTurn(input: {
+        userId: string;
+        conversationId: string;
+        clientTurnId: string;
+        content: string;
+      }): Promise<{ message: DbMessage; created: boolean }> {
+        const inserted = await pool.query(
+          `INSERT INTO messages (user_id, conversation_id, role, content, client_turn_id)
+           VALUES ($1, $2, 'assistant', $3, $4)
+           ON CONFLICT (user_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
+           DO NOTHING
+           RETURNING *`,
+          [input.userId, input.conversationId, input.content, input.clientTurnId],
+        );
+        const created = inserted.rows.length > 0;
+        const row = created
+          ? inserted.rows[0]
+          : (await pool.query(
+              `SELECT * FROM messages
+               WHERE user_id = $1 AND client_turn_id = $2 AND role = 'assistant'`,
+              [input.userId, input.clientTurnId],
+            )).rows[0];
+        if (!row) throw new Error("client_turn_assistant_missing");
+        if (created) {
+          await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
+        }
+        return { message: mapMessage(row), created };
+      },
+      async acquireClientTurnExecutionLock(
+        userId: string,
+        clientTurnId: string,
+      ): Promise<() => Promise<void>> {
+        const lockKey = `${userId}:${clientTurnId}`;
+        while (true) {
+          const client = await turnLockPool.connect();
+          let locked = false;
+          try {
+            const result = await client.query<{ locked: boolean }>(
+              "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+              [lockKey],
+            );
+            locked = result.rows[0]?.locked === true;
+          } catch (error) {
+            client.release(true);
+            throw error;
+          }
+          if (!locked) {
+            client.release();
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
+
+          let released = false;
+          return async () => {
+            if (released) return;
+            released = true;
+            try {
+              const result = await client.query<{ unlocked: boolean }>(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
+                [lockKey],
+              );
+              if (result.rows[0]?.unlocked !== true) {
+                throw new Error("client_turn_lock_not_held");
+              }
+              client.release();
+            } catch (error) {
+              client.release(true);
+              throw error;
+            }
+          };
+        }
+      },
+      async findByClientTurn(
+        userId: string,
+        clientTurnId: string,
+        role: "user" | "assistant",
+      ): Promise<DbMessage | null> {
+        const result = await pool.query(
+          `SELECT * FROM messages
+           WHERE user_id = $1 AND client_turn_id = $2 AND role = $3`,
+          [userId, clientTurnId, role],
+        );
+        return result.rows[0] ? mapMessage(result.rows[0]) : null;
+      },
       async createFromProactiveTask(input: {
         taskId: string;
         userId: string;
@@ -456,12 +673,13 @@ export function createRepositories(pool: Pool = getPool()) {
         ]);
         return result.rows.map((row) => ({ ...mapMessage(row), visibleToUser: Boolean(row.visible_to_user) }));
       },
-      async recentHistory(conversationId: string, limit = 12) {
+      async recentHistory(conversationId: string, limit = 12, excludeClientTurnId?: string) {
         const result = await pool.query(
           `SELECT id, role, content FROM messages
            WHERE conversation_id = $1 AND visible_to_user = true AND role IN ('user', 'assistant')
+             ${excludeClientTurnId ? "AND client_turn_id IS DISTINCT FROM $3::uuid" : ""}
            ORDER BY created_at DESC LIMIT $2`,
-          [conversationId, limit],
+          excludeClientTurnId ? [conversationId, limit, excludeClientTurnId] : [conversationId, limit],
         );
         return result.rows
           .reverse()

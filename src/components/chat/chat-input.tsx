@@ -22,6 +22,7 @@ const CREATE_SKILL_COMMAND = "/create-skill";
 const MAX_SELECTED_SKILLS = 3;
 
 export type ChatInputSubmitOptions = {
+  clientTurnId: string;
   skillIds?: string[];
   searchEnabled?: boolean;
   attachmentIds?: string[];
@@ -43,10 +44,11 @@ export function ChatInput({
   shellRef,
 }: {
   disabled?: boolean;
-  onSubmit: (value: string, options?: ChatInputSubmitOptions) => Promise<boolean>;
+  onSubmit: (value: string, options: ChatInputSubmitOptions) => Promise<boolean>;
   shellRef?: Ref<HTMLFormElement>;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const [clientTurnId, setClientTurnId] = useState(createClientTurnId);
   const [value, setValue] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<SkillOption[]>([]);
   const [searchEnabled, setSearchEnabled] = useState(false);
@@ -55,6 +57,12 @@ export function ChatInput({
   const [activeIndex, setActiveIndex] = useState(0);
   const [attachments, setAttachments] = useState<UploadingAttachment[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  function invalidateClientTurn() {
+    setClientTurnId(createClientTurnId());
+    setSubmitError(null);
+  }
 
   const slashQuery =
     value.startsWith("/") && !value.includes("\n") && !value.startsWith(`${CREATE_SKILL_COMMAND} `)
@@ -95,6 +103,7 @@ export function ChatInput({
     : [];
 
   function pickItem(item: PickerItem) {
+    invalidateClientTurn();
     if (item.kind === "create") {
       setValue(`${CREATE_SKILL_COMMAND} `);
     } else {
@@ -128,6 +137,7 @@ export function ChatInput({
       || hasFailedUpload
     ) return;
     const options: ChatInputSubmitOptions = {
+      clientTurnId,
       ...(skillIds.length > 0 ? { skillIds } : {}),
       ...(searchEnabled ? { searchEnabled: true } : {}),
       ...(readyAttachments.length > 0
@@ -137,17 +147,21 @@ export function ChatInput({
           }
         : {}),
     };
-    const hasOptions = Object.keys(options).length > 0;
+    setSubmitError(null);
     setIsSubmitting(true);
     let succeeded = false;
     try {
-      succeeded = hasOptions ? await onSubmit(content, options) : await onSubmit(content);
+      succeeded = await onSubmit(content, options);
     } catch {
       succeeded = false;
     } finally {
       setIsSubmitting(false);
     }
-    if (!succeeded) return;
+    if (!succeeded) {
+      setSubmitError("发送失败，请重试。");
+      return;
+    }
+    setClientTurnId(createClientTurnId());
     setValue("");
     setSelectedSkills([]);
     setSearchEnabled(false);
@@ -235,11 +249,16 @@ export function ChatInput({
         </div>
       ) : null}
 
+      {submitError ? <div className="chat-submit-error" role="alert">{submitError}</div> : null}
+
       <div className="chat-input-stack">
         <AttachmentPicker
           attachments={attachments}
           disabled={disabled || isSubmitting}
-          onChange={setAttachments}
+          onChange={(nextAttachments) => {
+            invalidateClientTurn();
+            setAttachments(nextAttachments);
+          }}
         />
         {selectedSkills.length > 0 ? (
           <div className="skill-chip-row">
@@ -251,9 +270,10 @@ export function ChatInput({
                   type="button"
                   className="skill-chip-remove"
                   aria-label={`移除 Skill ${skill.name}`}
-                  onClick={() =>
+                  onClick={() => {
+                    invalidateClientTurn();
                     setSelectedSkills((current) => current.filter((item) => item.id !== skill.id))
-                  }
+                  }}
                 >
                   <X size={12} />
                 </button>
@@ -272,6 +292,7 @@ export function ChatInput({
             value={value}
             onKeyDown={handleKeyDown}
             onChange={(event) => {
+              invalidateClientTurn();
               setValue(event.target.value);
               if (!event.target.value.startsWith("/")) setPickerDismissed(false);
             }}
@@ -290,7 +311,10 @@ export function ChatInput({
               aria-label={searchEnabled ? "关闭联网搜索" : "开启联网搜索"}
               aria-pressed={searchEnabled}
               disabled={disabled || isSubmitting}
-              onClick={() => setSearchEnabled((enabled) => !enabled)}
+              onClick={() => {
+                invalidateClientTurn();
+                setSearchEnabled((enabled) => !enabled);
+              }}
             >
               <Globe2 size={18} strokeWidth={2} aria-hidden="true" />
               {searchEnabled ? <span>搜索</span> : null}
@@ -328,4 +352,8 @@ function toSafeChatAttachment(
     status: "ready",
     downloadUrl: `/api/chat/attachments/${attachment.id}/download`,
   };
+}
+
+function createClientTurnId(): string {
+  return globalThis.crypto.randomUUID();
 }

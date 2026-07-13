@@ -256,6 +256,7 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
     setMenuOpen(false);
+    triggerRef.current?.focus();
     void addFiles(files);
   }
 

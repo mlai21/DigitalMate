@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_id uuid;
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;
+
 CREATE TABLE IF NOT EXISTS message_attachments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -365,6 +370,9 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role
+  ON messages(user_id, client_turn_id, role)
+  WHERE client_turn_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task ON messages(source_task_id) WHERE source_task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(status, created_at) WHERE message_id IS NULL;

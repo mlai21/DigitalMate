@@ -28,6 +28,8 @@ const mocks = vi.hoisted(() => {
     role: "user" as const,
     content: "看看附件",
     createdAt: new Date("2026-07-08T10:01:00+08:00"),
+    clientTurnId: "00000000-0000-4000-8000-000000000005",
+    clientTurnPayloadHash: "private-payload-hash",
     internalSecret: "message-private-secret",
   };
   const internalMessage = {
@@ -151,6 +153,9 @@ describe("conversations API", () => {
     expect(serialized).not.toContain("conversationId");
     expect(serialized).not.toContain("internalSecret");
     expect(serialized).not.toContain("message-private-secret");
+    expect(serialized).not.toContain("clientTurnId");
+    expect(serialized).not.toContain("clientTurnPayloadHash");
+    expect(serialized).not.toContain("private-payload-hash");
     expect(serialized).not.toContain(mocks.internalMessage.id);
     expect(serialized).not.toContain("storageKey");
     expect(serialized).not.toContain("private-storage-key");

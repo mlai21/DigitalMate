@@ -20,9 +20,17 @@ export type ChatMessage = {
 };
 
 type SsePayload =
-  | { type: "accepted"; conversationId: string; userMessageId: string }
+  | { type: "accepted"; conversationId: string; clientTurnId: string; userMessageId: string }
   | { type: "chunk"; content: string }
-  | { type: "done"; conversationId: string; assistantMessageId?: string; degraded?: boolean }
+  | { type: "replace"; content: string }
+  | {
+      type: "done";
+      conversationId: string;
+      clientTurnId: string;
+      userMessageId: string;
+      assistantMessageId?: string;
+      degraded?: boolean;
+    }
   | { type: "error"; message: string };
 
 export function ChatShell({
@@ -216,7 +224,7 @@ export function ChatShell({
     if (response.ok) await refreshSidebar();
   }
 
-  async function sendMessage(content: string, options?: ChatInputSubmitOptions): Promise<boolean> {
+  async function sendMessage(content: string, options: ChatInputSubmitOptions): Promise<boolean> {
     let targetConversationId = activeConversationId;
     if (!targetConversationId) {
       try {
@@ -236,14 +244,15 @@ export function ChatShell({
     }
 
     const now = new Date().toISOString();
+    const clientTurnId = options.clientTurnId;
     const userMessage: ChatMessage = {
-      id: `local-user-${now}`,
+      id: `local-user-${clientTurnId}`,
       role: "user",
       content,
       createdAt: now,
-      ...(options?.attachments?.length ? { attachments: options.attachments } : {}),
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
     };
-    const draftId = `assistant-${now}`;
+    const draftId = `assistant-${clientTurnId}`;
     setMessages((current) => [
       ...current,
       userMessage,
@@ -262,9 +271,10 @@ export function ChatShell({
         body: JSON.stringify({
           message: content,
           conversationId: targetConversationId,
-          ...(options?.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
-          ...(options?.skillIds?.length ? { skillIds: options.skillIds } : {}),
-          ...(options?.searchEnabled ? { searchEnabled: true } : {}),
+          clientTurnId,
+          ...(options.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
+          ...(options.skillIds?.length ? { skillIds: options.skillIds } : {}),
+          ...(options.searchEnabled ? { searchEnabled: true } : {}),
         }),
       });
       if (!response.ok) throw new ChatSubmitError(await readChatError(response));
@@ -275,16 +285,15 @@ export function ChatShell({
           accepted = true;
           acceptedConversationId = payload.conversationId;
           setActiveConversationId(payload.conversationId);
-          setMessages((current) => current.map((message) => {
-            const uiId = getChatMessageUiId(message);
-            if (uiId !== userMessage.id && message.id !== payload.userMessageId) return message;
-            return {
+          setMessages((current) => reconcileOptimisticMessageId(
+            current,
+            userMessage.id,
+            payload.userMessageId,
+            (message) => ({
               ...message,
-              id: payload.userMessageId,
-              uiId: message.uiId ?? userMessage.id,
               attachments: message.attachments?.map((attachment) => ({ ...attachment, status: "bound" })),
-            };
-          }));
+            }),
+          ));
         }
         if (payload.type === "chunk") {
           setMessages((current) =>
@@ -295,20 +304,24 @@ export function ChatShell({
             ),
           );
         }
+        if (payload.type === "replace") {
+          setMessages((current) => current.map((message) =>
+            getChatMessageUiId(message) === draftId
+              ? { ...message, content: payload.content }
+              : message,
+          ));
+        }
         if (payload.type === "done") {
           completed = true;
           assistantMessageId = payload.assistantMessageId;
           setActiveConversationId(payload.conversationId);
           if (payload.assistantMessageId) {
             const persistedAssistantId = payload.assistantMessageId;
-            setMessages((current) => current.map((message) =>
-              getChatMessageUiId(message) === draftId || message.id === persistedAssistantId
-                ? {
-                    ...message,
-                    id: persistedAssistantId,
-                    uiId: message.uiId ?? draftId,
-                  }
-                : message,
+            setMessages((current) => reconcileOptimisticMessageId(
+              current,
+              draftId,
+              persistedAssistantId,
+              (message) => message,
             ));
           }
         }
@@ -322,23 +335,17 @@ export function ChatShell({
       void refreshSidebar();
       window.setTimeout(() => void refreshSidebar(), 6_000);
       return true;
-    } catch (error) {
+    } catch {
       if (accepted) {
         await reconcileAcceptedTurn(acceptedConversationId, draftId);
         void refreshSidebar();
         window.setTimeout(() => void refreshSidebar(), 6_000);
         return true;
       }
-      const errorMessage = error instanceof ChatSubmitError
-        ? error.message
-        : "我这边刚才没连上。等你把服务和数据库都启动好，我们再继续。";
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === draftId
-            ? { ...message, content: errorMessage }
-            : message,
-        ),
-      );
+      setMessages((current) => current.filter((message) => {
+        const uiId = getChatMessageUiId(message);
+        return uiId !== userMessage.id && uiId !== draftId;
+      }));
       return false;
     } finally {
       setIsStreaming(false);
@@ -506,8 +513,8 @@ async function* readSse(stream: ReadableStream<Uint8Array>): AsyncIterable<SsePa
 }
 
 export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  const seen = new Set(current.map((message) => message.id));
-  const next = [...current];
+  const next = dedupeMessagesById(current);
+  const seen = new Set(next.map((message) => message.id));
   for (const message of incoming) {
     if (seen.has(message.id)) continue;
     const optimisticIndex = next.findIndex((candidate) => isMatchingOptimisticMessage(candidate, message));
@@ -522,6 +529,30 @@ export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): 
     seen.add(message.id);
   }
   return next;
+}
+
+function reconcileOptimisticMessageId(
+  current: ChatMessage[],
+  optimisticUiId: string,
+  persistedId: string,
+  update: (message: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  const optimistic = current.find((message) => getChatMessageUiId(message) === optimisticUiId);
+  const stableUiId = optimistic ? getChatMessageUiId(optimistic) : optimisticUiId;
+  const reconciled = current.map((message) => {
+    if (getChatMessageUiId(message) !== optimisticUiId && message.id !== persistedId) return message;
+    return update({ ...message, id: persistedId, uiId: stableUiId });
+  });
+  return dedupeMessagesById(reconciled);
+}
+
+function dedupeMessagesById(messages: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>();
+  return messages.filter((message) => {
+    if (seen.has(message.id)) return false;
+    seen.add(message.id);
+    return true;
+  });
 }
 
 function getChatMessageUiId(message: ChatMessage): string {

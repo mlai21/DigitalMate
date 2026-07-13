@@ -606,6 +606,7 @@ describe("ChatShell attachment submit", () => {
       message: "",
       conversationId: "00000000-0000-4000-8000-000000000010",
       attachmentIds: ["00000000-0000-4000-8000-000000000001"],
+      clientTurnId: expect.any(String),
     });
     expect(JSON.stringify(body)).not.toMatch(/attachments|base64|blob:|cat\.png/);
     expect(await screen.findByRole("link", { name: /cat\.png/ })).toHaveAttribute(
@@ -647,9 +648,9 @@ describe("ChatShell attachment submit", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    expect(await screen.findByText("当前模型暂不支持图片理解，请切换到支持图片的模型后重试。" )).toBeInTheDocument();
+    expect(await screen.findByText("发送失败，请重试。")).toBeInTheDocument();
     expect(textarea).toHaveValue("看看这张图");
-    expect(screen.getAllByText("cat.png")).toHaveLength(2);
+    expect(screen.getAllByText("cat.png")).toHaveLength(1);
   });
 
   it("commits an accepted attachment turn after an SSE error and reconciles one fallback", async () => {
@@ -801,10 +802,165 @@ describe("ChatShell attachment submit", () => {
     const composer = document.querySelector(".chat-input-shell");
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByText("发送前失败");
+    await screen.findByText("发送失败，请重试。");
     expect(document.querySelector(".chat-input-shell")).toBe(composer);
     expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue("新会话草稿");
     expect(screen.getByRole("button", { name: "移除 cat.png" })).toBeInTheDocument();
+    expect(document.querySelectorAll(".message-row")).toHaveLength(0);
+    expect(screen.queryByText("发送前失败")).toBeNull();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+  });
+
+  it("retries a lost accepted event with one client turn and renders one persisted source", async () => {
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    const chatBodies: Array<Record<string, unknown>> = [];
+    let chatAttempt = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
+      if (url === "/api/chat") {
+        chatAttempt += 1;
+        chatBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (chatAttempt === 1) return sseResponse([{ type: "chunk", content: "客户端没收到 accepted" }]);
+        const clientTurnId = String(chatBodies[0].clientTurnId);
+        return sseResponse([
+          { type: "accepted", conversationId, clientTurnId, userMessageId: "message-user" },
+          { type: "chunk", content: "唯一回复" },
+          {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: "message-user",
+            assistantMessageId: "message-assistant",
+          },
+        ]);
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "同一个 turn" } });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await screen.findByText("发送失败，请重试。");
+    expect(document.querySelectorAll(".message-row")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "移除 cat.png" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[0].clientTurnId).toBe(chatBodies[1].clientTurnId);
+    expect(messageTexts("同一个 turn")).toHaveLength(1);
+    expect(messageTexts("唯一回复")).toHaveLength(1);
+    expect(screen.getAllByRole("link", { name: /cat\.png/ })).toHaveLength(1);
+  });
+
+  it("folds a replay into messages already restored by polling before the retry", async () => {
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    const restoredUser: ChatMessage = {
+      id: "message-user-restored",
+      role: "user",
+      content: "轮询已恢复",
+      createdAt: "2026-07-14T10:00:00.000Z",
+    };
+    const restoredAssistant: ChatMessage = {
+      id: "message-assistant-restored",
+      role: "assistant",
+      content: "唯一持久化回复",
+      createdAt: "2026-07-14T10:00:01.000Z",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/chat") {
+        const clientTurnId = String((JSON.parse(String(init?.body)) as { clientTurnId: string }).clientTurnId);
+        return sseResponse([
+          { type: "accepted", conversationId, clientTurnId, userMessageId: restoredUser.id },
+          { type: "chunk", content: restoredAssistant.content },
+          {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: restoredUser.id,
+            assistantMessageId: restoredAssistant.id,
+          },
+        ]);
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[restoredUser, restoredAssistant]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: restoredUser.content } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+
+    expect(messageTexts(restoredUser.content)).toHaveLength(1);
+    expect(messageTexts(restoredAssistant.content)).toHaveLength(1);
+    expect(new Set(Array.from(document.querySelectorAll(".message-row")).map((row) => row.textContent)).size).toBe(2);
+  });
+
+  it("commits an auto-created conversation when accepted is followed by a disconnect", async () => {
+    const conversation = conversationItem();
+    let pullCount = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCount += 1;
+        if (pullCount === 1) {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+            type: "accepted",
+            conversationId: conversation.id,
+            clientTurnId: "70000000-0000-4000-8000-000000000001",
+            userMessageId: "message-user-auto",
+          })}\n\n`));
+          return;
+        }
+        controller.error(new Error("disconnect_after_accept"));
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/conversations" && init?.method === "POST") {
+        return new Response(JSON.stringify({ conversation }), { status: 201 });
+      }
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url === `/api/conversations/${conversation.id}/messages`) {
+        return new Response(JSON.stringify({ messages: [{
+          id: "message-user-auto",
+          role: "user",
+          content: "自动会话断流",
+          createdAt: "2026-07-14T10:00:00.000Z",
+          attachments: [],
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatShell initialMessages={[]} initialConversations={[]} />);
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "自动会话断流" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    expect(messageTexts("自动会话断流")).toHaveLength(1);
+    expect(document.querySelector(".message-row-assistant")).toBeNull();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
   });
 
@@ -946,6 +1102,45 @@ describe("MessageBubble", () => {
 });
 
 describe("ChatInput", () => {
+  it("reuses one client turn id for an unchanged failed draft and rotates it after text edits", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ChatInput onSubmit={onSubmit} />);
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+
+    fireEvent.input(textarea, { target: { value: "失败后重试" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const firstTurnId = (onSubmit.mock.calls[0][1] as { clientTurnId: string }).clientTurnId;
+    expect(firstTurnId).toMatch(/^[0-9a-f-]{36}$/);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect((onSubmit.mock.calls[1][1] as { clientTurnId: string }).clientTurnId).toBe(firstTurnId);
+
+    fireEvent.input(textarea, { target: { value: "编辑后的新草稿" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(3));
+    expect((onSubmit.mock.calls[2][1] as { clientTurnId: string }).clientTurnId).not.toBe(firstTurnId);
+    expect(screen.getByRole("alert")).toHaveTextContent("发送失败，请重试。");
+  });
+
+  it("rotates the client turn id when search authorization changes", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ChatInput onSubmit={onSubmit} />);
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "联网草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const firstTurnId = (onSubmit.mock.calls[0][1] as { clientTurnId: string }).clientTurnId;
+
+    fireEvent.click(screen.getByRole("button", { name: "开启联网搜索" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+
+    expect((onSubmit.mock.calls[1][1] as { clientTurnId: string }).clientTurnId).not.toBe(firstTurnId);
+  });
+
   it("requires an explicit per-message toggle for web search and resets it after sending", async () => {
     const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
@@ -961,7 +1156,10 @@ describe("ChatInput", () => {
     fireEvent.input(textarea, { target: { value: "查查今天有什么新消息" } });
     fireEvent.submit(textarea.closest("form")!);
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("查查今天有什么新消息", { searchEnabled: true }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("查查今天有什么新消息", {
+      clientTurnId: expect.any(String),
+      searchEnabled: true,
+    }));
     expect(screen.getByRole("button", { name: "开启联网搜索" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByText("搜索")).toBeNull();
   });
@@ -990,7 +1188,10 @@ describe("ChatInput", () => {
 
     fireEvent.submit(textarea.closest("form")!);
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("这是一段很长的输入，发送后输入框应该回到单行高度。"));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
+      "这是一段很长的输入，发送后输入框应该回到单行高度。",
+      { clientTurnId: expect.any(String) },
+    ));
     await waitFor(() => expect(textarea.value).toBe(""));
     expect(textarea.style.height).toBe("");
   });
@@ -1005,7 +1206,10 @@ describe("ChatInput", () => {
     const eventWasNotPrevented = fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
 
     expect(eventWasNotPrevented).toBe(false);
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("回车发送"));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
+      "回车发送",
+      { clientTurnId: expect.any(String) },
+    ));
     await waitFor(() => expect(textarea.value).toBe(""));
   });
 
@@ -1068,11 +1272,54 @@ describe("ChatInput attachments", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "false");
 
     await user.click(trigger);
+    await user.click(screen.getByRole("button", { name: "上传图片" }));
     fireEvent.change(screen.getByLabelText("选择图片"), {
       target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
     });
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveFocus();
     expect(await screen.findByText("cat.png")).toBeInTheDocument();
+  });
+
+  it("rotates the client turn id when attachments change", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ChatInput onSubmit={onSubmit} />);
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    fireEvent.input(textarea, { target: { value: "附件草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const firstTurnId = (onSubmit.mock.calls[0][1] as { clientTurnId: string }).clientTurnId;
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+
+    expect((onSubmit.mock.calls[1][1] as { clientTurnId: string }).clientTurnId).not.toBe(firstTurnId);
+  });
+
+  it("rotates the client turn id when a Skill selection changes", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      skills: [{ id: "00000000-0000-4000-8000-000000000099", name: "周报整理", trigger: "整理周报" }],
+    }), { status: 200 })));
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ChatInput onSubmit={onSubmit} />);
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    fireEvent.input(textarea, { target: { value: "/" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const firstTurnId = (onSubmit.mock.calls[0][1] as { clientTurnId: string }).clientTurnId;
+
+    fireEvent.mouseDown(await screen.findByText("周报整理"));
+    fireEvent.input(textarea, { target: { value: "整理它" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+
+    expect((onSubmit.mock.calls[1][1] as { clientTurnId: string }).clientTurnId).not.toBe(firstTurnId);
   });
 
   it("keeps the attachment menu and Skill picker mutually exclusive", async () => {
@@ -1235,6 +1482,7 @@ describe("ChatInput attachments", () => {
       expect(onSubmit).toHaveBeenCalledWith("", {
         attachmentIds: ["00000000-0000-4000-8000-000000000001"],
         attachments: [expect.objectContaining({ fileName: "cat.png", status: "ready" })],
+        clientTurnId: expect.any(String),
       }),
     );
     await waitFor(() => expect(screen.queryByText("cat.png")).toBeNull());
@@ -1605,6 +1853,7 @@ describe("ChatInput skill picker", () => {
 
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith("帮我整理这周的更新", {
+        clientTurnId: expect.any(String),
         skillIds: ["00000000-0000-4000-8000-000000000001"],
       }),
     );

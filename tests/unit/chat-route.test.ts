@@ -8,6 +8,7 @@ import type { AppEnv } from "@/server/config/env";
 import type { LlmMessage } from "@/server/llm/types";
 
 type HistoryRow = { id: string; role: "user" | "assistant"; content: string };
+const DEFAULT_CLIENT_TURN_ID = "60000000-0000-4000-8000-000000000000";
 
 const mocks = vi.hoisted(() => {
   const readyDocument = {
@@ -62,6 +63,40 @@ const mocks = vi.hoisted(() => {
       status: "bound" as const,
     })),
   }));
+  const messagesCreateIdempotentUserTurn = vi.fn(async (input: {
+    userId: string;
+    conversationId: string;
+    content: string;
+    attachmentIds: string[];
+  }) => {
+    if (input.attachmentIds.length > 0) {
+      const result = await messagesCreateWithAttachments({
+        content: input.content,
+        attachmentIds: input.attachmentIds,
+      });
+      return { ...result, created: true };
+    }
+    const message = await messagesCreate({ role: "user", content: input.content });
+    return { message, attachments: [], created: true };
+  });
+  const messagesCreateIdempotentAssistantTurn = vi.fn(async (input: {
+    userId: string;
+    conversationId: string;
+    content: string;
+  }) => ({
+    message: await messagesCreate({ role: "assistant", content: input.content }),
+    created: true,
+  }));
+  const findByClientTurn = vi.fn<(userId: string, clientTurnId: string, role: "user" | "assistant") => Promise<{
+    id: string;
+    userId: string;
+    conversationId: string;
+    role: "user" | "assistant";
+    content: string;
+    createdAt: Date;
+  } | null>>(async () => null);
+  const acquireClientTurnExecutionLock = vi.fn(async () => vi.fn(async () => undefined));
+  const proactiveTaskCreate = vi.fn(async () => undefined);
   const getAttachmentForUser = vi.fn<
     (userId: string, attachmentId: string) => Promise<DbMessageAttachment | null>
   >(async (_userId, attachmentId) =>
@@ -79,6 +114,11 @@ const mocks = vi.hoisted(() => {
     extractAndSaveFromMessage,
     messagesCreate,
     messagesCreateWithAttachments,
+    messagesCreateIdempotentUserTurn,
+    messagesCreateIdempotentAssistantTurn,
+    findByClientTurn,
+    acquireClientTurnExecutionLock,
+    proactiveTaskCreate,
     getAttachmentForUser,
     listAttachmentsForMessages,
     recentHistory,
@@ -93,6 +133,10 @@ const mocks = vi.hoisted(() => {
       messages: {
         create: messagesCreate,
         createWithAttachments: messagesCreateWithAttachments,
+        createIdempotentUserTurn: messagesCreateIdempotentUserTurn,
+        createIdempotentAssistantTurn: messagesCreateIdempotentAssistantTurn,
+        findByClientTurn,
+        acquireClientTurnExecutionLock,
         recentHistory,
         list: listMessages,
         listAfter: listMessagesAfter,
@@ -105,7 +149,7 @@ const mocks = vi.hoisted(() => {
         extractAndSaveFromMessage,
       },
       proactiveTasks: {
-        create: vi.fn(async () => undefined),
+        create: proactiveTaskCreate,
       },
       settings: {
         get: vi.fn(async () => ({
@@ -171,9 +215,37 @@ vi.mock("@/server/agent/tools/web-search", () => ({
 describe("chat route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.runAgent.mockReset().mockImplementation(async function* () {
+      yield "收到。";
+    });
+    mocks.getAttachmentForUser.mockReset().mockImplementation(async (_userId, attachmentId) =>
+      attachmentId === mocks.readyImage.id
+        ? mocks.readyImage
+        : attachmentId === mocks.readyDocument.id
+          ? mocks.readyDocument
+          : null,
+    );
     mocks.listAttachmentsForMessages.mockReset().mockResolvedValue([]);
     mocks.listMessages.mockReset().mockResolvedValue([]);
     mocks.listMessagesAfter.mockReset().mockResolvedValue([]);
+    mocks.messagesCreateIdempotentUserTurn.mockReset().mockImplementation(async (input) => {
+      if (input.attachmentIds.length > 0) {
+        const result = await mocks.messagesCreateWithAttachments({
+          content: input.content,
+          attachmentIds: input.attachmentIds,
+        });
+        return { ...result, created: true };
+      }
+      const message = await mocks.messagesCreate({ role: "user", content: input.content });
+      return { message, attachments: [], created: true };
+    });
+    mocks.messagesCreateIdempotentAssistantTurn.mockReset().mockImplementation(async (input) => ({
+      message: await mocks.messagesCreate({ role: "assistant", content: input.content }),
+      created: true,
+    }));
+    mocks.findByClientTurn.mockReset().mockResolvedValue(null);
+    mocks.acquireClientTurnExecutionLock.mockReset().mockImplementation(async () => vi.fn(async () => undefined));
+    mocks.proactiveTaskCreate.mockReset().mockResolvedValue(undefined);
     mocks.getLlmClient.mockReturnValue({
       client: {
         stream: async function* () {
@@ -467,7 +539,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "", attachmentIds: [mocks.readyImage.id] }),
+        body: JSON.stringify(withClientTurn({ message: "", attachmentIds: [mocks.readyImage.id] })),
       }),
     );
 
@@ -477,15 +549,20 @@ describe("chat route", () => {
       type: "accepted",
       conversationId: "conversation-1",
       userMessageId: "message-user",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
     });
     expect(events.at(-1)).toEqual({
       type: "done",
       conversationId: "conversation-1",
       assistantMessageId: "message-assistant",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      userMessageId: "message-user",
     });
-    expect(mocks.messagesCreateWithAttachments).toHaveBeenCalledWith({
+    expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledWith({
       userId: "user-1",
       conversationId: "conversation-1",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      payloadHash: expect.any(String),
       content: "",
       attachmentIds: [mocks.readyImage.id],
     });
@@ -506,7 +583,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "   ", attachmentIds: [] }),
+        body: JSON.stringify(withClientTurn({ message: "   ", attachmentIds: [] })),
       }),
     );
 
@@ -516,13 +593,364 @@ describe("chat route", () => {
     expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
   });
 
+  it("requires a client turn id for every chat request", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "缺少 turn id" }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_request" });
+    expect(mocks.messagesCreateIdempotentUserTurn).not.toHaveBeenCalled();
+  });
+
+  it("replays an existing assistant without running the agent again", async () => {
+    mocks.messagesCreateIdempotentUserTurn.mockResolvedValueOnce({
+      message: persistedMessage("user", "同一个 turn"),
+      attachments: [],
+      created: false,
+    });
+    mocks.findByClientTurn
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(persistedMessage("assistant", "已经保存的完整回复"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "同一个 turn" })),
+    }));
+    const events = parseSseEvents(await response.text());
+
+    expect(events).toEqual([
+      {
+        type: "accepted",
+        conversationId: "conversation-1",
+        userMessageId: "message-user",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      },
+      { type: "chunk", content: "已经保存的完整回复" },
+      {
+        type: "done",
+        conversationId: "conversation-1",
+        userMessageId: "message-user",
+        assistantMessageId: "message-assistant",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      },
+    ]);
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateIdempotentAssistantTurn).not.toHaveBeenCalled();
+    expect(mocks.proactiveTaskCreate).not.toHaveBeenCalled();
+  });
+
+  it("handles an accepted-event retry as two HTTP responses but one agent execution and one persisted turn", async () => {
+    let storedUser: ReturnType<typeof persistedMessage> | null = null;
+    let storedAssistant: ReturnType<typeof persistedMessage> | null = null;
+    mocks.findByClientTurn.mockImplementation(async (_userId, _clientTurnId, role) =>
+      role === "user" ? storedUser : storedAssistant,
+    );
+    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (input) => {
+      if (storedUser) return { message: storedUser, attachments: [], created: false };
+      storedUser = persistedMessage("user", input.content);
+      return { message: storedUser, attachments: [], created: true };
+    });
+    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (input) => {
+      if (storedAssistant) return { message: storedAssistant, created: false };
+      storedAssistant = persistedMessage("assistant", input.content);
+      return { message: storedAssistant, created: true };
+    });
+
+    const requestBody = JSON.stringify(withClientTurn({ message: "accepted 事件可能丢失" }));
+    const first = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    }));
+    const firstEvents = parseSseEvents(await first.text());
+    const retry = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    }));
+    const retryEvents = parseSseEvents(await retry.text());
+
+    expect(firstEvents[0]).toMatchObject({ type: "accepted", clientTurnId: DEFAULT_CLIENT_TURN_ID });
+    expect(retryEvents).toEqual([
+      {
+        type: "accepted",
+        conversationId: "conversation-1",
+        userMessageId: "message-user",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      },
+      { type: "chunk", content: "收到。" },
+      {
+        type: "done",
+        conversationId: "conversation-1",
+        userMessageId: "message-user",
+        assistantMessageId: "message-assistant",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      },
+    ]);
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledTimes(2);
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes overlapping copies of one turn so the agent and tools execute once", async () => {
+    let storedUser: ReturnType<typeof persistedMessage> | null = null;
+    let storedAssistant: ReturnType<typeof persistedMessage> | null = null;
+    let lockHeld = false;
+    const lockWaiters: Array<() => void> = [];
+    mocks.acquireClientTurnExecutionLock.mockImplementation(async () => {
+      if (lockHeld) await new Promise<void>((resolve) => lockWaiters.push(resolve));
+      lockHeld = true;
+      return vi.fn(async () => {
+        lockHeld = false;
+        lockWaiters.shift()?.();
+      });
+    });
+    mocks.findByClientTurn.mockImplementation(async (_userId, _clientTurnId, role) =>
+      role === "user" ? storedUser : storedAssistant,
+    );
+    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (input) => {
+      if (storedUser) return { message: storedUser, attachments: [], created: false };
+      storedUser = persistedMessage("user", input.content);
+      return { message: storedUser, attachments: [], created: true };
+    });
+    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (input) => {
+      if (storedAssistant) return { message: storedAssistant, created: false };
+      storedAssistant = persistedMessage("assistant", input.content);
+      return { message: storedAssistant, created: true };
+    });
+    let releaseAgent: (() => void) | undefined;
+    const agentGate = new Promise<void>((resolve) => {
+      releaseAgent = resolve;
+    });
+    mocks.runAgent.mockImplementation(async function* () {
+      await agentGate;
+      yield "唯一执行";
+    });
+
+    const requestBody = JSON.stringify(withClientTurn({ message: "重叠重试" }));
+    const first = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    }));
+    const firstText = first.text();
+    await waitForMockCalls(mocks.runAgent, 1);
+    const second = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    }));
+    const secondText = second.text();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseAgent?.();
+    await Promise.all([firstText, secondText]);
+
+    expect(mocks.acquireClientTurnExecutionLock).toHaveBeenCalledTimes(2);
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes an existing user without an assistant and excludes that turn from history", async () => {
+    mocks.messagesCreateIdempotentUserTurn.mockResolvedValueOnce({
+      message: persistedMessage("user", "恢复执行"),
+      attachments: [],
+      created: false,
+    });
+    mocks.findByClientTurn.mockResolvedValueOnce(null);
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "恢复执行" })),
+    }));
+    await response.text();
+
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.recentHistory).toHaveBeenCalledWith("conversation-1", 12, DEFAULT_CLIENT_TURN_ID);
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable conflict when one client turn is reused for another payload", async () => {
+    mocks.messagesCreateIdempotentUserTurn.mockRejectedValueOnce(new Error("client_turn_conflict"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "冲突正文" })),
+    }));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: "client_turn_conflict" });
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not disguise an unknown turn persistence failure as an attachment error", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.messagesCreateIdempotentUserTurn.mockRejectedValueOnce(new Error("password=secret db unavailable"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "数据库异常" })),
+    }));
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload).toEqual({ error: "chat_turn_create_failed" });
+    expect(JSON.stringify(payload)).not.toContain("password");
+    expect(consoleError).toHaveBeenCalledWith("chat_turn_create_failed", { code: "turn_persist_failed" });
+    consoleError.mockRestore();
+  });
+
+  it("checks an existing turn conflict before rejecting a changed missing attachment", async () => {
+    mocks.findByClientTurn.mockResolvedValueOnce(persistedMessage("user", "原始正文"));
+    mocks.messagesCreateIdempotentUserTurn.mockRejectedValueOnce(new Error("client_turn_conflict"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({
+        message: "被错误复用的新正文",
+        attachmentIds: ["30000000-0000-4000-8000-000000000099"],
+      })),
+    }));
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: "client_turn_conflict" });
+    expect(mocks.getAttachmentForUser).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the user turn when an attachment becomes bound during preflight", async () => {
+    const userMessage = { ...persistedMessage("user", "附件并发重试"), role: "user" as const };
+    mocks.findByClientTurn
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(userMessage)
+      .mockResolvedValue(null);
+    mocks.getAttachmentForUser.mockResolvedValue({
+      ...mocks.readyImage,
+      messageId: userMessage.id,
+      status: "bound",
+    });
+    mocks.messagesCreateIdempotentUserTurn.mockResolvedValueOnce({
+      message: userMessage,
+      attachments: [{ ...mocks.readyImage, messageId: userMessage.id, status: "bound" }],
+      created: false,
+    });
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({
+        message: "附件并发重试",
+        attachmentIds: [mocks.readyImage.id],
+      })),
+    }));
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(mocks.getAttachmentForUser).toHaveBeenCalledTimes(2);
+    expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not create reminder side effects when another request already won the assistant row", async () => {
+    mocks.messagesCreateIdempotentAssistantTurn.mockResolvedValueOnce({
+      message: persistedMessage("assistant", "另一请求已保存"),
+      created: false,
+    });
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "10 分钟后提醒我吃药" })),
+    }));
+    await response.text();
+
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.proactiveTaskCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not enter fallback when the reader cancels after the assistant is persisted", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let resolveAssistant: ((value: { message: ReturnType<typeof persistedMessage>; created: boolean }) => void) | undefined;
+    mocks.messagesCreateIdempotentAssistantTurn.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveAssistant = resolve;
+    }));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "取消读取" })),
+    }));
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+    resolveAssistant?.({ message: persistedMessage("assistant", "收到。"), created: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+    expect(consoleError.mock.calls.filter(([code]) => code === "chat_agent_failed")).toHaveLength(0);
+    consoleError.mockRestore();
+  });
+
+  it("does not persist a fallback when the turn execution lock cannot be acquired", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.acquireClientTurnExecutionLock.mockRejectedValueOnce(new Error("lock_backend_unavailable"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "锁失败后重试" })),
+    }));
+    const events = parseSseEvents(await response.text());
+
+    expect(events).toEqual([{ type: "error", message: "消息暂时没有受理，请重试。" }]);
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateIdempotentAssistantTurn).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
+    consoleError.mockRestore();
+  });
+
+  it("returns the existing assistant when an agent failure loses the assistant race", async () => {
+    mocks.runAgent.mockImplementationOnce(async function* () {
+      throw new Error("agent_failed");
+    });
+    mocks.messagesCreateIdempotentAssistantTurn.mockResolvedValueOnce({
+      message: persistedMessage("assistant", "并发请求保存的回复"),
+      created: false,
+    });
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "并发失败" })),
+    }));
+    const events = parseSseEvents(await response.text());
+
+    expect(events.some((event) => event.type === "replace" && event.content === "并发请求保存的回复")).toBe(true);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      assistantMessageId: "message-assistant",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      degraded: true,
+    });
+  });
+
   it("rejects unowned attachments before creating or binding a message", async () => {
     mocks.getAttachmentForUser.mockResolvedValueOnce(null);
     const response = await POST(
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看看", attachmentIds: [mocks.readyDocument.id] })),
       }),
     );
 
@@ -543,7 +971,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看看", attachmentIds: [mocks.readyDocument.id] })),
       }),
     );
     expect(failedResponse.status).toBe(400);
@@ -557,7 +985,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看看", attachmentIds: [mocks.readyDocument.id] })),
       }),
     );
     expect(boundResponse.status).toBe(400);
@@ -572,7 +1000,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看看", attachmentIds: [mocks.readyDocument.id] })),
       }),
     );
 
@@ -596,7 +1024,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyImage.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看看", attachmentIds: [mocks.readyImage.id] })),
       }),
     );
 
@@ -645,7 +1073,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "继续", attachmentIds: [mocks.readyImage.id] }),
+        body: JSON.stringify(withClientTurn({ message: "继续", attachmentIds: [mocks.readyImage.id] })),
       }),
     );
     await response.text();
@@ -695,7 +1123,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "继续一轮" }),
+        body: JSON.stringify(withClientTurn({ message: "继续一轮" }, "60000000-0000-4000-8000-000000000001")),
       }),
     );
     await first.text();
@@ -703,7 +1131,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "再继续一轮" }),
+        body: JSON.stringify(withClientTurn({ message: "再继续一轮" }, "60000000-0000-4000-8000-000000000002")),
       }),
     );
     await second.text();
@@ -760,7 +1188,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看新的", attachmentIds: [mocks.readyDocument.id] }),
+        body: JSON.stringify(withClientTurn({ message: "看新的", attachmentIds: [mocks.readyDocument.id] })),
       }),
     );
     await response.text();
@@ -794,7 +1222,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "分析这些文件", attachmentIds }),
+        body: JSON.stringify(withClientTurn({ message: "分析这些文件", attachmentIds })),
       }),
     );
 
@@ -829,7 +1257,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "继续纯文本聊天" }),
+        body: JSON.stringify(withClientTurn({ message: "继续纯文本聊天" })),
       }),
     );
     await response.text();
@@ -861,7 +1289,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "继续" }),
+        body: JSON.stringify(withClientTurn({ message: "继续" })),
       }),
     );
     await response.text();
@@ -886,7 +1314,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "你好" }),
+        body: JSON.stringify(withClientTurn({ message: "你好" })),
       }),
     );
     const body = await response.text();
@@ -897,6 +1325,7 @@ describe("chat route", () => {
       type: "accepted",
       conversationId: "conversation-1",
       userMessageId: "message-user",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
     });
     expect(events.filter((event) => event.type === "error")).toEqual([]);
     expect(events.at(-1)).toEqual({
@@ -904,6 +1333,8 @@ describe("chat route", () => {
       conversationId: "conversation-1",
       assistantMessageId: "message-assistant",
       degraded: true,
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      userMessageId: "message-user",
     });
     expect(mocks.messagesCreate).toHaveBeenCalledTimes(2);
     expect(mocks.messagesCreate).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -921,30 +1352,32 @@ describe("chat route", () => {
     mocks.runAgent.mockImplementationOnce(async function* () {
       throw new Error("secret-agent-value");
     });
-    mocks.messagesCreate
-      .mockResolvedValueOnce({
-        id: "message-user",
-        userId: "user-1",
-        conversationId: "conversation-1",
-        role: "user",
-        content: "你好",
-        createdAt: new Date("2026-07-05T10:00:00+08:00"),
-      })
-      .mockRejectedValueOnce(new Error("secret-database-value"));
+    mocks.messagesCreateIdempotentAssistantTurn.mockRejectedValueOnce(new Error("secret-database-value"));
 
     const response = await POST(
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "你好" }),
+        body: JSON.stringify(withClientTurn({ message: "你好" })),
       }),
     );
     const body = await response.text();
     const events = parseSseEvents(body);
 
     expect(events).toEqual([
-      { type: "accepted", conversationId: "conversation-1", userMessageId: "message-user" },
-      { type: "done", conversationId: "conversation-1", degraded: true },
+      {
+        type: "accepted",
+        conversationId: "conversation-1",
+        userMessageId: "message-user",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      },
+      {
+        type: "done",
+        conversationId: "conversation-1",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+        userMessageId: "message-user",
+        degraded: true,
+      },
     ]);
     expect(body).not.toContain("secret-agent-value");
     expect(body).not.toContain("secret-database-value");
@@ -958,7 +1391,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "我喜欢咖啡" }),
+        body: JSON.stringify(withClientTurn({ message: "我喜欢咖啡" })),
       }),
     );
 
@@ -970,11 +1403,14 @@ describe("chat route", () => {
       type: "accepted",
       conversationId: "conversation-1",
       userMessageId: "message-user",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
     });
     expect(events.at(-1)).toEqual({
       type: "done",
       conversationId: "conversation-1",
       assistantMessageId: "message-assistant",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+      userMessageId: "message-user",
     });
     expect(mocks.messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ role: "user", content: "我喜欢咖啡" }),
@@ -988,11 +1424,11 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+        body: JSON.stringify(withClientTurn({
           message: "看看今天的新消息",
           attachmentIds: [mocks.readyDocument.id],
           searchEnabled: true,
-        }),
+        })),
       }),
     );
 
@@ -1041,10 +1477,10 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+        body: JSON.stringify(withClientTurn({
           message: "继续聊",
           conversationId: "00000000-0000-4000-8000-000000000999",
-        }),
+        })),
       }),
     );
 
@@ -1063,6 +1499,20 @@ describe("chat route", () => {
       messages: {
         create: mocks.messagesCreate,
         recentHistory: vi.fn(async () => []),
+        findByClientTurn: vi.fn(async () => null),
+        createIdempotentUserTurn: vi.fn(async (input: { content: string }) => ({
+          message: await mocks.messagesCreate({ role: "user", content: input.content }),
+          attachments: [],
+          created: true,
+        })),
+        createIdempotentAssistantTurn: vi.fn(async (input: { content: string }) => ({
+          message: await mocks.messagesCreate({ role: "assistant", content: input.content }),
+          created: true,
+        })),
+        acquireClientTurnExecutionLock: vi.fn(async () => vi.fn(async () => undefined)),
+      },
+      messageAttachments: {
+        listForMessages: vi.fn(async () => []),
       },
       memories: {
         extractAndSaveFromMessage: mocks.extractAndSaveFromMessage,
@@ -1084,7 +1534,7 @@ describe("chat route", () => {
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "10 分钟后紧急提醒我吃药" }),
+        body: JSON.stringify(withClientTurn({ message: "10 分钟后紧急提醒我吃药" })),
       }),
     );
 
@@ -1147,4 +1597,29 @@ function parseSseEvents(body: string): Array<Record<string, unknown>> {
     .map((event) => event.split("\n").find((line) => line.startsWith("data: ")))
     .filter((line): line is string => Boolean(line))
     .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+}
+
+function withClientTurn<T extends Record<string, unknown>>(
+  body: T,
+  clientTurnId = DEFAULT_CLIENT_TURN_ID,
+): T & { clientTurnId: string } {
+  return { ...body, clientTurnId };
+}
+
+function persistedMessage(role: "user" | "assistant", content: string) {
+  return {
+    id: role === "user" ? "message-user" : "message-assistant",
+    userId: "user-1",
+    conversationId: "conversation-1",
+    role,
+    content,
+    createdAt: new Date("2026-07-14T00:00:00Z"),
+  };
+}
+
+async function waitForMockCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 50 && mock.mock.calls.length < count; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  if (mock.mock.calls.length < count) throw new Error(`mock_call_timeout:${count}`);
 }

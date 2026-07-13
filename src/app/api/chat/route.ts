@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { generateConversationTitle } from "@/server/agent/conversation-title";
@@ -25,6 +26,7 @@ const requestSchema = z
   .object({
     message: z.string().max(8000).default(""),
     attachmentIds: z.array(z.string().uuid()).max(ATTACHMENT_LIMITS.maxCount).default([]),
+    clientTurnId: z.string().uuid(),
     conversationId: z.string().uuid().optional(),
     skillIds: z.array(z.string().uuid()).max(3).optional(),
     searchEnabled: z.boolean().optional(),
@@ -55,19 +57,92 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
   const conversationId = conversation.id;
+  const clientTurnId = body.data.clientTurnId;
+  const payloadHash = hashClientTurnPayload({
+    conversationId,
+    message: body.data.message,
+    attachmentIds: body.data.attachmentIds,
+    skillIds: body.data.skillIds ?? [],
+    searchEnabled: body.data.searchEnabled === true,
+  });
+
+  const existingUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+  const encoder = new TextEncoder();
+  let userTurn: Awaited<ReturnType<typeof repositories.messages.createIdempotentUserTurn>> | undefined;
+  if (existingUserMessage) {
+    try {
+      userTurn = await repositories.messages.createIdempotentUserTurn({
+        userId: user.id,
+        conversationId,
+        clientTurnId,
+        payloadHash,
+        content: body.data.message,
+        attachmentIds: body.data.attachmentIds,
+      });
+    } catch (error) {
+      return createClientTurnErrorResponse(error);
+    }
+
+    const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+    if (existingAssistant) {
+      return createReplayResponse({
+        encoder,
+        conversationId,
+        clientTurnId,
+        userMessageId: userTurn.message.id,
+        assistantMessageId: existingAssistant.id,
+        content: existingAssistant.content,
+      });
+    }
+  }
 
   // Read history before creating the current turn so it cannot be appended
   // twice by buildMessages (once in history and once as the current user turn).
-  const historyRows = await repositories.messages.recentHistory(conversationId);
+  const historyRows = await repositories.messages.recentHistory(conversationId, 12, clientTurnId);
   const settings = await repositories.settings.get(user.id);
   const env = readEnv();
   const { client, model } = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
-  const currentAttachments = await loadBindableAttachments({
+  let currentAttachments = await loadTurnAttachments({
     repositories,
     userId: user.id,
     attachmentIds: body.data.attachmentIds,
+    existingUserMessageId: existingUserMessage?.id,
   });
+  if (!currentAttachments && !existingUserMessage) {
+    const racedUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+    if (racedUserMessage) {
+      try {
+        userTurn = await repositories.messages.createIdempotentUserTurn({
+          userId: user.id,
+          conversationId,
+          clientTurnId,
+          payloadHash,
+          content: body.data.message,
+          attachmentIds: body.data.attachmentIds,
+        });
+      } catch (error) {
+        return createClientTurnErrorResponse(error);
+      }
+      const racedAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+      if (racedAssistant) {
+        return createReplayResponse({
+          encoder,
+          conversationId,
+          clientTurnId,
+          userMessageId: userTurn.message.id,
+          assistantMessageId: racedAssistant.id,
+          content: racedAssistant.content,
+        });
+      }
+      currentAttachments = await loadTurnAttachments({
+        repositories,
+        userId: user.id,
+        attachmentIds: body.data.attachmentIds,
+        existingUserMessageId: racedUserMessage.id,
+      });
+    }
+  }
   if (!currentAttachments) {
     return NextResponse.json({ error: "attachment_not_bindable" }, { status: 400 });
   }
@@ -105,34 +180,40 @@ export async function POST(request: Request) {
   const history = attachHistoryFiles(historyRows, orderedHistoricalAttachments, attachmentContext.history);
   const currentLlmAttachments = attachmentContext.current;
 
-  let userMessage;
-  if (body.data.attachmentIds.length > 0) {
+  if (!userTurn) {
     try {
-      const created = await repositories.messages.createWithAttachments({
+      userTurn = await repositories.messages.createIdempotentUserTurn({
         userId: user.id,
         conversationId,
+        clientTurnId,
+        payloadHash,
         content: body.data.message,
         attachmentIds: body.data.attachmentIds,
       });
-      userMessage = created.message;
-    } catch {
-      return NextResponse.json({ error: "attachment_not_bindable" }, { status: 400 });
+    } catch (error) {
+      return createClientTurnErrorResponse(error);
     }
-  } else {
-    userMessage = await repositories.messages.create({
+  }
+  const userMessage = userTurn.message;
+  if (userTurn.created) {
+    await recordEventReflection(repositories, {
       userId: user.id,
+      event: "user_dissatisfaction",
+      summary: body.data.message,
+      source: { conversationId, messageId: userMessage.id },
+    }).catch(() => undefined);
+  }
+  const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+  if (existingAssistant) {
+    return createReplayResponse({
+      encoder,
       conversationId,
-      role: "user",
-      content: body.data.message,
+      clientTurnId,
+      userMessageId: userMessage.id,
+      assistantMessageId: existingAssistant.id,
+      content: existingAssistant.content,
     });
   }
-  await recordEventReflection(repositories, {
-    userId: user.id,
-    event: "user_dissatisfaction",
-    summary: body.data.message,
-    source: { conversationId, messageId: userMessage.id },
-  }).catch(() => undefined);
-  const encoder = new TextEncoder();
 
   // Explicit skill invocation (P1-11) and the /create-skill flow (P1-12):
   // skill cards arrive as structured skillIds; typed slash commands are parsed
@@ -161,12 +242,35 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       let assistantText = "";
-      controller.enqueue(encoder.encode(toSse({
+      let releaseExecutionLock: (() => Promise<void>) | undefined;
+      try {
+        releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(user.id, clientTurnId);
+      } catch {
+        console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
+        safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
+        safeClose(controller);
+        return;
+      }
+      safeEnqueue(controller, encoder, {
         type: "accepted",
         conversationId,
         userMessageId: userMessage.id,
-      })));
+        clientTurnId,
+      });
       try {
+        const assistantAfterLock = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+        if (assistantAfterLock) {
+          safeEnqueue(controller, encoder, { type: "chunk", content: assistantAfterLock.content });
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            assistantMessageId: assistantAfterLock.id,
+          });
+          safeClose(controller);
+          return;
+        }
         for await (const chunk of runAgent({
           userId: user.id,
           conversationId,
@@ -199,22 +303,27 @@ export async function POST(request: Request) {
           },
         })) {
           assistantText += chunk;
-          controller.enqueue(encoder.encode(toSse({ type: "chunk", content: chunk })));
+          safeEnqueue(controller, encoder, { type: "chunk", content: chunk });
         }
 
         if (!assistantText.trim()) {
           assistantText = "我这边刚才没顺利想出来，等一下我们再试一次。";
-          controller.enqueue(encoder.encode(toSse({ type: "chunk", content: assistantText })));
+          safeEnqueue(controller, encoder, { type: "chunk", content: assistantText });
         }
 
-        const assistantMessage = await repositories.messages.create({
+        const assistantTurn = await repositories.messages.createIdempotentAssistantTurn({
           userId: user.id,
           conversationId,
-          role: "assistant",
+          clientTurnId,
           content: assistantText,
         });
+        const assistantMessage = assistantTurn.message;
+        if (!assistantTurn.created && assistantMessage.content !== assistantText) {
+          safeEnqueue(controller, encoder, { type: "replace", content: assistantMessage.content });
+          assistantText = assistantMessage.content;
+        }
 
-        try {
+        if (assistantTurn.created) try {
           const reminder = parseReminder(body.data.message);
           if (reminder) {
             await repositories.proactiveTasks.create({
@@ -241,17 +350,19 @@ export async function POST(request: Request) {
           console.error("chat_proactive_task_failed", { code: "proactive_task_create_failed" });
         }
 
-        controller.enqueue(encoder.encode(toSse({
+        safeEnqueue(controller, encoder, {
           type: "done",
           conversationId,
+          clientTurnId,
+          userMessageId: userMessage.id,
           assistantMessageId: assistantMessage.id,
-        })));
-        controller.close();
+        });
+        safeClose(controller);
 
         // Post-turn background work on the light model: auto-title new
         // conversations and run the Hermes-style per-turn review. Neither may
         // block or fail the reply.
-        setTimeout(() => {
+        if (assistantTurn.created) setTimeout(() => {
           void runPostTurnTasks({
             repositories,
             userId: user.id,
@@ -271,12 +382,12 @@ export async function POST(request: Request) {
           code: "agent_response_failed",
           errorType: error instanceof Error ? "Error" : "NonError",
         });
-        let fallbackMessage;
+        let fallbackTurn;
         try {
-          fallbackMessage = await repositories.messages.create({
+          fallbackTurn = await repositories.messages.createIdempotentAssistantTurn({
             userId: user.id,
             conversationId,
-            role: "assistant",
+            clientTurnId,
             content,
           });
         } catch (fallbackError) {
@@ -284,18 +395,37 @@ export async function POST(request: Request) {
             code: "fallback_persist_failed",
             errorType: fallbackError instanceof Error ? "Error" : "NonError",
           });
-          controller.enqueue(encoder.encode(toSse({ type: "done", conversationId, degraded: true })));
-          controller.close();
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            degraded: true,
+          });
+          safeClose(controller);
           return;
         }
-        controller.enqueue(encoder.encode(toSse({ type: "chunk", content: suffix })));
-        controller.enqueue(encoder.encode(toSse({
+        const fallbackMessage = fallbackTurn.message;
+        if (fallbackTurn.created) {
+          safeEnqueue(controller, encoder, { type: "chunk", content: suffix });
+        } else {
+          safeEnqueue(controller, encoder, { type: "replace", content: fallbackMessage.content });
+        }
+        safeEnqueue(controller, encoder, {
           type: "done",
           conversationId,
+          clientTurnId,
+          userMessageId: userMessage.id,
           assistantMessageId: fallbackMessage.id,
           degraded: true,
-        })));
-        controller.close();
+        });
+        safeClose(controller);
+      } finally {
+        if (releaseExecutionLock) {
+          await releaseExecutionLock().catch(() => {
+            console.error("chat_turn_lock_release_failed", { code: "turn_lock_release_failed" });
+          });
+        }
       }
     },
   });
@@ -309,10 +439,11 @@ export async function POST(request: Request) {
   });
 }
 
-async function loadBindableAttachments(input: {
+async function loadTurnAttachments(input: {
   repositories: ReturnType<typeof createRepositories>;
   userId: string;
   attachmentIds: string[];
+  existingUserMessageId?: string;
 }): Promise<DbMessageAttachment[] | null> {
   if (new Set(input.attachmentIds).size !== input.attachmentIds.length) return null;
   const attachments = await Promise.all(
@@ -320,7 +451,16 @@ async function loadBindableAttachments(input: {
   );
   if (
     attachments.some(
-      (attachment) => !attachment || attachment.status !== "ready" || attachment.messageId !== null,
+      (attachment) =>
+        !attachment
+        || !(
+          (attachment.status === "ready" && attachment.messageId === null)
+          || (
+            attachment.status === "bound"
+            && Boolean(input.existingUserMessageId)
+            && attachment.messageId === input.existingUserMessageId
+          )
+        ),
     )
   ) {
     return null;
@@ -380,6 +520,92 @@ function attachHistoryFiles(
 
 function toSse(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function safeEnqueue(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  payload: unknown,
+): boolean {
+  try {
+    controller.enqueue(encoder.encode(toSse(payload)));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeClose(controller: ReadableStreamDefaultController<Uint8Array>): void {
+  try {
+    controller.close();
+  } catch {
+    // The client may have cancelled after persistence; transport closure is best-effort.
+  }
+}
+
+function createClientTurnErrorResponse(error: unknown): NextResponse {
+  const code = error instanceof Error ? error.message : "chat_turn_create_failed";
+  if (code === "client_turn_conflict") {
+    return NextResponse.json({ error: code }, { status: 409 });
+  }
+  if (code === "conversation_not_found") {
+    return NextResponse.json({ error: code }, { status: 404 });
+  }
+  if (
+    code === "attachment_not_bindable"
+    || code === "attachment_count_exceeded"
+    || code === "attachment_total_size_exceeded"
+  ) {
+    return NextResponse.json({ error: code }, { status: 400 });
+  }
+  console.error("chat_turn_create_failed", { code: "turn_persist_failed" });
+  return NextResponse.json({ error: "chat_turn_create_failed" }, { status: 500 });
+}
+
+function createReplayResponse(input: {
+  encoder: TextEncoder;
+  conversationId: string;
+  clientTurnId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  content: string;
+}): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      safeEnqueue(controller, input.encoder, {
+        type: "accepted",
+        conversationId: input.conversationId,
+        clientTurnId: input.clientTurnId,
+        userMessageId: input.userMessageId,
+      });
+      safeEnqueue(controller, input.encoder, { type: "chunk", content: input.content });
+      safeEnqueue(controller, input.encoder, {
+        type: "done",
+        conversationId: input.conversationId,
+        clientTurnId: input.clientTurnId,
+        userMessageId: input.userMessageId,
+        assistantMessageId: input.assistantMessageId,
+      });
+      safeClose(controller);
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    },
+  });
+}
+
+function hashClientTurnPayload(input: {
+  conversationId: string;
+  message: string;
+  attachmentIds: string[];
+  skillIds: string[];
+  searchEnabled: boolean;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 async function runPostTurnTasks(input: {

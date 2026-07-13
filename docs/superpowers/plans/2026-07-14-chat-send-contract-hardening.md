@@ -171,3 +171,111 @@
 git add <本计划涉及文件>
 git commit -m "fix(P0-10): 建立附件发送接受协议"
 ```
+
+### 任务 8：把 turn 幂等下沉到 PostgreSQL
+
+**文件：**
+- 修改：`src/server/db/schema.sql`
+- 修改：`src/server/db/repositories.ts`
+- 修改：`tests/unit/repositories-attachments.test.ts`
+
+- [x] **步骤 1：编写失败的真实 PostgreSQL 测试**
+
+在 embedded PostgreSQL fixture 中先执行 `client_turn_id`/payload hash 迁移，再覆盖：同一 turn 并发创建只产生一个 user；附件已经绑定后的相同 turn 重试返回原 user 与原附件；同 turn 不同 payload 抛出 `client_turn_conflict`；并发 assistant 正常/降级竞争只保留一个。
+
+- [x] **步骤 2：运行测试验证失败**
+
+运行：`npm test -- --run tests/unit/repositories-attachments.test.ts`
+预期：FAIL，仓储没有 turn API，schema 没有唯一部分索引。
+
+- [x] **步骤 3：实现迁移和事务 API**
+
+给 `messages` 增加 nullable `client_turn_id uuid` 和内部 payload hash，建立 `(user_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL` 唯一索引。新增 `createIdempotentUserTurn`、`createIdempotentAssistantTurn`、`findByClientTurn`；使用事务内 `INSERT ... ON CONFLICT ... DO NOTHING`，existing 分支核对 conversation/content/hash/附件绑定，assistant 返回 `{message, created}`。
+
+- [x] **步骤 4：运行测试验证通过**
+
+运行：`npm test -- --run tests/unit/repositories-attachments.test.ts`
+预期：PASS。
+
+### 任务 9：路由按 turn 恢复而非重复执行
+
+**文件：**
+- 修改：`src/app/api/chat/route.ts`
+- 修改：`tests/unit/chat-route.test.ts`
+
+- [x] **步骤 1：编写失败的路由测试**
+
+请求必须含 UUID `clientTurnId`；重复请求已有 assistant 时只输出 accepted、完整 chunk、done 且不调用 Agent；已有 user 无 assistant 时继续执行；history 排除当前 turn；提醒、跟进和 post-turn 只在 assistant `created=true` 时执行；controller 已关闭不进入 fallback；Agent 失败若 assistant 已被并发请求写入则回放既有内容。
+
+- [x] **步骤 2：运行测试验证失败**
+
+运行：`npm test -- --run tests/unit/chat-route.test.ts`
+预期：FAIL，当前请求没有 turn ID，重试会再次创建消息并运行 Agent。
+
+- [x] **步骤 3：实现恢复协议**
+
+规范化正文、附件、Skill、搜索和会话后生成内部 payload hash；仓储冲突返回稳定 409。SSE 的 accepted/done 都携带 `clientTurnId`；已有 assistant 直接回放。正常和 fallback 都调用 idempotent assistant insert。Agent 执行前通过独立小连接池持有 PostgreSQL turn advisory lock，等待者 try-lock 轮询且不得占用业务连接；锁内二次检查 assistant，保证重叠请求不重复执行 Agent/搜索/工具。用 `safeEnqueue`/`safeClose` 吞掉 reader cancel/closed controller，消息落库后发送失败不得转入 fallback。
+
+- [x] **步骤 4：运行测试验证通过**
+
+运行：`npm test -- --run tests/unit/chat-route.test.ts`
+预期：PASS。
+
+### 任务 10：客户端草稿持有稳定 clientTurnId
+
+**文件：**
+- 修改：`src/components/chat/chat-input.tsx`
+- 修改：`src/components/chat/chat-shell.tsx`
+- 修改：`tests/unit/chat-ui.test.tsx`
+
+- [x] **步骤 1：编写失败的草稿/重试测试**
+
+验证失败重试复用同一 UUID；正文、附件、Skill 或搜索被用户编辑后换新 UUID；API body 必须携带 ID。accepted 前失败移除该 turn 的乐观 user/assistant，只由输入框保留唯一草稿并显示失败；accepted 后清草稿。补无活动会话 accepted 后断流，以及 accepted 事件丢失后两次 HTTP 仍只有一个可见 turn 的测试。
+
+- [x] **步骤 2：运行测试验证失败**
+
+运行：`npm test -- --run tests/unit/chat-ui.test.tsx`
+预期：FAIL，ChatInput 不持有 turn ID，accepted 前失败会在消息区留下 user/错误泡。
+
+- [x] **步骤 3：实现稳定草稿 ID 与 UI 回滚**
+
+ChatInput 初始化草稿 UUID；每次用户编辑重新生成，submit false 不变，submit true 清理后生成新值。ChatShell 以 clientTurnId 生成稳定乐观 `uiId`，accepted 前 catch 删除两条乐观消息并返回 false；accepted/done/poll 用真实 ID 合并并折叠已由轮询恢复的同 ID 消息。
+
+- [x] **步骤 4：运行测试验证通过**
+
+运行：`npm test -- --run tests/unit/chat-ui.test.tsx`
+预期：PASS。
+
+### 任务 11：附件弹层选择后恢复焦点
+
+**文件：**
+- 修改：`src/components/chat/attachment-picker.tsx`
+- 修改：`tests/unit/chat-ui.test.tsx`
+
+- [x] **步骤 1：编写失败的焦点测试**
+
+模拟文件选择完成，断言 dialog 关闭、`aria-expanded=false`，焦点回到“添加附件”触发器。
+
+- [x] **步骤 2：运行测试验证失败**
+
+运行：`npm test -- --run tests/unit/chat-ui.test.tsx`
+预期：FAIL，当前 selection 关闭后焦点仍停在隐藏 file input。
+
+- [x] **步骤 3：实现选择完成焦点恢复并验证通过**
+
+`handleInputChange` 关闭弹层后聚焦触发器，再运行同一测试文件，预期 PASS。
+
+### 任务 12：完整验证与第二次提交
+
+**文件：** 上述全部文件。
+
+- [x] **步骤 1：执行验证门禁**
+
+运行：`npm test`、embedded PostgreSQL 测试、`npm run test:e2e`、`npm run typecheck`、`npm run build`、改动文件 ESLint、`git diff --check`。公开消息序列化测试继续断言没有 `clientTurnId`/payload hash。
+
+- [x] **步骤 2：提交**
+
+```bash
+git add src/server/db/schema.sql src/server/db/repositories.ts src/app/api/chat/route.ts src/components/chat/chat-input.tsx src/components/chat/chat-shell.tsx src/components/chat/attachment-picker.tsx tests docs/superpowers/plans/2026-07-14-chat-send-contract-hardening.md
+git commit -m "fix(P0-10): 建立聊天轮次数据库幂等"
+```
