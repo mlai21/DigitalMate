@@ -28,6 +28,13 @@ const mocks = vi.hoisted(() => {
     role: "user" as const,
     content: "看看附件",
     createdAt: new Date("2026-07-08T10:01:00+08:00"),
+    internalSecret: "message-private-secret",
+  };
+  const internalMessage = {
+    ...message,
+    id: "00000000-0000-4000-8000-000000000099",
+    role: "system" as const,
+    content: "internal system message",
   };
   const boundAttachment = {
     id: "00000000-0000-4000-8000-000000000004",
@@ -61,7 +68,7 @@ const mocks = vi.hoisted(() => {
       getForUser: vi.fn(async () => project),
     },
     messages: {
-      list: vi.fn(async () => [message]),
+      list: vi.fn(async () => [message, internalMessage]),
     },
     messageAttachments: {
       listForMessages: listAttachmentsForMessages,
@@ -71,6 +78,7 @@ const mocks = vi.hoisted(() => {
     conversation,
     project,
     message,
+    internalMessage,
     boundAttachment,
     listAttachmentsForMessages,
     repositories,
@@ -115,8 +123,11 @@ describe("conversations API", () => {
     const serialized = JSON.stringify(body);
 
     expect(response.status).toBe(200);
-    expect(body.messages).toEqual([expect.objectContaining({
+    expect(body.messages).toEqual([{
       id: mocks.message.id,
+      role: "user",
+      content: "看看附件",
+      createdAt: "2026-07-08T02:01:00.000Z",
       attachments: [{
         id: mocks.boundAttachment.id,
         kind: "document",
@@ -126,9 +137,21 @@ describe("conversations API", () => {
         status: "bound",
         downloadUrl: `/api/chat/attachments/${mocks.boundAttachment.id}/download`,
       }],
-    })]);
+    }]);
+    expect(Object.keys(body.messages[0]).sort()).toEqual([
+      "attachments",
+      "content",
+      "createdAt",
+      "id",
+      "role",
+    ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [mocks.message.id]);
+    expect(serialized).not.toContain("userId");
+    expect(serialized).not.toContain("conversationId");
+    expect(serialized).not.toContain("internalSecret");
+    expect(serialized).not.toContain("message-private-secret");
+    expect(serialized).not.toContain(mocks.internalMessage.id);
     expect(serialized).not.toContain("storageKey");
     expect(serialized).not.toContain("private-storage-key");
     expect(serialized).not.toContain("extractedText");
@@ -150,6 +173,37 @@ describe("conversations API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ messages: [] });
     expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("does not query messages or attachments for an unowned conversation", async () => {
+    mocks.repositories.conversations.getForUser.mockResolvedValueOnce(null as never);
+
+    const response = await listConversationMessages(
+      new Request("http://localhost/api/conversations/unowned/messages"),
+      { params: Promise.resolve({ conversationId: "unowned" }) },
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "conversation_not_found" });
+    expect(mocks.repositories.messages.list).not.toHaveBeenCalled();
+    expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when conversation attachment loading fails", async () => {
+    mocks.listAttachmentsForMessages.mockRejectedValueOnce(
+      new Error("secret-token=abc /private/attachments/hidden"),
+    );
+
+    const response = await listConversationMessages(
+      new Request(`http://localhost/api/conversations/${mocks.conversation.id}/messages`),
+      { params: Promise.resolve({ conversationId: mocks.conversation.id }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body).toEqual({ error: "messages_load_failed" });
+    expect(JSON.stringify(body)).not.toContain("secret-token");
+    expect(JSON.stringify(body)).not.toContain("/private/attachments");
   });
 
   it("creates a conversation, optionally inside a project", async () => {

@@ -193,8 +193,15 @@ describe("chat route", () => {
       role: "user" as const,
       content: "看看附件",
       createdAt: new Date("2026-07-14T00:01:00Z"),
+      internalSecret: "message-private-secret",
     };
-    mocks.listMessagesAfter.mockResolvedValueOnce([message]);
+    const internalMessage = {
+      ...message,
+      id: "20000000-0000-4000-8000-000000000098",
+      role: "system",
+      content: "internal system message",
+    };
+    mocks.listMessagesAfter.mockResolvedValueOnce([message, internalMessage] as never);
     mocks.listAttachmentsForMessages.mockResolvedValueOnce([
       {
         ...mocks.readyDocument,
@@ -233,8 +240,11 @@ describe("chat route", () => {
     const serialized = JSON.stringify(body);
 
     expect(response.status).toBe(200);
-    expect(body.messages).toEqual([expect.objectContaining({
+    expect(body.messages).toEqual([{
       id: message.id,
+      role: "user",
+      content: "看看附件",
+      createdAt: "2026-07-14T00:01:00.000Z",
       attachments: [{
         id: mocks.readyDocument.id,
         kind: "document",
@@ -244,9 +254,21 @@ describe("chat route", () => {
         status: "bound",
         downloadUrl: `/api/chat/attachments/${mocks.readyDocument.id}/download`,
       }],
-    })]);
+    }]);
+    expect(Object.keys(body.messages[0]).sort()).toEqual([
+      "attachments",
+      "content",
+      "createdAt",
+      "id",
+      "role",
+    ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    expect(serialized).not.toContain("userId");
+    expect(serialized).not.toContain("conversationId");
+    expect(serialized).not.toContain("internalSecret");
+    expect(serialized).not.toContain("message-private-secret");
+    expect(serialized).not.toContain(internalMessage.id);
     expect(serialized).not.toContain("000000000091");
     expect(serialized).not.toContain("000000000092");
     expect(serialized).not.toContain("000000000093");
@@ -272,6 +294,28 @@ describe("chat route", () => {
     expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
   });
 
+  it("returns a stable error when polling attachment loading fails", async () => {
+    mocks.listMessagesAfter.mockResolvedValueOnce([{
+      id: "20000000-0000-4000-8000-000000000097",
+      role: "user",
+      content: "附件",
+      createdAt: new Date("2026-07-14T00:03:00Z"),
+    }] as never);
+    mocks.listAttachmentsForMessages.mockRejectedValueOnce(
+      new Error("secret-token=abc /private/attachments/hidden"),
+    );
+
+    const response = await pollMessages(new Request(
+      "http://localhost/api/messages?conversationId=conversation-1&after=2026-07-14T00%3A00%3A00.000Z",
+    ));
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body).toEqual({ error: "messages_load_failed" });
+    expect(JSON.stringify(body)).not.toContain("secret-token");
+    expect(JSON.stringify(body)).not.toContain("/private/attachments");
+  });
+
   it("returns safe attachment card data in the initial chat page", async () => {
     const message = {
       id: "20000000-0000-4000-8000-000000000011",
@@ -280,6 +324,13 @@ describe("chat route", () => {
       role: "user" as const,
       content: "首屏附件",
       createdAt: new Date("2026-07-14T00:02:00Z"),
+      internalSecret: "message-private-secret",
+    };
+    const internalMessage = {
+      ...message,
+      id: "20000000-0000-4000-8000-000000000096",
+      role: "tool",
+      content: "internal tool message",
     };
     const conversation = {
       id: "conversation-1",
@@ -298,7 +349,7 @@ describe("chat route", () => {
         getOrCreateDefault: vi.fn(async () => conversation),
       },
       projects: { list: vi.fn(async () => []) },
-      messages: { list: vi.fn(async () => [message]) },
+      messages: { list: vi.fn(async () => [message, internalMessage] as never) },
       messageAttachments: {
         listForMessages: mocks.listAttachmentsForMessages.mockResolvedValueOnce([{
           ...mocks.readyDocument,
@@ -316,8 +367,11 @@ describe("chat route", () => {
     const initialMessages = (page.props as { initialMessages: Array<Record<string, unknown>> }).initialMessages;
     const serialized = JSON.stringify(initialMessages);
 
-    expect(initialMessages).toEqual([expect.objectContaining({
+    expect(initialMessages).toEqual([{
       id: message.id,
+      role: "user",
+      content: "首屏附件",
+      createdAt: "2026-07-14T00:02:00.000Z",
       attachments: [{
         id: mocks.readyDocument.id,
         kind: "document",
@@ -327,9 +381,21 @@ describe("chat route", () => {
         status: "bound",
         downloadUrl: `/api/chat/attachments/${mocks.readyDocument.id}/download`,
       }],
-    })]);
+    }]);
+    expect(Object.keys(initialMessages[0] ?? {}).sort()).toEqual([
+      "attachments",
+      "content",
+      "createdAt",
+      "id",
+      "role",
+    ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    expect(serialized).not.toContain("userId");
+    expect(serialized).not.toContain("conversationId");
+    expect(serialized).not.toContain("internalSecret");
+    expect(serialized).not.toContain("message-private-secret");
+    expect(serialized).not.toContain(internalMessage.id);
     for (const secret of [
       "storageKey",
       "private-storage-key",
@@ -340,6 +406,60 @@ describe("chat route", () => {
       "deletionClaimToken",
       "private-deletion-token",
     ]) expect(serialized).not.toContain(secret);
+  });
+
+  it("does not initialize repositories or query attachments for a signed-out chat page", async () => {
+    mocks.getCurrentUser.mockResolvedValueOnce(null as never);
+
+    const page = await Home();
+    const props = page.props as { loginRequired?: boolean; initialMessages: unknown[] };
+
+    expect(props.loginRequired).toBe(true);
+    expect(props.initialMessages).toEqual([]);
+    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("uses a safe chat-history notice when initial attachment loading fails", async () => {
+    const conversation = {
+      id: "conversation-1",
+      userId: "user-1",
+      channel: "web",
+      title: "附件会话",
+      projectId: null,
+      pinned: false,
+      updatedAt: new Date("2026-07-14T00:02:00Z"),
+      messageCount: 1,
+      lastMessageAt: new Date("2026-07-14T00:02:00Z"),
+    };
+    mocks.createRepositories.mockReturnValueOnce({
+      conversations: {
+        listWithStats: vi.fn(async () => [conversation]),
+        getOrCreateDefault: vi.fn(async () => conversation),
+      },
+      projects: { list: vi.fn(async () => []) },
+      messages: {
+        list: vi.fn(async () => [{
+          id: "20000000-0000-4000-8000-000000000095",
+          role: "user",
+          content: "附件",
+          createdAt: new Date("2026-07-14T00:02:00Z"),
+        }]),
+      },
+      messageAttachments: {
+        listForMessages: vi.fn(async () => {
+          throw new Error("secret-token=abc /private/attachments/hidden");
+        }),
+      },
+    });
+
+    const page = await Home();
+    const props = page.props as { setupNotice?: string; initialMessages: unknown[] };
+
+    expect(props.initialMessages).toEqual([]);
+    expect(props.setupNotice).toBe("聊天记录暂时加载失败，请稍后刷新。");
+    expect(JSON.stringify(props)).not.toContain("secret-token");
+    expect(JSON.stringify(props)).not.toContain("/private/attachments");
   });
 
   it("allows an attachment-only message and atomically binds it before running the agent", async () => {

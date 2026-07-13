@@ -1,7 +1,20 @@
 import type { ChatAttachment } from "@/server/attachments/types";
 import type { DbMessageAttachment } from "@/server/db/repositories";
 
-type MessageWithId = { id: string };
+type ChatMessageSource = {
+  id: string;
+  role: string;
+  content: string;
+  createdAt: Date;
+};
+
+export type PublicChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  attachments: ChatAttachment[];
+};
 
 type ListForMessages = (
   userId: string,
@@ -29,14 +42,24 @@ export function toChatAttachment(
   };
 }
 
-export async function withChatAttachments<T extends MessageWithId>(
+export async function serializeChatMessages(
   userId: string,
-  messages: T[],
+  messages: ChatMessageSource[],
   listForMessages: ListForMessages,
-): Promise<Array<T & { attachments: ChatAttachment[] }>> {
-  if (messages.length === 0) return [];
+): Promise<PublicChatMessage[]> {
+  const publicMessages: Array<Omit<PublicChatMessage, "attachments">> = [];
+  for (const message of messages) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    publicMessages.push({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      createdAt: message.createdAt.toISOString(),
+    });
+  }
+  if (publicMessages.length === 0) return [];
 
-  const messageIds = messages.map((message) => message.id);
+  const messageIds = publicMessages.map((message) => message.id);
   const allowedMessageIds = new Set(messageIds);
   const attachments = await listForMessages(userId, messageIds);
   const byMessageId = new Map<string, ChatAttachment[]>();
@@ -50,8 +73,11 @@ export async function withChatAttachments<T extends MessageWithId>(
     byMessageId.set(attachment.messageId, list);
   }
 
-  return messages.map((message) => ({
-    ...message,
+  return publicMessages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    createdAt: message.createdAt,
     attachments: byMessageId.get(message.id) ?? [],
   }));
 }

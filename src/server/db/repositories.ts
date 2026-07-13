@@ -544,7 +544,7 @@ export function createRepositories(pool: Pool = getPool()) {
         const result = await pool.query(
           `SELECT * FROM message_attachments
            WHERE user_id = $1 AND message_id = ANY($2::uuid[])
-           ORDER BY created_at ASC`,
+           ORDER BY created_at ASC, id ASC`,
           [userId, messageIds],
         );
         return result.rows.map(mapMessageAttachment);

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { withChatAttachments } from "@/server/attachments/presentation";
+import { serializeChatMessages } from "@/server/attachments/presentation";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -14,26 +14,22 @@ export async function GET(_request: Request, context: { params: Promise<{ conver
   }
 
   const { conversationId } = await context.params;
-  const repositories = createRepositories();
-  const conversation = await repositories.conversations.getForUser(user.id, conversationId);
-  if (!conversation) {
-    return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
+  try {
+    const repositories = createRepositories();
+    const conversation = await repositories.conversations.getForUser(user.id, conversationId);
+    if (!conversation) {
+      return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
+    }
+
+    const messages = await repositories.messages.list(conversationId);
+    const messagesWithAttachments = await serializeChatMessages(
+      user.id,
+      messages,
+      repositories.messageAttachments.listForMessages,
+    );
+
+    return NextResponse.json({ messages: messagesWithAttachments });
+  } catch {
+    return NextResponse.json({ error: "messages_load_failed" }, { status: 500 });
   }
-
-  const messages = await repositories.messages.list(conversationId);
-  const serializedMessages = messages.map((message) => ({
-    id: message.id,
-    role: message.role === "user" ? "user" as const : "assistant" as const,
-    content: message.content,
-    createdAt: message.createdAt.toISOString(),
-  }));
-  const messagesWithAttachments = await withChatAttachments(
-    user.id,
-    serializedMessages,
-    repositories.messageAttachments.listForMessages,
-  );
-
-  return NextResponse.json({
-    messages: messagesWithAttachments,
-  });
 }

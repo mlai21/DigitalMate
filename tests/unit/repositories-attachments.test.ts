@@ -141,6 +141,7 @@ describe("message attachments repository", () => {
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("user_id = $1");
     expect(sql).toContain("message_id = ANY($2::uuid[])");
+    expect(sql).toContain("ORDER BY created_at ASC, id ASC");
     expect(params).toEqual([USER_1, [MESSAGE_1]]);
   });
 
