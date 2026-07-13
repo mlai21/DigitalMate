@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { WorkerOptions } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -109,6 +110,22 @@ describe("attachment text extraction", () => {
     expect(parser.destroy).toHaveBeenCalledTimes(1);
   });
 
+  it("does not start another page after the cumulative budget is exactly full", async () => {
+    const parser = {
+      getInfo: vi.fn(async () => ({ total: 2 })),
+      getText: vi.fn(async ({ partial }: { partial: number[] }) => {
+        const text = partial[0] === 1 ? "abcd" : "must-not-be-read";
+        return { text, pages: [{ num: partial[0], text }] };
+      }),
+      destroy: vi.fn(async () => undefined),
+    };
+
+    await expect(
+      extractPdfWithinBudget(parser, { maxPages: 2, maxCharacters: 4 }),
+    ).resolves.toEqual({ text: "abcd", truncated: true });
+    expect(parser.getText).toHaveBeenCalledTimes(1);
+  });
+
   it("does not let destroy failure replace the primary extraction error", async () => {
     const parser = {
       getInfo: vi.fn(async () => {
@@ -151,5 +168,52 @@ describe("attachment text extraction", () => {
     await assertion;
     expect(worker.terminate).toHaveBeenCalledTimes(1);
     expect(worker.running).toBe(false);
+  });
+
+  it("starts the PDF worker with explicit memory and stack limits", async () => {
+    const worker = new FakePdfWorker();
+    let capturedOptions: WorkerOptions | undefined;
+
+    const result = extractPdfText(Buffer.from("%PDF-limited"), {
+      workerFactory: (_source, options) => {
+        capturedOptions = options;
+        queueMicrotask(() => worker.emit("message", { ok: true, result: { text: "ok", truncated: false } }));
+        return worker;
+      },
+    });
+
+    await expect(result).resolves.toBe("ok");
+    expect(capturedOptions?.resourceLimits).toMatchObject({
+      maxOldGenerationSizeMb: expect.any(Number),
+      maxYoungGenerationSizeMb: expect.any(Number),
+      stackSizeMb: expect.any(Number),
+    });
+  });
+
+  it.each([
+    ["worker OOM", (worker: FakePdfWorker) => worker.emit("error", new Error("ERR_WORKER_OUT_OF_MEMORY secret"))],
+    ["abnormal worker exit", (worker: FakePdfWorker) => worker.emit("exit", 134)],
+  ])("maps %s to a stable extraction error", async (_label, failWorker) => {
+    const worker = new FakePdfWorker();
+    const result = extractPdfText(Buffer.from("%PDF-fail"), {
+      workerFactory: () => {
+        queueMicrotask(() => failWorker(worker));
+        return worker;
+      },
+    });
+
+    await expect(result).rejects.toThrow("attachment_text_extraction_failed");
+    await expect(result).rejects.not.toThrow("secret");
+  });
+
+  it("does not expose a sensitive worker construction error", async () => {
+    const result = extractPdfText(Buffer.from("%PDF-factory"), {
+      workerFactory: () => {
+        throw new Error("sensitive worker factory details");
+      },
+    });
+
+    await expect(result).rejects.toThrow("attachment_text_extraction_failed");
+    await expect(result).rejects.not.toThrow("sensitive worker factory details");
   });
 });

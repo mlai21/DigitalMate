@@ -6,6 +6,11 @@ export const PDF_EXTRACTION_LIMITS = {
   maxCharacters: ATTACHMENT_TEXT_MAX_CHARACTERS,
   timeoutMs: 15_000,
 } as const;
+const PDF_WORKER_RESOURCE_LIMITS = {
+  maxOldGenerationSizeMb: 128,
+  maxYoungGenerationSizeMb: 16,
+  stackSizeMb: 4,
+} as const;
 
 export type ExtractedAttachmentText = {
   text: string;
@@ -92,6 +97,10 @@ export async function extractPdfWithinBudget(
       let truncated = info.total > limits.maxPages;
 
       for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber += 1) {
+        if (characterCount >= limits.maxCharacters) {
+          truncated = true;
+          break;
+        }
         const result = await parser.getText({ partial: [pageNumber], pageJoiner: "" });
         const pageText = (result.pages?.[0]?.text ?? result.text).trim();
         if (!pageText) continue;
@@ -212,8 +221,8 @@ function runPdfWorker(worker: PdfExtractionWorker, timeoutMs: number) {
         void settle({ error: stableError(message.errorCode) });
       }
     };
-    const onError = (error: Error) => {
-      void settle({ error: stableError("attachment_text_extraction_failed", error) });
+    const onError = () => {
+      void settle({ error: stableError("attachment_text_extraction_failed") });
     };
     const onExit = (code: number) => {
       if (code !== 0) {
@@ -236,16 +245,22 @@ async function extractPdfResult(
 ): Promise<ExtractedAttachmentText> {
   const workerFactory =
     options.workerFactory ?? ((source, workerOptions) => new Worker(source, workerOptions));
-  const worker = workerFactory(createPdfWorkerSource(), {
-    eval: true,
-    workerData: {
-      bytes: new Uint8Array(bytes),
-      limits: {
-        maxPages: PDF_EXTRACTION_LIMITS.maxPages,
-        maxCharacters: PDF_EXTRACTION_LIMITS.maxCharacters,
+  let worker: PdfExtractionWorker;
+  try {
+    worker = workerFactory(createPdfWorkerSource(), {
+      eval: true,
+      resourceLimits: PDF_WORKER_RESOURCE_LIMITS,
+      workerData: {
+        bytes: new Uint8Array(bytes),
+        limits: {
+          maxPages: PDF_EXTRACTION_LIMITS.maxPages,
+          maxCharacters: PDF_EXTRACTION_LIMITS.maxCharacters,
+        },
       },
-    },
-  });
+    });
+  } catch {
+    throw stableError("attachment_text_extraction_failed");
+  }
   return runPdfWorker(worker, options.timeoutMs ?? PDF_EXTRACTION_LIMITS.timeoutMs);
 }
 

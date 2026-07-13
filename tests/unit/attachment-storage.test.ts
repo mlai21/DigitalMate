@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { readEnv } from "@/server/config/env";
 import {
+  cleanupAttachmentTemporaryFile,
   createAttachmentStorageKey,
   deleteAttachment,
   readAttachment,
@@ -70,6 +71,52 @@ describe("private attachment storage", () => {
     const rejection = results.find((result) => result.status === "rejected");
     expect(rejection).toMatchObject({ status: "rejected", reason: { code: "EEXIST" } });
     expect(["first", "second"]).toContain((await readAttachment(root, storageKey)).toString());
+  });
+
+  it("publishes the final path atomically so readers never observe an empty placeholder", async () => {
+    const root = await createTemporaryRoot();
+    const storageKey = createAttachmentStorageKey();
+    const bytes = Buffer.alloc(10 * 1024 * 1024, 0x61);
+    let finished = false;
+    const observedSizes: number[] = [];
+
+    const save = saveAttachment(root, storageKey, bytes).finally(() => {
+      finished = true;
+    });
+    while (!finished) {
+      try {
+        observedSizes.push((await stat(path.join(root, storageKey))).size);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await save;
+
+    observedSizes.push((await stat(path.join(root, storageKey))).size);
+    expect(observedSizes).not.toContain(0);
+    expect(new Set(observedSizes)).toEqual(new Set([bytes.length]));
+  });
+
+  it("does not delete or alter a pre-existing target when publication returns EEXIST", async () => {
+    const root = await createTemporaryRoot();
+    const storageKey = createAttachmentStorageKey();
+    await saveAttachment(root, storageKey, Buffer.from("original"));
+
+    await expect(saveAttachment(root, storageKey, Buffer.from("replacement"))).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    await expect(readAttachment(root, storageKey)).resolves.toEqual(Buffer.from("original"));
+  });
+
+  it("does not let temporary cleanup failure replace the primary publication error", async () => {
+    const primaryError = Object.assign(new Error("target exists"), { code: "EEXIST" });
+
+    await expect(
+      cleanupAttachmentTemporaryFile("/private/temp", primaryError, async () => {
+        throw new Error("sensitive cleanup failure");
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it.each(["../../secret", "not-a-uuid", "00000000-0000-0000-0000-000000000000"])(

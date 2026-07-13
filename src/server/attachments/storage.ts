@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,6 +25,20 @@ function isMissingFile(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
+export async function cleanupAttachmentTemporaryFile(
+  temporaryPath: string,
+  primaryError: unknown,
+  removeFile: (target: string) => Promise<void> = unlink,
+) {
+  try {
+    await removeFile(temporaryPath);
+  } catch (cleanupError) {
+    if (!isMissingFile(cleanupError) && primaryError === undefined) {
+      throw cleanupError;
+    }
+  }
+}
+
 export function createAttachmentStorageKey() {
   return randomUUID();
 }
@@ -39,35 +53,35 @@ export async function saveAttachment(rootDirectory: string, storageKey: string, 
     throw stableError("attachment_invalid_storage_key");
   }
 
-  let targetReserved = false;
+  let temporaryFileCreated = false;
+  let primaryError: unknown;
   try {
-    await writeFile(temporaryPath, bytes, { flag: "wx", mode: 0o600 });
-    await chmod(temporaryPath, 0o600);
-
-    const targetHandle = await open(resolved, "wx", 0o600);
-    targetReserved = true;
-    await targetHandle.close();
-    await chmod(resolved, 0o600);
-
-    await rename(temporaryPath, resolved);
-    await chmod(resolved, 0o600);
-    targetReserved = false;
-  } catch (error) {
-    if (targetReserved) {
+    const temporaryHandle = await open(temporaryPath, "wx", 0o600);
+    temporaryFileCreated = true;
+    let writeError: unknown;
+    try {
+      await temporaryHandle.writeFile(bytes);
+      await temporaryHandle.chmod(0o600);
+      await temporaryHandle.sync();
+    } catch (error) {
+      writeError = error;
+      throw error;
+    } finally {
       try {
-        await unlink(resolved);
-      } catch (cleanupError) {
-        if (!isMissingFile(cleanupError)) {
-          throw new AggregateError([error, cleanupError], "attachment_storage_cleanup_failed");
-        }
+        await temporaryHandle.close();
+      } catch (closeError) {
+        if (writeError === undefined) throw closeError;
       }
     }
+
+    // Hard-link publication is atomic and fails with EEXIST instead of replacing an existing key.
+    await link(temporaryPath, resolved);
+  } catch (error) {
+    primaryError = error;
     throw error;
   } finally {
-    try {
-      await unlink(temporaryPath);
-    } catch (error) {
-      if (!isMissingFile(error)) throw error;
+    if (temporaryFileCreated) {
+      await cleanupAttachmentTemporaryFile(temporaryPath, primaryError);
     }
   }
 }

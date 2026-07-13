@@ -101,6 +101,16 @@ describe("attachment validation", () => {
     ).toBe("photo.png");
   });
 
+  it("removes Unicode bidirectional control characters from the visible file name", () => {
+    expect(
+      validateAttachmentFile({
+        fileName: "safe\u202Egnp.png",
+        declaredMime: "image/png",
+        bytes: pngBytes,
+      }).fileName,
+    ).toBe("safegnp.png");
+  });
+
   it.each(["x.png.exe", "x.exe.png", "x.png.pdf", "x.exe.final.png"])(
     "rejects a disguised double extension: %s",
     (fileName) => {
