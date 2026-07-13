@@ -52,18 +52,37 @@ export function ChatShell({
   const [conversations, setConversations] = useState<ConversationItem[]>(initialConversations);
   const [projects, setProjects] = useState<ProjectItem[]>(initialProjects);
   const [activeConversationId, setActiveConversationId] = useState(conversationId);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingConversationIds, setStreamingConversationIds] = useState<Set<string>>(() => new Set());
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [inputShellNode, setInputShellNode] = useState<HTMLFormElement | null>(null);
   const [composerVersion, setComposerVersion] = useState(0);
   const stageRef = useRef<HTMLElement>(null);
+  const activeConversationIdRef = useRef(conversationId);
   const inputShellRef = useCallback((node: HTMLFormElement | null) => setInputShellNode(node), []);
   const messageIds = useMemo(() => messages.map(getChatMessageUiId), [messages]);
   const chatScroll = useChatScroll({ conversationId: activeConversationId, messageIds });
   const { containerRef, endRef, unreadCount, jumpToLatest } = chatScroll;
   const latestMessageTime = useMemo(() => messages.at(-1)?.createdAt ?? new Date(0).toISOString(), [messages]);
+  const isActiveConversationStreaming = Boolean(
+    activeConversationId && streamingConversationIds.has(activeConversationId),
+  );
 
   const activeConversation = conversations.find((conversation) => conversation.id === activeConversationId);
+
+  function activateConversation(nextConversationId: string | undefined) {
+    activeConversationIdRef.current = nextConversationId;
+    setActiveConversationId(nextConversationId);
+  }
+
+  function updateActiveConversationMessages(
+    targetConversationId: string,
+    update: (current: ChatMessage[]) => ChatMessage[],
+  ) {
+    if (activeConversationIdRef.current !== targetConversationId) return;
+    setMessages((current) =>
+      activeConversationIdRef.current === targetConversationId ? update(current) : current,
+    );
+  }
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -89,14 +108,18 @@ export function ChatShell({
 
   useEffect(() => {
     if (!activeConversationId) return;
+    const pollingConversationId = activeConversationId;
     const timer = window.setInterval(async () => {
       const response = await fetch(
-        `/api/messages?conversationId=${activeConversationId}&after=${encodeURIComponent(latestMessageTime)}`,
+        `/api/messages?conversationId=${pollingConversationId}&after=${encodeURIComponent(latestMessageTime)}`,
       );
       if (!response.ok) return;
       const data = (await response.json()) as { messages?: ChatMessage[] };
       if (!data.messages?.length) return;
-      setMessages((current) => mergeMessages(current, data.messages ?? []));
+      updateActiveConversationMessages(
+        pollingConversationId,
+        (current) => mergeMessages(current, data.messages ?? []),
+      );
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [activeConversationId, latestMessageTime]);
@@ -118,7 +141,7 @@ export function ChatShell({
       setMobileSidebarOpen(false);
       return;
     }
-    setActiveConversationId(id);
+    activateConversation(id);
     setComposerVersion((version) => version + 1);
     setMobileSidebarOpen(false);
     setMessages([]);
@@ -126,7 +149,7 @@ export function ChatShell({
       const response = await fetch(`/api/conversations/${id}/messages`);
       if (!response.ok) return;
       const data = (await response.json()) as { messages?: ChatMessage[] };
-      setMessages(data.messages ?? []);
+      updateActiveConversationMessages(id, () => data.messages ?? []);
     } catch {
       // keep the empty state; polling will backfill when possible
     }
@@ -142,7 +165,7 @@ export function ChatShell({
       if (!response.ok) return;
       const data = (await response.json()) as { conversation: ConversationItem };
       setConversations((current) => [data.conversation, ...current]);
-      setActiveConversationId(data.conversation.id);
+      activateConversation(data.conversation.id);
       setMessages([]);
       setComposerVersion((version) => version + 1);
       setMobileSidebarOpen(false);
@@ -198,7 +221,7 @@ export function ChatShell({
       if (next) {
         await selectConversation(next.id);
       } else {
-        setActiveConversationId(undefined);
+        activateConversation(undefined);
         setMessages([]);
         setComposerVersion((version) => version + 1);
       }
@@ -225,7 +248,8 @@ export function ChatShell({
   }
 
   async function sendMessage(content: string, options: ChatInputSubmitOptions): Promise<boolean> {
-    let targetConversationId = activeConversationId;
+    const activeConversationIdAtSubmit = activeConversationIdRef.current;
+    let targetConversationId = activeConversationIdAtSubmit;
     if (!targetConversationId) {
       try {
         const response = await fetch("/api/conversations", {
@@ -237,11 +261,14 @@ export function ChatShell({
         const data = (await response.json()) as { conversation: ConversationItem };
         targetConversationId = data.conversation.id;
         setConversations((current) => [data.conversation, ...current]);
-        setActiveConversationId(targetConversationId);
+        if (activeConversationIdRef.current === activeConversationIdAtSubmit) {
+          activateConversation(targetConversationId);
+        }
       } catch {
         return false;
       }
     }
+    const turnConversationId = targetConversationId;
 
     const now = new Date().toISOString();
     const clientTurnId = options.clientTurnId;
@@ -253,16 +280,19 @@ export function ChatShell({
       ...(options.attachments?.length ? { attachments: options.attachments } : {}),
     };
     const draftId = `assistant-${clientTurnId}`;
-    setMessages((current) => [
+    updateActiveConversationMessages(turnConversationId, (current) => [
       ...current,
       userMessage,
       { id: draftId, role: "assistant", content: "", createdAt: now },
     ]);
-    setIsStreaming(true);
+    setStreamingConversationIds((current) => {
+      const next = new Set(current);
+      next.add(turnConversationId);
+      return next;
+    });
 
     let completed = false;
     let accepted = false;
-    let acceptedConversationId = targetConversationId;
     let assistantMessageId: string | undefined;
     try {
       const response = await fetch("/api/chat", {
@@ -270,7 +300,7 @@ export function ChatShell({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           message: content,
-          conversationId: targetConversationId,
+          conversationId: turnConversationId,
           clientTurnId,
           ...(options.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
           ...(options.skillIds?.length ? { skillIds: options.skillIds } : {}),
@@ -283,9 +313,7 @@ export function ChatShell({
       for await (const payload of readSse(response.body)) {
         if (payload.type === "accepted") {
           accepted = true;
-          acceptedConversationId = payload.conversationId;
-          setActiveConversationId(payload.conversationId);
-          setMessages((current) => reconcileOptimisticMessageId(
+          updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
             current,
             userMessage.id,
             payload.userMessageId,
@@ -296,7 +324,7 @@ export function ChatShell({
           ));
         }
         if (payload.type === "chunk") {
-          setMessages((current) =>
+          updateActiveConversationMessages(turnConversationId, (current) =>
             current.map((message) =>
               getChatMessageUiId(message) === draftId
                 ? { ...message, content: `${message.content}${payload.content}` }
@@ -305,7 +333,7 @@ export function ChatShell({
           );
         }
         if (payload.type === "replace") {
-          setMessages((current) => current.map((message) =>
+          updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
             getChatMessageUiId(message) === draftId
               ? { ...message, content: payload.content }
               : message,
@@ -314,10 +342,9 @@ export function ChatShell({
         if (payload.type === "done") {
           completed = true;
           assistantMessageId = payload.assistantMessageId;
-          setActiveConversationId(payload.conversationId);
           if (payload.assistantMessageId) {
             const persistedAssistantId = payload.assistantMessageId;
-            setMessages((current) => reconcileOptimisticMessageId(
+            updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
               current,
               draftId,
               persistedAssistantId,
@@ -329,7 +356,7 @@ export function ChatShell({
       }
       if (!accepted) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
       if (!completed || !assistantMessageId) {
-        await reconcileAcceptedTurn(acceptedConversationId, draftId);
+        await reconcileAcceptedTurn(turnConversationId, draftId);
       }
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
@@ -337,27 +364,40 @@ export function ChatShell({
       return true;
     } catch {
       if (accepted) {
-        await reconcileAcceptedTurn(acceptedConversationId, draftId);
+        await reconcileAcceptedTurn(turnConversationId, draftId);
         void refreshSidebar();
         window.setTimeout(() => void refreshSidebar(), 6_000);
         return true;
       }
-      setMessages((current) => current.filter((message) => {
+      updateActiveConversationMessages(turnConversationId, (current) => current.filter((message) => {
         const uiId = getChatMessageUiId(message);
         return uiId !== userMessage.id && uiId !== draftId;
       }));
       return false;
     } finally {
-      setIsStreaming(false);
+      setStreamingConversationIds((current) => {
+        const next = new Set(current);
+        next.delete(turnConversationId);
+        return next;
+      });
     }
 
-    async function reconcileAcceptedTurn(conversationId: string, assistantDraftId: string) {
-      setMessages((current) => current.filter((message) => getChatMessageUiId(message) !== assistantDraftId));
+    async function reconcileAcceptedTurn(
+      targetConversationId: string,
+      assistantDraftId: string,
+    ) {
+      updateActiveConversationMessages(
+        targetConversationId,
+        (current) => current.filter((message) => getChatMessageUiId(message) !== assistantDraftId),
+      );
       try {
-        const response = await fetch(`/api/conversations/${conversationId}/messages`);
+        const response = await fetch(`/api/conversations/${targetConversationId}/messages`);
         if (!response.ok) return;
         const data = (await response.json()) as { messages?: ChatMessage[] };
-        setMessages((current) => mergeMessages(current, data.messages ?? []));
+        updateActiveConversationMessages(
+          targetConversationId,
+          (current) => mergeMessages(current, data.messages ?? []),
+        );
       } catch {
         // Polling will retry reconciliation without resubmitting the accepted turn.
       }
@@ -451,7 +491,7 @@ export function ChatShell({
               attachments={message.attachments}
             />
           ))}
-          {isStreaming ? <TypingDots /> : null}
+          {isActiveConversationStreaming ? <TypingDots /> : null}
           <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
 
@@ -473,7 +513,7 @@ export function ChatShell({
         <ChatInput
           key={`composer-${composerVersion}`}
           shellRef={inputShellRef}
-          disabled={Boolean(setupNotice) || isStreaming}
+          disabled={Boolean(setupNotice) || isActiveConversationStreaming}
           onSubmit={sendMessage}
         />
       </section>

@@ -1036,6 +1036,231 @@ describe("ChatShell attachment submit", () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
     vi.useRealTimers();
   });
+
+  it("does not let late accepted and done events take over a conversation selected during streaming", async () => {
+    const firstConversation = conversationItem();
+    const secondConversation = {
+      ...conversationItem(),
+      id: "00000000-0000-4000-8000-000000000020",
+      title: "切换后的会话",
+    };
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url === `/api/conversations/${secondConversation.id}/messages`) {
+        return new Response(JSON.stringify({ messages: [{
+          id: "second-message",
+          role: "user",
+          content: "切换后的历史",
+          createdAt: "2026-07-14T10:01:00.000Z",
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        conversations: [firstConversation, secondConversation],
+        projects: [],
+        messages: [],
+      }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={firstConversation.id}
+        initialMessages={[]}
+        initialConversations={[firstConversation, secondConversation]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "旧会话请求" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/chat", expect.any(Object)));
+    fireEvent.click(screen.getByText(secondConversation.title));
+    await screen.findByText("切换后的历史");
+
+    await act(async () => {
+      const clientTurnId = "70000000-0000-4000-8000-000000000070";
+      streamController.enqueue(new TextEncoder().encode([
+        `data: ${JSON.stringify({
+          type: "accepted",
+          conversationId: firstConversation.id,
+          clientTurnId,
+          userMessageId: "first-user",
+        })}`,
+        `data: ${JSON.stringify({ type: "chunk", content: "旧会话回复" })}`,
+        `data: ${JSON.stringify({ type: "replace", content: "旧会话替换回复" })}`,
+        `data: ${JSON.stringify({
+          type: "done",
+          conversationId: firstConversation.id,
+          clientTurnId,
+          userMessageId: "first-user",
+          assistantMessageId: "first-assistant",
+        })}`,
+        "",
+      ].join("\n\n")));
+      streamController.close();
+    });
+
+    await waitFor(() => expect(document.querySelector(".sidebar-conversation-row.active .sidebar-row-label"))
+      .toHaveTextContent(secondConversation.title));
+    expect(messageTexts("切换后的历史")).toHaveLength(1);
+    expect(screen.queryByText("旧会话请求")).toBeNull();
+    expect(screen.queryByText("旧会话回复")).toBeNull();
+    expect(screen.queryByText("旧会话替换回复")).toBeNull();
+  });
+
+  it("does not merge an accepted old turn into the current conversation after a switched-away disconnect", async () => {
+    const firstConversation = conversationItem();
+    const secondConversation = {
+      ...conversationItem(),
+      id: "00000000-0000-4000-8000-000000000021",
+      title: "断流时的当前会话",
+    };
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url === `/api/conversations/${secondConversation.id}/messages`) {
+        return new Response(JSON.stringify({ messages: [{
+          id: "second-only-message",
+          role: "user",
+          content: "只属于当前会话",
+          createdAt: "2026-07-14T10:02:00.000Z",
+        }] }), { status: 200 });
+      }
+      if (url === `/api/conversations/${firstConversation.id}/messages`) {
+        return new Response(JSON.stringify({ messages: [{
+          id: "first-persisted-message",
+          role: "assistant",
+          content: "旧会话断流恢复内容",
+          createdAt: "2026-07-14T10:01:00.000Z",
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        conversations: [firstConversation, secondConversation],
+        projects: [],
+        messages: [],
+      }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={firstConversation.id}
+        initialMessages={[]}
+        initialConversations={[firstConversation, secondConversation]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "会断流的旧请求" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/chat", expect.any(Object)));
+    await act(async () => {
+      streamController.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+        type: "accepted",
+        conversationId: firstConversation.id,
+        clientTurnId: "70000000-0000-4000-8000-000000000071",
+        userMessageId: "first-user-disconnect",
+      })}\n\n`));
+    });
+    fireEvent.click(screen.getByText(secondConversation.title));
+    await screen.findByText("只属于当前会话");
+
+    await act(async () => {
+      streamController.error(new Error("disconnect_after_switch"));
+    });
+
+    await waitFor(() => expect(fetchMock)
+      .toHaveBeenCalledWith(`/api/conversations/${firstConversation.id}/messages`));
+    expect(document.querySelector(".sidebar-conversation-row.active .sidebar-row-label"))
+      .toHaveTextContent(secondConversation.title);
+    expect(messageTexts("只属于当前会话")).toHaveLength(1);
+    expect(screen.queryByText("旧会话断流恢复内容")).toBeNull();
+  });
+
+  it("does not let an old stream take over a conversation created during streaming", async () => {
+    const firstConversation = conversationItem();
+    const createdConversation = {
+      ...conversationItem(),
+      id: "00000000-0000-4000-8000-000000000022",
+      title: "流式中新建的会话",
+    };
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url === "/api/conversations" && init?.method === "POST") {
+        return new Response(JSON.stringify({ conversation: createdConversation }), { status: 201 });
+      }
+      return new Response(JSON.stringify({
+        conversations: [firstConversation, createdConversation],
+        projects: [],
+        messages: [],
+      }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={firstConversation.id}
+        initialMessages={[]}
+        initialConversations={[firstConversation]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "新建前的旧请求" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/chat", expect.any(Object)));
+    fireEvent.click(screen.getAllByRole("button", { name: "新建会话" })[0]);
+    await waitFor(() => expect(document.querySelector(".sidebar-conversation-row.active .sidebar-row-label"))
+      .toHaveTextContent(createdConversation.title));
+    expect(screen.getByRole("textbox", { name: "输入消息" })).toBeEnabled();
+
+    await act(async () => {
+      const clientTurnId = "70000000-0000-4000-8000-000000000072";
+      streamController.enqueue(new TextEncoder().encode([
+        `data: ${JSON.stringify({
+          type: "accepted",
+          conversationId: firstConversation.id,
+          clientTurnId,
+          userMessageId: "first-user-before-create",
+        })}`,
+        `data: ${JSON.stringify({ type: "chunk", content: "不应进入新会话" })}`,
+        `data: ${JSON.stringify({
+          type: "done",
+          conversationId: firstConversation.id,
+          clientTurnId,
+          userMessageId: "first-user-before-create",
+          assistantMessageId: "first-assistant-before-create",
+        })}`,
+        "",
+      ].join("\n\n")));
+      streamController.close();
+    });
+
+    await waitFor(() => expect(document.querySelector(".sidebar-conversation-row.active .sidebar-row-label"))
+      .toHaveTextContent(createdConversation.title));
+    expect(screen.queryByText("新建前的旧请求")).toBeNull();
+    expect(screen.queryByText("不应进入新会话")).toBeNull();
+  });
 });
 
 describe("MessageBubble", () => {
