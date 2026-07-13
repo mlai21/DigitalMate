@@ -226,6 +226,84 @@ describe("useChatScroll", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(cancelAnimationFrame).toHaveBeenCalledWith(oldFrameId);
   });
+
+  it("用户在滚动帧执行前离开底部时取消待执行帧", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    scrollIntoView.mockClear();
+
+    rerender(<ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />);
+    const pendingFrameId = vi.mocked(requestAnimationFrame).mock.results[0]?.value;
+    expect(pendingFrameId).toBeTypeOf("number");
+
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    flushAnimationFrames();
+
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(pendingFrameId);
+  });
+
+  it("清空未读引发内部重渲染时只执行手动平滑滚动", () => {
+    const { rerender } = render(
+      <FreshArrayChatScrollHarness conversationId="conversation-a" messageIds={["history-1"]} />,
+    );
+    const container = screen.getByTestId("scroll-container");
+    setScrollMetrics(container, { scrollHeight: 1_000, scrollTop: 0, clientHeight: 500 });
+    fireEvent.scroll(container);
+    rerender(
+      <FreshArrayChatScrollHarness
+        conversationId="conversation-a"
+        messageIds={["history-1", "new-1"]}
+      />,
+    );
+    expect(screen.getByTestId("unread-count")).toHaveTextContent("1");
+    scrollIntoView.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "到最新" }));
+    flushAnimationFrames();
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
+  });
+
+  it("没有未读时点击到最新不会跳过下一次流式跟随", () => {
+    const { rerender } = render(
+      <FreshArrayChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    scrollIntoView.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "到最新" }));
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
+
+    scrollIntoView.mockClear();
+    rerender(
+      <FreshArrayChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "end" });
+  });
+
+  it("卸载时取消尚未执行的滚动帧", () => {
+    const { rerender, unmount } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    scrollIntoView.mockClear();
+    rerender(<ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />);
+    const pendingFrameId = vi.mocked(requestAnimationFrame).mock.results[0]?.value;
+    expect(pendingFrameId).toBeTypeOf("number");
+
+    unmount();
+    flushAnimationFrames();
+
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(pendingFrameId);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
 });
 
 describe("MessageBubble", () => {
@@ -439,6 +517,29 @@ function ChatScrollHarness({
   const { containerRef, endRef, unreadCount, jumpToLatest } = useChatScroll({
     conversationId,
     messageIds,
+  });
+
+  return (
+    <div ref={containerRef} data-testid="scroll-container">
+      <span data-testid="unread-count">{unreadCount}</span>
+      <button type="button" onClick={jumpToLatest}>
+        到最新
+      </button>
+      <div ref={endRef} />
+    </div>
+  );
+}
+
+function FreshArrayChatScrollHarness({
+  conversationId,
+  messageIds,
+}: {
+  conversationId?: string;
+  messageIds: string[];
+}) {
+  const { containerRef, endRef, unreadCount, jumpToLatest } = useChatScroll({
+    conversationId,
+    messageIds: [...messageIds],
   });
 
   return (

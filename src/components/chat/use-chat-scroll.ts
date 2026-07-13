@@ -24,9 +24,17 @@ export function useChatScroll({
   const followLatestRef = useRef(true);
   const previousIdsRef = useRef<Set<string>>(new Set());
   const unreadIdsRef = useRef<Set<string>>(new Set());
+  const pendingFrameRef = useRef<number | null>(null);
+  const skipNextFollowFrameRef = useRef(false);
   const previousConversationIdRef = useRef<string | undefined>(conversationId);
   const initializedRef = useRef(false);
   const [unreadCount, setUnreadCount] = useState(0);
+
+  const cancelPendingFrame = useCallback(() => {
+    if (pendingFrameRef.current === null) return;
+    cancelAnimationFrame(pendingFrameRef.current);
+    pendingFrameRef.current = null;
+  }, []);
 
   const clearUnread = useCallback(() => {
     unreadIdsRef.current = new Set();
@@ -34,10 +42,13 @@ export function useChatScroll({
   }, []);
 
   const jumpToLatest = useCallback(() => {
+    const hadUnread = unreadIdsRef.current.size > 0;
+    cancelPendingFrame();
     followLatestRef.current = true;
+    if (hadUnread) skipNextFollowFrameRef.current = true;
     clearUnread();
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [clearUnread]);
+  }, [cancelPendingFrame, clearUnread]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -46,12 +57,16 @@ export function useChatScroll({
     const handleScroll = () => {
       const isNearBottom = isNearChatBottom(container);
       followLatestRef.current = isNearBottom;
-      if (isNearBottom) clearUnread();
+      if (isNearBottom) {
+        clearUnread();
+      } else {
+        cancelPendingFrame();
+      }
     };
 
     container.addEventListener("scroll", handleScroll);
     return () => container.removeEventListener("scroll", handleScroll);
-  }, [clearUnread]);
+  }, [cancelPendingFrame, clearUnread]);
 
   useEffect(() => {
     const conversationChanged =
@@ -62,6 +77,7 @@ export function useChatScroll({
       previousConversationIdRef.current = conversationId;
       previousIdsRef.current = new Set(messageIds);
       unreadIdsRef.current = new Set();
+      skipNextFollowFrameRef.current = false;
       followLatestRef.current = true;
       setUnreadCount(0);
       endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
@@ -71,6 +87,11 @@ export function useChatScroll({
     const newIds = messageIds.filter((id) => !previousIdsRef.current.has(id));
     previousIdsRef.current = new Set([...previousIdsRef.current, ...messageIds]);
 
+    if (skipNextFollowFrameRef.current) {
+      skipNextFollowFrameRef.current = false;
+      if (newIds.length === 0) return;
+    }
+
     if (!followLatestRef.current) {
       if (newIds.length > 0) {
         unreadIdsRef.current = collectUnreadMessageIds(unreadIdsRef.current, newIds);
@@ -79,12 +100,19 @@ export function useChatScroll({
       return;
     }
 
-    const animationFrameId = requestAnimationFrame(() => {
+    pendingFrameRef.current = requestAnimationFrame(() => {
+      pendingFrameRef.current = null;
+      if (!followLatestRef.current) return;
       endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
     });
 
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [conversationId, messageIds]);
+    return cancelPendingFrame;
+  }, [cancelPendingFrame, conversationId, messageIds]);
+
+  useEffect(() => {
+    // Keep jump suppression scoped to the render caused by clearing unread state.
+    skipNextFollowFrameRef.current = false;
+  });
 
   return { containerRef, endRef, unreadCount, jumpToLatest };
 }
