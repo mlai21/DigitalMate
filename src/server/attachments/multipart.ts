@@ -44,6 +44,9 @@ export async function parseAttachmentMultipart(request: Request): Promise<Parsed
     parser = busboy({
       headers: { "content-type": request.headers.get("content-type") ?? "" },
       limits: {
+        // Busboy 1.6 applies its own fixed multipart-header bounds. Configure
+        // only limits consumed by its multipart parser and enforce total bytes
+        // independently while streaming the request below.
         // Busboy emits `limit` when the configured size is reached, so allow
         // one sentinel byte to distinguish an exact 10 MiB file from overflow.
         fileSize: ATTACHMENT_LIMITS.maxFileBytes + 1,
@@ -52,9 +55,7 @@ export async function parseAttachmentMultipart(request: Request): Promise<Parsed
         // Busboy emits partsLimit when the count reaches the configured value,
         // so three rejects the third part while allowing exactly kind + file.
         parts: 3,
-        fieldNameSize: 32,
         fieldSize: 16,
-        headerPairs: 16,
       },
     });
   } catch {
@@ -85,7 +86,11 @@ export async function parseAttachmentMultipart(request: Request): Promise<Parsed
       return;
     }
     fileSeen = true;
-    fileName = info.filename;
+    if (typeof info.filename !== "string" || info.filename.trim().length === 0) {
+      fail("attachment_file_required");
+    } else {
+      fileName = info.filename;
+    }
     declaredMime = info.mimeType;
     stream.on("limit", () => fail("attachment_file_too_large"));
     stream.on("data", (chunk: Buffer) => {

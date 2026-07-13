@@ -88,6 +88,7 @@ type MultipartFile = {
   type: string;
   content: string | Uint8Array;
   fieldName?: string;
+  omitFileName?: boolean;
 };
 
 function encode(value: string) {
@@ -109,9 +110,10 @@ function multipartRequest(input: {
     chunks.push(encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
   };
   const pushFile = (file: MultipartFile) => {
+    const fileNameParameter = file.omitFileName ? "" : `; filename="${file.name}"`;
     chunks.push(
       encode(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${file.fieldName ?? "file"}"; filename="${file.name}"\r\nContent-Type: ${file.type}\r\n\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="${file.fieldName ?? "file"}"${fileNameParameter}\r\nContent-Type: ${file.type}\r\n\r\n`,
       ),
     );
     const bytes = typeof file.content === "string" ? encode(file.content) : file.content;
@@ -208,6 +210,43 @@ describe("chat attachment upload route", () => {
     await expect(response.json()).resolves.toEqual({ error: "attachment_file_empty" });
     expect(mocks.saveAttachment).not.toHaveBeenCalled();
     expect(mocks.createDraft).not.toHaveBeenCalled();
+  });
+
+  it("rejects a real multipart file part without a filename using a stable 400", async () => {
+    const response = await uploadAttachment(
+      multipartRequest({
+        kind: "document",
+        file: {
+          name: "unused",
+          type: "application/octet-stream",
+          content: "hello",
+          omitFileName: true,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "attachment_file_required" });
+    expect(mocks.createDraft).not.toHaveBeenCalled();
+    expect(mocks.saveAttachment).not.toHaveBeenCalled();
+  });
+
+  it("rejects a real multipart file part with a blank filename using a stable 400", async () => {
+    const response = await uploadAttachment(
+      multipartRequest({
+        kind: "document",
+        file: {
+          name: "   ",
+          type: "text/plain",
+          content: "hello",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "attachment_file_required" });
+    expect(mocks.createDraft).not.toHaveBeenCalled();
+    expect(mocks.saveAttachment).not.toHaveBeenCalled();
   });
 
   it("quickly rejects an oversized declared request without reading the body", async () => {
