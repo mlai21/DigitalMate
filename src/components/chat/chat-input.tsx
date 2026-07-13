@@ -119,7 +119,14 @@ export function ChatInput({
     const content =
       text || (selectedSkills.length > 0 ? `使用 Skill：${selectedSkills.map((skill) => skill.name).join("、")}` : "");
     const hasPendingUpload = attachments.some((attachment) => attachment.status === "uploading");
-    if ((!content && readyAttachments.length === 0) || disabled || isSubmitting || hasPendingUpload) return;
+    const hasFailedUpload = attachments.some((attachment) => attachment.status === "failed");
+    if (
+      (!content && readyAttachments.length === 0)
+      || disabled
+      || isSubmitting
+      || hasPendingUpload
+      || hasFailedUpload
+    ) return;
     const options: ChatInputSubmitOptions = {
       ...(skillIds.length > 0 ? { skillIds } : {}),
       ...(searchEnabled ? { searchEnabled: true } : {}),
@@ -296,6 +303,7 @@ export function ChatInput({
               disabled
               || isSubmitting
               || attachments.some((attachment) => attachment.status === "uploading")
+              || attachments.some((attachment) => attachment.status === "failed")
               || (!value.trim() && selectedSkills.length === 0 && !attachments.some((attachment) => attachment.status === "ready"))
             }
             aria-label="发送"

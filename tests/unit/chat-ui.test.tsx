@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatShell, mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
 import { ChatInput, filterSkillOptions } from "@/components/chat/chat-input";
@@ -692,10 +693,16 @@ describe("MessageBubble", () => {
       "href",
       "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
     );
-    expect(screen.getByRole("link", { name: /notes\.md/ })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: /cat\.png/ })).toHaveAttribute("target", "_blank");
+    expect(screen.getByRole("link", { name: /cat\.png/ })).toHaveAttribute("rel", "noopener");
+    expect(screen.getByRole("link", { name: /cat\.png/ })).not.toHaveAttribute("download");
+    const documentLink = screen.getByRole("link", { name: /notes\.md/ });
+    expect(documentLink).toHaveAttribute(
       "href",
       "/api/chat/attachments/00000000-0000-4000-8000-000000000002/download",
     );
+    expect(documentLink).toHaveAttribute("download", "notes.md");
+    expect(documentLink).not.toHaveAttribute("target");
   });
 });
 
@@ -1064,6 +1071,201 @@ describe("ChatInput attachments", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "移除 same.txt" })[0]);
 
     await waitFor(() => expect(screen.getAllByRole("button", { name: "移除 same.txt" })).toHaveLength(1));
+  });
+
+  it("recovers its mounted state after the StrictMode effect probe", async () => {
+    let resolveUpload!: (response: Response) => void;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/chat/attachments") {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <StrictMode>
+        <ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />
+      </StrictMode>,
+    );
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await act(async () => resolveUpload(uploadResponse(imageAttachment())));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes("/00000000-"))).toHaveLength(0);
+  });
+
+  it("deletes a late successful upload exactly once after the card is removed", async () => {
+    let resolveUpload!: (response: Response) => void;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/chat/attachments") {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "移除 cat.png" }));
+    await act(async () => resolveUpload(uploadResponse(imageAttachment())));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input]) => String(input) === "/api/chat/attachments/00000000-0000-4000-8000-000000000001",
+        ),
+      ).toHaveLength(1),
+    );
+  });
+
+  it("deletes a late successful upload exactly once after a real unmount", async () => {
+    let resolveUpload!: (response: Response) => void;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/chat/attachments") {
+        return new Promise<Response>((resolve) => {
+          resolveUpload = resolve;
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { unmount } = render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    unmount();
+    await act(async () => resolveUpload(uploadResponse(imageAttachment())));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input]) => String(input) === "/api/chat/attachments/00000000-0000-4000-8000-000000000001",
+        ),
+      ).toHaveLength(1),
+    );
+  });
+
+  it("blocks a text message while any attachment has failed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: "attachment_upload_failed" }), { status: 500 })),
+    );
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    fireEvent.input(textarea, { target: { value: "不要静默丢掉失败附件" } });
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: { files: [new File(["bad"], "bad.txt", { type: "text/plain" })] },
+    });
+
+    expect(await screen.findByText("请先重试或移除上传失败的附件。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    fireEvent.submit(textarea.closest("form")!);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("blocks ready attachments while another attachment has failed", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const file = (init?.body as FormData).get("file") as File;
+      if (file.name === "bad.txt") {
+        return new Response(JSON.stringify({ error: "attachment_upload_failed" }), { status: 500 });
+      }
+      return uploadResponse(documentAttachment(
+        "00000000-0000-4000-8000-000000000001",
+        "good.txt",
+        "text/plain",
+      ));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: {
+        files: [
+          new File(["good"], "good.txt", { type: "text/plain" }),
+          new File(["bad"], "bad.txt", { type: "text/plain" }),
+        ],
+      },
+    });
+
+    expect(await screen.findByText("请先重试或移除上传失败的附件。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("textbox", { name: "输入消息" }).closest("form")!);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("disables retry and remove actions when the composer becomes disabled", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const file = init?.body instanceof FormData ? init.body.get("file") as File : null;
+      if (file?.name === "bad.txt") {
+        return new Response(JSON.stringify({ error: "attachment_upload_failed" }), { status: 500 });
+      }
+      return uploadResponse(documentAttachment(
+        "00000000-0000-4000-8000-000000000001",
+        "good.txt",
+        "text/plain",
+      ));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    const { rerender } = render(<ChatInput onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: {
+        files: [
+          new File(["good"], "good.txt", { type: "text/plain" }),
+          new File(["bad"], "bad.txt", { type: "text/plain" }),
+        ],
+      },
+    });
+    await screen.findByRole("button", { name: "重试 bad.txt" });
+
+    rerender(<ChatInput disabled onSubmit={onSubmit} />);
+    const retry = screen.getByRole("button", { name: "重试 bad.txt" });
+    const removes = screen.getAllByRole("button", { name: /移除 (good|bad)\.txt/ });
+    expect(retry).toBeDisabled();
+    removes.forEach((button) => expect(button).toBeDisabled());
+    const requestCount = fetchMock.mock.calls.length;
+    fireEvent.click(retry);
+    removes.forEach((button) => fireEvent.click(button));
+
+    expect(fetchMock).toHaveBeenCalledTimes(requestCount);
+    expect(screen.getByText("good.txt")).toBeInTheDocument();
+    expect(screen.getByText("bad.txt")).toBeInTheDocument();
+  });
+
+  it("does not delete an attachment during an in-flight send", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    let resolveSubmit!: (success: boolean) => void;
+    const onSubmit = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveSubmit = resolve;
+    }));
+    render(<ChatInput onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    const remove = screen.getByRole("button", { name: "移除 cat.png" });
+    expect(remove).toBeDisabled();
+    fireEvent.click(remove);
+    expect(screen.getByText("cat.png")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveSubmit(false));
   });
 });
 

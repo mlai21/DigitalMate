@@ -890,6 +890,11 @@ input {
   color: var(--ink);
 }
 
+.attachment-card-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 .attachment-error,
 .attachment-validation-error {
   color: var(--danger);
@@ -1078,8 +1083,8 @@ input {
 }
 
 .send-button {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   border: 0;
   border-radius: 50%;
   display: grid;
@@ -1725,6 +1730,7 @@ input {
 
   .attachment-menu {
     width: min(212px, calc(100vw - 48px));
+    bottom: calc(100% + 68px);
   }
 
   .admin-shell {

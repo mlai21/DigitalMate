@@ -30,7 +30,9 @@ export function MessageBubble({ role, content, attachments = [] }: MessageBubble
                   key={attachment.id}
                   className="message-attachment-card"
                   href={downloadUrl}
-                  download={attachment.fileName}
+                  {...(attachment.kind === "image"
+                    ? { target: "_blank", rel: "noopener" }
+                    : { download: attachment.fileName })}
                 >
                   {attachment.kind === "image" ? (
                     // eslint-disable-next-line @next/next/no-img-element

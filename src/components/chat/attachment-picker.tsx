@@ -80,6 +80,7 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
   }, [attachments]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       renderedAttachmentsRef.current.forEach((attachment) => {
@@ -211,8 +212,14 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
   }
 
   function removeAttachment(attachment: UploadingAttachment) {
+    if (disabled) return;
     commit(attachmentsRef.current.filter((item) => item.localId !== attachment.localId));
     if (attachment.id) void deleteDraft(attachment.id);
+  }
+
+  function retryAttachment(attachment: UploadingAttachment) {
+    if (disabled) return;
+    void uploadAttachment(attachment);
   }
 
   function handleInputChange(event: ChangeEvent<HTMLInputElement>) {
@@ -293,7 +300,8 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
                     type="button"
                     className="attachment-card-button"
                     aria-label={`重试 ${attachment.fileName}`}
-                    onClick={() => void uploadAttachment(attachment)}
+                    disabled={disabled}
+                    onClick={() => retryAttachment(attachment)}
                   >
                     <RotateCcw size={16} />
                   </button>
@@ -302,6 +310,7 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
                   type="button"
                   className="attachment-card-button"
                   aria-label={`移除 ${attachment.fileName}`}
+                  disabled={disabled}
                   onClick={() => removeAttachment(attachment)}
                 >
                   <X size={16} />
@@ -315,6 +324,12 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
       {validationError ? (
         <div className="attachment-validation-error" role="alert">
           {validationError}
+        </div>
+      ) : null}
+
+      {attachments.some((attachment) => attachment.status === "failed") ? (
+        <div className="attachment-validation-error" role="alert">
+          请先重试或移除上传失败的附件。
         </div>
       ) : null}
 
