@@ -456,6 +456,86 @@ describe("ChatShell scroll behavior", () => {
     expect(screen.queryByRole("button", { name: /条新消息/ })).toBeNull();
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
+
+  it("切换会话后继续观察新的输入框高度并更新消息留白", async () => {
+    const observers: ResizeObserverStub[] = [];
+
+    class ResizeObserverStub {
+      readonly observed: Element[] = [];
+      disconnected = false;
+
+      constructor(private readonly callback: ResizeObserverCallback) {
+        observers.push(this);
+      }
+
+      observe(target: Element) {
+        this.observed.push(target);
+      }
+
+      unobserve() {}
+
+      disconnect() {
+        this.disconnected = true;
+      }
+
+      trigger() {
+        this.callback([], this as unknown as ResizeObserver);
+      }
+    }
+
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+    render(
+      <ChatShell
+        conversationId="conversation-a"
+        initialMessages={[]}
+        initialConversations={[
+          {
+            id: "conversation-a",
+            title: "会话 A",
+            channel: "web",
+            projectId: null,
+            pinned: false,
+            updatedAt: "2026-07-14T10:00:00.000Z",
+            messageCount: 0,
+          },
+          {
+            id: "conversation-b",
+            title: "会话 B",
+            channel: "web",
+            projectId: null,
+            pinned: false,
+            updatedAt: "2026-07-14T10:00:01.000Z",
+            messageCount: 0,
+          },
+        ]}
+      />,
+    );
+    const firstComposer = document.querySelector<HTMLFormElement>(".chat-input-shell");
+    expect(firstComposer).not.toBeNull();
+    expect(observers).toHaveLength(1);
+    expect(observers[0].observed).toEqual([firstComposer]);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "会话 B" }));
+      await Promise.resolve();
+    });
+
+    const nextComposer = document.querySelector<HTMLFormElement>(".chat-input-shell");
+    expect(nextComposer).not.toBeNull();
+    expect(nextComposer).not.toBe(firstComposer);
+    expect(observers).toHaveLength(2);
+    expect(observers[0].disconnected).toBe(true);
+    expect(observers[1].observed).toEqual([nextComposer]);
+
+    Object.defineProperty(nextComposer, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ height: 180 }),
+    });
+    observers[1].trigger();
+
+    const stage = document.querySelector<HTMLElement>(".chat-stage");
+    expect(stage?.style.getPropertyValue("--chat-input-clearance")).toBe("204px");
+  });
 });
 
 describe("MessageBubble", () => {

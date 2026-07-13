@@ -25,6 +25,15 @@ createRoot(document.getElementById("root")!).render(
           updatedAt: "2026-07-14T00:00:17.000Z",
           messageCount: initialMessages.length,
         },
+        {
+          id: "conversation-secondary",
+          title: "切换后会话",
+          channel: "web",
+          projectId: null,
+          pinned: false,
+          updatedAt: "2026-07-14T00:00:18.000Z",
+          messageCount: initialMessages.length,
+        },
       ]}
     />
   </StrictMode>,

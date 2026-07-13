@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Menu, Settings, SquarePen, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatInput } from "@/components/chat/chat-input";
 import { ChatSidebar, type ConversationItem, type ProjectItem } from "@/components/chat/chat-sidebar";
 import { MessageBubble } from "@/components/chat/message-bubble";
@@ -43,8 +43,9 @@ export function ChatShell({
   const [activeConversationId, setActiveConversationId] = useState(conversationId);
   const [isStreaming, setIsStreaming] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [inputShellNode, setInputShellNode] = useState<HTMLFormElement | null>(null);
   const stageRef = useRef<HTMLElement>(null);
-  const inputShellRef = useRef<HTMLFormElement>(null);
+  const inputShellRef = useCallback((node: HTMLFormElement | null) => setInputShellNode(node), []);
   const messageIds = useMemo(() => messages.map(getChatMessageUiId), [messages]);
   const chatScroll = useChatScroll({ conversationId: activeConversationId, messageIds });
   const { containerRef, endRef, unreadCount, jumpToLatest } = chatScroll;
@@ -54,7 +55,7 @@ export function ChatShell({
 
   useEffect(() => {
     const stage = stageRef.current;
-    const input = inputShellRef.current;
+    const input = inputShellNode;
     if (!stage || !input) return;
 
     const updateInputClearance = () => {
@@ -72,7 +73,7 @@ export function ChatShell({
       observer?.disconnect();
       window.removeEventListener("resize", updateInputClearance);
     };
-  }, []);
+  }, [inputShellNode]);
 
   useEffect(() => {
     if (!activeConversationId) return;
