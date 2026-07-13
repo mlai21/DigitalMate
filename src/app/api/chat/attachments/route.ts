@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 import { extractAttachmentText } from "@/server/attachments/extraction";
 import {
+  parseAttachmentMultipart,
+  type ParsedAttachmentUpload,
+} from "@/server/attachments/multipart";
+import {
   createAttachmentStorageKey,
   deleteAttachment,
   saveAttachment,
 } from "@/server/attachments/storage";
-import { ATTACHMENT_LIMITS, type AttachmentKind } from "@/server/attachments/types";
 import { validateAttachmentFile } from "@/server/attachments/validation";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
@@ -28,23 +31,22 @@ const UNPROCESSABLE_ATTACHMENT_ERRORS = new Set([
   "attachment_extraction_timeout",
 ]);
 
+const PAYLOAD_LIMIT_ERRORS = new Set([
+  "attachment_file_too_large",
+  "attachment_request_too_large",
+  "attachment_multipart_limit_exceeded",
+]);
+
+const BAD_REQUEST_ERRORS = new Set([
+  "invalid_request",
+  "attachment_file_required",
+  "attachment_file_empty",
+  "attachment_kind_required",
+  "attachment_invalid_file_name",
+]);
+
 function errorResponse(error: string, status: number) {
   return NextResponse.json({ error }, { status });
-}
-
-function isUploadFile(value: FormDataEntryValue | null): value is File {
-  return Boolean(
-    value &&
-      typeof value !== "string" &&
-      typeof value.name === "string" &&
-      typeof value.type === "string" &&
-      typeof value.size === "number" &&
-      typeof value.arrayBuffer === "function",
-  );
-}
-
-function isAttachmentKind(value: FormDataEntryValue | null): value is AttachmentKind {
-  return value === "image" || value === "document";
 }
 
 function publicAttachment(attachment: DbMessageAttachment) {
@@ -60,7 +62,7 @@ function publicAttachment(attachment: DbMessageAttachment) {
 
 function statusForUploadError(error: unknown) {
   const errorCode = error instanceof Error ? error.message : "";
-  if (errorCode === "attachment_file_too_large") {
+  if (PAYLOAD_LIMIT_ERRORS.has(errorCode)) {
     return { error: errorCode, status: 413 };
   }
   if (UNSUPPORTED_ATTACHMENT_ERRORS.has(errorCode)) {
@@ -69,7 +71,7 @@ function statusForUploadError(error: unknown) {
   if (UNPROCESSABLE_ATTACHMENT_ERRORS.has(errorCode)) {
     return { error: errorCode, status: 422 };
   }
-  if (errorCode === "attachment_invalid_file_name") {
+  if (BAD_REQUEST_ERRORS.has(errorCode)) {
     return { error: errorCode, status: 400 };
   }
   return { error: "attachment_upload_failed", status: 500 };
@@ -83,51 +85,31 @@ export async function POST(request: Request) {
     return errorResponse("unauthorized", 401);
   }
 
-  let form: FormData;
+  let upload: ParsedAttachmentUpload;
   try {
-    form = await request.formData();
-  } catch {
-    return errorResponse("invalid_request", 400);
+    upload = await parseAttachmentMultipart(request);
+  } catch (error) {
+    const mapped = statusForUploadError(error);
+    return errorResponse(mapped.error, mapped.status);
   }
 
-  const file = form.get("file");
-  if (!isUploadFile(file)) {
-    return errorResponse("attachment_file_required", 400);
-  }
-  const declaredKind = form.get("kind");
-  if (!isAttachmentKind(declaredKind)) {
-    return errorResponse("attachment_kind_required", 400);
-  }
-  if (file.size === 0) {
-    return errorResponse("attachment_file_empty", 400);
-  }
-  if (file.size > ATTACHMENT_LIMITS.maxFileBytes) {
-    return errorResponse("attachment_file_too_large", 413);
-  }
-
-  let storageKey: string | null = null;
-  let storageRoot: string | null = null;
-  let storageSaved = false;
   try {
-    const bytes = Buffer.from(await file.arrayBuffer());
     const validated = validateAttachmentFile({
-      fileName: file.name,
-      declaredMime: file.type,
-      bytes,
+      fileName: upload.fileName,
+      declaredMime: upload.declaredMime,
+      bytes: upload.bytes,
     });
-    if (validated.kind !== declaredKind) {
+    if (validated.kind !== upload.declaredKind) {
       throw new Error("attachment_kind_mismatch");
     }
 
     const extracted = validated.kind === "document"
-      ? await extractAttachmentText({ mimeType: validated.mimeType, bytes })
+      ? await extractAttachmentText({ mimeType: validated.mimeType, bytes: upload.bytes })
       : null;
-    storageKey = createAttachmentStorageKey();
-    storageRoot = readEnv().attachmentStorageDir;
-    await saveAttachment(storageRoot, storageKey, bytes);
-    storageSaved = true;
-
-    const attachment = await createRepositories().messageAttachments.createDraft({
+    const storageKey = createAttachmentStorageKey();
+    const storageRoot = readEnv().attachmentStorageDir;
+    const attachments = createRepositories().messageAttachments;
+    const draft = await attachments.createDraft({
       userId: user.id,
       kind: validated.kind,
       fileName: validated.fileName,
@@ -138,11 +120,20 @@ export async function POST(request: Request) {
       textTruncated: extracted?.truncated ?? false,
     });
 
-    return NextResponse.json({ attachment: publicAttachment(attachment) }, { status: 201 });
-  } catch (error) {
-    if (storageKey && storageRoot && storageSaved) {
-      await deleteAttachment(storageRoot, storageKey).catch(() => undefined);
+    try {
+      await saveAttachment(storageRoot, storageKey, upload.bytes);
+      const attachment = await attachments.markReady(user.id, draft.id);
+      if (!attachment) throw new Error("attachment_ready_transition_failed");
+      return NextResponse.json({ attachment: publicAttachment(attachment) }, { status: 201 });
+    } catch (error) {
+      await attachments.markFailed(user.id, draft.id, "attachment_upload_failed").catch(() => undefined);
+      const isExistingTarget = error instanceof Error && "code" in error && error.code === "EEXIST";
+      if (!isExistingTarget) {
+        await deleteAttachment(storageRoot, storageKey).catch(() => undefined);
+      }
+      return errorResponse("attachment_upload_failed", 500);
     }
+  } catch (error) {
     const mapped = statusForUploadError(error);
     return errorResponse(mapped.error, mapped.status);
   }

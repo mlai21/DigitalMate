@@ -299,11 +299,15 @@ expect(JSON.stringify(await response.clone().json())).not.toContain("storageKey"
 
 - [ ] **步骤 3：实现上传路由**
 
-`POST` 固定 `runtime = "nodejs"`，读取 `request.formData()` 的 `file` 与 `kind`，依次执行登录、声明类型、字节上限、真实签名、文本提取、私有保存和草稿入库。任何失败都删除已经写入的临时文件。错误码映射为稳定 HTTP 状态，不返回异常栈。
+`POST` 固定 `runtime = "nodejs"`，登录后使用 `busboy` 直接流式消费 `request.body`，不得调用会先完整解析请求的 `request.formData()`。`Content-Length` 只用于 11 MiB 快速拒绝，同时流内强制单文件 10 MiB、总请求 11 MiB、单文件/单字段/最多两有效 part；达到限制立即取消剩余请求体并返回稳定 413。随后执行声明类型、真实签名和文本提取。
+
+附件状态按 `pending → ready|failed` 发布：先创建 pending 草稿，再原子保存私有文件，最后 `markReady`；保存或 ready 转换失败时先 `markFailed` 保留可观测记录，再尽力删除磁盘文件。超过 24 小时的 pending 也必须进入清理认领。Caddy 对 `POST /api/chat/attachments` 设置 11 MB 请求体上限，作为应用层流式限制之前的外围防线。
 
 - [ ] **步骤 4：实现删除与下载路由**
 
-`DELETE` 只删除 `message_id IS NULL` 且属于当前用户的记录；先取得 storageKey，再删除记录和磁盘文件。`GET download` 通过 userId 查询附件，设置 `Content-Type`、`Content-Length` 与 RFC 5987 编码文件名，文件缺失返回 404。
+`DELETE` 只删除 `message_id IS NULL` 且属于当前用户的记录；缺失、跨用户、已绑定和已删除统一空 204。删除认领必须生成 `deletion_claim_token`，接管 ready/failed/deleting 草稿；释放和最终删除都匹配 token，旧 worker 不能改写新认领。磁盘删除或数据库删除失败均尝试按 token 释放为 failed，重复请求可用新 token 立即接管并继续幂等删除。`GET download` 通过 userId 查询附件，设置 `Content-Type`、`Content-Length` 与 RFC 5987 编码文件名，文件缺失返回 404。
+
+仓储并发测试默认通过 `embedded-postgres` 临时启动真实 PostgreSQL 16（macOS arm64/Linux、Node 22），运行后清理数据目录；`TEST_DATABASE_URL` 仍可覆盖。不得因本机没有常驻 PostgreSQL 而跳过 `FOR UPDATE SKIP LOCKED`、事务绑定和 deletion token fencing 测试。
 
 - [ ] **步骤 5：运行测试并提交**
 
@@ -583,7 +587,7 @@ git commit -m "feat(P0-10): 在聊天框上传并展示附件"
 
 - [ ] **步骤 1：编写 24 小时清理失败测试**
 
-模拟 `messageAttachments.claimExpiredDrafts(24)` 原子返回 deleting 草稿，断言服务删除对应磁盘文件后调用 `deleteDraft`；单个文件缺失不阻断其他清理；删除失败调用 `releaseDeletionClaim` 恢复为 failed 且 5 分钟内不重试；进程崩溃留下的 deleting 在 15 分钟租约后可重新认领；两个清理 worker 不会认领同一记录，bound 附件不会被认领。
+模拟 `messageAttachments.claimExpiredDrafts(24)` 原子返回带 `deletionClaimToken` 的 deleting 草稿，断言服务删除对应磁盘文件后按相同 token 调用 `deleteDraft`；单个文件缺失不阻断其他清理；删除失败按相同 token 调用 `releaseDeletionClaim` 恢复为 failed 且 5 分钟内不重试；旧 token 不能释放或删除新 worker 的认领；进程崩溃留下的 deleting 在 15 分钟租约后可重新认领；两个清理 worker 不会认领同一记录，pending 超过 24 小时可被认领，bound 附件不会被认领。另需清理私有存储目录中超过安全租约时间的 `.tmp` 原子写入残留；不得把刚写入中的临时文件删除。
 
 - [ ] **步骤 2：运行测试确认失败**
 

@@ -43,7 +43,16 @@ export function createAttachmentStorageKey() {
   return randomUUID();
 }
 
-export async function saveAttachment(rootDirectory: string, storageKey: string, bytes: Buffer) {
+export type SaveAttachmentOptions = {
+  removeTemporaryFile?: (target: string) => Promise<void>;
+};
+
+export async function saveAttachment(
+  rootDirectory: string,
+  storageKey: string,
+  bytes: Buffer,
+  options: SaveAttachmentOptions = {},
+) {
   const { root, resolved } = resolveStoragePath(rootDirectory, storageKey);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
@@ -54,6 +63,7 @@ export async function saveAttachment(rootDirectory: string, storageKey: string, 
   }
 
   let temporaryFileCreated = false;
+  let published = false;
   let primaryError: unknown;
   try {
     const temporaryHandle = await open(temporaryPath, "wx", 0o600);
@@ -76,12 +86,17 @@ export async function saveAttachment(rootDirectory: string, storageKey: string, 
 
     // Hard-link publication is atomic and fails with EEXIST instead of replacing an existing key.
     await link(temporaryPath, resolved);
+    published = true;
   } catch (error) {
     primaryError = error;
     throw error;
   } finally {
     if (temporaryFileCreated) {
-      await cleanupAttachmentTemporaryFile(temporaryPath, primaryError);
+      await cleanupAttachmentTemporaryFile(
+        temporaryPath,
+        primaryError ?? (published ? new Error("attachment_published") : undefined),
+        options.removeTemporaryFile,
+      );
     }
   }
 }

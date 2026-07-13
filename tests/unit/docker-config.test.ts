@@ -23,6 +23,13 @@ describe("docker deployment config", () => {
     expect(compose).toMatch(/expose:\s*\n\s*- "3000"/);
   });
 
+  it("caps attachment upload request bodies before proxying to the web service", async () => {
+    const caddyfile = await readFile(path.join(process.cwd(), "Caddyfile"), "utf8");
+
+    expect(caddyfile).toMatch(/@attachmentUpload[\s\S]*path \/api\/chat\/attachments/);
+    expect(caddyfile).toMatch(/request_body @attachmentUpload[\s\S]*max_size 11MB/);
+  });
+
   it("sets the app runtime timezone for local reminder scheduling", async () => {
     const compose = await readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8");
     const dockerfile = await readFile(path.join(process.cwd(), "Dockerfile"), "utf8");

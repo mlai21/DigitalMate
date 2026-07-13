@@ -107,6 +107,7 @@ export type DbMessageAttachment = {
   textTruncated: boolean;
   status: DbAttachmentStatus;
   errorCode: string | null;
+  deletionClaimToken: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -501,7 +502,7 @@ export function createRepositories(pool: Pool = getPool()) {
         const result = await pool.query(
           `INSERT INTO message_attachments
            (user_id, kind, file_name, mime_type, size_bytes, storage_key, extracted_text, text_truncated, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready')
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
            RETURNING *`,
           [
             input.userId,
@@ -515,6 +516,17 @@ export function createRepositories(pool: Pool = getPool()) {
           ],
         );
         return mapMessageAttachment(result.rows[0]);
+      },
+      async markReady(userId: string, attachmentId: string): Promise<DbMessageAttachment | null> {
+        const result = await pool.query(
+          `UPDATE message_attachments
+           SET status = 'ready', error_code = NULL, deletion_claim_token = NULL, updated_at = now()
+           WHERE user_id = $1 AND id = $2
+             AND message_id IS NULL AND status = 'pending'
+           RETURNING *`,
+          [userId, attachmentId],
+        );
+        return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
       },
       async getForUser(userId: string, attachmentId: string): Promise<DbMessageAttachment | null> {
         const result = await pool.query(
@@ -539,20 +551,26 @@ export function createRepositories(pool: Pool = getPool()) {
       ): Promise<DbMessageAttachment | null> {
         const result = await pool.query(
           `UPDATE message_attachments
-           SET status = 'deleting', updated_at = now()
+           SET status = 'deleting', deletion_claim_token = gen_random_uuid(), updated_at = now()
            WHERE user_id = $1 AND id = $2
-             AND message_id IS NULL AND status IN ('ready', 'failed')
+             AND message_id IS NULL AND status IN ('ready', 'failed', 'deleting')
            RETURNING *`,
           [userId, attachmentId],
         );
         return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
       },
-      async deleteDraft(userId: string, attachmentId: string): Promise<boolean> {
+      async deleteDraft(
+        userId: string,
+        attachmentId: string,
+        deletionClaimToken: string,
+      ): Promise<boolean> {
         const result = await pool.query(
           `DELETE FROM message_attachments
-           WHERE user_id = $1 AND id = $2 AND message_id IS NULL
+           WHERE user_id = $1 AND id = $2
+             AND message_id IS NULL AND status = 'deleting'
+             AND deletion_claim_token = $3
            RETURNING id`,
-          [userId, attachmentId],
+          [userId, attachmentId, deletionClaimToken],
         );
         return result.rows.length > 0;
       },
@@ -566,6 +584,8 @@ export function createRepositories(pool: Pool = getPool()) {
                AND (
                  (status = 'ready'
                    AND created_at < now() - ($1 * interval '1 hour'))
+                 OR (status = 'pending'
+                   AND created_at < now() - ($1 * interval '1 hour'))
                  OR (status = 'failed'
                    AND created_at < now() - ($1 * interval '1 hour')
                    AND updated_at < now() - interval '5 minutes')
@@ -577,7 +597,7 @@ export function createRepositories(pool: Pool = getPool()) {
              FOR UPDATE SKIP LOCKED
            )
            UPDATE message_attachments AS attachment
-           SET status = 'deleting', updated_at = now()
+           SET status = 'deleting', deletion_claim_token = gen_random_uuid(), updated_at = now()
            FROM candidates
            WHERE attachment.id = candidates.id
            RETURNING attachment.*`,
@@ -588,7 +608,7 @@ export function createRepositories(pool: Pool = getPool()) {
       async markFailed(userId: string, attachmentId: string, errorCode: string): Promise<void> {
         await pool.query(
           `UPDATE message_attachments
-           SET status = 'failed', error_code = $3, updated_at = now()
+           SET status = 'failed', error_code = $3, deletion_claim_token = NULL, updated_at = now()
            WHERE user_id = $1
              AND id = $2
              AND message_id IS NULL
@@ -596,14 +616,22 @@ export function createRepositories(pool: Pool = getPool()) {
           [userId, attachmentId, errorCode],
         );
       },
-      async releaseDeletionClaim(userId: string, attachmentId: string, errorCode: string): Promise<void> {
-        await pool.query(
+      async releaseDeletionClaim(
+        userId: string,
+        attachmentId: string,
+        deletionClaimToken: string,
+        errorCode: string,
+      ): Promise<boolean> {
+        const result = await pool.query(
           `UPDATE message_attachments
-           SET status = 'failed', error_code = $3, updated_at = now()
+           SET status = 'failed', error_code = $4, deletion_claim_token = NULL, updated_at = now()
            WHERE user_id = $1 AND id = $2
-             AND message_id IS NULL AND status = 'deleting'`,
-          [userId, attachmentId, errorCode],
+             AND message_id IS NULL AND status = 'deleting'
+             AND deletion_claim_token = $3
+           RETURNING id`,
+          [userId, attachmentId, deletionClaimToken, errorCode],
         );
+        return result.rows.length > 0;
       },
     },
     memories: {
@@ -1724,6 +1752,10 @@ function mapMessageAttachment(row: Record<string, unknown>): DbMessageAttachment
     textTruncated: Boolean(row.text_truncated),
     status: row.status as DbAttachmentStatus,
     errorCode: row.error_code === null || row.error_code === undefined ? null : String(row.error_code),
+    deletionClaimToken:
+      row.deletion_claim_token === null || row.deletion_claim_token === undefined
+        ? null
+        : String(row.deletion_claim_token),
     createdAt: row.created_at as Date,
     updatedAt: row.updated_at as Date,
   };

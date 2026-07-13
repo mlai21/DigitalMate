@@ -1,5 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
+import EmbeddedPostgres from "embedded-postgres";
 import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
@@ -28,6 +31,7 @@ function attachmentRow(overrides: Record<string, unknown> = {}) {
     text_truncated: false,
     status: "ready",
     error_code: null,
+    deletion_claim_token: null,
     created_at: createdAt,
     updated_at: createdAt,
     ...overrides,
@@ -61,8 +65,8 @@ function createTransactionalPool(query: ReturnType<typeof vi.fn>) {
 }
 
 describe("message attachments repository", () => {
-  it("creates a ready attachment draft and maps private metadata", async () => {
-    const query = vi.fn(async () => ({ rows: [attachmentRow()] }));
+  it("creates a pending attachment draft before private storage publication", async () => {
+    const query = vi.fn(async () => ({ rows: [attachmentRow({ status: "pending" })] }));
     const repositories = createRepositories(createPool(query));
 
     await expect(
@@ -81,11 +85,12 @@ describe("message attachments repository", () => {
       messageId: null,
       fileName: "notes.md",
       storageKey: "storage-1",
-      status: "ready",
+      status: "pending",
     });
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("INSERT INTO message_attachments");
+    expect(sql).toContain("'pending'");
     expect(params).toEqual([
       USER_1,
       "document",
@@ -96,6 +101,21 @@ describe("message attachments repository", () => {
       "hello",
       false,
     ]);
+  });
+
+  it("marks only an owned pending draft ready after storage publication", async () => {
+    const query = vi.fn(async () => ({ rows: [attachmentRow()] }));
+    const repositories = createRepositories(createPool(query));
+
+    await expect(
+      repositories.messageAttachments.markReady(USER_1, ATTACHMENT_1),
+    ).resolves.toMatchObject({ id: ATTACHMENT_1, status: "ready" });
+
+    const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
+    expect(sql).toContain("SET status = 'ready'");
+    expect(sql).toContain("message_id IS NULL AND status = 'pending'");
+    expect(sql).toContain("deletion_claim_token = NULL");
+    expect(params).toEqual([USER_1, ATTACHMENT_1]);
   });
 
   it("only reads an attachment through its owning user", async () => {
@@ -132,8 +152,11 @@ describe("message attachments repository", () => {
     expect(query).not.toHaveBeenCalled();
   });
 
-  it("atomically claims one owned ready draft for interactive deletion", async () => {
-    const query = vi.fn(async () => ({ rows: [attachmentRow({ status: "deleting" })] }));
+  it("atomically fences one owned unbound draft for interactive deletion", async () => {
+    const claimToken = "50000000-0000-4000-8000-000000000001";
+    const query = vi.fn(async () => ({
+      rows: [attachmentRow({ status: "deleting", deletion_claim_token: claimToken })],
+    }));
     const repositories = createRepositories(createPool(query));
 
     await expect(
@@ -143,28 +166,33 @@ describe("message attachments repository", () => {
       userId: USER_1,
       messageId: null,
       status: "deleting",
+      deletionClaimToken: claimToken,
     });
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("UPDATE message_attachments");
     expect(sql).toContain("SET status = 'deleting'");
+    expect(sql).toContain("deletion_claim_token = gen_random_uuid()");
     expect(sql).toContain("user_id = $1 AND id = $2");
-    expect(sql).toContain("message_id IS NULL AND status IN ('ready', 'failed')");
+    expect(sql).toContain("message_id IS NULL AND status IN ('ready', 'failed', 'deleting')");
     expect(sql).toContain("RETURNING *");
     expect(params).toEqual([USER_1, ATTACHMENT_1]);
   });
 
-  it("deletes and marks failed only unbound drafts owned by the user", async () => {
+  it("deletes only the matching fenced claim and marks upload drafts failed", async () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));
+    const claimToken = "50000000-0000-4000-8000-000000000001";
 
-    await repositories.messageAttachments.deleteDraft(USER_1, ATTACHMENT_1);
+    await repositories.messageAttachments.deleteDraft(USER_1, ATTACHMENT_1, claimToken);
     await repositories.messageAttachments.markFailed(USER_1, ATTACHMENT_2, "attachment_parse_failed");
 
     const [deleteSql, deleteParams] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(deleteSql).toContain("DELETE FROM message_attachments");
-    expect(deleteSql).toContain("user_id = $1 AND id = $2 AND message_id IS NULL");
-    expect(deleteParams).toEqual([USER_1, ATTACHMENT_1]);
+    expect(deleteSql).toContain("user_id = $1 AND id = $2");
+    expect(deleteSql).toContain("status = 'deleting'");
+    expect(deleteSql).toContain("deletion_claim_token = $3");
+    expect(deleteParams).toEqual([USER_1, ATTACHMENT_1, claimToken]);
 
     const [failedSql, failedParams] = query.mock.calls[1] as unknown as [string, unknown[]];
     expect(failedSql).toContain("status = 'failed'");
@@ -185,6 +213,7 @@ describe("message attachments repository", () => {
     expect(sql).toContain("WITH candidates AS");
     expect(sql).toContain("message_id IS NULL");
     expect(sql).toContain("status = 'ready'");
+    expect(sql).toContain("status = 'pending'");
     expect(sql).toContain("status = 'failed'");
     expect(sql).toContain("status = 'deleting'");
     expect(sql).toContain("created_at < now() - ($1 * interval '1 hour')");
@@ -193,6 +222,7 @@ describe("message attachments repository", () => {
     expect(sql).toContain("ORDER BY updated_at ASC, id ASC");
     expect(sql).toContain("FOR UPDATE SKIP LOCKED");
     expect(sql).toContain("SET status = 'deleting'");
+    expect(sql).toContain("deletion_claim_token = gen_random_uuid()");
     expect(sql).toContain("RETURNING attachment.*");
     expect(sql).toContain("LIMIT $2");
     expect(params).toEqual([24, 100]);
@@ -208,17 +238,25 @@ describe("message attachments repository", () => {
     expect(params).toEqual([24, 100]);
   });
 
-  it("releases a deletion claim back to failed only for its owning unbound draft", async () => {
+  it("releases only the matching deletion claim back to failed", async () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));
+    const claimToken = "50000000-0000-4000-8000-000000000001";
 
-    await repositories.messageAttachments.releaseDeletionClaim(USER_1, ATTACHMENT_1, "attachment_cleanup_failed");
+    await repositories.messageAttachments.releaseDeletionClaim(
+      USER_1,
+      ATTACHMENT_1,
+      claimToken,
+      "attachment_cleanup_failed",
+    );
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("SET status = 'failed'");
     expect(sql).toContain("user_id = $1 AND id = $2");
     expect(sql).toContain("message_id IS NULL AND status = 'deleting'");
-    expect(params).toEqual([USER_1, ATTACHMENT_1, "attachment_cleanup_failed"]);
+    expect(sql).toContain("deletion_claim_token = $3");
+    expect(sql).toContain("deletion_claim_token = NULL");
+    expect(params).toEqual([USER_1, ATTACHMENT_1, claimToken, "attachment_cleanup_failed"]);
   });
 
   it.each([
@@ -411,8 +449,6 @@ describe("messages.createWithAttachments", () => {
   });
 });
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-
 async function readAttachmentStatusMigration(): Promise<string> {
   const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
   const migration = schema.match(
@@ -422,10 +458,40 @@ async function readAttachmentStatusMigration(): Promise<string> {
   return migration;
 }
 
-describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency", () => {
+async function readAttachmentClaimTokenMigration(): Promise<string> {
+  const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+  const migration = schema.match(
+    /ALTER TABLE IF EXISTS message_attachments\s+ADD COLUMN IF NOT EXISTS deletion_claim_token uuid;/,
+  )?.[0];
+  if (!migration) throw new Error("message_attachment_claim_token_migration_missing");
+  return migration;
+}
+
+async function reservePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("postgres_test_port_unavailable"));
+        return;
+      }
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(address.port);
+      });
+    });
+  });
+}
+
+describe("message attachment PostgreSQL concurrency", () => {
   const schemaName = `attachment_repository_${process.pid}_${Date.now()}`;
   let adminPool: Pool;
   let databasePool: Pool;
+  let embeddedPostgres: EmbeddedPostgres | null = null;
+  let embeddedDatabaseDirectory: string | null = null;
   let legacyConstraintDefinition: string;
   let migratedConstraintOid: number;
 
@@ -443,10 +509,28 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
   }
 
   beforeAll(async () => {
-    adminPool = new Pool({ connectionString: TEST_DATABASE_URL });
+    let databaseUrl = process.env.TEST_DATABASE_URL;
+    if (!databaseUrl) {
+      const port = await reservePort();
+      embeddedDatabaseDirectory = await mkdtemp(path.join(os.tmpdir(), "digitalmate-postgres-"));
+      embeddedPostgres = new EmbeddedPostgres({
+        databaseDir: embeddedDatabaseDirectory,
+        port,
+        user: "postgres",
+        password: "digitalmate-test",
+        persistent: false,
+        onLog: () => undefined,
+        onError: () => undefined,
+      });
+      await embeddedPostgres.initialise();
+      await embeddedPostgres.start();
+      databaseUrl = `postgresql://postgres:digitalmate-test@127.0.0.1:${port}/postgres`;
+    }
+
+    adminPool = new Pool({ connectionString: databaseUrl });
     await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
     databasePool = new Pool({
-      connectionString: TEST_DATABASE_URL,
+      connectionString: databaseUrl,
       options: `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`,
     });
     await databasePool.query(`
@@ -490,15 +574,20 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
       );
     `);
     legacyConstraintDefinition = (await readStatusConstraint()).definition;
+    await databasePool.query(await readAttachmentClaimTokenMigration());
     await databasePool.query(await readAttachmentStatusMigration());
     migratedConstraintOid = (await readStatusConstraint()).oid;
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await databasePool?.end();
     if (adminPool) {
       await adminPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
       await adminPool.end();
+    }
+    await embeddedPostgres?.stop();
+    if (embeddedDatabaseDirectory) {
+      await rm(embeddedDatabaseDirectory, { recursive: true, force: true });
     }
   });
 
@@ -531,10 +620,62 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
     expect(migrated.oid).toBe(migratedConstraintOid);
 
     await databasePool.query(await readAttachmentStatusMigration());
+    await databasePool.query(await readAttachmentClaimTokenMigration());
 
     const rerun = await readStatusConstraint();
     expect(rerun.definition).toContain("deleting");
     expect(rerun.oid).toBe(migratedConstraintOid);
+    const tokenColumn = await databasePool.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = current_schema()
+         AND table_name = 'message_attachments'
+         AND column_name = 'deletion_claim_token'`,
+    );
+    expect(tokenColumn.rows).toHaveLength(1);
+  });
+
+  it("prevents an old deletion token from releasing or deleting a newer claim", async () => {
+    const userId = "40000000-0000-4000-8000-000000000007";
+    const conversationId = "41000000-0000-4000-8000-000000000007";
+    const attachmentId = "42000000-0000-4000-8000-000000000060";
+    await seedConversation(userId, conversationId);
+    await seedAttachment({ id: attachmentId, userId, storageKey: "pg-token-fence" });
+    const repositories = createRepositories(databasePool);
+
+    const firstClaim = await repositories.messageAttachments.claimDraftForDeletion(userId, attachmentId);
+    const secondClaim = await repositories.messageAttachments.claimDraftForDeletion(userId, attachmentId);
+    expect(firstClaim?.deletionClaimToken).toBeTruthy();
+    expect(secondClaim?.deletionClaimToken).toBeTruthy();
+    expect(secondClaim?.deletionClaimToken).not.toBe(firstClaim?.deletionClaimToken);
+
+    await expect(
+      repositories.messageAttachments.releaseDeletionClaim(
+        userId,
+        attachmentId,
+        firstClaim!.deletionClaimToken!,
+        "old_worker",
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      repositories.messageAttachments.deleteDraft(
+        userId,
+        attachmentId,
+        firstClaim!.deletionClaimToken!,
+      ),
+    ).resolves.toBe(false);
+
+    const stored = await repositories.messageAttachments.getForUser(userId, attachmentId);
+    expect(stored).toMatchObject({
+      status: "deleting",
+      deletionClaimToken: secondClaim!.deletionClaimToken,
+    });
+    await expect(
+      repositories.messageAttachments.deleteDraft(
+        userId,
+        attachmentId,
+        secondClaim!.deletionClaimToken!,
+      ),
+    ).resolves.toBe(true);
   });
 
   it("allows only one message transaction to bind the same ready attachment", async () => {
@@ -663,6 +804,9 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
     expect(second).toHaveLength(2);
     const claimedIds = [...first, ...second].map((attachment) => attachment.id);
     expect(new Set(claimedIds)).toEqual(new Set(attachmentIds));
+    const claimTokens = [...first, ...second].map((attachment) => attachment.deletionClaimToken);
+    expect(claimTokens.every(Boolean)).toBe(true);
+    expect(new Set(claimTokens).size).toBe(4);
   });
 
   it("reclaims an abandoned deleting lease after fifteen minutes", async () => {

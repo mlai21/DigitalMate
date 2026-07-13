@@ -119,6 +119,23 @@ describe("private attachment storage", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("treats a published final file as saved when temporary unlink fails", async () => {
+    const root = await createTemporaryRoot();
+    const storageKey = createAttachmentStorageKey();
+    const bytes = Buffer.from("published attachment");
+
+    await expect(
+      saveAttachment(root, storageKey, bytes, {
+        removeTemporaryFile: async () => {
+          throw new Error("temporary cleanup unavailable");
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(readAttachment(root, storageKey)).resolves.toEqual(bytes);
+    expect((await readdir(root)).some((entry) => entry.endsWith(".tmp"))).toBe(true);
+  });
+
   it.each(["../../secret", "not-a-uuid", "00000000-0000-0000-0000-000000000000"])(
     "rejects a non-generated storage key: %s",
     async (storageKey) => {

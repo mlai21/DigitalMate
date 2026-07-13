@@ -42,22 +42,43 @@ export async function DELETE(
   if (!attachment) {
     return deletedResponse();
   }
+  if (!attachment.deletionClaimToken) {
+    return errorResponse("attachment_delete_failed", 500);
+  }
+  const deletionClaimToken = attachment.deletionClaimToken;
+
+  const releaseClaim = async () => {
+    try {
+      return await attachments.releaseDeletionClaim(
+        user.id,
+        attachment.id,
+        deletionClaimToken,
+        "attachment_delete_failed",
+      );
+    } catch {
+      return false;
+    }
+  };
 
   try {
     await deleteAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
   } catch {
-    await attachments
-      .releaseDeletionClaim(user.id, attachment.id, "attachment_delete_failed")
-      .catch(() => undefined);
+    await releaseClaim();
     return errorResponse("attachment_delete_failed", 500);
   }
 
   try {
-    const deleted = await attachments.deleteDraft(user.id, attachment.id);
+    const deleted = await attachments.deleteDraft(
+      user.id,
+      attachment.id,
+      deletionClaimToken,
+    );
     if (!deleted) {
+      await releaseClaim();
       return errorResponse("attachment_delete_failed", 500);
     }
   } catch {
+    await releaseClaim();
     return errorResponse("attachment_delete_failed", 500);
   }
 

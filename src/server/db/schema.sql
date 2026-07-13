@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS message_attachments (
   text_truncated boolean NOT NULL DEFAULT false,
   status text NOT NULL,
   error_code text,
+  deletion_claim_token uuid,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT message_attachments_status_check
@@ -63,6 +64,9 @@ CREATE TABLE IF NOT EXISTS message_attachments (
     OR (status <> 'bound' AND message_id IS NULL)
   )
 );
+
+ALTER TABLE IF EXISTS message_attachments
+  ADD COLUMN IF NOT EXISTS deletion_claim_token uuid;
 
 DO $message_attachments_status$
 DECLARE
