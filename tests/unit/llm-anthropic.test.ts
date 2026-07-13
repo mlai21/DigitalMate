@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readEnv } from "@/server/config/env";
 import { AnthropicClient } from "@/server/llm/anthropic";
 import type { LlmStreamEvent } from "@/server/llm/types";
+import { runAgent } from "@/server/agent/run-agent";
 
 describe("AnthropicClient", () => {
   afterEach(() => {
@@ -192,6 +193,48 @@ describe("AnthropicClient", () => {
     await expect(collect(client.stream({ model: "claude-opus-4-8", messages: [{ role: "user", content: "Hi" }] }))).rejects.toThrow(
       "Claude request failed",
     );
+  });
+
+  it("merges attachment correction into the single Anthropic system payload", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response([
+        'data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_bad","name":"web_search"}}',
+        'data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}',
+        'data: {"type":"content_block_stop"}',
+        "",
+      ].join("\n"), { headers: { "content-type": "text/event-stream" } }))
+      .mockResolvedValueOnce(new Response(
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"直接看附件内容。"}}\n',
+        { headers: { "content-type": "text/event-stream" } },
+      ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "看附件",
+      attachments: [{
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        text: "正文",
+        truncated: false,
+      }],
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm: new AnthropicClient(env()),
+      model: "claude-opus-4-8",
+      repositories: {
+        memories: { findRelevant: async () => [] },
+        toolLogs: { create: vi.fn() },
+      },
+      search: { run: vi.fn() },
+    })) void chunk;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondPayload = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(secondPayload.system).toContain("请直接针对用户提供的内容给出自然语言答复");
+    expect(secondPayload.messages.every((message: { role: string }) => message.role !== "system")).toBe(true);
   });
 });
 

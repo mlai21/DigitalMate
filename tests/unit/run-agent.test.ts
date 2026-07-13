@@ -3,6 +3,7 @@ import { buildMessages, runAgent } from "@/server/agent/run-agent";
 import { loadLlmAttachments } from "@/server/attachments/context";
 import type { DbMessageAttachment } from "@/server/db/repositories";
 import type { LlmAttachment, LlmClient, LlmStreamEvent, LlmStreamInput } from "@/server/llm/types";
+import { estimateMessagesTokenUsage, estimateTokenCount } from "@/server/llm/usage";
 
 type ScriptedTurn = LlmStreamEvent[];
 
@@ -178,6 +179,24 @@ describe("runAgent", () => {
     expect(messages.at(-1)).toEqual({ role: "user", content: "继续看", attachments: [currentAttachment] });
   });
 
+  it("keeps the attachment system prompt consistent with deterministic tool closure", () => {
+    const messages = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "请搜索后分析",
+      webSearchEnabled: true,
+      enabledTools: [{ name: "local_tool", description: "本地工具", command: "echo" }],
+      attachmentContextPresent: true,
+    });
+    const system = messages[0]?.content ?? "";
+
+    expect(system).toContain("本轮仅可分析、总结或回答附件及对话内容");
+    expect(system).toContain("不得使用或声称使用任何外部工具");
+    expect(system).toContain("不得声称已搜索或已执行外部动作");
+    expect(system).not.toMatch(/web_search|save_skill|install_skill|create_skill|已确认工具|local_tool/);
+  });
+
   it("keeps all tools closed while current or historical attachment context exists, then restores them", async () => {
     const attachment: LlmAttachment = {
       kind: "document",
@@ -289,6 +308,50 @@ describe("runAgent", () => {
 
     expect(seenRestored[0]?.tools?.some((tool) => tool.name === "web_search")).toBe(true);
     expect(searchRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("accumulates usage across attachment correction calls including hidden text and tool arguments", async () => {
+    const seenInputs: LlmStreamInput[] = [];
+    const logUsage = vi.fn();
+    const llm = scriptedLlm(
+      [
+        [
+          { type: "text", text: "隐藏的半成品" },
+          { type: "tool_call", toolCall: { id: "bad", name: "web_search", arguments: '{"query":"敏感参数"}' } },
+        ],
+        [{ type: "text", text: "安全答复" }],
+      ],
+      seenInputs,
+    );
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "看附件",
+      attachments: [{
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        text: "正文",
+        truncated: false,
+      }],
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), llmUsage: { create: logUsage } },
+      search: { run: vi.fn() },
+    })) void chunk;
+
+    const usage = logUsage.mock.calls[0]?.[0];
+    expect(usage.inputTokens).toBe(
+      seenInputs.reduce((sum, input) => sum + estimateMessagesTokenUsage(input.messages), 0),
+    );
+    expect(usage.outputTokens).toBeGreaterThanOrEqual(
+      estimateTokenCount("隐藏的半成品")
+        + estimateTokenCount('{"query":"敏感参数"}')
+        + estimateTokenCount("安全答复"),
+    );
+    expect(usage.totalTokens).toBe(usage.inputTokens + usage.outputTokens);
   });
 
   it("treats attachments as untrusted reference data rather than authorization", () => {

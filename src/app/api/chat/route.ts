@@ -6,7 +6,7 @@ import { runAgent } from "@/server/agent/run-agent";
 import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
 import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
-import { loadLlmAttachments } from "@/server/attachments/context";
+import { loadAttachmentContext } from "@/server/attachments/context";
 import { readAttachment } from "@/server/attachments/storage";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import { requireCurrentUser } from "@/server/auth/current-user";
@@ -79,9 +79,8 @@ export async function POST(request: Request) {
     ? await repositories.messageAttachments.listForMessages(user.id, historyMessageIds)
     : [];
   const orderedHistoricalAttachments = orderAttachmentsByMessage(historyMessageIds, historicalAttachments);
-  const allContextAttachments = [...orderedHistoricalAttachments, ...currentAttachments];
-
-  if (allContextAttachments.some((attachment) => attachment.kind === "image") && !supportsImageInput(model)) {
+  const imageInputSupported = supportsImageInput(model);
+  if (currentAttachments.some((attachment) => attachment.kind === "image") && !imageInputSupported) {
     return NextResponse.json(
       {
         error: "image_model_not_supported",
@@ -91,18 +90,20 @@ export async function POST(request: Request) {
     );
   }
 
-  let llmAttachments;
+  let attachmentContext;
   try {
-    llmAttachments = await loadLlmAttachments(allContextAttachments, {
-      read: (storageKey) => readAttachment(env.attachmentStorageDir, storageKey),
+    attachmentContext = await loadAttachmentContext({
+      currentAttachments,
+      historicalAttachments: orderedHistoricalAttachments,
+      storage: { read: (storageKey) => readAttachment(env.attachmentStorageDir, storageKey) },
+      includeHistoricalImages: imageInputSupported,
     });
   } catch (error) {
     const code = error instanceof Error ? error.message : "attachment_context_invalid";
     return NextResponse.json({ error: code }, { status: 400 });
   }
-  const historicalLlmAttachments = llmAttachments.slice(0, orderedHistoricalAttachments.length);
-  const currentLlmAttachments = llmAttachments.slice(orderedHistoricalAttachments.length);
-  const history = attachHistoryFiles(historyRows, orderedHistoricalAttachments, historicalLlmAttachments);
+  const history = attachHistoryFiles(historyRows, attachmentContext.history);
+  const currentLlmAttachments = attachmentContext.current;
 
   let userMessage;
   if (body.data.attachmentIds.length > 0) {
@@ -251,13 +252,18 @@ export async function POST(request: Request) {
         }, 0);
       } catch (error) {
         const content = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
+        console.error("chat_agent_failed", {
+          code: "agent_response_failed",
+          errorType: error instanceof Error ? "Error" : "NonError",
+        });
         await repositories.messages.create({ userId: user.id, conversationId, role: "assistant", content });
         controller.enqueue(encoder.encode(toSse({ type: "chunk", content })));
         controller.enqueue(
           encoder.encode(
             toSse({
               type: "error",
-              message: error instanceof Error ? error.message : "unknown_error",
+              code: "agent_response_failed",
+              message: "回复生成失败，请稍后重试。",
             }),
           ),
         );
@@ -309,15 +315,16 @@ function orderAttachmentsByMessage(
 
 function attachHistoryFiles(
   historyRows: Array<{ role: "user" | "assistant"; content: string; id?: string }>,
-  dbAttachments: DbMessageAttachment[],
-  llmAttachments: NonNullable<LlmMessage["attachments"]>,
+  loadedAttachments: Array<{
+    attachment: DbMessageAttachment;
+    llmAttachment: NonNullable<LlmMessage["attachments"]>[number];
+  }>,
 ): LlmMessage[] {
   const byMessage = new Map<string, NonNullable<LlmMessage["attachments"]>>();
-  dbAttachments.forEach((attachment, index) => {
+  loadedAttachments.forEach(({ attachment, llmAttachment }) => {
     if (!attachment.messageId) return;
     const list = byMessage.get(attachment.messageId) ?? [];
-    const llmAttachment = llmAttachments[index];
-    if (llmAttachment) list.push(llmAttachment);
+    list.push(llmAttachment);
     byMessage.set(attachment.messageId, list);
   });
   return historyRows.map((message) => ({

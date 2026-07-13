@@ -441,7 +441,12 @@ export async function loadLlmAttachments(
 ): Promise<LlmAttachment[]>;
 ```
 
-图片读取私有文件并 base64；文档使用 `extractedText`。最多载入当前上下文内 4 个附件、20 MB 图片和每文档 100,000 字符，超过时抛出稳定错误而不是静默忽略。
+图片读取私有文件并 base64；文档使用 `extractedText`。上传/消息绑定上限继续使用
+`ATTACHMENT_LIMITS`，模型上下文另设 `ATTACHMENT_CONTEXT_LIMITS`：最多 4 个附件、图片原始
+字节合计 10 MiB、文档合计 200,000 字符且每文档最多 100,000 字符。当前消息附件优先，
+当前附件超限时在绑定前抛出稳定错误；历史附件按消息和附件的最新顺序择优载入，超过剩余
+预算时只裁剪历史，不得阻止新的纯文本消息继续创建。图片必须逐个读取并立即转换为 base64，
+不得同时把所有原始 Buffer 保留在内存中。
 
 - [ ] **步骤 4：接入 Chat API 与 Agent**
 
@@ -457,7 +462,7 @@ const requestSchema = z.object({
 }).refine((value) => value.message.trim().length > 0 || value.attachmentIds.length > 0, "message_or_attachment_required");
 ```
 
-先在创建本轮 user message 前读取 recent history，避免现有流程把当前消息同时放进 history，又在 `buildMessages` 末尾追加一次。当当前附件或待注入的历史上下文中存在图片时，再用 `supportsImageInput(model)` 检查图片能力；未知或不支持的模型返回稳定错误码 `image_model_not_supported` 和用户可理解提示（例如“当前模型暂不支持图片理解，请切换到支持图片的模型后重试”），且必须在 `createWithAttachments` 前返回，不创建消息、不绑定附件。检查通过后用 `createWithAttachments`，把历史消息对应附件和当前附件分别传给 `runAgent`。`RunAgentInput` 增加 `attachments?: LlmAttachment[]`，`buildMessages` 的最后一条 user message 带当前附件；历史附件仍绑定在各自的 `LlmMessage` 上。
+先在创建本轮 user message 前读取 recent history，避免现有流程把当前消息同时放进 history，又在 `buildMessages` 末尾追加一次。当前消息含图片时用 `supportsImageInput(model)` 检查图片能力；未知或不支持的模型返回稳定错误码 `image_model_not_supported` 和用户可理解提示（例如“当前模型暂不支持图片理解，请切换到支持图片的模型后重试”），且必须在 `createWithAttachments` 前返回，不创建消息、不绑定附件。历史图片在当前模型不支持图片输入时直接退出本轮实际模型上下文，不得锁死后续纯文本消息。检查通过后按独立上下文预算选择附件，再用 `createWithAttachments` 原子绑定当前附件，把选中的历史附件和当前附件分别传给 `runAgent`。`RunAgentInput` 增加 `attachments?: LlmAttachment[]`，`buildMessages` 的最后一条 user message 带当前附件；入选的历史附件仍绑定在各自的 `LlmMessage` 上，工具门控只依据实际入选模型上下文的附件。
 
 第一期采用确定性工具门控，禁用条件固定为：
 

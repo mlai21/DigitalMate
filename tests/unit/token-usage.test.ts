@@ -33,4 +33,32 @@ describe("LLM usage helpers", () => {
       ]),
     ).toBeGreaterThan(0);
   });
+
+  it("includes document text and image payloads in prompt estimates", () => {
+    const plain = estimateMessagesTokenUsage([{ role: "user", content: "看附件" }]);
+    const withDocument = estimateMessagesTokenUsage([{
+      role: "user",
+      content: "看附件",
+      attachments: [{
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        text: "正文".repeat(200),
+        truncated: false,
+      }],
+    }]);
+    const withImage = estimateMessagesTokenUsage([{
+      role: "user",
+      content: "看附件",
+      attachments: [{
+        kind: "image",
+        fileName: "cat.png",
+        mimeType: "image/png",
+        base64: Buffer.alloc(3_000).toString("base64"),
+      }],
+    }]);
+
+    expect(withDocument).toBeGreaterThan(plain + 200);
+    expect(withImage).toBeGreaterThan(plain + 500);
+  });
 });

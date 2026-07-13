@@ -364,6 +364,205 @@ describe("chat route", () => {
     );
   });
 
+  it("crops over-budget historical attachments newest-first so plain text turns can keep advancing", async () => {
+    const historyRows = Array.from({ length: 5 }, (_, index) => ({
+      id: `20000000-0000-4000-8000-00000000000${index + 1}`,
+      role: "user" as const,
+      content: `历史 ${index + 1}`,
+    }));
+    const historyAttachments: DbMessageAttachment[] = historyRows.map((message, index) => ({
+      ...mocks.readyDocument,
+      id: `30000000-0000-4000-8000-00000000001${index}`,
+      messageId: message.id,
+      fileName: `history-${index + 1}.md`,
+      storageKey: `40000000-0000-4000-8000-00000000001${index}`,
+      status: "bound",
+    }));
+    mocks.recentHistory
+      .mockResolvedValueOnce(historyRows)
+      .mockResolvedValueOnce([
+        ...historyRows.slice(2),
+        { id: "20000000-0000-4000-8000-000000000099", role: "user", content: "继续一轮" },
+      ]);
+    mocks.listAttachmentsForMessages
+      .mockResolvedValueOnce(historyAttachments)
+      .mockResolvedValueOnce(historyAttachments.slice(2));
+
+    const first = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "继续一轮" }),
+      }),
+    );
+    await first.text();
+    const second = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "再继续一轮" }),
+      }),
+    );
+    await second.text();
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const agentCalls = mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>;
+    const firstHistory = agentCalls[0]?.[0].history as Array<{
+      content: string;
+      attachments?: Array<{ fileName: string }>;
+    }>;
+    expect(firstHistory.flatMap((message) => message.attachments ?? []).map((item) => item.fileName)).toEqual([
+      "history-2.md",
+      "history-3.md",
+      "history-4.md",
+      "history-5.md",
+    ]);
+    const secondHistory = agentCalls[1]?.[0].history as Array<{
+      attachments?: Array<{ fileName: string }>;
+    }>;
+    expect(secondHistory.flatMap((message) => message.attachments ?? []).map((item) => item.fileName)).toEqual([
+      "history-3.md",
+      "history-4.md",
+      "history-5.md",
+    ]);
+    expect(mocks.messagesCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ role: "user", content: "继续一轮" }),
+    );
+    expect(mocks.messagesCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ role: "user", content: "再继续一轮" }),
+    );
+  });
+
+  it("reserves context budget for current attachments before selecting newest history", async () => {
+    const historyRows = Array.from({ length: 4 }, (_, index) => ({
+      id: `21000000-0000-4000-8000-00000000000${index + 1}`,
+      role: "user" as const,
+      content: `历史 ${index + 1}`,
+    }));
+    const historyAttachments: DbMessageAttachment[] = historyRows.map((message, index) => ({
+      ...mocks.readyDocument,
+      id: `31000000-0000-4000-8000-00000000001${index}`,
+      messageId: message.id,
+      fileName: `old-${index + 1}.md`,
+      storageKey: `41000000-0000-4000-8000-00000000001${index}`,
+      status: "bound",
+    }));
+    mocks.recentHistory.mockResolvedValueOnce(historyRows);
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce(historyAttachments);
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看新的", attachmentIds: [mocks.readyDocument.id] }),
+      }),
+    );
+    await response.text();
+
+    expect(response.status).toBe(200);
+    const input = (mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0];
+    if (!input) throw new Error("runAgent was not called");
+    expect(input.attachments).toEqual([expect.objectContaining({ fileName: "notes.md" })]);
+    expect(
+      (input.history as Array<{ attachments?: Array<{ fileName: string }> }>)
+        .flatMap((message) => message.attachments ?? [])
+        .map((item) => item.fileName),
+    ).toEqual(["old-2.md", "old-3.md", "old-4.md"]);
+  });
+
+  it("rejects current attachments that exceed the model context budget before binding", async () => {
+    const attachmentIds = [
+      "32000000-0000-4000-8000-000000000001",
+      "32000000-0000-4000-8000-000000000002",
+      "32000000-0000-4000-8000-000000000003",
+    ];
+    for (const attachmentId of attachmentIds) {
+      mocks.getAttachmentForUser.mockResolvedValueOnce({
+        ...mocks.readyDocument,
+        id: attachmentId,
+        extractedText: "a".repeat(100_000),
+      });
+    }
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "分析这些文件", attachmentIds }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "attachment_context_text_exceeded" });
+    expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("skips historical images on a text-only model instead of locking later text turns", async () => {
+    mocks.getLlmClient.mockReturnValueOnce({
+      client: {
+        stream: async function* () {
+          yield { type: "text", text: "收到。" };
+        },
+        completeText: vi.fn(async () => "收到。"),
+      },
+      model: "claude-opus-4-8",
+    });
+    const historyMessageId = "22000000-0000-4000-8000-000000000001";
+    mocks.recentHistory.mockResolvedValueOnce([
+      { id: historyMessageId, role: "user", content: "上一轮图片" },
+    ]);
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce([{
+      ...mocks.readyImage,
+      messageId: historyMessageId,
+      status: "bound",
+    }]);
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "继续纯文本聊天" }),
+      }),
+    );
+    await response.text();
+
+    expect(response.status).toBe(200);
+    const input = (mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0];
+    expect(input?.history).toEqual([{ role: "user", content: "上一轮图片" }]);
+    expect(mocks.readAttachment).not.toHaveBeenCalled();
+    expect(mocks.messagesCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ role: "user", content: "继续纯文本聊天" }),
+    );
+  });
+
+  it("never exposes an upstream error payload through SSE", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.runAgent.mockImplementationOnce(async function* () {
+      throw new Error("secret-token=abc /private/attachments/hidden");
+    });
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "你好" }),
+      }),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain('"type":"error"');
+    expect(body).toContain('"code":"agent_response_failed"');
+    expect(body).toContain("回复生成失败，请稍后重试");
+    expect(body).not.toContain("secret-token");
+    expect(body).not.toContain("/private/attachments");
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("secret-token");
+    consoleError.mockRestore();
+  });
+
   it("leaves memory extraction to the async agent service", async () => {
     const response = await POST(
       new Request("http://localhost/api/chat", {

@@ -32,7 +32,23 @@ export function estimateTokenCount(text: string): number {
 }
 
 export function estimateMessagesTokenUsage(messages: LlmMessage[]): number {
-  return messages.reduce((total, message) => total + estimateTokenCount(message.content) + 4, 0);
+  return messages.reduce(
+    (total, message) => total + estimateTokenCount(message.content) + estimateAttachmentTokenUsage(message) + 4,
+    0,
+  );
+}
+
+function estimateAttachmentTokenUsage(message: LlmMessage): number {
+  return (message.attachments ?? []).reduce((total, attachment) => {
+    const metadataTokens = estimateTokenCount(`${attachment.fileName} ${attachment.mimeType}`) + 4;
+    if (attachment.kind === "document") {
+      return total + metadataTokens + estimateTokenCount(attachment.text);
+    }
+    // Base64 is ASCII-heavy and averages roughly four encoded characters per
+    // token in compatible APIs. This keeps image-bearing prompts from being
+    // accounted as nearly free without pretending to know provider vision fees.
+    return total + metadataTokens + Math.max(1, Math.ceil(attachment.base64.length / 4));
+  }, 0);
 }
 
 export function summarizeUsageLogs(logs: UsageLogForSummary[]) {
