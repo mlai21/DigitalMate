@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatShell, mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
 import { ChatInput, filterSkillOptions } from "@/components/chat/chat-input";
@@ -538,6 +538,110 @@ describe("ChatShell scroll behavior", () => {
   });
 });
 
+describe("ChatShell attachment submit", () => {
+  beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn((file: File) => `blob:${file.name}`),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+
+  it("sends only attachment IDs to chat while the optimistic message uses safe display metadata", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void init;
+      const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
+      if (url === "/api/chat") {
+        return new Response(
+          `data: ${JSON.stringify({ type: "done", conversationId: "00000000-0000-4000-8000-000000000010" })}\n\n`,
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      if (url === "/api/conversations") {
+        return new Response(JSON.stringify({ conversations: [], projects: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId="00000000-0000-4000-8000-000000000010"
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input) === "/api/chat")).toBe(true));
+    const chatCall = fetchMock.mock.calls.find(([input]) => String(input) === "/api/chat");
+    const body = JSON.parse(String(chatCall?.[1]?.body));
+    expect(body).toEqual({
+      message: "",
+      conversationId: "00000000-0000-4000-8000-000000000010",
+      attachmentIds: ["00000000-0000-4000-8000-000000000001"],
+    });
+    expect(JSON.stringify(body)).not.toMatch(/attachments|base64|blob:|cat\.png/);
+    expect(await screen.findByRole("link", { name: /cat\.png/ })).toHaveAttribute(
+      "href",
+      "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
+    );
+  });
+
+  it("shows the model capability error and keeps the image draft for retry", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
+      if (url === "/api/chat") {
+        return new Response(
+          JSON.stringify({
+            error: "image_model_not_supported",
+            message: "当前模型暂不支持图片理解，请切换到支持图片的模型后重试。",
+          }),
+          { status: 422, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId="00000000-0000-4000-8000-000000000010"
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    fireEvent.input(textarea, { target: { value: "看看这张图" } });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText("当前模型暂不支持图片理解，请切换到支持图片的模型后重试。" )).toBeInTheDocument();
+    expect(textarea).toHaveValue("看看这张图");
+    expect(screen.getAllByText("cat.png")).toHaveLength(2);
+  });
+});
+
 describe("MessageBubble", () => {
   it("does not render internal tool details", () => {
     render(<MessageBubble role="assistant" content='{"tool_call":"web_search"}最后结果' />);
@@ -551,11 +655,53 @@ describe("MessageBubble", () => {
 
     expect(container.querySelector(".message-bubble-assistant")).toBeNull();
   });
+
+  it("renders downloadable image and document cards even when the message has no text", () => {
+    render(
+      <MessageBubble
+        role="user"
+        content=""
+        attachments={[
+          {
+            id: "00000000-0000-4000-8000-000000000001",
+            kind: "image",
+            fileName: "cat.png",
+            mimeType: "image/png",
+            sizeBytes: 1_024,
+            status: "bound",
+            downloadUrl: "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
+          },
+          {
+            id: "00000000-0000-4000-8000-000000000002",
+            kind: "document",
+            fileName: "notes.md",
+            mimeType: "text/markdown",
+            sizeBytes: 2_048,
+            status: "bound",
+            downloadUrl: "/api/chat/attachments/00000000-0000-4000-8000-000000000002/download",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("img", { name: "cat.png" })).toHaveAttribute(
+      "src",
+      "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
+    );
+    expect(screen.getByRole("link", { name: /cat\.png/ })).toHaveAttribute(
+      "href",
+      "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
+    );
+    expect(screen.getByRole("link", { name: /notes\.md/ })).toHaveAttribute(
+      "href",
+      "/api/chat/attachments/00000000-0000-4000-8000-000000000002/download",
+    );
+  });
 });
 
 describe("ChatInput", () => {
-  it("requires an explicit per-message toggle for web search and resets it after sending", () => {
-    const onSubmit = vi.fn();
+  it("requires an explicit per-message toggle for web search and resets it after sending", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
 
     const searchButton = screen.getByRole("button", { name: "开启联网搜索" });
@@ -569,13 +715,13 @@ describe("ChatInput", () => {
     fireEvent.input(textarea, { target: { value: "查查今天有什么新消息" } });
     fireEvent.submit(textarea.closest("form")!);
 
-    expect(onSubmit).toHaveBeenCalledWith("查查今天有什么新消息", { searchEnabled: true });
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("查查今天有什么新消息", { searchEnabled: true }));
     expect(screen.getByRole("button", { name: "开启联网搜索" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByText("搜索")).toBeNull();
   });
 
   it("resets the search toggle when the active conversation changes", () => {
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(true);
     const { rerender } = render(<ChatInput key="conversation-a" onSubmit={onSubmit} />);
 
     fireEvent.click(screen.getByRole("button", { name: "开启联网搜索" }));
@@ -586,8 +732,8 @@ describe("ChatInput", () => {
     expect(screen.getByRole("button", { name: "开启联网搜索" })).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("shrinks back after a tall draft is sent", () => {
-    const onSubmit = vi.fn();
+  it("shrinks back after a tall draft is sent", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
 
     const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
@@ -598,13 +744,13 @@ describe("ChatInput", () => {
 
     fireEvent.submit(textarea.closest("form")!);
 
-    expect(onSubmit).toHaveBeenCalledWith("这是一段很长的输入，发送后输入框应该回到单行高度。");
-    expect(textarea.value).toBe("");
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("这是一段很长的输入，发送后输入框应该回到单行高度。"));
+    await waitFor(() => expect(textarea.value).toBe(""));
     expect(textarea.style.height).toBe("");
   });
 
-  it("submits when Enter is pressed without Shift", () => {
-    const onSubmit = vi.fn();
+  it("submits when Enter is pressed without Shift", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
 
     const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
@@ -613,12 +759,12 @@ describe("ChatInput", () => {
     const eventWasNotPrevented = fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
 
     expect(eventWasNotPrevented).toBe(false);
-    expect(onSubmit).toHaveBeenCalledWith("回车发送");
-    expect(textarea.value).toBe("");
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("回车发送"));
+    await waitFor(() => expect(textarea.value).toBe(""));
   });
 
   it("keeps Shift Enter available for line breaks", () => {
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
 
     const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
@@ -629,6 +775,295 @@ describe("ChatInput", () => {
     expect(eventWasNotPrevented).toBe(true);
     expect(onSubmit).not.toHaveBeenCalled();
     expect(textarea.value).toBe("第一行");
+  });
+});
+
+describe("ChatInput attachments", () => {
+  const IMAGE_ACCEPT = ".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp";
+  const DOCUMENT_ACCEPT = ".pdf,.txt,.md,.json,.csv,application/pdf,text/plain,text/markdown,application/json,text/csv";
+  let createObjectURL: ReturnType<typeof vi.fn>;
+  let revokeObjectURL: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    createObjectURL = vi.fn((file: File) => `blob:${file.name}`);
+    revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("opens a two-item menu with exact accept lists and closes via Escape, outside click and selection", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    const trigger = screen.getByRole("button", { name: "添加附件" });
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("menuitem", { name: "上传文件" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "上传图片" })).toBeInTheDocument();
+    expect(screen.getByLabelText("选择图片")).toHaveAttribute("accept", IMAGE_ACCEPT);
+    expect(screen.getByLabelText("选择文件")).toHaveAttribute("accept", DOCUMENT_ACCEPT);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+    fireEvent.mouseDown(document.body);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(await screen.findByText("cat.png")).toBeInTheDocument();
+  });
+
+  it("keeps the attachment menu and Skill picker mutually exclusive", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ skills: [] }), { status: 200 })),
+    );
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    const attachmentTrigger = screen.getByRole("button", { name: "添加附件" });
+
+    fireEvent.input(textarea, { target: { value: "/" } });
+    expect(await screen.findByRole("listbox", { name: "Skill 列表" })).toBeInTheDocument();
+    fireEvent.click(attachmentTrigger);
+    expect(screen.queryByRole("listbox", { name: "Skill 列表" })).toBeNull();
+    expect(screen.getByRole("menu", { name: "添加附件菜单" })).toBeInTheDocument();
+
+    fireEvent.input(textarea, { target: { value: "普通文字" } });
+    fireEvent.input(textarea, { target: { value: "/" } });
+
+    expect(await screen.findByRole("listbox", { name: "Skill 列表" })).toBeInTheDocument();
+    expect(screen.queryByRole("menu", { name: "添加附件菜单" })).toBeNull();
+  });
+
+  it("uploads every selected file independently and disables send while uploads are pending", async () => {
+    const resolvers: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn(
+      () => new Promise<Response>((resolve) => resolvers.push(resolve)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: {
+        files: [
+          new File(["one"], "one.txt", { type: "text/plain" }),
+          new File(["two"], "two.md", { type: "text/markdown" }),
+        ],
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    expect(screen.getAllByText(/上传中/)).toHaveLength(2);
+
+    await act(async () => {
+      resolvers[0](uploadResponse(documentAttachment("00000000-0000-4000-8000-000000000001", "one.txt", "text/plain")));
+      resolvers[1](uploadResponse(documentAttachment("00000000-0000-4000-8000-000000000002", "two.md", "text/markdown")));
+    });
+    await waitFor(() => expect(screen.queryByText(/上传中/)).toBeNull());
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+  });
+
+  it("shows a readable upload error and retries the same file", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "attachment_no_extractable_text" }), { status: 422 }))
+      .mockResolvedValueOnce(uploadResponse(documentAttachment("00000000-0000-4000-8000-000000000001", "blank.pdf", "application/pdf")));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: { files: [new File(["%PDF-"], "blank.pdf", { type: "application/pdf" })] },
+    });
+
+    expect(await screen.findByText("无法读取此文件，请重试或移除。" )).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试 blank.pdf" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试 blank.pdf" })).toBeNull());
+  });
+
+  it("deletes a ready draft when it is removed and revokes its image preview URL", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse(imageAttachment()))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "移除 cat.png" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        "/api/chat/attachments/00000000-0000-4000-8000-000000000001",
+        { method: "DELETE" },
+      ),
+    );
+    expect(screen.queryByText("cat.png")).toBeNull();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:cat.png");
+  });
+
+  it("supports a pure attachment message and clears only after a successful submit", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith("", {
+        attachmentIds: ["00000000-0000-4000-8000-000000000001"],
+        attachments: [expect.objectContaining({ fileName: "cat.png", status: "ready" })],
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("cat.png")).toBeNull());
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:cat.png");
+  });
+
+  it("preserves text, skill, search authorization and attachments after submit returns false", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/api/skills") {
+        return new Response(JSON.stringify({
+          skills: [{ id: "00000000-0000-4000-8000-000000000099", name: "周报整理", trigger: "整理周报" }],
+        }), { status: 200 });
+      }
+      return uploadResponse(imageAttachment());
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "/" } });
+    fireEvent.mouseDown(await screen.findByText("周报整理"));
+    fireEvent.click(screen.getByRole("button", { name: "开启联网搜索" }));
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.input(textarea, { target: { value: "分析一下" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(textarea).toHaveValue("分析一下");
+    expect(screen.getByLabelText("移除 Skill 周报整理")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭联网搜索" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("cat.png")).toBeInTheDocument();
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("uses the same allowlist and size limits for file selection and composer drops", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+    const form = screen.getByRole("textbox", { name: "输入消息" }).closest("form")!;
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: { files: [new File(["svg"], "logo.svg", { type: "image/svg+xml" })] },
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("仅支持 JPEG、PNG、WebP、PDF、TXT、MD、JSON、CSV");
+
+    const oversized = new File([new Uint8Array(10 * 1024 * 1024 + 1)], "large.pdf", { type: "application/pdf" });
+    fireEvent.drop(form, { dataTransfer: { files: [oversized] } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("单个附件不能超过 10 MB");
+  });
+
+  it("enforces count and aggregate-size limits for dropped files", async () => {
+    let uploadIndex = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      uploadIndex += 1;
+      return uploadResponse(documentAttachment(
+        `00000000-0000-4000-8000-${String(uploadIndex).padStart(12, "0")}`,
+        `part-${uploadIndex}.txt`,
+        "text/plain",
+        6 * 1024 * 1024,
+      ));
+    }));
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+    const form = screen.getByRole("textbox", { name: "输入消息" }).closest("form")!;
+    const sixMiB = () => new Uint8Array(6 * 1024 * 1024);
+
+    fireEvent.drop(form, {
+      dataTransfer: {
+        files: [
+          new File([sixMiB()], "part-1.txt", { type: "text/plain" }),
+          new File([sixMiB()], "part-2.txt", { type: "text/plain" }),
+          new File([sixMiB()], "part-3.txt", { type: "text/plain" }),
+          new File([sixMiB()], "part-4.txt", { type: "text/plain" }),
+        ],
+      },
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("附件总大小不能超过 20 MB");
+    await waitFor(() => expect(screen.getAllByText(/part-[123]\.txt/)).toHaveLength(3));
+
+    fireEvent.drop(form, {
+      dataTransfer: { files: [new File(["four"], "part-4.txt", { type: "text/plain" })] },
+    });
+    await waitFor(() => expect(screen.getAllByText(/part-[1-4]\.txt/)).toHaveLength(4));
+    fireEvent.drop(form, {
+      dataTransfer: { files: [new File(["five"], "part-5.txt", { type: "text/plain" })] },
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("每条消息最多 4 个附件");
+  });
+
+  it("revokes image object URLs when the composer unmounts", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
+    const { unmount } = render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await screen.findByText("cat.png");
+
+    unmount();
+
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:cat.png");
+  });
+
+  it("keeps repeated selections of the same file independently removable", async () => {
+    let uploadIndex = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/chat/attachments/")) {
+        return new Response(null, { status: 204 });
+      }
+      uploadIndex += 1;
+      return uploadResponse(documentAttachment(
+        `00000000-0000-4000-8000-${String(uploadIndex).padStart(12, "0")}`,
+        "same.txt",
+        "text/plain",
+      ));
+    }));
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+    const input = screen.getByLabelText("选择文件");
+    const sameFile = () => new File(["same"], "same.txt", { type: "text/plain", lastModified: 1 });
+
+    fireEvent.change(input, { target: { files: [sameFile(), sameFile()] } });
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "移除 same.txt" })).toHaveLength(2));
+    fireEvent.click(screen.getAllByRole("button", { name: "移除 same.txt" })[0]);
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "移除 same.txt" })).toHaveLength(1));
+
+    fireEvent.change(input, { target: { files: [sameFile()] } });
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "移除 same.txt" })).toHaveLength(2));
+    fireEvent.click(screen.getAllByRole("button", { name: "移除 same.txt" })[0]);
+
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "移除 same.txt" })).toHaveLength(1));
   });
 });
 
@@ -651,7 +1086,7 @@ describe("ChatInput skill picker", () => {
 
   it("opens the picker on '/' and submits the selected skill as structured skillIds", async () => {
     stubSkillsApi();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<ChatInput onSubmit={onSubmit} />);
 
     const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
@@ -669,10 +1104,12 @@ describe("ChatInput skill picker", () => {
     fireEvent.input(textarea, { target: { value: "帮我整理这周的更新" } });
     fireEvent.submit(textarea.closest("form")!);
 
-    expect(onSubmit).toHaveBeenCalledWith("帮我整理这周的更新", {
-      skillIds: ["00000000-0000-4000-8000-000000000001"],
-    });
-    expect(screen.queryByLabelText("移除 Skill 周报整理")).toBeNull();
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith("帮我整理这周的更新", {
+        skillIds: ["00000000-0000-4000-8000-000000000001"],
+      }),
+    );
+    await waitFor(() => expect(screen.queryByLabelText("移除 Skill 周报整理")).toBeNull());
   });
 
   it("inserts the /create-skill command when the create entry is picked", async () => {
@@ -843,4 +1280,50 @@ function FreshArrayChatScrollHarness({
       <div ref={endRef} />
     </div>
   );
+}
+
+function imageAttachment() {
+  return {
+    id: "00000000-0000-4000-8000-000000000001",
+    kind: "image" as const,
+    fileName: "cat.png",
+    mimeType: "image/png",
+    sizeBytes: 3,
+    status: "ready" as const,
+  };
+}
+
+function documentAttachment(
+  id: string,
+  fileName: string,
+  mimeType: string,
+  sizeBytes = 3,
+) {
+  return {
+    id,
+    kind: "document" as const,
+    fileName,
+    mimeType,
+    sizeBytes,
+    status: "ready" as const,
+  };
+}
+
+function uploadResponse(attachment: ReturnType<typeof imageAttachment> | ReturnType<typeof documentAttachment>) {
+  return new Response(JSON.stringify({ attachment }), {
+    status: 201,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function conversationItem() {
+  return {
+    id: "00000000-0000-4000-8000-000000000010",
+    title: "附件测试",
+    channel: "web",
+    projectId: null,
+    pinned: false,
+    updatedAt: "2026-07-14T10:00:00.000Z",
+    messageCount: 0,
+  } as const;
 }

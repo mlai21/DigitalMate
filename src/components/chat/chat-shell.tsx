@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { Menu, Settings, SquarePen, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChatInput } from "@/components/chat/chat-input";
+import { ChatInput, type ChatInputSubmitOptions } from "@/components/chat/chat-input";
 import { ChatSidebar, type ConversationItem, type ProjectItem } from "@/components/chat/chat-sidebar";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { TypingDots } from "@/components/chat/typing-dots";
@@ -211,7 +211,7 @@ export function ChatShell({
     if (response.ok) await refreshSidebar();
   }
 
-  async function sendMessage(content: string, options?: { skillIds?: string[]; searchEnabled?: boolean }) {
+  async function sendMessage(content: string, options?: ChatInputSubmitOptions): Promise<boolean> {
     let targetConversationId = activeConversationId;
     if (!targetConversationId) {
       try {
@@ -220,18 +220,24 @@ export function ChatShell({
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
-        if (!response.ok) return;
+        if (!response.ok) return false;
         const data = (await response.json()) as { conversation: ConversationItem };
         targetConversationId = data.conversation.id;
         setConversations((current) => [data.conversation, ...current]);
         setActiveConversationId(targetConversationId);
       } catch {
-        return;
+        return false;
       }
     }
 
     const now = new Date().toISOString();
-    const userMessage: ChatMessage = { id: `local-user-${now}`, role: "user", content, createdAt: now };
+    const userMessage: ChatMessage = {
+      id: `local-user-${now}`,
+      role: "user",
+      content,
+      createdAt: now,
+      ...(options?.attachments?.length ? { attachments: options.attachments } : {}),
+    };
     const draftId = `assistant-${now}`;
     setMessages((current) => [
       ...current,
@@ -240,6 +246,7 @@ export function ChatShell({
     ]);
     setIsStreaming(true);
 
+    let completed = false;
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -247,11 +254,13 @@ export function ChatShell({
         body: JSON.stringify({
           message: content,
           conversationId: targetConversationId,
+          ...(options?.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
           ...(options?.skillIds?.length ? { skillIds: options.skillIds } : {}),
           ...(options?.searchEnabled ? { searchEnabled: true } : {}),
         }),
       });
-      if (!response.ok || !response.body) throw new Error("chat_request_failed");
+      if (!response.ok) throw new ChatSubmitError(await readChatError(response));
+      if (!response.body) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
 
       for await (const payload of readSse(response.body)) {
         if (payload.type === "chunk") {
@@ -262,20 +271,28 @@ export function ChatShell({
           );
         }
         if (payload.type === "done") {
+          completed = true;
           setActiveConversationId(payload.conversationId);
         }
+        if (payload.type === "error") throw new ChatSubmitError(payload.message);
       }
+      if (!completed) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
       window.setTimeout(() => void refreshSidebar(), 6_000);
-    } catch {
+      return true;
+    } catch (error) {
+      const errorMessage = error instanceof ChatSubmitError
+        ? error.message
+        : "我这边刚才没连上。等你把服务和数据库都启动好，我们再继续。";
       setMessages((current) =>
         current.map((message) =>
           message.id === draftId
-            ? { ...message, content: "我这边刚才没连上。等你把服务和数据库都启动好，我们再继续。" }
+            ? { ...message, content: errorMessage }
             : message,
         ),
       );
+      return false;
     } finally {
       setIsStreaming(false);
     }
@@ -361,7 +378,12 @@ export function ChatShell({
             </div>
           ) : null}
           {messages.map((message) => (
-            <MessageBubble key={getChatMessageUiId(message)} role={message.role} content={message.content} />
+            <MessageBubble
+              key={getChatMessageUiId(message)}
+              role={message.role}
+              content={message.content}
+              attachments={message.attachments}
+            />
           ))}
           {isStreaming ? <TypingDots /> : null}
           <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
@@ -391,6 +413,18 @@ export function ChatShell({
       </section>
     </main>
   );
+}
+
+class ChatSubmitError extends Error {}
+
+async function readChatError(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as { message?: unknown };
+    if (typeof data.message === "string" && data.message.trim()) return data.message;
+  } catch {
+    // Fall through to the stable user-facing message.
+  }
+  return "消息发送失败，请稍后重试。";
 }
 
 async function* readSse(stream: ReadableStream<Uint8Array>): AsyncIterable<SsePayload> {
