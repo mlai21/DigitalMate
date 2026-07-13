@@ -368,6 +368,7 @@ export function ChatShell({
             className="new-message-button"
             type="button"
             aria-label={`查看 ${unreadCount} 条新消息`}
+            aria-live="polite"
             onClick={jumpToLatest}
           >
             ↓ {unreadCount} 条新消息
@@ -411,9 +412,8 @@ export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): 
     if (seen.has(message.id)) continue;
     const optimisticIndex = next.findIndex((candidate) => isMatchingOptimisticMessage(candidate, message));
     if (optimisticIndex >= 0) {
-      seen.delete(next[optimisticIndex].id);
-      next[optimisticIndex] = message;
-      seen.add(message.id);
+      const candidate = next[optimisticIndex];
+      next[optimisticIndex] = { ...message, id: candidate.id };
       continue;
     }
     next.push(message);

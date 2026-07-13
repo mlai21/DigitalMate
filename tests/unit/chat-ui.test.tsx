@@ -308,10 +308,19 @@ describe("useChatScroll", () => {
 
 describe("ChatShell scroll behavior", () => {
   let scrollIntoView: ReturnType<typeof vi.fn>;
+  let pollMessages: ChatMessage[];
 
   beforeEach(() => {
     vi.useFakeTimers();
     scrollIntoView = vi.fn();
+    pollMessages = [
+      message(
+        "assistant-new",
+        "assistant",
+        "轮询带来的新消息",
+        "2026-07-14T10:00:05.000Z",
+      ),
+    ];
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
       value: scrollIntoView,
@@ -324,16 +333,7 @@ describe("ChatShell scroll behavior", () => {
         if (url.startsWith("/api/messages?conversationId=conversation-a")) {
           return {
             ok: true,
-            json: async () => ({
-              messages: [
-                message(
-                  "assistant-new",
-                  "assistant",
-                  "轮询带来的新消息",
-                  "2026-07-14T10:00:05.000Z",
-                ),
-              ],
-            }),
+            json: async () => ({ messages: pollMessages }),
           };
         }
         return { ok: true, json: async () => ({}) };
@@ -388,15 +388,67 @@ describe("ChatShell scroll behavior", () => {
     });
 
     expect(screen.getByText("轮询带来的新消息")).toBeInTheDocument();
-    const newMessageButton = screen.queryByRole("button", { name: "查看 1 条新消息" });
-    expect.soft(newMessageButton).toBeInTheDocument();
-    expect.soft(scrollIntoView).not.toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
-    if (!newMessageButton) return;
+    const newMessageButton = screen.getByRole("button", { name: "查看 1 条新消息" });
+    expect(newMessageButton).toHaveAttribute("aria-live", "polite");
+    expect(scrollIntoView).not.toHaveBeenCalled();
 
     fireEvent.click(newMessageButton);
 
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
     expect(screen.queryByRole("button", { name: "查看 1 条新消息" })).toBeNull();
+  });
+
+  it("乐观消息被轮询结果持久化时保持同一气泡且不累计未读", async () => {
+    const optimisticId = "assistant-2026-07-14T10:00:00.000Z";
+    pollMessages = [
+      message(
+        "persisted-assistant",
+        "assistant",
+        "已经显示的乐观回复",
+        "2026-07-14T10:00:05.000Z",
+      ),
+    ];
+    render(
+      <ChatShell
+        conversationId="conversation-a"
+        initialMessages={[
+          message(
+            optimisticId,
+            "assistant",
+            "已经显示的乐观回复",
+            "2026-07-14T10:00:00.000Z",
+          ),
+        ]}
+        initialConversations={[
+          {
+            id: "conversation-a",
+            title: "测试会话",
+            channel: "web",
+            projectId: null,
+            pinned: false,
+            updatedAt: "2026-07-14T10:00:00.000Z",
+            messageCount: 1,
+          },
+        ]}
+      />,
+    );
+    const container = document.querySelector<HTMLElement>(".messages");
+    expect(container).not.toBeNull();
+    setElementScrollMetrics(container!, {
+      scrollHeight: 1_000,
+      scrollTop: 0,
+      clientHeight: 500,
+    });
+    fireEvent.scroll(container!);
+    scrollIntoView.mockClear();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(screen.getByText("已经显示的乐观回复")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /条新消息/ })).toBeNull();
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 });
 
@@ -576,7 +628,7 @@ describe("filterSkillOptions", () => {
 });
 
 describe("mergeMessages", () => {
-  it("replaces optimistic turn messages when polling returns persisted messages", () => {
+  it("keeps optimistic UI ids when polling returns persisted messages", () => {
     const optimisticTime = "2026-07-09T04:00:00.000Z";
     const current: ChatMessage[] = [
       message("m-prev", "assistant", "之前的消息", "2026-07-09T03:59:00.000Z"),
@@ -589,11 +641,14 @@ describe("mergeMessages", () => {
       message("persisted-assistant", "assistant", "在的在的～", "2026-07-09T04:00:02.000Z"),
     ];
 
-    expect(mergeMessages(current, incoming)).toEqual([
+    const merged = mergeMessages(current, incoming);
+
+    expect(merged).toEqual([
       message("m-prev", "assistant", "之前的消息", "2026-07-09T03:59:00.000Z"),
-      message("persisted-user", "user", "在吗", "2026-07-09T04:00:01.000Z"),
-      message("persisted-assistant", "assistant", "在的在的～", "2026-07-09T04:00:02.000Z"),
+      message(`local-user-${optimisticTime}`, "user", "在吗", "2026-07-09T04:00:01.000Z"),
+      message(`assistant-${optimisticTime}`, "assistant", "在的在的～", "2026-07-09T04:00:02.000Z"),
     ]);
+    expect(mergeMessages(merged, incoming)).toEqual(merged);
   });
 });
 
