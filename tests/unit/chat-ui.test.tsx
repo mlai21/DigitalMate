@@ -204,6 +204,28 @@ describe("useChatScroll", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("unread-count")).toHaveTextContent("0");
   });
+
+  it("消息再次变化时取消尚未执行的旧滚动帧", () => {
+    const { rerender } = render(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />,
+    );
+    scrollIntoView.mockClear();
+
+    rerender(<ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1"]} />);
+    const oldFrameId = vi.mocked(requestAnimationFrame).mock.results[0]?.value;
+
+    rerender(
+      <ChatScrollHarness conversationId="conversation-a" messageIds={["streaming-1", "new-1"]} />,
+    );
+    const newFrameId = vi.mocked(requestAnimationFrame).mock.results[1]?.value;
+
+    expect(oldFrameId).toBeTypeOf("number");
+    expect(newFrameId).toBeTypeOf("number");
+    expect(newFrameId).not.toBe(oldFrameId);
+    flushAnimationFrames();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(oldFrameId);
+  });
 });
 
 describe("MessageBubble", () => {
