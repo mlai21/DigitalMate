@@ -52,15 +52,44 @@ CREATE TABLE IF NOT EXISTS message_attachments (
   storage_key text NOT NULL UNIQUE,
   extracted_text text,
   text_truncated boolean NOT NULL DEFAULT false,
-  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
+  status text NOT NULL,
   error_code text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (
+  CONSTRAINT message_attachments_status_check
+    CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
+  CONSTRAINT message_attachments_binding_check CHECK (
     (status = 'bound' AND message_id IS NOT NULL)
     OR (status <> 'bound' AND message_id IS NULL)
   )
 );
+
+DO $message_attachments_status$
+DECLARE
+  current_definition text;
+BEGIN
+  SELECT pg_get_constraintdef(constraint_row.oid)
+  INTO current_definition
+  FROM pg_constraint AS constraint_row
+  JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+  JOIN pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+  WHERE namespace_row.nspname = current_schema()
+    AND table_row.relname = 'message_attachments'
+    AND constraint_row.conname = 'message_attachments_status_check';
+
+  IF current_definition IS NULL THEN
+    ALTER TABLE message_attachments
+      ADD CONSTRAINT message_attachments_status_check
+      CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound'));
+  ELSIF position('deleting' IN current_definition) = 0 THEN
+    ALTER TABLE message_attachments
+      DROP CONSTRAINT message_attachments_status_check;
+    ALTER TABLE message_attachments
+      ADD CONSTRAINT message_attachments_status_check
+      CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound'));
+  END IF;
+END
+$message_attachments_status$;
 
 CREATE TABLE IF NOT EXISTS conversation_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

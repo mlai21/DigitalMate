@@ -36,7 +36,17 @@ describe("database schema", () => {
     expect(attachmentTable).toBeDefined();
     expect(attachmentTable).toContain("user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE");
     expect(attachmentTable).toContain("message_id uuid REFERENCES messages(id) ON DELETE CASCADE");
+    expect(attachmentTable).toContain("CONSTRAINT message_attachments_status_check");
+    expect(attachmentTable).toContain("CONSTRAINT message_attachments_binding_check");
     expect(attachmentTable).toContain("'pending', 'ready', 'failed', 'deleting', 'bound'");
+    const statusMigration = schema.match(
+      /DO \$message_attachments_status\$[\s\S]*?\$message_attachments_status\$;/,
+    )?.[0];
+    expect(statusMigration).toBeDefined();
+    expect(statusMigration).toContain("pg_get_constraintdef");
+    expect(statusMigration).toContain("IF current_definition IS NULL THEN");
+    expect(statusMigration).toContain("ELSIF position('deleting' IN current_definition) = 0 THEN");
+    expect(statusMigration).toContain("DROP CONSTRAINT message_attachments_status_check");
     expect(schema).toContain("idx_message_attachments_message");
     expect(schema).toContain("idx_message_attachments_stale");
     expect(schema).toMatch(/memory_entries[\s\S]+user_id uuid NOT NULL/);

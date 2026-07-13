@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
@@ -149,7 +151,7 @@ describe("message attachments repository", () => {
     expect(failedParams).toEqual([USER_1, ATTACHMENT_2, "attachment_parse_failed"]);
   });
 
-  it("atomically claims expired ready or failed drafts for deletion", async () => {
+  it("atomically claims expired drafts with leases, retry backoff and fair ordering", async () => {
     const query = vi.fn(async () => ({ rows: [attachmentRow({ status: "deleting" })] }));
     const repositories = createRepositories(createPool(query));
 
@@ -160,9 +162,13 @@ describe("message attachments repository", () => {
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("WITH candidates AS");
     expect(sql).toContain("message_id IS NULL");
-    expect(sql).toContain("status IN ('ready', 'failed')");
+    expect(sql).toContain("status = 'ready'");
+    expect(sql).toContain("status = 'failed'");
+    expect(sql).toContain("status = 'deleting'");
     expect(sql).toContain("created_at < now() - ($1 * interval '1 hour')");
-    expect(sql).toContain("ORDER BY id");
+    expect(sql).toContain("updated_at < now() - interval '5 minutes'");
+    expect(sql).toContain("updated_at < now() - interval '15 minutes'");
+    expect(sql).toContain("ORDER BY updated_at ASC, id ASC");
     expect(sql).toContain("FOR UPDATE SKIP LOCKED");
     expect(sql).toContain("SET status = 'deleting'");
     expect(sql).toContain("RETURNING attachment.*");
@@ -385,10 +391,34 @@ describe("messages.createWithAttachments", () => {
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 
+async function readAttachmentStatusMigration(): Promise<string> {
+  const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+  const migration = schema.match(
+    /DO \$message_attachments_status\$[\s\S]*?\$message_attachments_status\$;/,
+  )?.[0];
+  if (!migration) throw new Error("message_attachments_status_migration_missing");
+  return migration;
+}
+
 describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency", () => {
   const schemaName = `attachment_repository_${process.pid}_${Date.now()}`;
   let adminPool: Pool;
   let databasePool: Pool;
+  let legacyConstraintDefinition: string;
+  let migratedConstraintOid: number;
+
+  async function readStatusConstraint(): Promise<{ oid: number; definition: string }> {
+    const result = await databasePool.query<{ oid: number; definition: string }>(
+      `SELECT constraint_row.oid, pg_get_constraintdef(constraint_row.oid) AS definition
+       FROM pg_constraint AS constraint_row
+       JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+       JOIN pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+       WHERE namespace_row.nspname = current_schema()
+         AND table_row.relname = 'message_attachments'
+         AND constraint_row.conname = 'message_attachments_status_check'`,
+    );
+    return result.rows[0];
+  }
 
   beforeAll(async () => {
     adminPool = new Pool({ connectionString: TEST_DATABASE_URL });
@@ -425,12 +455,21 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
         storage_key text NOT NULL UNIQUE,
         extracted_text text,
         text_truncated boolean NOT NULL DEFAULT false,
-        status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
+        status text NOT NULL,
         error_code text,
         created_at timestamptz NOT NULL DEFAULT now(),
-        updated_at timestamptz NOT NULL DEFAULT now()
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT message_attachments_status_check
+          CHECK (status IN ('pending', 'ready', 'failed', 'bound')),
+        CONSTRAINT message_attachments_binding_check CHECK (
+          (status = 'bound' AND message_id IS NOT NULL)
+          OR (status <> 'bound' AND message_id IS NULL)
+        )
       );
     `);
+    legacyConstraintDefinition = (await readStatusConstraint()).definition;
+    await databasePool.query(await readAttachmentStatusMigration());
+    migratedConstraintOid = (await readStatusConstraint()).oid;
   });
 
   afterAll(async () => {
@@ -451,14 +490,30 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
     userId: string;
     storageKey: string;
     createdAt?: Date;
+    updatedAt?: Date;
+    status?: "ready" | "failed" | "deleting";
   }): Promise<void> {
+    const createdAt = input.createdAt ?? new Date();
     await databasePool.query(
       `INSERT INTO message_attachments
        (id, user_id, kind, file_name, mime_type, size_bytes, storage_key, status, created_at, updated_at)
-       VALUES ($1, $2, 'document', 'notes.md', 'text/markdown', 12, $3, 'ready', $4, $4)`,
-      [input.id, input.userId, input.storageKey, input.createdAt ?? new Date()],
+       VALUES ($1, $2, 'document', 'notes.md', 'text/markdown', 12, $3, $4, $5, $6)`,
+      [input.id, input.userId, input.storageKey, input.status ?? "ready", createdAt, input.updatedAt ?? createdAt],
     );
   }
+
+  it("migrates the legacy status constraint once and keeps reruns idempotent", async () => {
+    expect(legacyConstraintDefinition).not.toContain("deleting");
+    const migrated = await readStatusConstraint();
+    expect(migrated.definition).toContain("deleting");
+    expect(migrated.oid).toBe(migratedConstraintOid);
+
+    await databasePool.query(await readAttachmentStatusMigration());
+
+    const rerun = await readStatusConstraint();
+    expect(rerun.definition).toContain("deleting");
+    expect(rerun.oid).toBe(migratedConstraintOid);
+  });
 
   it("allows only one message transaction to bind the same ready attachment", async () => {
     const userId = "40000000-0000-4000-8000-000000000001";
@@ -559,5 +614,97 @@ describe.skipIf(!TEST_DATABASE_URL)("message attachment PostgreSQL concurrency",
     );
     expect(stored.rows[0].status).toBe(bindSucceeded ? "bound" : "deleting");
     expect(Boolean(stored.rows[0].message_id)).toBe(bindSucceeded);
+  });
+
+  it("lets two cleanup workers claim disjoint batches", async () => {
+    const userId = "40000000-0000-4000-8000-000000000004";
+    const conversationId = "41000000-0000-4000-8000-000000000004";
+    await seedConversation(userId, conversationId);
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const attachmentIds = Array.from(
+      { length: 4 },
+      (_, index) => `42000000-0000-4000-8000-${String(30 + index).padStart(12, "0")}`,
+    );
+    await Promise.all(
+      attachmentIds.map((id, index) =>
+        seedAttachment({ id, userId, storageKey: `pg-worker-${index}`, createdAt: old, updatedAt: old }),
+      ),
+    );
+    const repositories = createRepositories(databasePool);
+
+    const [first, second] = await Promise.all([
+      repositories.messageAttachments.claimExpiredDrafts(24, 2),
+      repositories.messageAttachments.claimExpiredDrafts(24, 2),
+    ]);
+
+    expect(first).toHaveLength(2);
+    expect(second).toHaveLength(2);
+    const claimedIds = [...first, ...second].map((attachment) => attachment.id);
+    expect(new Set(claimedIds)).toEqual(new Set(attachmentIds));
+  });
+
+  it("reclaims an abandoned deleting lease after fifteen minutes", async () => {
+    const userId = "40000000-0000-4000-8000-000000000005";
+    const conversationId = "41000000-0000-4000-8000-000000000005";
+    const staleId = "42000000-0000-4000-8000-000000000040";
+    const freshId = "42000000-0000-4000-8000-000000000041";
+    await seedConversation(userId, conversationId);
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await seedAttachment({
+      id: staleId,
+      userId,
+      storageKey: "pg-stale-lease",
+      createdAt: old,
+      updatedAt: new Date(Date.now() - 16 * 60 * 1000),
+      status: "deleting",
+    });
+    await seedAttachment({
+      id: freshId,
+      userId,
+      storageKey: "pg-fresh-lease",
+      createdAt: old,
+      updatedAt: new Date(),
+      status: "deleting",
+    });
+    const repositories = createRepositories(databasePool);
+
+    const claimed = await repositories.messageAttachments.claimExpiredDrafts(24, 10);
+
+    expect(claimed.map((attachment) => attachment.id)).toEqual([staleId]);
+  });
+
+  it("backs off failed cleanup and lets an older eligible record proceed", async () => {
+    const userId = "40000000-0000-4000-8000-000000000006";
+    const conversationId = "41000000-0000-4000-8000-000000000006";
+    const failedLowId = "42000000-0000-4000-8000-000000000050";
+    const readyHighId = "42000000-0000-4000-8000-000000000051";
+    await seedConversation(userId, conversationId);
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await seedAttachment({
+      id: failedLowId,
+      userId,
+      storageKey: "pg-failed-backoff",
+      createdAt: old,
+      updatedAt: new Date(),
+      status: "failed",
+    });
+    await seedAttachment({
+      id: readyHighId,
+      userId,
+      storageKey: "pg-ready-fair",
+      createdAt: old,
+      updatedAt: old,
+    });
+    const repositories = createRepositories(databasePool);
+
+    const firstClaim = await repositories.messageAttachments.claimExpiredDrafts(24, 1);
+    expect(firstClaim.map((attachment) => attachment.id)).toEqual([readyHighId]);
+
+    await databasePool.query(
+      "UPDATE message_attachments SET updated_at = now() - interval '6 minutes' WHERE id = $1",
+      [failedLowId],
+    );
+    const retryClaim = await repositories.messageAttachments.claimExpiredDrafts(24, 1);
+    expect(retryClaim.map((attachment) => attachment.id)).toEqual([failedLowId]);
   });
 });

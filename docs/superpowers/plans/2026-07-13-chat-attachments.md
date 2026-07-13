@@ -239,7 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(
 
 - [ ] **步骤 4：实现仓储事务**
 
-新增 `DbMessageAttachment` 和 `messageAttachments.createDraft/getForUser/listForMessages/deleteDraft/claimExpiredDrafts/markFailed/releaseDeletionClaim`。`claimExpiredDrafts` 必须使用单条 CTE、`FOR UPDATE SKIP LOCKED` 和 `UPDATE ... RETURNING`，把未绑定的 ready/failed 过期草稿原子更新为 deleting；认领后不能再被消息绑定，清理失败通过 `releaseDeletionClaim` 回到 failed。新增：
+新增 `DbMessageAttachment` 和 `messageAttachments.createDraft/getForUser/listForMessages/deleteDraft/claimExpiredDrafts/markFailed/releaseDeletionClaim`。`claimExpiredDrafts` 必须使用单条 CTE、`FOR UPDATE SKIP LOCKED` 和 `UPDATE ... RETURNING`，把未绑定的过期 ready、已退避 5 分钟的 failed，以及租约超过 15 分钟的 deleting 草稿原子更新为 deleting；候选按 `updated_at, id` 排序，避免失败项反复霸占批次。认领后不能再被消息绑定，清理失败通过 `releaseDeletionClaim` 回到 failed 并从当前时间重新退避。新增：
 
 ```ts
 messages.createWithAttachments(input: {
@@ -583,7 +583,7 @@ git commit -m "feat(P0-10): 在聊天框上传并展示附件"
 
 - [ ] **步骤 1：编写 24 小时清理失败测试**
 
-模拟 `messageAttachments.claimExpiredDrafts(24)` 原子返回 deleting 草稿，断言服务删除对应磁盘文件后调用 `deleteDraft`；单个文件缺失不阻断其他清理；删除失败调用 `releaseDeletionClaim` 恢复为 failed；bound 附件不会被认领。
+模拟 `messageAttachments.claimExpiredDrafts(24)` 原子返回 deleting 草稿，断言服务删除对应磁盘文件后调用 `deleteDraft`；单个文件缺失不阻断其他清理；删除失败调用 `releaseDeletionClaim` 恢复为 failed 且 5 分钟内不重试；进程崩溃留下的 deleting 在 15 分钟租约后可重新认领；两个清理 worker 不会认领同一记录，bound 附件不会被认领。
 
 - [ ] **步骤 2：运行测试确认失败**
 

@@ -549,9 +549,16 @@ export function createRepositories(pool: Pool = getPool()) {
              SELECT id
              FROM message_attachments
              WHERE message_id IS NULL
-               AND status IN ('ready', 'failed')
-               AND created_at < now() - ($1 * interval '1 hour')
-             ORDER BY id
+               AND (
+                 (status = 'ready'
+                   AND created_at < now() - ($1 * interval '1 hour'))
+                 OR (status = 'failed'
+                   AND created_at < now() - ($1 * interval '1 hour')
+                   AND updated_at < now() - interval '5 minutes')
+                 OR (status = 'deleting'
+                   AND updated_at < now() - interval '15 minutes')
+               )
+             ORDER BY updated_at ASC, id ASC
              LIMIT $2
              FOR UPDATE SKIP LOCKED
            )
