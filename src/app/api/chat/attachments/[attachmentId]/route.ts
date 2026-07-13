@@ -12,6 +12,10 @@ function errorResponse(error: string, status: number) {
   return NextResponse.json({ error }, { status });
 }
 
+function deletedResponse() {
+  return new Response(null, { status: 204 });
+}
+
 export async function DELETE(
   _request: Request,
   context: { params: Promise<{ attachmentId: string }> },
@@ -25,7 +29,7 @@ export async function DELETE(
 
   const { attachmentId } = await context.params;
   if (!UUID_PATTERN.test(attachmentId)) {
-    return errorResponse("attachment_not_found", 404);
+    return deletedResponse();
   }
 
   const attachments = createRepositories().messageAttachments;
@@ -36,7 +40,7 @@ export async function DELETE(
     return errorResponse("attachment_delete_failed", 500);
   }
   if (!attachment) {
-    return errorResponse("attachment_not_found", 404);
+    return deletedResponse();
   }
 
   try {
@@ -57,5 +61,5 @@ export async function DELETE(
     return errorResponse("attachment_delete_failed", 500);
   }
 
-  return new Response(null, { status: 204 });
+  return deletedResponse();
 }

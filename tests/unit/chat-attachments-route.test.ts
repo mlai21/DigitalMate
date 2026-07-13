@@ -252,14 +252,48 @@ describe("chat attachment delete route", () => {
     expect(mocks.claimDraftForDeletion).not.toHaveBeenCalled();
   });
 
-  it("returns 404 for another user's, bound, or missing attachment", async () => {
+  it("treats another user's, bound, missing, or already deleted attachment as an idempotent success", async () => {
     mocks.claimDraftForDeletion.mockResolvedValueOnce(null);
 
     const response = await deleteAttachmentDraft(new Request("http://localhost"), attachmentContext());
 
-    expect(response.status).toBe(404);
-    await expect(response.json()).resolves.toEqual({ error: "attachment_not_found" });
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
     expect(mocks.deleteStoredAttachment).not.toHaveBeenCalled();
+    expect(mocks.deleteDraft).not.toHaveBeenCalled();
+  });
+
+  it("returns 204 for an invalid attachment id without querying or revealing existence", async () => {
+    const response = await deleteAttachmentDraft(
+      new Request("http://localhost"),
+      attachmentContext("not-an-attachment-id"),
+    );
+
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    expect(mocks.claimDraftForDeletion).not.toHaveBeenCalled();
+    expect(mocks.deleteStoredAttachment).not.toHaveBeenCalled();
+  });
+
+  it("returns success for consecutive deletes while removing storage and record only once", async () => {
+    mocks.claimDraftForDeletion
+      .mockResolvedValueOnce({ ...mocks.draft, status: "deleting" })
+      .mockResolvedValueOnce(null);
+
+    const firstResponse = await deleteAttachmentDraft(
+      new Request("http://localhost"),
+      attachmentContext(),
+    );
+    const secondResponse = await deleteAttachmentDraft(
+      new Request("http://localhost"),
+      attachmentContext(),
+    );
+
+    expect(firstResponse.status).toBe(204);
+    expect(secondResponse.status).toBe(204);
+    expect(mocks.claimDraftForDeletion).toHaveBeenCalledTimes(2);
+    expect(mocks.deleteStoredAttachment).toHaveBeenCalledOnce();
+    expect(mocks.deleteDraft).toHaveBeenCalledOnce();
   });
 
   it("claims the draft before removing its private file and database record", async () => {
