@@ -41,12 +41,16 @@ describe("chooseLlmClientName", () => {
     expect(routed.model).toBe("mock-light");
   });
 
-  it("declares image input support for every built-in main model", () => {
-    const mainModels = MODEL_CATALOG.filter((entry) => entry.recommendedFor.includes("main"));
-
-    expect(mainModels.length).toBeGreaterThan(0);
-    expect(mainModels.every((entry) => Object.hasOwn(entry, "supportsImageInput"))).toBe(true);
-    expect(mainModels.every((entry) => entry.supportsImageInput === true)).toBe(true);
+  it("declares image input support conservatively for each built-in model", () => {
+    expect(Object.fromEntries(MODEL_CATALOG.map((entry) => [entry.id, entry.supportsImageInput]))).toEqual({
+      "claude-opus-4-8": false,
+      "claude-sonnet-4-6": false,
+      "claude-haiku-4-5": false,
+      "gemini-3-5-pro-openai": false,
+      "gemini-3-5-flash-openai": true,
+      "gpt-5-2-openai": false,
+      "gpt-5-2-mini-openai": false,
+    });
   });
 
   it("does not assume that unknown custom models support image input", () => {
