@@ -11,6 +11,7 @@ import { useChatScroll } from "@/components/chat/use-chat-scroll";
 
 export type ChatMessage = {
   id: string;
+  uiId?: string;
   role: "user" | "assistant";
   content: string;
   createdAt: string;
@@ -44,7 +45,7 @@ export function ChatShell({
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const stageRef = useRef<HTMLElement>(null);
   const inputShellRef = useRef<HTMLFormElement>(null);
-  const messageIds = useMemo(() => messages.map((message) => message.id), [messages]);
+  const messageIds = useMemo(() => messages.map(getChatMessageUiId), [messages]);
   const chatScroll = useChatScroll({ conversationId: activeConversationId, messageIds });
   const { containerRef, endRef, unreadCount, jumpToLatest } = chatScroll;
   const latestMessageTime = useMemo(() => messages.at(-1)?.createdAt ?? new Date(0).toISOString(), [messages]);
@@ -357,7 +358,7 @@ export function ChatShell({
             </div>
           ) : null}
           {messages.map((message) => (
-            <MessageBubble key={message.id} role={message.role} content={message.content} />
+            <MessageBubble key={getChatMessageUiId(message)} role={message.role} content={message.content} />
           ))}
           {isStreaming ? <TypingDots /> : null}
           <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
@@ -368,7 +369,6 @@ export function ChatShell({
             className="new-message-button"
             type="button"
             aria-label={`查看 ${unreadCount} 条新消息`}
-            aria-live="polite"
             onClick={jumpToLatest}
           >
             ↓ {unreadCount} 条新消息
@@ -413,13 +413,19 @@ export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): 
     const optimisticIndex = next.findIndex((candidate) => isMatchingOptimisticMessage(candidate, message));
     if (optimisticIndex >= 0) {
       const candidate = next[optimisticIndex];
-      next[optimisticIndex] = { ...message, id: candidate.id };
+      seen.delete(candidate.id);
+      next[optimisticIndex] = { ...message, uiId: getChatMessageUiId(candidate) };
+      seen.add(message.id);
       continue;
     }
     next.push(message);
     seen.add(message.id);
   }
   return next;
+}
+
+function getChatMessageUiId(message: ChatMessage): string {
+  return message.uiId ?? message.id;
 }
 
 function isMatchingOptimisticMessage(candidate: ChatMessage, persisted: ChatMessage): boolean {

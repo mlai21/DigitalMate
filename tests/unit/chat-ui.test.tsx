@@ -389,7 +389,6 @@ describe("ChatShell scroll behavior", () => {
 
     expect(screen.getByText("轮询带来的新消息")).toBeInTheDocument();
     const newMessageButton = screen.getByRole("button", { name: "查看 1 条新消息" });
-    expect(newMessageButton).toHaveAttribute("aria-live", "polite");
     expect(scrollIntoView).not.toHaveBeenCalled();
 
     fireEvent.click(newMessageButton);
@@ -432,6 +431,8 @@ describe("ChatShell scroll behavior", () => {
         ]}
       />,
     );
+    const optimisticRow = screen.getByText("已经显示的乐观回复").closest(".message-row");
+    expect(optimisticRow).not.toBeNull();
     const container = document.querySelector<HTMLElement>(".messages");
     expect(container).not.toBeNull();
     setElementScrollMetrics(container!, {
@@ -446,7 +447,7 @@ describe("ChatShell scroll behavior", () => {
       await vi.advanceTimersByTimeAsync(5_000);
     });
 
-    expect(screen.getByText("已经显示的乐观回复")).toBeInTheDocument();
+    expect(screen.getByText("已经显示的乐观回复").closest(".message-row")).toBe(optimisticRow);
     expect(screen.queryByRole("button", { name: /条新消息/ })).toBeNull();
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
@@ -628,27 +629,75 @@ describe("filterSkillOptions", () => {
 });
 
 describe("mergeMessages", () => {
-  it("keeps optimistic UI ids when polling returns persisted messages", () => {
-    const optimisticTime = "2026-07-09T04:00:00.000Z";
-    const current: ChatMessage[] = [
-      message("m-prev", "assistant", "之前的消息", "2026-07-09T03:59:00.000Z"),
-      message(`local-user-${optimisticTime}`, "user", "在吗", optimisticTime),
-      message(`assistant-${optimisticTime}`, "assistant", "在的在的～", optimisticTime),
-    ];
+  it("stores the persisted id while keeping the optimistic UI id stable", () => {
+    const optimisticId = "assistant-optimistic-1";
+    const persisted = message(
+      "persisted-1",
+      "assistant",
+      "好的",
+      "2026-07-09T04:00:01.000Z",
+    );
 
-    const incoming: ChatMessage[] = [
-      message("persisted-user", "user", "在吗", "2026-07-09T04:00:01.000Z"),
-      message("persisted-assistant", "assistant", "在的在的～", "2026-07-09T04:00:02.000Z"),
-    ];
+    const merged = mergeMessages(
+      [message(optimisticId, "assistant", "好的", "2026-07-09T04:00:00.000Z")],
+      [persisted],
+    );
 
-    const merged = mergeMessages(current, incoming);
+    expect(merged).toEqual([{ ...persisted, uiId: optimisticId }]);
+    expect(mergeMessages(merged, [persisted])).toEqual(merged);
+  });
 
-    expect(merged).toEqual([
-      message("m-prev", "assistant", "之前的消息", "2026-07-09T03:59:00.000Z"),
-      message(`local-user-${optimisticTime}`, "user", "在吗", "2026-07-09T04:00:01.000Z"),
-      message(`assistant-${optimisticTime}`, "assistant", "在的在的～", "2026-07-09T04:00:02.000Z"),
+  it("appends a later persisted message with the same role and content", () => {
+    const optimisticId = "assistant-optimistic-1";
+    const persistedFirst = message(
+      "persisted-1",
+      "assistant",
+      "好的",
+      "2026-07-09T04:00:01.000Z",
+    );
+    const persistedSecond = message(
+      "persisted-2",
+      "assistant",
+      "好的",
+      "2026-07-09T04:00:02.000Z",
+    );
+    const persisted = mergeMessages(
+      [message(optimisticId, "assistant", "好的", "2026-07-09T04:00:00.000Z")],
+      [persistedFirst],
+    );
+
+    expect(mergeMessages(persisted, [persistedSecond])).toEqual([
+      { ...persistedFirst, uiId: optimisticId },
+      persistedSecond,
     ]);
-    expect(mergeMessages(merged, incoming)).toEqual(merged);
+  });
+
+  it("matches identical optimistic messages to persisted messages one by one", () => {
+    const persistedFirst = message(
+      "persisted-1",
+      "assistant",
+      "好的",
+      "2026-07-09T04:00:01.000Z",
+    );
+    const persistedSecond = message(
+      "persisted-2",
+      "assistant",
+      "好的",
+      "2026-07-09T04:00:02.000Z",
+    );
+
+    expect(
+      mergeMessages(
+        [
+          message("assistant-optimistic-1", "assistant", "好的", "2026-07-09T04:00:00.000Z"),
+          message("assistant-optimistic-2", "assistant", "好的", "2026-07-09T04:00:00.500Z"),
+        ],
+        [persistedFirst, persistedSecond],
+      ),
+    ).toEqual([
+      { ...persistedFirst, uiId: "assistant-optimistic-1" },
+      { ...persistedSecond, uiId: "assistant-optimistic-2" },
+    ]);
   });
 });
 
