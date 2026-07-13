@@ -103,7 +103,7 @@ export default function HomePage() {
         <div className={styles.nav}>
           <div className={styles.logo}>
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img alt="DigitalMate" className={`${styles.logoImg} ${styles.logoImgLight}`} src="/home/logo-light.png" />
+            <img alt="DigitalMate" className={`${styles.logoImg} ${styles.logoImgLight}`} src="/home/logo-light-v2.png" />
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img alt="DigitalMate" className={`${styles.logoImg} ${styles.logoImgDark}`} src="/home/logo-dark.png" />
           </div>
