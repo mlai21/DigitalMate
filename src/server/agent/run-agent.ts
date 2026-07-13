@@ -4,7 +4,7 @@ import { sanitizeAssistantText } from "@/server/agent/streaming";
 import type { RankableMemory } from "@/server/agent/memory";
 import { createSkillDraft, type SkillDraft } from "@/server/evolution/skills";
 import type { SkillInstallOutcome } from "@/server/skills/install";
-import type { LlmClient, LlmMessage, LlmPurpose, LlmTool, LlmToolCall } from "@/server/llm/types";
+import type { LlmAttachment, LlmClient, LlmMessage, LlmPurpose, LlmTool, LlmToolCall } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount, type LlmUsageLogInput } from "@/server/llm/usage";
 import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/server/tasks/tools";
 
@@ -37,6 +37,7 @@ export type RunAgentInput = {
   userId: string;
   conversationId: string;
   message: string;
+  attachments?: LlmAttachment[];
   history: LlmMessage[];
   persona: PersonaConfig;
   llm: LlmClient;
@@ -95,6 +96,7 @@ export type RunAgentInput = {
 const maxToolIterations = 4;
 const rawSearchLeakFallback =
   "我查到了相关信息，但这次结果还没有整理到可以直接发给你的程度。为了不把原始检索内容塞进对话里，我先不贴出来。";
+const attachmentReplyFallback = "我已经看到了附件。你可以告诉我最想让我关注哪一部分，我接着帮你看。";
 
 const webSearchTool: LlmTool = {
   name: "web_search",
@@ -187,7 +189,10 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     }
   }
 
-  const tools = buildTools(enabledTools, {
+  const hasAttachmentContext =
+    (input.attachments?.length ?? 0) > 0
+    || input.history.some((message) => (message.attachments?.length ?? 0) > 0);
+  const tools = hasAttachmentContext ? [] : buildTools(enabledTools, {
     includeSaveSkill: Boolean(input.repositories.skills?.create),
     includeCreateSkill: Boolean(input.repositories.skills?.create),
     includeInstallSkill: Boolean(input.skillInstaller),
@@ -204,11 +209,33 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     enabledTools,
     history: input.history,
     userText: input.message,
+    attachments: input.attachments,
   });
   let outputTokens = 0;
   const searchEvidence = new Set<string>();
 
-  for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
+  if (hasAttachmentContext) {
+    const firstTurn = await collectTurn(input.llm.stream({ messages: activeMessages, model: input.model, tools: [] }));
+    let visible = "";
+    if (firstTurn.toolCalls.length === 0) {
+      visible = sanitizeAssistantText(firstTurn.text);
+    } else {
+      const retryMessages: LlmMessage[] = [
+        ...activeMessages,
+        {
+          role: "system",
+          content: "请直接针对用户提供的内容给出自然语言答复，不要请求或描述任何外部操作。",
+        },
+      ];
+      const retryTurn = await collectTurn(input.llm.stream({ messages: retryMessages, model: input.model, tools: [] }));
+      if (retryTurn.toolCalls.length === 0) {
+        visible = sanitizeAssistantText(retryTurn.text);
+      }
+    }
+    const safeVisible = visible || attachmentReplyFallback;
+    outputTokens += estimateTokenCount(safeVisible);
+    yield safeVisible;
+  } else for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
     const { text, toolCalls } = await collectTurn(input.llm.stream({ messages: activeMessages, model: input.model, tools }));
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
@@ -670,6 +697,7 @@ export function buildMessages(input: {
   enabledTools?: EnabledToolContext[];
   history: LlmMessage[];
   userText: string;
+  attachments?: LlmAttachment[];
 }): LlmMessage[] {
   const contextParts = [
     buildPersonaPrompt(input.persona),
@@ -708,6 +736,6 @@ export function buildMessages(input: {
   return [
     { role: "system", content: contextParts.join("\n\n") },
     ...input.history,
-    { role: "user", content: input.userText },
+    { role: "user", content: input.userText, attachments: input.attachments },
   ];
 }

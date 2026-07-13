@@ -1,7 +1,36 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/chat/route";
+import type { DbMessageAttachment } from "@/server/db/repositories";
+
+type HistoryRow = { id: string; role: "user" | "assistant"; content: string };
 
 const mocks = vi.hoisted(() => {
+  const readyDocument = {
+    id: "30000000-0000-4000-8000-000000000001",
+    userId: "user-1",
+    messageId: null,
+    kind: "document" as const,
+    fileName: "notes.md",
+    mimeType: "text/markdown",
+    sizeBytes: 12,
+    storageKey: "40000000-0000-4000-8000-000000000001",
+    extractedText: "附件正文",
+    textTruncated: false,
+    status: "ready" as const,
+    errorCode: null,
+    deletionClaimToken: null,
+    createdAt: new Date("2026-07-14T00:00:00Z"),
+    updatedAt: new Date("2026-07-14T00:00:00Z"),
+  };
+  const readyImage = {
+    ...readyDocument,
+    id: "30000000-0000-4000-8000-000000000002",
+    kind: "image" as const,
+    fileName: "cat.png",
+    mimeType: "image/png",
+    storageKey: "40000000-0000-4000-8000-000000000002",
+    extractedText: null,
+  };
   const extractAndSaveFromMessage = vi.fn(async () => undefined);
   const messagesCreate = vi.fn(async (input: { role: string; content: string }) => ({
     id: input.role === "user" ? "message-user" : "message-assistant",
@@ -12,17 +41,54 @@ const mocks = vi.hoisted(() => {
     createdAt: new Date("2026-07-05T10:00:00+08:00"),
   }));
 
+  const messagesCreateWithAttachments = vi.fn(async (input: { content: string; attachmentIds: string[] }) => ({
+    message: {
+      id: "message-user",
+      userId: "user-1",
+      conversationId: "conversation-1",
+      role: "user" as const,
+      content: input.content,
+      createdAt: new Date("2026-07-05T10:00:00+08:00"),
+    },
+    attachments: input.attachmentIds.map((id) => ({
+      ...(id === readyImage.id ? readyImage : readyDocument),
+      id,
+      messageId: "message-user",
+      status: "bound" as const,
+    })),
+  }));
+  const getAttachmentForUser = vi.fn<
+    (userId: string, attachmentId: string) => Promise<DbMessageAttachment | null>
+  >(async (_userId, attachmentId) =>
+    attachmentId === readyImage.id ? readyImage : attachmentId === readyDocument.id ? readyDocument : null,
+  );
+  const listAttachmentsForMessages = vi.fn<() => Promise<DbMessageAttachment[]>>(async () => []);
+  const recentHistory = vi.fn<() => Promise<HistoryRow[]>>(async () => []);
+  const readAttachment = vi.fn(async () => Buffer.from("private-image"));
+
   return {
+    readyDocument,
+    readyImage,
     extractAndSaveFromMessage,
     messagesCreate,
-    createRepositories: vi.fn(() => ({
+    messagesCreateWithAttachments,
+    getAttachmentForUser,
+    listAttachmentsForMessages,
+    recentHistory,
+    readAttachment,
+    createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
         getForUser: vi.fn(async (): Promise<{ id: string } | null> => ({ id: "conversation-1" })),
       },
       messages: {
         create: messagesCreate,
-        recentHistory: vi.fn(async () => []),
+        createWithAttachments: messagesCreateWithAttachments,
+        recentHistory,
+      },
+      messageAttachments: {
+        getForUser: getAttachmentForUser,
+        listForMessages: listAttachmentsForMessages,
       },
       memories: {
         extractAndSaveFromMessage,
@@ -73,7 +139,11 @@ vi.mock("@/server/llm/router", () => ({
 }));
 
 vi.mock("@/server/config/env", () => ({
-  readEnv: vi.fn(() => ({})),
+  readEnv: vi.fn(() => ({ attachmentStorageDir: "/private/attachments" })),
+}));
+
+vi.mock("@/server/attachments/storage", () => ({
+  readAttachment: mocks.readAttachment,
 }));
 
 vi.mock("@/server/agent/run-agent", () => ({
@@ -88,6 +158,210 @@ vi.mock("@/server/agent/tools/web-search", () => ({
 describe("chat route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getLlmClient.mockReturnValue({
+      client: {
+        stream: async function* () {
+          yield { type: "text", text: "收到。" };
+        },
+        completeText: vi.fn(async () => "收到。"),
+      },
+      model: "gemini-3-5-flash-openai",
+    });
+  });
+
+  it("allows an attachment-only message and atomically binds it before running the agent", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "", attachmentIds: [mocks.readyImage.id] }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(mocks.messagesCreateWithAttachments).toHaveBeenCalledWith({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      content: "",
+      attachmentIds: [mocks.readyImage.id],
+    });
+    expect(mocks.runAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "",
+        attachments: [expect.objectContaining({ kind: "image", fileName: "cat.png" })],
+      }),
+    );
+    expect(mocks.readAttachment).toHaveBeenCalledWith(
+      "/private/attachments",
+      mocks.readyImage.storageKey,
+    );
+  });
+
+  it("rejects a request when both message and attachments are empty", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "   ", attachmentIds: [] }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_request" });
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
+  });
+
+  it("rejects unowned attachments before creating or binding a message", async () => {
+    mocks.getAttachmentForUser.mockResolvedValueOnce(null);
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "attachment_not_bindable" });
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects failed or already-bound attachments before creating a message", async () => {
+    mocks.getAttachmentForUser.mockResolvedValueOnce({
+      ...mocks.readyDocument,
+      status: "failed",
+      errorCode: "attachment_parse_failed",
+    });
+    const failedResponse = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+      }),
+    );
+    expect(failedResponse.status).toBe(400);
+
+    mocks.getAttachmentForUser.mockResolvedValueOnce({
+      ...mocks.readyDocument,
+      status: "bound",
+      messageId: "20000000-0000-4000-8000-000000000099",
+    });
+    const boundResponse = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+      }),
+    );
+    expect(boundResponse.status).toBe(400);
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not start the agent or create an assistant message when atomic binding loses a race", async () => {
+    mocks.messagesCreateWithAttachments.mockRejectedValueOnce(new Error("attachment_not_bindable"));
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyDocument.id] }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "attachment_not_bindable" });
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+  });
+
+  it("checks image capability before creating or binding the message", async () => {
+    mocks.getLlmClient.mockReturnValueOnce({
+      client: {
+        stream: async function* () {
+          yield { type: "text", text: "不应调用" };
+        },
+        completeText: vi.fn(async () => ""),
+      },
+      model: "claude-opus-4-8",
+    });
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看", attachmentIds: [mocks.readyImage.id] }),
+      }),
+    );
+
+    expect(response.status).toBe(422);
+    await expect(response.json()).resolves.toEqual({
+      error: "image_model_not_supported",
+      message: "当前模型暂不支持图片理解，请切换到支持图片的模型后重试。",
+    });
+    expect(mocks.messagesCreate).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateWithAttachments).not.toHaveBeenCalled();
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("loads recent history before creating the current message and keeps attachments on their original turns", async () => {
+    const calls: string[] = [];
+    mocks.recentHistory.mockImplementationOnce(async () => {
+      calls.push("history");
+      return [
+        { id: "20000000-0000-4000-8000-000000000001", role: "user" as const, content: "上一轮" },
+        { id: "20000000-0000-4000-8000-000000000002", role: "assistant" as const, content: "看过了" },
+      ];
+    });
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce([
+      {
+        ...mocks.readyDocument,
+        messageId: "20000000-0000-4000-8000-000000000001",
+        status: "bound",
+      },
+    ]);
+    mocks.messagesCreateWithAttachments.mockImplementationOnce(async (input) => {
+      calls.push("create");
+      return {
+        message: {
+          id: "message-user",
+          userId: "user-1",
+          conversationId: "conversation-1",
+          role: "user" as const,
+          content: input.content,
+          createdAt: new Date(),
+        },
+        attachments: [{ ...mocks.readyImage, messageId: "message-user", status: "bound" as const }],
+      };
+    });
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "继续", attachmentIds: [mocks.readyImage.id] }),
+      }),
+    );
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual(["history", "create"]);
+    expect(mocks.runAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        history: [
+          expect.objectContaining({
+            role: "user",
+            content: "上一轮",
+            attachments: [expect.objectContaining({ kind: "document", fileName: "notes.md" })],
+          }),
+          { role: "assistant", content: "看过了" },
+        ],
+        attachments: [expect.objectContaining({ kind: "image", fileName: "cat.png" })],
+      }),
+    );
   });
 
   it("leaves memory extraction to the async agent service", async () => {
@@ -110,12 +384,16 @@ describe("chat route", () => {
     expect(mocks.extractAndSaveFromMessage).not.toHaveBeenCalled();
   });
 
-  it("passes the per-message search authorization to the agent", async () => {
+  it("preserves per-message search authorization without letting attachments rewrite it", async () => {
     const response = await POST(
       new Request("http://localhost/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: "看看今天的新消息", searchEnabled: true }),
+        body: JSON.stringify({
+          message: "看看今天的新消息",
+          attachmentIds: [mocks.readyDocument.id],
+          searchEnabled: true,
+        }),
       }),
     );
 
@@ -125,7 +403,9 @@ describe("chat route", () => {
     expect(mocks.runAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         message: "看看今天的新消息",
+        attachments: [expect.objectContaining({ kind: "document", fileName: "notes.md" })],
         webSearchEnabled: true,
+        searchGate: expect.objectContaining({ evaluate: expect.any(Function) }),
       }),
     );
   });

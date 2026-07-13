@@ -458,14 +458,18 @@ export function createRepositories(pool: Pool = getPool()) {
       },
       async recentHistory(conversationId: string, limit = 12) {
         const result = await pool.query(
-          `SELECT role, content FROM messages
+          `SELECT id, role, content FROM messages
            WHERE conversation_id = $1 AND visible_to_user = true AND role IN ('user', 'assistant')
            ORDER BY created_at DESC LIMIT $2`,
           [conversationId, limit],
         );
         return result.rows
           .reverse()
-          .map((row: { role: "user" | "assistant"; content: string }) => ({ role: row.role, content: row.content }));
+          .map((row: { id: string; role: "user" | "assistant"; content: string }) => ({
+            id: row.id,
+            role: row.role,
+            content: row.content,
+          }));
       },
       async listAfter(conversationId: string, after: Date): Promise<DbMessage[]> {
         const result = await pool.query(

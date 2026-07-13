@@ -6,22 +6,33 @@ import { runAgent } from "@/server/agent/run-agent";
 import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
 import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
+import { loadLlmAttachments } from "@/server/attachments/context";
+import { readAttachment } from "@/server/attachments/storage";
+import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories } from "@/server/db/repositories";
+import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { recordTurnReview } from "@/server/evolution/turn-review";
+import { supportsImageInput } from "@/server/llm/catalog";
+import type { LlmMessage } from "@/server/llm/types";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
 
 export const runtime = "nodejs";
 
-const requestSchema = z.object({
-  message: z.string().min(1).max(8000),
-  conversationId: z.string().uuid().optional(),
-  skillIds: z.array(z.string().uuid()).max(3).optional(),
-  searchEnabled: z.boolean().optional(),
-});
+const requestSchema = z
+  .object({
+    message: z.string().max(8000).default(""),
+    attachmentIds: z.array(z.string().uuid()).max(ATTACHMENT_LIMITS.maxCount).default([]),
+    conversationId: z.string().uuid().optional(),
+    skillIds: z.array(z.string().uuid()).max(3).optional(),
+    searchEnabled: z.boolean().optional(),
+  })
+  .refine(
+    (value) => value.message.trim().length > 0 || value.attachmentIds.length > 0,
+    "message_or_attachment_required",
+  );
 
 export async function POST(request: Request) {
   let user;
@@ -44,23 +55,82 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
   const conversationId = conversation.id;
-  const userMessage = await repositories.messages.create({
+
+  // Read history before creating the current turn so it cannot be appended
+  // twice by buildMessages (once in history and once as the current user turn).
+  const historyRows = await repositories.messages.recentHistory(conversationId);
+  const settings = await repositories.settings.get(user.id);
+  const env = readEnv();
+  const { client, model } = getLlmClient("main", env, settings.modelRouting);
+  const light = getLlmClient("light", env, settings.modelRouting);
+  const currentAttachments = await loadBindableAttachments({
+    repositories,
     userId: user.id,
-    conversationId,
-    role: "user",
-    content: body.data.message,
+    attachmentIds: body.data.attachmentIds,
   });
+  if (!currentAttachments) {
+    return NextResponse.json({ error: "attachment_not_bindable" }, { status: 400 });
+  }
+
+  const historyMessageIds = historyRows
+    .map((message) => ("id" in message && typeof message.id === "string" ? message.id : null))
+    .filter((id): id is string => id !== null);
+  const historicalAttachments = historyMessageIds.length > 0
+    ? await repositories.messageAttachments.listForMessages(user.id, historyMessageIds)
+    : [];
+  const orderedHistoricalAttachments = orderAttachmentsByMessage(historyMessageIds, historicalAttachments);
+  const allContextAttachments = [...orderedHistoricalAttachments, ...currentAttachments];
+
+  if (allContextAttachments.some((attachment) => attachment.kind === "image") && !supportsImageInput(model)) {
+    return NextResponse.json(
+      {
+        error: "image_model_not_supported",
+        message: "当前模型暂不支持图片理解，请切换到支持图片的模型后重试。",
+      },
+      { status: 422 },
+    );
+  }
+
+  let llmAttachments;
+  try {
+    llmAttachments = await loadLlmAttachments(allContextAttachments, {
+      read: (storageKey) => readAttachment(env.attachmentStorageDir, storageKey),
+    });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "attachment_context_invalid";
+    return NextResponse.json({ error: code }, { status: 400 });
+  }
+  const historicalLlmAttachments = llmAttachments.slice(0, orderedHistoricalAttachments.length);
+  const currentLlmAttachments = llmAttachments.slice(orderedHistoricalAttachments.length);
+  const history = attachHistoryFiles(historyRows, orderedHistoricalAttachments, historicalLlmAttachments);
+
+  let userMessage;
+  if (body.data.attachmentIds.length > 0) {
+    try {
+      const created = await repositories.messages.createWithAttachments({
+        userId: user.id,
+        conversationId,
+        content: body.data.message,
+        attachmentIds: body.data.attachmentIds,
+      });
+      userMessage = created.message;
+    } catch {
+      return NextResponse.json({ error: "attachment_not_bindable" }, { status: 400 });
+    }
+  } else {
+    userMessage = await repositories.messages.create({
+      userId: user.id,
+      conversationId,
+      role: "user",
+      content: body.data.message,
+    });
+  }
   await recordEventReflection(repositories, {
     userId: user.id,
     event: "user_dissatisfaction",
     summary: body.data.message,
     source: { conversationId, messageId: userMessage.id },
   }).catch(() => undefined);
-  const settings = await repositories.settings.get(user.id);
-  const history = await repositories.messages.recentHistory(conversationId);
-  const env = readEnv();
-  const { client, model } = getLlmClient("main", env, settings.modelRouting);
-  const light = getLlmClient("light", env, settings.modelRouting);
   const encoder = new TextEncoder();
 
   // Explicit skill invocation (P1-11) and the /create-skill flow (P1-12):
@@ -95,6 +165,7 @@ export async function POST(request: Request) {
           userId: user.id,
           conversationId,
           message: agentMessage,
+          attachments: currentLlmAttachments,
           history,
           persona: settings.persona,
           llm: client,
@@ -202,6 +273,58 @@ export async function POST(request: Request) {
       connection: "keep-alive",
     },
   });
+}
+
+async function loadBindableAttachments(input: {
+  repositories: ReturnType<typeof createRepositories>;
+  userId: string;
+  attachmentIds: string[];
+}): Promise<DbMessageAttachment[] | null> {
+  if (new Set(input.attachmentIds).size !== input.attachmentIds.length) return null;
+  const attachments = await Promise.all(
+    input.attachmentIds.map((attachmentId) => input.repositories.messageAttachments.getForUser(input.userId, attachmentId)),
+  );
+  if (
+    attachments.some(
+      (attachment) => !attachment || attachment.status !== "ready" || attachment.messageId !== null,
+    )
+  ) {
+    return null;
+  }
+  const bindable = attachments as DbMessageAttachment[];
+  const totalSize = bindable.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+  return totalSize <= ATTACHMENT_LIMITS.maxMessageBytes ? bindable : null;
+}
+
+function orderAttachmentsByMessage(
+  messageIds: string[],
+  attachments: DbMessageAttachment[],
+): DbMessageAttachment[] {
+  const order = new Map(messageIds.map((messageId, index) => [messageId, index]));
+  return [...attachments].sort(
+    (left, right) => (order.get(left.messageId ?? "") ?? Number.MAX_SAFE_INTEGER)
+      - (order.get(right.messageId ?? "") ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+function attachHistoryFiles(
+  historyRows: Array<{ role: "user" | "assistant"; content: string; id?: string }>,
+  dbAttachments: DbMessageAttachment[],
+  llmAttachments: NonNullable<LlmMessage["attachments"]>,
+): LlmMessage[] {
+  const byMessage = new Map<string, NonNullable<LlmMessage["attachments"]>>();
+  dbAttachments.forEach((attachment, index) => {
+    if (!attachment.messageId) return;
+    const list = byMessage.get(attachment.messageId) ?? [];
+    const llmAttachment = llmAttachments[index];
+    if (llmAttachment) list.push(llmAttachment);
+    byMessage.set(attachment.messageId, list);
+  });
+  return historyRows.map((message) => ({
+    role: message.role,
+    content: message.content,
+    ...(message.id && byMessage.has(message.id) ? { attachments: byMessage.get(message.id) } : {}),
+  }));
 }
 
 function toSse(payload: unknown): string {
