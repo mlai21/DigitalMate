@@ -20,8 +20,9 @@ export type ChatMessage = {
 };
 
 type SsePayload =
+  | { type: "accepted"; conversationId: string; userMessageId: string }
   | { type: "chunk"; content: string }
-  | { type: "done"; conversationId: string }
+  | { type: "done"; conversationId: string; assistantMessageId?: string; degraded?: boolean }
   | { type: "error"; message: string };
 
 export function ChatShell({
@@ -46,6 +47,7 @@ export function ChatShell({
   const [isStreaming, setIsStreaming] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [inputShellNode, setInputShellNode] = useState<HTMLFormElement | null>(null);
+  const [composerVersion, setComposerVersion] = useState(0);
   const stageRef = useRef<HTMLElement>(null);
   const inputShellRef = useCallback((node: HTMLFormElement | null) => setInputShellNode(node), []);
   const messageIds = useMemo(() => messages.map(getChatMessageUiId), [messages]);
@@ -109,6 +111,7 @@ export function ChatShell({
       return;
     }
     setActiveConversationId(id);
+    setComposerVersion((version) => version + 1);
     setMobileSidebarOpen(false);
     setMessages([]);
     try {
@@ -133,6 +136,7 @@ export function ChatShell({
       setConversations((current) => [data.conversation, ...current]);
       setActiveConversationId(data.conversation.id);
       setMessages([]);
+      setComposerVersion((version) => version + 1);
       setMobileSidebarOpen(false);
     } catch {
       // ignore; user can retry
@@ -188,6 +192,7 @@ export function ChatShell({
       } else {
         setActiveConversationId(undefined);
         setMessages([]);
+        setComposerVersion((version) => version + 1);
       }
     }
   }
@@ -247,6 +252,9 @@ export function ChatShell({
     setIsStreaming(true);
 
     let completed = false;
+    let accepted = false;
+    let acceptedConversationId = targetConversationId;
+    let assistantMessageId: string | undefined;
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -263,25 +271,64 @@ export function ChatShell({
       if (!response.body) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
 
       for await (const payload of readSse(response.body)) {
+        if (payload.type === "accepted") {
+          accepted = true;
+          acceptedConversationId = payload.conversationId;
+          setActiveConversationId(payload.conversationId);
+          setMessages((current) => current.map((message) => {
+            const uiId = getChatMessageUiId(message);
+            if (uiId !== userMessage.id && message.id !== payload.userMessageId) return message;
+            return {
+              ...message,
+              id: payload.userMessageId,
+              uiId: message.uiId ?? userMessage.id,
+              attachments: message.attachments?.map((attachment) => ({ ...attachment, status: "bound" })),
+            };
+          }));
+        }
         if (payload.type === "chunk") {
           setMessages((current) =>
             current.map((message) =>
-              message.id === draftId ? { ...message, content: `${message.content}${payload.content}` } : message,
+              getChatMessageUiId(message) === draftId
+                ? { ...message, content: `${message.content}${payload.content}` }
+                : message,
             ),
           );
         }
         if (payload.type === "done") {
           completed = true;
+          assistantMessageId = payload.assistantMessageId;
           setActiveConversationId(payload.conversationId);
+          if (payload.assistantMessageId) {
+            const persistedAssistantId = payload.assistantMessageId;
+            setMessages((current) => current.map((message) =>
+              getChatMessageUiId(message) === draftId || message.id === persistedAssistantId
+                ? {
+                    ...message,
+                    id: persistedAssistantId,
+                    uiId: message.uiId ?? draftId,
+                  }
+                : message,
+            ));
+          }
         }
         if (payload.type === "error") throw new ChatSubmitError(payload.message);
       }
-      if (!completed) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
+      if (!accepted) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
+      if (!completed || !assistantMessageId) {
+        await reconcileAcceptedTurn(acceptedConversationId, draftId);
+      }
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
       window.setTimeout(() => void refreshSidebar(), 6_000);
       return true;
     } catch (error) {
+      if (accepted) {
+        await reconcileAcceptedTurn(acceptedConversationId, draftId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return true;
+      }
       const errorMessage = error instanceof ChatSubmitError
         ? error.message
         : "我这边刚才没连上。等你把服务和数据库都启动好，我们再继续。";
@@ -295,6 +342,18 @@ export function ChatShell({
       return false;
     } finally {
       setIsStreaming(false);
+    }
+
+    async function reconcileAcceptedTurn(conversationId: string, assistantDraftId: string) {
+      setMessages((current) => current.filter((message) => getChatMessageUiId(message) !== assistantDraftId));
+      try {
+        const response = await fetch(`/api/conversations/${conversationId}/messages`);
+        if (!response.ok) return;
+        const data = (await response.json()) as { messages?: ChatMessage[] };
+        setMessages((current) => mergeMessages(current, data.messages ?? []));
+      } catch {
+        // Polling will retry reconciliation without resubmitting the accepted turn.
+      }
     }
   }
 
@@ -405,7 +464,7 @@ export function ChatShell({
         ) : null}
 
         <ChatInput
-          key={activeConversationId ?? "new-conversation"}
+          key={`composer-${composerVersion}`}
           shellRef={inputShellRef}
           disabled={Boolean(setupNotice) || isStreaming}
           onSubmit={sendMessage}

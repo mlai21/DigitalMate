@@ -1720,12 +1720,21 @@ input {
     left: 16px;
     right: 16px;
     width: auto;
+    max-height: calc(100dvh - 96px);
     transform: none;
     bottom: max(12px, env(safe-area-inset-bottom));
   }
 
   .attachment-preview-list {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: min(136px, 24dvh);
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+
+  .chat-input-shell textarea {
+    max-height: min(112px, 20dvh);
+    overflow-y: auto;
   }
 
   .attachment-menu {

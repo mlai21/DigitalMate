@@ -1,7 +1,7 @@
 "use client";
 
 import { FileText, Image as ImageIcon, Plus, RotateCcw, X } from "lucide-react";
-import { ChangeEvent, useEffect, useRef, useState } from "react";
+import { ChangeEvent, useEffect, useId, useRef, useState } from "react";
 import { ATTACHMENT_LIMITS, type AttachmentKind } from "@/server/attachments/types";
 
 export const IMAGE_ATTACHMENT_ACCEPT = ".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp";
@@ -53,13 +53,17 @@ const ALLOWED_FILES: Readonly<Record<string, { kind: AttachmentKind; mimeType: s
 };
 
 export function AttachmentPicker({ attachments, disabled, onChange }: AttachmentPickerProps) {
+  const disclosureId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const firstDisclosureButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const documentInputRef = useRef<HTMLInputElement>(null);
   const localIdCounterRef = useRef(0);
   const attachmentsRef = useRef(attachments);
   const renderedAttachmentsRef = useRef(attachments);
   const mountedRef = useRef(true);
+  const uploadControllersRef = useRef(new Map<string, AbortController>());
   const [menuOpen, setMenuOpen] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
@@ -81,8 +85,11 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
 
   useEffect(() => {
     mountedRef.current = true;
+    const uploadControllers = uploadControllersRef.current;
     return () => {
       mountedRef.current = false;
+      uploadControllers.forEach((controller) => controller.abort());
+      uploadControllers.clear();
       renderedAttachmentsRef.current.forEach((attachment) => {
         if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
       });
@@ -91,13 +98,16 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
 
   useEffect(() => {
     if (!menuOpen) return;
+    firstDisclosureButtonRef.current?.focus();
     const closeOnPointerDown = (event: MouseEvent) => {
       if (event.target instanceof Node && !rootRef.current?.contains(event.target)) {
         setMenuOpen(false);
       }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMenuOpen(false);
+      if (event.key !== "Escape") return;
+      setMenuOpen(false);
+      triggerRef.current?.focus();
     };
     document.addEventListener("mousedown", closeOnPointerDown);
     document.addEventListener("keydown", closeOnEscape);
@@ -171,19 +181,32 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
   }
 
   async function uploadAttachment(attachment: UploadingAttachment) {
+    uploadControllersRef.current.get(attachment.localId)?.abort();
+    const controller = new AbortController();
+    uploadControllersRef.current.set(attachment.localId, controller);
     updateAttachment(attachment.localId, { status: "uploading", error: undefined, id: undefined });
     const form = new FormData();
     form.set("kind", attachment.kind);
     form.set("file", attachment.file);
 
     try {
-      const response = await fetch("/api/chat/attachments", { method: "POST", body: form });
+      const response = await fetch("/api/chat/attachments", {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      });
       const data = await readUploadResponse(response);
       if (!response.ok || !data.attachment) {
         throw new Error(readableUploadError(data.error));
       }
 
-      if (!mountedRef.current || !attachmentsRef.current.some((item) => item.localId === attachment.localId)) {
+      const isCurrentUpload = uploadControllersRef.current.get(attachment.localId) === controller;
+      if (
+        controller.signal.aborted
+        || !isCurrentUpload
+        || !mountedRef.current
+        || !attachmentsRef.current.some((item) => item.localId === attachment.localId)
+      ) {
         void deleteDraft(data.attachment.id);
         return;
       }
@@ -197,11 +220,16 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
         error: undefined,
       });
     } catch (error) {
-      if (!mountedRef.current) return;
+      const isCurrentUpload = uploadControllersRef.current.get(attachment.localId) === controller;
+      if (controller.signal.aborted || isAbortError(error) || !isCurrentUpload || !mountedRef.current) return;
       updateAttachment(attachment.localId, {
         status: "failed",
         error: error instanceof Error ? error.message : "上传失败，请重试。",
       });
+    } finally {
+      if (uploadControllersRef.current.get(attachment.localId) === controller) {
+        uploadControllersRef.current.delete(attachment.localId);
+      }
     }
   }
 
@@ -213,6 +241,8 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
 
   function removeAttachment(attachment: UploadingAttachment) {
     if (disabled) return;
+    uploadControllersRef.current.get(attachment.localId)?.abort();
+    uploadControllersRef.current.delete(attachment.localId);
     commit(attachmentsRef.current.filter((item) => item.localId !== attachment.localId));
     if (attachment.id) void deleteDraft(attachment.id);
   }
@@ -334,9 +364,12 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
       ) : null}
 
       <button
+        ref={triggerRef}
         type="button"
         className={`attachment-trigger${menuOpen ? " active" : ""}`}
         aria-label="添加附件"
+        aria-haspopup="dialog"
+        aria-controls={disclosureId}
         aria-expanded={menuOpen}
         disabled={disabled}
         data-attachment-picker-trigger
@@ -346,12 +379,12 @@ export function AttachmentPicker({ attachments, disabled, onChange }: Attachment
       </button>
 
       {menuOpen ? (
-        <div className="attachment-menu" role="menu" aria-label="添加附件菜单">
-          <button type="button" role="menuitem" onClick={() => documentInputRef.current?.click()}>
+        <div id={disclosureId} className="attachment-menu" role="dialog" aria-label="添加附件">
+          <button ref={firstDisclosureButtonRef} type="button" onClick={() => documentInputRef.current?.click()}>
             <FileText size={19} aria-hidden="true" />
             上传文件
           </button>
-          <button type="button" role="menuitem" onClick={() => imageInputRef.current?.click()}>
+          <button type="button" onClick={() => imageInputRef.current?.click()}>
             <ImageIcon size={19} aria-hidden="true" />
             上传图片
           </button>
@@ -396,6 +429,10 @@ async function deleteDraft(id: string) {
   } catch {
     // Draft cleanup is best-effort; the server also expires unbound uploads.
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function formatFileSize(sizeBytes: number): string {

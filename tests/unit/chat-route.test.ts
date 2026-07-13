@@ -472,7 +472,17 @@ describe("chat route", () => {
     );
 
     expect(response.status).toBe(200);
-    await response.text();
+    const events = parseSseEvents(await response.text());
+    expect(events[0]).toEqual({
+      type: "accepted",
+      conversationId: "conversation-1",
+      userMessageId: "message-user",
+    });
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      conversationId: "conversation-1",
+      assistantMessageId: "message-assistant",
+    });
     expect(mocks.messagesCreateWithAttachments).toHaveBeenCalledWith({
       userId: "user-1",
       conversationId: "conversation-1",
@@ -865,9 +875,10 @@ describe("chat route", () => {
     assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(input?.history as LlmMessage[]));
   });
 
-  it("never exposes an upstream error payload through SSE", async () => {
+  it("persists one degraded fallback and finishes with done after an agent failure", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     mocks.runAgent.mockImplementationOnce(async function* () {
+      yield "先收到半句";
       throw new Error("secret-token=abc /private/attachments/hidden");
     });
 
@@ -879,14 +890,66 @@ describe("chat route", () => {
       }),
     );
     const body = await response.text();
+    const events = parseSseEvents(body);
 
     expect(response.status).toBe(200);
-    expect(body).toContain('"type":"error"');
-    expect(body).toContain('"code":"agent_response_failed"');
-    expect(body).toContain("回复生成失败，请稍后重试");
+    expect(events[0]).toEqual({
+      type: "accepted",
+      conversationId: "conversation-1",
+      userMessageId: "message-user",
+    });
+    expect(events.filter((event) => event.type === "error")).toEqual([]);
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      conversationId: "conversation-1",
+      assistantMessageId: "message-assistant",
+      degraded: true,
+    });
+    expect(mocks.messagesCreate).toHaveBeenCalledTimes(2);
+    expect(mocks.messagesCreate).toHaveBeenLastCalledWith(expect.objectContaining({
+      role: "assistant",
+      content: "先收到半句\n\n我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。",
+    }));
     expect(body).not.toContain("secret-token");
     expect(body).not.toContain("/private/attachments");
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain("secret-token");
+    consoleError.mockRestore();
+  });
+
+  it("ends an accepted stream without leaking when fallback persistence also fails", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.runAgent.mockImplementationOnce(async function* () {
+      throw new Error("secret-agent-value");
+    });
+    mocks.messagesCreate
+      .mockResolvedValueOnce({
+        id: "message-user",
+        userId: "user-1",
+        conversationId: "conversation-1",
+        role: "user",
+        content: "你好",
+        createdAt: new Date("2026-07-05T10:00:00+08:00"),
+      })
+      .mockRejectedValueOnce(new Error("secret-database-value"));
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "你好" }),
+      }),
+    );
+    const body = await response.text();
+    const events = parseSseEvents(body);
+
+    expect(events).toEqual([
+      { type: "accepted", conversationId: "conversation-1", userMessageId: "message-user" },
+      { type: "done", conversationId: "conversation-1", degraded: true },
+    ]);
+    expect(body).not.toContain("secret-agent-value");
+    expect(body).not.toContain("secret-database-value");
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("secret-agent-value");
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("secret-database-value");
     consoleError.mockRestore();
   });
 
@@ -900,9 +963,19 @@ describe("chat route", () => {
     );
 
     const body = await response.text();
+    const events = parseSseEvents(body);
 
     expect(response.status).toBe(200);
-    expect(body).toContain('"type":"done"');
+    expect(events[0]).toEqual({
+      type: "accepted",
+      conversationId: "conversation-1",
+      userMessageId: "message-user",
+    });
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      conversationId: "conversation-1",
+      assistantMessageId: "message-assistant",
+    });
     expect(mocks.messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ role: "user", content: "我喜欢咖啡" }),
     );
@@ -1066,4 +1139,12 @@ function assertAnthropicHasNoEmptyUserContent(body: {
       if (block.type === "text") expect(block.text?.trim()).not.toBe("");
     }
   }
+}
+
+function parseSseEvents(body: string): Array<Record<string, unknown>> {
+  return body
+    .split("\n\n")
+    .map((event) => event.split("\n").find((line) => line.startsWith("data: ")))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
 }

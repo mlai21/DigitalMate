@@ -161,6 +161,11 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       let assistantText = "";
+      controller.enqueue(encoder.encode(toSse({
+        type: "accepted",
+        conversationId,
+        userMessageId: userMessage.id,
+      })));
       try {
         for await (const chunk of runAgent({
           userId: user.id,
@@ -202,37 +207,45 @@ export async function POST(request: Request) {
           controller.enqueue(encoder.encode(toSse({ type: "chunk", content: assistantText })));
         }
 
-        await repositories.messages.create({
+        const assistantMessage = await repositories.messages.create({
           userId: user.id,
           conversationId,
           role: "assistant",
           content: assistantText,
         });
 
-        const reminder = parseReminder(body.data.message);
-        if (reminder) {
-          await repositories.proactiveTasks.create({
-            userId: user.id,
-            conversationId,
-            kind: "reminder",
-            content: reminder.content,
-            scheduledAt: reminder.scheduledAt,
-            metadata: { urgent: reminder.urgent },
-          });
-        } else {
-          const followUp = parseFollowUp(body.data.message);
-          if (followUp) {
+        try {
+          const reminder = parseReminder(body.data.message);
+          if (reminder) {
             await repositories.proactiveTasks.create({
               userId: user.id,
               conversationId,
-              kind: "follow_up",
-              content: followUp.content,
-              scheduledAt: followUp.scheduledAt,
+              kind: "reminder",
+              content: reminder.content,
+              scheduledAt: reminder.scheduledAt,
+              metadata: { urgent: reminder.urgent },
             });
+          } else {
+            const followUp = parseFollowUp(body.data.message);
+            if (followUp) {
+              await repositories.proactiveTasks.create({
+                userId: user.id,
+                conversationId,
+                kind: "follow_up",
+                content: followUp.content,
+                scheduledAt: followUp.scheduledAt,
+              });
+            }
           }
+        } catch {
+          console.error("chat_proactive_task_failed", { code: "proactive_task_create_failed" });
         }
 
-        controller.enqueue(encoder.encode(toSse({ type: "done", conversationId })));
+        controller.enqueue(encoder.encode(toSse({
+          type: "done",
+          conversationId,
+          assistantMessageId: assistantMessage.id,
+        })));
         controller.close();
 
         // Post-turn background work on the light model: auto-title new
@@ -251,22 +264,37 @@ export async function POST(request: Request) {
           });
         }, 0);
       } catch (error) {
-        const content = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
+        const fallback = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
+        const suffix = assistantText.trim() ? `\n\n${fallback}` : fallback;
+        const content = `${assistantText}${suffix}`;
         console.error("chat_agent_failed", {
           code: "agent_response_failed",
           errorType: error instanceof Error ? "Error" : "NonError",
         });
-        await repositories.messages.create({ userId: user.id, conversationId, role: "assistant", content });
-        controller.enqueue(encoder.encode(toSse({ type: "chunk", content })));
-        controller.enqueue(
-          encoder.encode(
-            toSse({
-              type: "error",
-              code: "agent_response_failed",
-              message: "回复生成失败，请稍后重试。",
-            }),
-          ),
-        );
+        let fallbackMessage;
+        try {
+          fallbackMessage = await repositories.messages.create({
+            userId: user.id,
+            conversationId,
+            role: "assistant",
+            content,
+          });
+        } catch (fallbackError) {
+          console.error("chat_fallback_persist_failed", {
+            code: "fallback_persist_failed",
+            errorType: fallbackError instanceof Error ? "Error" : "NonError",
+          });
+          controller.enqueue(encoder.encode(toSse({ type: "done", conversationId, degraded: true })));
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(toSse({ type: "chunk", content: suffix })));
+        controller.enqueue(encoder.encode(toSse({
+          type: "done",
+          conversationId,
+          assistantMessageId: fallbackMessage.id,
+          degraded: true,
+        })));
         controller.close();
       }
     },

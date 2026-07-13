@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatShell, mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
@@ -553,6 +554,7 @@ describe("ChatShell attachment submit", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
   });
@@ -563,10 +565,18 @@ describe("ChatShell attachment submit", () => {
       const url = String(input);
       if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
       if (url === "/api/chat") {
-        return new Response(
-          `data: ${JSON.stringify({ type: "done", conversationId: "00000000-0000-4000-8000-000000000010" })}\n\n`,
-          { status: 200, headers: { "content-type": "text/event-stream" } },
-        );
+        return sseResponse([
+          {
+            type: "accepted",
+            conversationId: "00000000-0000-4000-8000-000000000010",
+            userMessageId: "message-user",
+          },
+          {
+            type: "done",
+            conversationId: "00000000-0000-4000-8000-000000000010",
+            assistantMessageId: "message-assistant",
+          },
+        ]);
       }
       if (url === "/api/conversations") {
         return new Response(JSON.stringify({ conversations: [], projects: [] }), { status: 200 });
@@ -640,6 +650,235 @@ describe("ChatShell attachment submit", () => {
     expect(await screen.findByText("当前模型暂不支持图片理解，请切换到支持图片的模型后重试。" )).toBeInTheDocument();
     expect(textarea).toHaveValue("看看这张图");
     expect(screen.getAllByText("cat.png")).toHaveLength(2);
+  });
+
+  it("commits an accepted attachment turn after an SSE error and reconciles one fallback", async () => {
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    const fallback = "服务端已经保存的降级回复";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
+      if (url === "/api/chat") {
+        return sseResponse([
+          { type: "accepted", conversationId, userMessageId: "message-user" },
+          { type: "chunk", content: fallback },
+          { type: "error", message: "不应覆盖服务端回复" },
+        ]);
+      }
+      if (url === `/api/conversations/${conversationId}/messages`) {
+        return new Response(JSON.stringify({
+          messages: [
+            {
+              id: "message-user",
+              role: "user",
+              content: "看看这张图",
+              createdAt: "2026-07-14T10:00:00.000Z",
+              attachments: [{
+                ...imageAttachment(),
+                status: "bound",
+                downloadUrl: "/api/chat/attachments/00000000-0000-4000-8000-000000000001/download",
+              }],
+            },
+            {
+              id: "message-assistant",
+              role: "assistant",
+              content: fallback,
+              createdAt: "2026-07-14T10:00:01.000Z",
+              attachments: [],
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url === "/api/conversations") {
+        return new Response(JSON.stringify({ conversations: [], projects: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" });
+    fireEvent.input(textarea, { target: { value: "看看这张图" } });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    expect(screen.queryByRole("button", { name: "移除 cat.png" })).toBeNull();
+    expect(screen.getAllByText(fallback)).toHaveLength(1);
+    expect(screen.queryByText("不应覆盖服务端回复")).toBeNull();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(`/api/conversations/${conversationId}/messages`);
+    expect(screen.getAllByRole("link", { name: /cat\.png/ })).toHaveLength(1);
+  });
+
+  it("treats a stream disconnect after accepted as committed and removes the empty assistant draft", async () => {
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    let pullCount = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCount += 1;
+        if (pullCount === 1) {
+          controller.enqueue(new TextEncoder().encode(
+            `data: ${JSON.stringify({ type: "accepted", conversationId, userMessageId: "message-user" })}\n\n`,
+          ));
+          return;
+        }
+        controller.error(new Error("connection_lost"));
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url === `/api/conversations/${conversationId}/messages`) {
+        return new Response(JSON.stringify({
+          messages: [{
+            id: "message-user",
+            role: "user",
+            content: "断线也只提交一次",
+            createdAt: "2026-07-14T10:00:00.000Z",
+            attachments: [],
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), {
+      target: { value: "断线也只提交一次" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    expect(screen.getAllByText("断线也只提交一次")).toHaveLength(1);
+    expect(document.querySelector(".message-row-assistant")).toBeNull();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(`/api/conversations/${conversationId}/messages`);
+  });
+
+  it("keeps a new-conversation draft mounted when the chat request fails before accepted", async () => {
+    const createdConversation = conversationItem();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
+      if (url === "/api/conversations" && init?.method === "POST") {
+        return new Response(JSON.stringify({ conversation: createdConversation }), { status: 201 });
+      }
+      if (url === "/api/chat") {
+        return new Response(JSON.stringify({ message: "发送前失败" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatShell initialMessages={[]} initialConversations={[]} />);
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "新会话草稿" } });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    const composer = document.querySelector(".chat-input-shell");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByText("发送前失败");
+    expect(document.querySelector(".chat-input-shell")).toBe(composer);
+    expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue("新会话草稿");
+    expect(screen.getByRole("button", { name: "移除 cat.png" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+  });
+
+  it("does not duplicate an accepted turn when polling wins the race with done", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(new TextEncoder().encode([
+          `data: ${JSON.stringify({ type: "accepted", conversationId, userMessageId: "message-user" })}`,
+          `data: ${JSON.stringify({ type: "chunk", content: "即时助手" })}`,
+          "",
+        ].join("\n\n")));
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (url.startsWith("/api/messages?")) {
+        return new Response(JSON.stringify({ messages: [
+          {
+            id: "message-user",
+            role: "user",
+            content: "即时用户",
+            createdAt: "2026-07-14T10:00:00.000Z",
+            attachments: [],
+          },
+          {
+            id: "message-assistant",
+            role: "assistant",
+            content: "即时助手",
+            createdAt: "2026-07-14T10:00:01.000Z",
+            attachments: [],
+          },
+        ] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "即时用户" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_100);
+    });
+    await waitFor(() => expect(messageTexts("即时用户")).toHaveLength(1));
+    expect(messageTexts("即时助手")).toHaveLength(1);
+
+    await act(async () => {
+      streamController.enqueue(new TextEncoder().encode(
+        `data: ${JSON.stringify({
+          type: "done",
+          conversationId,
+          assistantMessageId: "message-assistant",
+        })}\n\n`,
+      ));
+      streamController.close();
+    });
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    expect(messageTexts("即时用户")).toHaveLength(1);
+    expect(messageTexts("即时助手")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+    vi.useRealTimers();
   });
 });
 
@@ -801,26 +1040,34 @@ describe("ChatInput attachments", () => {
     vi.unstubAllGlobals();
   });
 
-  it("opens a two-item menu with exact accept lists and closes via Escape, outside click and selection", async () => {
+  it("opens an accessible attachment disclosure and restores focus after Escape", async () => {
+    const user = userEvent.setup();
     vi.stubGlobal("fetch", vi.fn(async () => uploadResponse(imageAttachment())));
     render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
 
     const trigger = screen.getByRole("button", { name: "添加附件" });
-    fireEvent.click(trigger);
+    await user.click(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("menuitem", { name: "上传文件" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "上传图片" })).toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
+    const disclosure = screen.getByRole("dialog", { name: "添加附件" });
+    expect(disclosure).toHaveAttribute("id", trigger.getAttribute("aria-controls"));
+    const fileButton = screen.getByRole("button", { name: "上传文件" });
+    const imageButton = screen.getByRole("button", { name: "上传图片" });
+    await waitFor(() => expect(fileButton).toHaveFocus());
+    await user.tab();
+    expect(imageButton).toHaveFocus();
     expect(screen.getByLabelText("选择图片")).toHaveAttribute("accept", IMAGE_ACCEPT);
     expect(screen.getByLabelText("选择文件")).toHaveAttribute("accept", DOCUMENT_ACCEPT);
 
-    fireEvent.keyDown(document, { key: "Escape" });
+    await user.keyboard("{Escape}");
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveFocus();
 
-    fireEvent.click(trigger);
+    await user.click(trigger);
     fireEvent.mouseDown(document.body);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
 
-    fireEvent.click(trigger);
+    await user.click(trigger);
     fireEvent.change(screen.getByLabelText("选择图片"), {
       target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
     });
@@ -841,13 +1088,13 @@ describe("ChatInput attachments", () => {
     expect(await screen.findByRole("listbox", { name: "Skill 列表" })).toBeInTheDocument();
     fireEvent.click(attachmentTrigger);
     expect(screen.queryByRole("listbox", { name: "Skill 列表" })).toBeNull();
-    expect(screen.getByRole("menu", { name: "添加附件菜单" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "添加附件" })).toBeInTheDocument();
 
     fireEvent.input(textarea, { target: { value: "普通文字" } });
     fireEvent.input(textarea, { target: { value: "/" } });
 
     expect(await screen.findByRole("listbox", { name: "Skill 列表" })).toBeInTheDocument();
-    expect(screen.queryByRole("menu", { name: "添加附件菜单" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "添加附件" })).toBeNull();
   });
 
   it("uploads every selected file independently and disables send while uploads are pending", async () => {
@@ -877,6 +1124,56 @@ describe("ChatInput attachments", () => {
     });
     await waitFor(() => expect(screen.queryByText(/上传中/)).toBeNull());
     expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+  });
+
+  it("aborts a pending upload when its card is removed without showing a failure", async () => {
+    let uploadSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      uploadSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        uploadSignal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: { files: [new File(["pending"], "pending.txt", { type: "text/plain" })] },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "移除 pending.txt" }));
+
+    expect(uploadSignal?.aborted).toBe(true);
+    expect(screen.queryByText("pending.txt")).toBeNull();
+    expect(screen.queryByText("上传失败，请重试。")).toBeNull();
+    expect(screen.queryByText("请先重试或移除上传失败的附件。")).toBeNull();
+  });
+
+  it("aborts every pending upload when the composer unmounts", async () => {
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      if (signal) signals.push(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { unmount } = render(<ChatInput onSubmit={vi.fn().mockResolvedValue(true)} />);
+
+    fireEvent.change(screen.getByLabelText("选择文件"), {
+      target: {
+        files: [
+          new File(["one"], "one.txt", { type: "text/plain" }),
+          new File(["two"], "two.md", { type: "text/markdown" }),
+        ],
+      },
+    });
+    await waitFor(() => expect(signals).toHaveLength(2));
+    unmount();
+
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
   });
 
   it("shows a readable upload error and retries the same file", async () => {
@@ -1516,6 +1813,18 @@ function uploadResponse(attachment: ReturnType<typeof imageAttachment> | ReturnT
     status: 201,
     headers: { "content-type": "application/json" },
   });
+}
+
+function sseResponse(events: Array<Record<string, unknown>>) {
+  return new Response(
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+function messageTexts(content: string) {
+  return Array.from(document.querySelectorAll(".message-text"))
+    .filter((element) => element.textContent === content);
 }
 
 function conversationItem() {

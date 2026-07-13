@@ -142,6 +142,97 @@ test("the mobile new-message button keeps a 44px touch target above the composer
   expect(844 - (inputBox!.y + inputBox!.height)).toBeGreaterThanOrEqual(12);
 });
 
+for (const height of [667, 568]) {
+  test(`short mobile ${height}px keeps four attachments, long text and disclosure usable`, async ({ page }) => {
+    await page.setViewportSize({ width: 375, height });
+    await page.clock.install();
+    let uploadIndex = 0;
+    await page.route("**/api/chat/attachments", async (route) => {
+      uploadIndex += 1;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          attachment: {
+            id: `attachment-e2e-${uploadIndex}`,
+            kind: "document",
+            fileName: `part-${uploadIndex}.txt`,
+            mimeType: "text/plain",
+            sizeBytes: 8,
+            status: "ready",
+          },
+        }),
+      });
+    });
+    await page.route("**/api/messages?**", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: [{
+            id: `assistant-short-${height}`,
+            role: "assistant",
+            content: "短屏上的真实轮询消息",
+            createdAt: "2026-07-14T00:01:00.000Z",
+          }],
+        }),
+      });
+    });
+
+    await page.goto("/");
+    const messages = page.locator(".messages");
+    await messages.evaluate((node) => {
+      node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - 240);
+      node.dispatchEvent(new Event("scroll"));
+    });
+    await page.clock.fastForward(5_100);
+    const newMessageButton = page.getByRole("button", { name: "查看 1 条新消息" });
+    await expect(newMessageButton).toBeVisible();
+
+    await page.getByLabel("选择文件").setInputFiles(
+      Array.from({ length: 4 }, (_, index) => ({
+        name: `part-${index + 1}.txt`,
+        mimeType: "text/plain",
+        buffer: Buffer.from(`part-${index + 1}`),
+      })),
+    );
+    await expect(page.locator(".attachment-preview-card")).toHaveCount(4);
+    await page.getByRole("textbox", { name: "输入消息" }).fill(
+      Array.from({ length: 8 }, (_, index) => `第 ${index + 1} 行短屏输入`).join("\n"),
+    );
+    await page.getByRole("button", { name: "添加附件" }).click();
+
+    const disclosure = page.getByRole("dialog", { name: "添加附件" });
+    const composer = page.locator(".chat-input-shell");
+    await expect(disclosure).toBeVisible();
+    const [disclosureBox, newMessageBox, composerBox] = await Promise.all([
+      disclosure.boundingBox(),
+      newMessageButton.boundingBox(),
+      composer.boundingBox(),
+    ]);
+    expect(disclosureBox).not.toBeNull();
+    expect(newMessageBox).not.toBeNull();
+    expect(composerBox).not.toBeNull();
+
+    for (const box of [disclosureBox!, newMessageBox!, composerBox!]) {
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.y).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(375);
+      expect(box.y + box.height).toBeLessThanOrEqual(height);
+    }
+    expect(rectanglesIntersect(disclosureBox!, newMessageBox!)).toBe(false);
+    expect(rectanglesIntersect(disclosureBox!, composerBox!)).toBe(false);
+    expect(rectanglesIntersect(newMessageBox!, composerBox!)).toBe(false);
+
+    const scrollMetrics = await messages.evaluate((node) => ({
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+    }));
+    expect(scrollMetrics.clientHeight).toBeGreaterThan(80);
+    expect(scrollMetrics.scrollHeight).toBeGreaterThan(scrollMetrics.clientHeight);
+  });
+}
+
 test("an image attachment opens inline in a new page while documents remain downloads", async ({ page }) => {
   const imageUrl = "**/api/chat/attachments/image-e2e/download";
   const png = Buffer.from(
@@ -177,3 +268,15 @@ test("an image attachment opens inline in a new page while documents remain down
   expect(downloadStarted).toBe(false);
   await expect(page.getByRole("link", { name: /notes\.md/ })).toHaveAttribute("download", "notes.md");
 });
+
+function rectanglesIntersect(
+  first: { x: number; y: number; width: number; height: number },
+  second: { x: number; y: number; width: number; height: number },
+) {
+  return !(
+    first.x + first.width <= second.x
+    || second.x + second.width <= first.x
+    || first.y + first.height <= second.y
+    || second.y + second.height <= first.y
+  );
+}
