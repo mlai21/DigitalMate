@@ -132,6 +132,28 @@ describe("message attachments repository", () => {
     expect(query).not.toHaveBeenCalled();
   });
 
+  it("atomically claims one owned ready draft for interactive deletion", async () => {
+    const query = vi.fn(async () => ({ rows: [attachmentRow({ status: "deleting" })] }));
+    const repositories = createRepositories(createPool(query));
+
+    await expect(
+      repositories.messageAttachments.claimDraftForDeletion(USER_1, ATTACHMENT_1),
+    ).resolves.toMatchObject({
+      id: ATTACHMENT_1,
+      userId: USER_1,
+      messageId: null,
+      status: "deleting",
+    });
+
+    const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
+    expect(sql).toContain("UPDATE message_attachments");
+    expect(sql).toContain("SET status = 'deleting'");
+    expect(sql).toContain("user_id = $1 AND id = $2");
+    expect(sql).toContain("message_id IS NULL AND status IN ('ready', 'failed')");
+    expect(sql).toContain("RETURNING *");
+    expect(params).toEqual([USER_1, ATTACHMENT_1]);
+  });
+
   it("deletes and marks failed only unbound drafts owned by the user", async () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));

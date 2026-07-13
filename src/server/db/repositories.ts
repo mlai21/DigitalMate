@@ -533,6 +533,20 @@ export function createRepositories(pool: Pool = getPool()) {
         );
         return result.rows.map(mapMessageAttachment);
       },
+      async claimDraftForDeletion(
+        userId: string,
+        attachmentId: string,
+      ): Promise<DbMessageAttachment | null> {
+        const result = await pool.query(
+          `UPDATE message_attachments
+           SET status = 'deleting', updated_at = now()
+           WHERE user_id = $1 AND id = $2
+             AND message_id IS NULL AND status IN ('ready', 'failed')
+           RETURNING *`,
+          [userId, attachmentId],
+        );
+        return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
+      },
       async deleteDraft(userId: string, attachmentId: string): Promise<boolean> {
         const result = await pool.query(
           `DELETE FROM message_attachments

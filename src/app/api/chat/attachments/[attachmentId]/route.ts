@@ -1,0 +1,61 @@
+import { NextResponse } from "next/server";
+import { deleteAttachment } from "@/server/attachments/storage";
+import { requireCurrentUser } from "@/server/auth/current-user";
+import { readEnv } from "@/server/config/env";
+import { createRepositories } from "@/server/db/repositories";
+
+export const runtime = "nodejs";
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function errorResponse(error: string, status: number) {
+  return NextResponse.json({ error }, { status });
+}
+
+export async function DELETE(
+  _request: Request,
+  context: { params: Promise<{ attachmentId: string }> },
+) {
+  let user;
+  try {
+    user = await requireCurrentUser();
+  } catch {
+    return errorResponse("unauthorized", 401);
+  }
+
+  const { attachmentId } = await context.params;
+  if (!UUID_PATTERN.test(attachmentId)) {
+    return errorResponse("attachment_not_found", 404);
+  }
+
+  const attachments = createRepositories().messageAttachments;
+  let attachment;
+  try {
+    attachment = await attachments.claimDraftForDeletion(user.id, attachmentId);
+  } catch {
+    return errorResponse("attachment_delete_failed", 500);
+  }
+  if (!attachment) {
+    return errorResponse("attachment_not_found", 404);
+  }
+
+  try {
+    await deleteAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
+  } catch {
+    await attachments
+      .releaseDeletionClaim(user.id, attachment.id, "attachment_delete_failed")
+      .catch(() => undefined);
+    return errorResponse("attachment_delete_failed", 500);
+  }
+
+  try {
+    const deleted = await attachments.deleteDraft(user.id, attachment.id);
+    if (!deleted) {
+      return errorResponse("attachment_delete_failed", 500);
+    }
+  } catch {
+    return errorResponse("attachment_delete_failed", 500);
+  }
+
+  return new Response(null, { status: 204 });
+}
