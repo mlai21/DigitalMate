@@ -57,6 +57,7 @@ services:
       PROACTIVE_QUIET_START: ${PROACTIVE_QUIET_START:-23:00}
       PROACTIVE_QUIET_END: ${PROACTIVE_QUIET_END:-08:00}
       PROACTIVE_MAX_PER_DAY: ${PROACTIVE_MAX_PER_DAY:-3}
+      ATTACHMENT_STORAGE_DIR: /app/data/attachments
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
@@ -67,6 +68,7 @@ services:
       - "3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - digitalmate-attachments:/app/data/attachments
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,6 +93,7 @@ services:
       PROACTIVE_QUIET_START: ${PROACTIVE_QUIET_START:-23:00}
       PROACTIVE_QUIET_END: ${PROACTIVE_QUIET_END:-08:00}
       PROACTIVE_MAX_PER_DAY: ${PROACTIVE_MAX_PER_DAY:-3}
+      ATTACHMENT_STORAGE_DIR: /app/data/attachments
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
@@ -103,9 +106,11 @@ services:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - digitalmate-attachments:/app/data/attachments
     restart: unless-stopped
 
 volumes:
   digitalmate-postgres:
   digitalmate-caddy-data:
   digitalmate-caddy-config:
+  digitalmate-attachments:

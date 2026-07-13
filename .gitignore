@@ -20,6 +20,7 @@ coverage
 playwright-report
 test-results
 data/artifacts
+data/attachments/
 .superpowers/
 .worktrees/
 

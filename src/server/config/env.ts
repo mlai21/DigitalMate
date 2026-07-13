@@ -1,3 +1,4 @@
+import path from "node:path";
 import { z } from "zod";
 
 const envSchema = z.object({
@@ -30,6 +31,7 @@ const envSchema = z.object({
   FEISHU_APP_SECRET: z.string().optional(),
   FEISHU_VERIFICATION_TOKEN: z.string().optional(),
   DINGTALK_ROBOT_CODE: z.string().optional(),
+  ATTACHMENT_STORAGE_DIR: z.string().optional(),
 });
 
 export type AppEnv = ReturnType<typeof readEnv>;
@@ -67,5 +69,7 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     feishuAppSecret: parsed.FEISHU_APP_SECRET,
     feishuVerificationToken: parsed.FEISHU_VERIFICATION_TOKEN,
     dingTalkRobotCode: parsed.DINGTALK_ROBOT_CODE,
+    attachmentStorageDir:
+      parsed.ATTACHMENT_STORAGE_DIR ?? path.join(process.cwd(), "data", "attachments"),
   };
 }

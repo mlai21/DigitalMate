@@ -7,6 +7,11 @@ import {
   type AttachmentStatus,
   type ChatAttachment,
 } from "@/server/attachments/types";
+import { validateAttachmentFile } from "@/server/attachments/validation";
+
+const pngBytes = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00,
+]);
 
 describe("attachment types", () => {
   it.each([
@@ -69,5 +74,111 @@ describe("attachment types", () => {
     };
 
     expect(attachment).toMatchObject({ kind: "document", status: "ready" });
+  });
+});
+
+describe("attachment validation", () => {
+  it("removes client-supplied path segments from the visible file name", () => {
+    expect(
+      validateAttachmentFile({
+        fileName: "../x.png",
+        declaredMime: "image/png",
+        bytes: pngBytes,
+      }),
+    ).toMatchObject({
+      fileName: "x.png",
+      kind: "image",
+      mimeType: "image/png",
+      sizeBytes: pngBytes.length,
+    });
+
+    expect(
+      validateAttachmentFile({
+        fileName: "C:\\fakepath\\photo.png",
+        declaredMime: "image/png",
+        bytes: pngBytes,
+      }).fileName,
+    ).toBe("photo.png");
+  });
+
+  it.each(["x.png.exe", "x.exe.png", "x.png.pdf"])(
+    "rejects a disguised double extension: %s",
+    (fileName) => {
+      expect(() =>
+        validateAttachmentFile({ fileName, declaredMime: "image/png", bytes: pngBytes }),
+      ).toThrow("attachment_type_not_allowed");
+    },
+  );
+
+  it.each([
+    ["x.jpg", "image/jpeg", Buffer.from([0xff, 0xd8, 0xff, 0x00])],
+    ["x.png", "image/png", pngBytes],
+    ["x.webp", "image/webp", Buffer.from("RIFF0000WEBPpayload")],
+    ["x.pdf", "application/pdf", Buffer.from("%PDF-1.7\n")],
+  ])("accepts the required binary signature for %s", (fileName, declaredMime, bytes) => {
+    expect(validateAttachmentFile({ fileName, declaredMime, bytes })).toMatchObject({
+      fileName,
+      mimeType: declaredMime,
+    });
+  });
+
+  it("rejects a binary file whose content does not match its signature", () => {
+    expect(() =>
+      validateAttachmentFile({
+        fileName: "x.png",
+        declaredMime: "image/png",
+        bytes: Buffer.from("not-png"),
+      }),
+    ).toThrow("attachment_signature_mismatch");
+  });
+
+  it.each([
+    ["notes.txt", "text/plain"],
+    ["notes.md", "text/markdown"],
+    ["table.csv", "text/csv"],
+  ])("accepts valid UTF-8 text for %s", (fileName, declaredMime) => {
+    const bytes = Buffer.from("你好,DigitalMate\n");
+
+    expect(validateAttachmentFile({ fileName, declaredMime, bytes })).toMatchObject({
+      kind: "document",
+      fileName,
+      sizeBytes: bytes.length,
+    });
+  });
+
+  it("rejects invalid UTF-8 and NUL bytes in text documents", () => {
+    expect(() =>
+      validateAttachmentFile({
+        fileName: "notes.txt",
+        declaredMime: "text/plain",
+        bytes: Buffer.from([0xc3, 0x28]),
+      }),
+    ).toThrow("attachment_invalid_utf8");
+
+    expect(() =>
+      validateAttachmentFile({
+        fileName: "notes.md",
+        declaredMime: "text/markdown",
+        bytes: Buffer.from("hello\0world"),
+      }),
+    ).toThrow("attachment_text_contains_nul");
+  });
+
+  it("requires JSON documents to be parseable", () => {
+    expect(
+      validateAttachmentFile({
+        fileName: "data.json",
+        declaredMime: "application/json",
+        bytes: Buffer.from('{"ok":true}'),
+      }),
+    ).toMatchObject({ kind: "document", mimeType: "application/json" });
+
+    expect(() =>
+      validateAttachmentFile({
+        fileName: "data.json",
+        declaredMime: "application/json",
+        bytes: Buffer.from("{broken"),
+      }),
+    ).toThrow("attachment_invalid_json");
   });
 });
