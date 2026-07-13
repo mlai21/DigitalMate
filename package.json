@@ -22,6 +22,7 @@
     "cheerio": "^1.2.0",
     "lucide-react": "^1.23.0",
     "next": "16.2.10",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.22.0",
     "pptxgenjs": "^4.0.1",
     "react": "19.2.4",
