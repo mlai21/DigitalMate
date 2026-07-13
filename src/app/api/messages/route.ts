@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withChatAttachments } from "@/server/attachments/presentation";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -23,6 +24,11 @@ export async function GET(request: Request) {
   }
   const after = url.searchParams.get("after") ? new Date(url.searchParams.get("after") as string) : new Date(0);
   const messages = await repositories.messages.listAfter(conversation.id, after);
+  const messagesWithAttachments = await withChatAttachments(
+    user.id,
+    messages,
+    repositories.messageAttachments.listForMessages,
+  );
 
-  return NextResponse.json({ messages });
+  return NextResponse.json({ messages: messagesWithAttachments });
 }

@@ -8,6 +8,7 @@ import { ChatSidebar, type ConversationItem, type ProjectItem } from "@/componen
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { TypingDots } from "@/components/chat/typing-dots";
 import { useChatScroll } from "@/components/chat/use-chat-scroll";
+import type { ChatAttachment } from "@/server/attachments/types";
 
 export type ChatMessage = {
   id: string;
@@ -15,6 +16,7 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments?: ChatAttachment[];
 };
 
 type SsePayload =

@@ -1,5 +1,6 @@
 import { ChatShell, type ChatMessage } from "@/components/chat/chat-shell";
 import type { ConversationItem, ProjectItem } from "@/components/chat/chat-sidebar";
+import { withChatAttachments } from "@/server/attachments/presentation";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -70,12 +71,17 @@ async function loadChatPageData(): Promise<{
     }
 
     const messages = await repositories.messages.list(active.id);
-    const initialMessages: ChatMessage[] = messages.map((message) => ({
+    const serializedMessages: ChatMessage[] = messages.map((message) => ({
       id: message.id,
       role: message.role === "user" ? "user" : "assistant",
       content: message.content,
       createdAt: message.createdAt.toISOString(),
     }));
+    const initialMessages = await withChatAttachments(
+      user.id,
+      serializedMessages,
+      repositories.messageAttachments.listForMessages,
+    );
 
     if (!initialConversations.some((conversation) => conversation.id === active.id)) {
       initialConversations.unshift({

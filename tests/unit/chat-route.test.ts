@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/chat/route";
+import { GET as pollMessages } from "@/app/api/messages/route";
+import Home from "@/app/page";
 import type { DbMessageAttachment } from "@/server/db/repositories";
 import { AnthropicClient } from "@/server/llm/anthropic";
 import type { AppEnv } from "@/server/config/env";
@@ -67,6 +69,8 @@ const mocks = vi.hoisted(() => {
   );
   const listAttachmentsForMessages = vi.fn<() => Promise<DbMessageAttachment[]>>(async () => []);
   const recentHistory = vi.fn<() => Promise<HistoryRow[]>>(async () => []);
+  const listMessages = vi.fn(async () => [] as HistoryRow[]);
+  const listMessagesAfter = vi.fn(async () => [] as HistoryRow[]);
   const readAttachment = vi.fn(async () => Buffer.from("private-image"));
 
   return {
@@ -78,6 +82,8 @@ const mocks = vi.hoisted(() => {
     getAttachmentForUser,
     listAttachmentsForMessages,
     recentHistory,
+    listMessages,
+    listMessagesAfter,
     readAttachment,
     createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
       conversations: {
@@ -88,6 +94,8 @@ const mocks = vi.hoisted(() => {
         create: messagesCreate,
         createWithAttachments: messagesCreateWithAttachments,
         recentHistory,
+        list: listMessages,
+        listAfter: listMessagesAfter,
       },
       messageAttachments: {
         getForUser: getAttachmentForUser,
@@ -109,6 +117,7 @@ const mocks = vi.hoisted(() => {
       },
     })),
     requireCurrentUser: vi.fn(async () => ({ id: "user-1", displayName: "Tang" })),
+    getCurrentUser: vi.fn(async () => ({ id: "user-1", displayName: "Tang" })),
     recordEventReflection: vi.fn(async () => undefined),
     getLlmClient: vi.fn(() => ({
       client: {
@@ -127,6 +136,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("@/server/auth/current-user", () => ({
   requireCurrentUser: mocks.requireCurrentUser,
+  getCurrentUser: mocks.getCurrentUser,
 }));
 
 vi.mock("@/server/db/repositories", () => ({
@@ -161,6 +171,9 @@ vi.mock("@/server/agent/tools/web-search", () => ({
 describe("chat route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.listAttachmentsForMessages.mockReset().mockResolvedValue([]);
+    mocks.listMessages.mockReset().mockResolvedValue([]);
+    mocks.listMessagesAfter.mockReset().mockResolvedValue([]);
     mocks.getLlmClient.mockReturnValue({
       client: {
         stream: async function* () {
@@ -170,6 +183,163 @@ describe("chat route", () => {
       },
       model: "gemini-3-5-flash-openai",
     });
+  });
+
+  it("returns safe attachment card data from message polling with one batch query", async () => {
+    const message = {
+      id: "20000000-0000-4000-8000-000000000010",
+      userId: "user-1",
+      conversationId: "conversation-1",
+      role: "user" as const,
+      content: "看看附件",
+      createdAt: new Date("2026-07-14T00:01:00Z"),
+    };
+    mocks.listMessagesAfter.mockResolvedValueOnce([message]);
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce([
+      {
+        ...mocks.readyDocument,
+        messageId: message.id,
+        status: "bound",
+        storageKey: "private-storage-key",
+        extractedText: "private extracted text",
+        errorCode: "private_error",
+        deletionClaimToken: "private-deletion-token",
+      },
+      {
+        ...mocks.readyDocument,
+        id: "30000000-0000-4000-8000-000000000091",
+        userId: "other-user",
+        messageId: message.id,
+        status: "bound",
+      },
+      {
+        ...mocks.readyDocument,
+        id: "30000000-0000-4000-8000-000000000092",
+        messageId: message.id,
+        status: "ready",
+      },
+      {
+        ...mocks.readyDocument,
+        id: "30000000-0000-4000-8000-000000000093",
+        messageId: "20000000-0000-4000-8000-000000000099",
+        status: "bound",
+      },
+    ]);
+
+    const response = await pollMessages(new Request(
+      "http://localhost/api/messages?conversationId=conversation-1&after=2026-07-14T00%3A00%3A00.000Z",
+    ));
+    const body = await response.json();
+    const serialized = JSON.stringify(body);
+
+    expect(response.status).toBe(200);
+    expect(body.messages).toEqual([expect.objectContaining({
+      id: message.id,
+      attachments: [{
+        id: mocks.readyDocument.id,
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        sizeBytes: 12,
+        status: "bound",
+        downloadUrl: `/api/chat/attachments/${mocks.readyDocument.id}/download`,
+      }],
+    })]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    expect(serialized).not.toContain("000000000091");
+    expect(serialized).not.toContain("000000000092");
+    expect(serialized).not.toContain("000000000093");
+    for (const secret of [
+      "storageKey",
+      "private-storage-key",
+      "extractedText",
+      "private extracted text",
+      "textTruncated",
+      "errorCode",
+      "deletionClaimToken",
+      "private-deletion-token",
+    ]) expect(serialized).not.toContain(secret);
+  });
+
+  it("does not query attachments when message polling returns no messages", async () => {
+    const response = await pollMessages(new Request(
+      "http://localhost/api/messages?conversationId=conversation-1&after=2026-07-14T00%3A00%3A00.000Z",
+    ));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ messages: [] });
+    expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("returns safe attachment card data in the initial chat page", async () => {
+    const message = {
+      id: "20000000-0000-4000-8000-000000000011",
+      userId: "user-1",
+      conversationId: "conversation-1",
+      role: "user" as const,
+      content: "首屏附件",
+      createdAt: new Date("2026-07-14T00:02:00Z"),
+    };
+    const conversation = {
+      id: "conversation-1",
+      userId: "user-1",
+      channel: "web",
+      title: "附件会话",
+      projectId: null,
+      pinned: false,
+      updatedAt: new Date("2026-07-14T00:02:00Z"),
+      messageCount: 1,
+      lastMessageAt: new Date("2026-07-14T00:02:00Z"),
+    };
+    mocks.createRepositories.mockReturnValueOnce({
+      conversations: {
+        listWithStats: vi.fn(async () => [conversation]),
+        getOrCreateDefault: vi.fn(async () => conversation),
+      },
+      projects: { list: vi.fn(async () => []) },
+      messages: { list: vi.fn(async () => [message]) },
+      messageAttachments: {
+        listForMessages: mocks.listAttachmentsForMessages.mockResolvedValueOnce([{
+          ...mocks.readyDocument,
+          messageId: message.id,
+          status: "bound",
+          storageKey: "private-storage-key",
+          extractedText: "private extracted text",
+          errorCode: "private_error",
+          deletionClaimToken: "private-deletion-token",
+        }]),
+      },
+    });
+
+    const page = await Home();
+    const initialMessages = (page.props as { initialMessages: Array<Record<string, unknown>> }).initialMessages;
+    const serialized = JSON.stringify(initialMessages);
+
+    expect(initialMessages).toEqual([expect.objectContaining({
+      id: message.id,
+      attachments: [{
+        id: mocks.readyDocument.id,
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        sizeBytes: 12,
+        status: "bound",
+        downloadUrl: `/api/chat/attachments/${mocks.readyDocument.id}/download`,
+      }],
+    })]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    for (const secret of [
+      "storageKey",
+      "private-storage-key",
+      "extractedText",
+      "private extracted text",
+      "textTruncated",
+      "errorCode",
+      "deletionClaimToken",
+      "private-deletion-token",
+    ]) expect(serialized).not.toContain(secret);
   });
 
   it("allows an attachment-only message and atomically binds it before running the agent", async () => {
