@@ -41,6 +41,27 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS message_attachments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_id uuid REFERENCES messages(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('image', 'document')),
+  file_name text NOT NULL,
+  mime_type text NOT NULL,
+  size_bytes integer NOT NULL CHECK (size_bytes > 0),
+  storage_key text NOT NULL UNIQUE,
+  extracted_text text,
+  text_truncated boolean NOT NULL DEFAULT false,
+  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'bound')),
+  error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (status = 'bound' AND message_id IS NOT NULL)
+    OR (status <> 'bound' AND message_id IS NULL)
+  )
+);
+
 CREATE TABLE IF NOT EXISTS conversation_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -312,6 +333,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task ON messages(source_task_id) WHERE source_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(status, created_at) WHERE message_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_user_active ON memory_entries(user_id, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_memory_entries_embedding ON memory_entries USING ivfflat (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;

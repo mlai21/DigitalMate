@@ -19,6 +19,11 @@ import { defaultSettings } from "@/server/settings/defaults";
 import { DEFAULT_GOAL_BUDGET_USED, type GoalBudgetUsed, type GoalContract } from "@/server/goals/contract";
 import type { GoalStatus } from "@/server/goals/state-machine";
 import { getPool } from "@/server/db/client";
+import {
+  ATTACHMENT_LIMITS,
+  type AttachmentKind,
+  type AttachmentStatus,
+} from "@/server/attachments/types";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -87,6 +92,23 @@ export type DbMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: Date;
+};
+
+export type DbMessageAttachment = {
+  id: string;
+  userId: string;
+  messageId: string | null;
+  kind: AttachmentKind;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  storageKey: string;
+  extractedText: string | null;
+  textTruncated: boolean;
+  status: AttachmentStatus;
+  errorCode: string | null;
+  createdAt: Date;
+  updatedAt: Date;
 };
 
 export type DbMemoryEntry = RankableMemory & {
@@ -302,6 +324,104 @@ export function createRepositories(pool: Pool = getPool()) {
         await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
         return mapMessage(result.rows[0]);
       },
+      async createWithAttachments(input: {
+        userId: string;
+        conversationId: string;
+        content: string;
+        attachmentIds: string[];
+      }): Promise<{ message: DbMessage; attachments: DbMessageAttachment[] }> {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+
+          if (input.attachmentIds.length > ATTACHMENT_LIMITS.maxCount) {
+            throw new Error("attachment_count_exceeded");
+          }
+          if (new Set(input.attachmentIds).size !== input.attachmentIds.length) {
+            throw new Error("attachment_not_bindable");
+          }
+
+          const conversation = await client.query(
+            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            [input.conversationId, input.userId],
+          );
+          if (!conversation.rows[0]) {
+            throw new Error("conversation_not_found");
+          }
+
+          let lockedAttachments: DbMessageAttachment[] = [];
+          if (input.attachmentIds.length > 0) {
+            const locked = await client.query(
+              `SELECT * FROM message_attachments
+               WHERE id = ANY($1::uuid[])
+               FOR UPDATE`,
+              [input.attachmentIds],
+            );
+            lockedAttachments = locked.rows.map(mapMessageAttachment);
+
+            const allBindable =
+              lockedAttachments.length === input.attachmentIds.length
+              && lockedAttachments.every(
+                (attachment) =>
+                  attachment.userId === input.userId
+                  && attachment.status === "ready"
+                  && attachment.messageId === null,
+              );
+            if (!allBindable) {
+              throw new Error("attachment_not_bindable");
+            }
+
+            const totalSize = lockedAttachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+            if (totalSize > ATTACHMENT_LIMITS.maxMessageBytes) {
+              throw new Error("attachment_total_size_exceeded");
+            }
+          }
+
+          const createdMessage = await client.query(
+            `INSERT INTO messages (user_id, conversation_id, role, content)
+             VALUES ($1, $2, 'user', $3)
+             RETURNING *`,
+            [input.userId, input.conversationId, input.content],
+          );
+          const message = mapMessage(createdMessage.rows[0]);
+
+          let attachments: DbMessageAttachment[] = [];
+          if (input.attachmentIds.length > 0) {
+            const bound = await client.query(
+              `UPDATE message_attachments
+               SET message_id = $2, status = 'bound', updated_at = now()
+               WHERE id = ANY($1::uuid[])
+                 AND user_id = $3
+                 AND status = 'ready'
+                 AND message_id IS NULL
+               RETURNING *`,
+              [input.attachmentIds, message.id, input.userId],
+            );
+            if (bound.rows.length !== input.attachmentIds.length) {
+              throw new Error("attachment_not_bindable");
+            }
+            const byId = new Map(
+              bound.rows.map((row) => {
+                const attachment = mapMessageAttachment(row);
+                return [attachment.id, attachment] as const;
+              }),
+            );
+            attachments = input.attachmentIds.map((attachmentId) => byId.get(attachmentId)!);
+          }
+
+          await client.query(
+            "UPDATE conversations SET updated_at = now() WHERE id = $1 AND user_id = $2",
+            [input.conversationId, input.userId],
+          );
+          await client.query("COMMIT");
+          return { message, attachments };
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
       async createFromProactiveTask(input: {
         taskId: string;
         userId: string;
@@ -362,6 +482,84 @@ export function createRepositories(pool: Pool = getPool()) {
       async markMemoryProcessed(ids: string[]): Promise<void> {
         if (ids.length === 0) return;
         await pool.query("UPDATE messages SET memory_processed = true WHERE id = ANY($1::uuid[])", [ids]);
+      },
+    },
+    messageAttachments: {
+      async createDraft(input: {
+        userId: string;
+        kind: AttachmentKind;
+        fileName: string;
+        mimeType: string;
+        sizeBytes: number;
+        storageKey: string;
+        extractedText?: string | null;
+        textTruncated?: boolean;
+      }): Promise<DbMessageAttachment> {
+        const result = await pool.query(
+          `INSERT INTO message_attachments
+           (user_id, kind, file_name, mime_type, size_bytes, storage_key, extracted_text, text_truncated, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready')
+           RETURNING *`,
+          [
+            input.userId,
+            input.kind,
+            input.fileName,
+            input.mimeType,
+            input.sizeBytes,
+            input.storageKey,
+            input.extractedText ?? null,
+            input.textTruncated ?? false,
+          ],
+        );
+        return mapMessageAttachment(result.rows[0]);
+      },
+      async getForUser(userId: string, attachmentId: string): Promise<DbMessageAttachment | null> {
+        const result = await pool.query(
+          "SELECT * FROM message_attachments WHERE user_id = $1 AND id = $2",
+          [userId, attachmentId],
+        );
+        return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
+      },
+      async listForMessages(userId: string, messageIds: string[]): Promise<DbMessageAttachment[]> {
+        if (messageIds.length === 0) return [];
+        const result = await pool.query(
+          `SELECT * FROM message_attachments
+           WHERE user_id = $1 AND message_id = ANY($2::uuid[])
+           ORDER BY created_at ASC`,
+          [userId, messageIds],
+        );
+        return result.rows.map(mapMessageAttachment);
+      },
+      async deleteDraft(userId: string, attachmentId: string): Promise<boolean> {
+        const result = await pool.query(
+          `DELETE FROM message_attachments
+           WHERE user_id = $1 AND id = $2 AND message_id IS NULL
+           RETURNING id`,
+          [userId, attachmentId],
+        );
+        return result.rows.length > 0;
+      },
+      async listExpiredDrafts(hours: number, limit = 100): Promise<DbMessageAttachment[]> {
+        const safeHours = Math.max(1, hours);
+        const safeLimit = Math.min(100, Math.max(1, limit));
+        const result = await pool.query(
+          `SELECT * FROM message_attachments
+           WHERE message_id IS NULL
+             AND status IN ('ready', 'failed')
+             AND created_at < now() - ($1 * interval '1 hour')
+           ORDER BY created_at ASC
+           LIMIT $2`,
+          [safeHours, safeLimit],
+        );
+        return result.rows.map(mapMessageAttachment);
+      },
+      async markFailed(userId: string, attachmentId: string, errorCode: string): Promise<void> {
+        await pool.query(
+          `UPDATE message_attachments
+           SET status = 'failed', error_code = $3, updated_at = now()
+           WHERE user_id = $1 AND id = $2 AND message_id IS NULL`,
+          [userId, attachmentId, errorCode],
+        );
       },
     },
     memories: {
@@ -1465,6 +1663,25 @@ function mapMessage(row: Record<string, unknown>): DbMessage {
     role: row.role as DbMessage["role"],
     content: String(row.content),
     createdAt: row.created_at as Date,
+  };
+}
+
+function mapMessageAttachment(row: Record<string, unknown>): DbMessageAttachment {
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    messageId: row.message_id ? String(row.message_id) : null,
+    kind: row.kind as AttachmentKind,
+    fileName: String(row.file_name),
+    mimeType: String(row.mime_type),
+    sizeBytes: Number(row.size_bytes),
+    storageKey: String(row.storage_key),
+    extractedText: row.extracted_text === null || row.extracted_text === undefined ? null : String(row.extracted_text),
+    textTruncated: Boolean(row.text_truncated),
+    status: row.status as AttachmentStatus,
+    errorCode: row.error_code === null || row.error_code === undefined ? null : String(row.error_code),
+    createdAt: row.created_at as Date,
+    updatedAt: row.updated_at as Date,
   };
 }
 

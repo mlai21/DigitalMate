@@ -10,6 +10,7 @@ describe("database schema", () => {
       "users",
       "conversations",
       "messages",
+      "message_attachments",
       "conversation_summaries",
       "memory_entries",
       "tool_call_logs",
@@ -29,6 +30,12 @@ describe("database schema", () => {
     }
 
     expect(schema).toContain("CREATE EXTENSION IF NOT EXISTS vector");
+    expect(schema).toMatch(/message_attachments[\s\S]+user_id uuid NOT NULL/);
+    expect(schema).toMatch(
+      /message_attachments[\s\S]+message_id uuid REFERENCES messages\(id\) ON DELETE CASCADE/,
+    );
+    expect(schema).toContain("idx_message_attachments_message");
+    expect(schema).toContain("idx_message_attachments_stale");
     expect(schema).toMatch(/memory_entries[\s\S]+user_id uuid NOT NULL/);
     expect(schema).toMatch(/conversation_summaries[\s\S]+conversation_id uuid NOT NULL/);
     expect(schema).toContain("idx_memory_entries_embedding");
