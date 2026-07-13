@@ -1,6 +1,6 @@
 "use client";
 
-import { Send, Sparkles, X } from "lucide-react";
+import { Globe2, Send, Sparkles, X } from "lucide-react";
 import { FormEvent, KeyboardEvent, Ref, useEffect, useRef, useState } from "react";
 
 export type SkillOption = {
@@ -31,12 +31,13 @@ export function ChatInput({
   shellRef,
 }: {
   disabled?: boolean;
-  onSubmit: (value: string, options?: { skillIds?: string[] }) => void;
+  onSubmit: (value: string, options?: { skillIds?: string[]; searchEnabled?: boolean }) => void;
   shellRef?: Ref<HTMLFormElement>;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [value, setValue] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<SkillOption[]>([]);
+  const [searchEnabled, setSearchEnabled] = useState(false);
   const [skillOptions, setSkillOptions] = useState<SkillOption[] | null>(null);
   const [pickerDismissed, setPickerDismissed] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -96,13 +97,17 @@ export function ChatInput({
     const content =
       text || (selectedSkills.length > 0 ? `使用 Skill：${selectedSkills.map((skill) => skill.name).join("、")}` : "");
     if (!content || disabled) return;
-    if (skillIds.length > 0) {
-      onSubmit(content, { skillIds });
+    if (skillIds.length > 0 || searchEnabled) {
+      onSubmit(content, {
+        ...(skillIds.length > 0 ? { skillIds } : {}),
+        ...(searchEnabled ? { searchEnabled: true } : {}),
+      });
     } else {
       onSubmit(content);
     }
     setValue("");
     setSelectedSkills([]);
+    setSearchEnabled(false);
     setPickerDismissed(false);
     if (ref.current) ref.current.style.height = "";
   }
@@ -203,7 +208,7 @@ export function ChatInput({
           <textarea
             ref={ref}
             aria-label="输入消息"
-            placeholder="今天想聊点什么？输入 / 可指定 Skill"
+            placeholder={searchEnabled ? "搜索网页" : "今天想聊点什么？输入 / 可指定 Skill"}
             rows={1}
             disabled={disabled}
             value={value}
@@ -218,6 +223,19 @@ export function ChatInput({
               element.style.height = `${Math.min(element.scrollHeight, 160)}px`;
             }}
           />
+        </div>
+        <div className="chat-input-toolbar">
+          <button
+            type="button"
+            className={`search-toggle${searchEnabled ? " active" : ""}`}
+            aria-label={searchEnabled ? "关闭联网搜索" : "开启联网搜索"}
+            aria-pressed={searchEnabled}
+            disabled={disabled}
+            onClick={() => setSearchEnabled((enabled) => !enabled)}
+          >
+            <Globe2 size={18} strokeWidth={2} aria-hidden="true" />
+            {searchEnabled ? <span>搜索</span> : null}
+          </button>
           <button className="send-button" type="submit" disabled={disabled} aria-label="发送">
             <Send size={18} strokeWidth={2.2} />
           </button>

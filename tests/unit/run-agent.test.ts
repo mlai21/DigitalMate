@@ -30,6 +30,10 @@ function baseRepositories() {
   };
 }
 
+const allowSearchGate = {
+  evaluate: async () => ({ allowed: true as const, method: "explicit" as const, reason: "用户显式要求搜索" }),
+};
+
 describe("runAgent", () => {
   it("injects recalled memories and streams visible assistant text", async () => {
     const seenInputs: LlmStreamInput[] = [];
@@ -85,6 +89,7 @@ describe("runAgent", () => {
       model: "mock-main",
       repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
       search: { run: searchRun },
+      searchGate: allowSearchGate,
     })) {
       chunks.push(chunk);
     }
@@ -394,7 +399,7 @@ describe("runAgent", () => {
       repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
       search: { run: searchRun },
       searchGate: {
-        evaluate: async () => ({ allowed: false, method: "llm_gate", reason: "观点讨论不需要实时信息" }),
+        evaluate: async () => ({ allowed: false, method: "policy_block", reason: "观点讨论不需要实时信息" }),
       },
     })) {
       chunks.push(chunk);
@@ -444,6 +449,36 @@ describe("runAgent", () => {
       expect.objectContaining({ toolName: "web_search_gate", outputSummary: expect.stringContaining("放行") }),
     );
     expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "web_search", status: "success" }));
+  });
+
+  it("fails closed when a caller forgets to provide the search gate", async () => {
+    const logTool = vi.fn();
+    const searchRun = vi.fn();
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"北京天气"}' } }],
+      [{ type: "text", text: "我先按已有信息回答。" }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "北京天气怎么样",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: { ...baseRepositories(), toolLogs: { create: logTool } },
+      search: { run: searchRun },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(searchRun).not.toHaveBeenCalled();
+    expect(chunks.join("")).toBe("我先按已有信息回答。");
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: "web_search_gate", status: "error", error: "Missing search gate" }),
+    );
   });
 
   it("creates an enabled skill through create_skill in the /create-skill flow", async () => {
@@ -741,6 +776,7 @@ describe("runAgent", () => {
           throw new Error("network down");
         }),
       },
+      searchGate: allowSearchGate,
     })) {
       chunks.push(chunk);
     }
@@ -804,6 +840,7 @@ describe("runAgent", () => {
           results: [{ title: "北京天气", url: "https://example.com", snippet: "明天小雨" }],
         })),
       },
+      searchGate: allowSearchGate,
     })) {
       void chunk;
     }
@@ -811,5 +848,71 @@ describe("runAgent", () => {
     const toolMessage = (seenInputs[1]?.messages ?? []).find((message) => message.role === "tool");
     expect(toolMessage?.content).toContain("不要原样罗列");
     expect(toolMessage?.content).toContain("1. 北京天气：明天小雨");
+  });
+
+  it("replaces a final answer that copies raw search titles or urls", async () => {
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"北京天气"}' } }],
+      [{ type: "text", text: "1. 北京天气预报：明天小雨（https://example.com/weather）" }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "帮我搜一下北京天气",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "1. 北京天气预报：明天小雨（https://example.com/weather）",
+          results: [{ title: "北京天气预报", url: "https://example.com/weather", snippet: "明天小雨" }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    const visible = chunks.join("");
+    expect(visible).not.toContain("北京天气预报");
+    expect(visible).not.toContain("https://example.com/weather");
+    expect(visible).toContain("原始检索内容");
+  });
+
+  it("replaces a final answer that copies only a long prefix of a search snippet", async () => {
+    const rawSnippet = "中央气象台预计明天下午有持续降雨，晚高峰道路湿滑，请注意安全";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"北京天气"}' } }],
+      [{ type: "text", text: "中央气象台预计明天下午有持续降雨，晚高峰道路湿滑。" }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "帮我查一下北京天气",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: rawSnippet,
+          results: [{ title: "天气提醒", url: "https://example.com/weather", snippet: rawSnippet }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    const visible = chunks.join("");
+    expect(visible).not.toContain("中央气象台预计");
+    expect(visible).toContain("原始检索内容");
   });
 });

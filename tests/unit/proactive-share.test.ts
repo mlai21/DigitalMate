@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildProactiveShareContent, shouldCreateProactiveShare } from "@/server/agent/proactive-share";
 
@@ -45,5 +47,14 @@ describe("buildProactiveShareContent", () => {
         searchSummary: "这周末北京北部山区天气晴，午后风力较大。",
       }),
     ).toContain("你之前提到");
+  });
+});
+
+describe("agent service proactive search", () => {
+  it("does not create unsolicited shares from arbitrary memories", async () => {
+    const source = await readFile(path.join(process.cwd(), "src/agent-service/index.ts"), "utf8");
+
+    expect(source).not.toContain("processProactiveShares");
+    expect(source).not.toContain("buildProactiveShareContent");
   });
 });

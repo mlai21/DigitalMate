@@ -1,13 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createSearchGate, isExplicitSearchRequest, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
-import type { LlmClient } from "@/server/llm/types";
-
-function gateLlm(reply: string | (() => Promise<string>)): LlmClient {
-  return {
-    async *stream() {},
-    completeText: typeof reply === "string" ? vi.fn(async () => reply) : vi.fn(reply),
-  };
-}
 
 describe("isExplicitSearchRequest", () => {
   it("detects explicit search phrasing", () => {
@@ -19,6 +11,27 @@ describe("isExplicitSearchRequest", () => {
   it("does not treat casual chat as an explicit request", () => {
     expect(isExplicitSearchRequest("你觉得人生的意义是什么")).toBe(false);
     expect(isExplicitSearchRequest("今天有点累")).toBe(false);
+  });
+
+  it("gives explicit refusals priority over search keywords", () => {
+    expect(isExplicitSearchRequest("不要搜索这个问题")).toBe(false);
+    expect(isExplicitSearchRequest("我没让你查询")).toBe(false);
+    expect(isExplicitSearchRequest("别帮我查，直接按已有知识回答")).toBe(false);
+    expect(isExplicitSearchRequest("请勿搜索")).toBe(false);
+    expect(isExplicitSearchRequest("不能搜索")).toBe(false);
+    expect(isExplicitSearchRequest("不可以搜索")).toBe(false);
+  });
+
+  it("does not confuse discussion of search with an instruction to search", () => {
+    expect(isExplicitSearchRequest("解释一下搜索算法")).toBe(false);
+    expect(isExplicitSearchRequest("我在做搜索功能")).toBe(false);
+    expect(isExplicitSearchRequest("Explain how search for text works")).toBe(false);
+    expect(isExplicitSearchRequest("I work at Google Search")).toBe(false);
+  });
+
+  it("allows a positive search command in a separate clause after rejecting another action", () => {
+    expect(isExplicitSearchRequest("不要只凭记忆，搜索一下最新消息")).toBe(true);
+    expect(isExplicitSearchRequest("别猜了，查一下官网")).toBe(true);
   });
 });
 
@@ -32,20 +45,42 @@ describe("normalizeSearchAggressiveness", () => {
 });
 
 describe("createSearchGate", () => {
+  it("passes a per-message UI authorization through without consulting the gate model", async () => {
+    const gate = createSearchGate({
+      aggressiveness: "conservative",
+      userMessage: "帮我看看这个问题",
+      userEnabled: true,
+    });
+
+    await expect(gate.evaluate("这个问题的最新信息")).resolves.toMatchObject({
+      allowed: true,
+      method: "ui_toggle",
+    });
+  });
+
+  it("blocks implicit realtime searches when the user did not authorize this turn", async () => {
+    const gate = createSearchGate({
+      aggressiveness: "conservative",
+      userMessage: "明天北京天气怎么样",
+      userEnabled: false,
+    });
+
+    await expect(gate.evaluate("北京明天天气")).resolves.toMatchObject({
+      allowed: false,
+      method: "policy_block",
+    });
+  });
+
   it("passes explicit user requests through without consulting the gate model", async () => {
-    const llm = gateLlm('{"allow": false, "reason": "不应该被调用"}');
     const gate = createSearchGate({
       aggressiveness: "conservative",
       userMessage: "帮我搜一下 WWDC 的最新消息",
-      llm,
-      model: "mock-light",
     });
 
     const decision = await gate.evaluate("WWDC 最新消息");
 
     expect(decision.allowed).toBe(true);
     expect(decision.method).toBe("explicit");
-    expect(llm.completeText).not.toHaveBeenCalled();
   });
 
   it("denies everything except explicit requests when the policy is off", async () => {
@@ -54,55 +89,24 @@ describe("createSearchGate", () => {
     const decision = await gate.evaluate("明天天气");
 
     expect(decision.allowed).toBe(false);
-    expect(decision.method).toBe("policy_off");
+    expect(decision.method).toBe("policy_block");
   });
 
-  it("allows without a hard gate on the standard tier", async () => {
+  it("does not let the legacy standard tier bypass explicit authorization", async () => {
     const gate = createSearchGate({ aggressiveness: "standard", userMessage: "明天天气怎么样" });
 
     const decision = await gate.evaluate("明天天气");
 
-    expect(decision.allowed).toBe(true);
-    expect(decision.method).toBe("prompt_only");
+    expect(decision.allowed).toBe(false);
+    expect(decision.method).toBe("policy_block");
   });
 
-  it("follows the light-model verdict on the conservative tier", async () => {
-    const allowGate = createSearchGate({
-      aggressiveness: "conservative",
-      userMessage: "明天北京会下雨吗",
-      llm: gateLlm('{"allow": true, "reason": "天气依赖实时数据"}'),
-      model: "mock-light",
-    });
-    const denyGate = createSearchGate({
-      aggressiveness: "conservative",
-      userMessage: "你怎么看远程办公",
-      llm: gateLlm('{"allow": false, "reason": "观点讨论不需要实时信息"}'),
-      model: "mock-light",
-    });
+  it("fails closed for ordinary messages without any model call", async () => {
+    const gate = createSearchGate({ aggressiveness: "conservative", userMessage: "有什么好看的电影" });
 
-    await expect(allowGate.evaluate("北京明天天气")).resolves.toMatchObject({ allowed: true, method: "llm_gate" });
-    await expect(denyGate.evaluate("远程办公 趋势")).resolves.toMatchObject({ allowed: false, method: "llm_gate" });
-  });
-
-  it("fails closed when the gate model errors or returns garbage", async () => {
-    const errorGate = createSearchGate({
-      aggressiveness: "conservative",
-      userMessage: "有什么好看的电影",
-      llm: gateLlm(async () => {
-        throw new Error("model down");
-      }),
-      model: "mock-light",
+    await expect(gate.evaluate("好看的电影")).resolves.toMatchObject({
+      allowed: false,
+      method: "policy_block",
     });
-    const garbageGate = createSearchGate({
-      aggressiveness: "conservative",
-      userMessage: "有什么好看的电影",
-      llm: gateLlm("我觉得可以搜"),
-      model: "mock-light",
-    });
-    const missingLlmGate = createSearchGate({ aggressiveness: "conservative", userMessage: "有什么好看的电影" });
-
-    await expect(errorGate.evaluate("好看的电影")).resolves.toMatchObject({ allowed: false });
-    await expect(garbageGate.evaluate("好看的电影")).resolves.toMatchObject({ allowed: false });
-    await expect(missingLlmGate.evaluate("好看的电影")).resolves.toMatchObject({ allowed: false });
   });
 });

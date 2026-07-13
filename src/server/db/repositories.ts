@@ -302,6 +302,23 @@ export function createRepositories(pool: Pool = getPool()) {
         await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
         return mapMessage(result.rows[0]);
       },
+      async createFromProactiveTask(input: {
+        taskId: string;
+        userId: string;
+        conversationId: string;
+        content: string;
+      }): Promise<boolean> {
+        const result = await pool.query(
+          `INSERT INTO messages (user_id, conversation_id, role, content, source_task_id)
+           VALUES ($1, $2, 'assistant', $3, $4)
+           ON CONFLICT (source_task_id) WHERE source_task_id IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [input.userId, input.conversationId, input.content, input.taskId],
+        );
+        if (result.rows.length === 0) return false;
+        await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
+        return true;
+      },
       async list(conversationId: string): Promise<DbMessage[]> {
         const result = await pool.query(
           "SELECT * FROM messages WHERE conversation_id = $1 AND visible_to_user = true ORDER BY created_at ASC",
@@ -559,6 +576,12 @@ export function createRepositories(pool: Pool = getPool()) {
       },
       async markSent(taskId: string): Promise<void> {
         await pool.query("UPDATE proactive_tasks SET status = 'sent', sent_at = now(), updated_at = now() WHERE id = $1", [taskId]);
+      },
+      async markCancelled(taskId: string): Promise<void> {
+        await pool.query("UPDATE proactive_tasks SET status = 'cancelled', updated_at = now() WHERE id = $1", [taskId]);
+      },
+      async markFailed(taskId: string): Promise<void> {
+        await pool.query("UPDATE proactive_tasks SET status = 'failed', updated_at = now() WHERE id = $1", [taskId]);
       },
       async countSentToday(userId: string, now = new Date()): Promise<number> {
         const result = await pool.query(

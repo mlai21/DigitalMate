@@ -20,6 +20,38 @@ describe("MessageBubble", () => {
 });
 
 describe("ChatInput", () => {
+  it("requires an explicit per-message toggle for web search and resets it after sending", () => {
+    const onSubmit = vi.fn();
+    render(<ChatInput onSubmit={onSubmit} />);
+
+    const searchButton = screen.getByRole("button", { name: "开启联网搜索" });
+    expect(searchButton).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(searchButton);
+    expect(screen.getByRole("button", { name: "关闭联网搜索" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("搜索")).toBeInTheDocument();
+
+    const textarea = screen.getByRole("textbox", { name: "输入消息" }) as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "查查今天有什么新消息" } });
+    fireEvent.submit(textarea.closest("form")!);
+
+    expect(onSubmit).toHaveBeenCalledWith("查查今天有什么新消息", { searchEnabled: true });
+    expect(screen.getByRole("button", { name: "开启联网搜索" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByText("搜索")).toBeNull();
+  });
+
+  it("resets the search toggle when the active conversation changes", () => {
+    const onSubmit = vi.fn();
+    const { rerender } = render(<ChatInput key="conversation-a" onSubmit={onSubmit} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开启联网搜索" }));
+    expect(screen.getByRole("button", { name: "关闭联网搜索" })).toHaveAttribute("aria-pressed", "true");
+
+    rerender(<ChatInput key="conversation-b" onSubmit={onSubmit} />);
+
+    expect(screen.getByRole("button", { name: "开启联网搜索" })).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("shrinks back after a tall draft is sent", () => {
     const onSubmit = vi.fn();
     render(<ChatInput onSubmit={onSubmit} />);

@@ -20,6 +20,7 @@ const requestSchema = z.object({
   message: z.string().min(1).max(8000),
   conversationId: z.string().uuid().optional(),
   skillIds: z.array(z.string().uuid()).max(3).optional(),
+  searchEnabled: z.boolean().optional(),
 });
 
 export async function POST(request: Request) {
@@ -83,8 +84,7 @@ export async function POST(request: Request) {
   const searchGate = createSearchGate({
     aggressiveness: normalizeSearchAggressiveness(settings.search?.aggressiveness),
     userMessage: body.data.message,
-    llm: light.client,
-    model: light.model,
+    userEnabled: body.data.searchEnabled === true,
   });
 
   const stream = new ReadableStream({
@@ -102,6 +102,7 @@ export async function POST(request: Request) {
           repositories,
           explicitSkillIds,
           createSkillMode,
+          webSearchEnabled: body.data.searchEnabled === true,
           searchGate,
           search: {
             run: async (query) => {

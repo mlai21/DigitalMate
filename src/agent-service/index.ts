@@ -1,12 +1,10 @@
 import { buildConversationSummary, shouldCompactConversation } from "@/server/agent/compaction";
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
-import { buildProactiveShareContent, shouldCreateProactiveShare } from "@/server/agent/proactive-share";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
 import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
-import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { createSkillDraft } from "@/server/evolution/skills";
 import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
 import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
@@ -47,7 +45,6 @@ async function tick(repositories: ReturnType<typeof createRepositories>) {
   await processConversationCompaction(repositories);
   await processDailyReflection(repositories);
   await processSkillImprovementJob(repositories);
-  await processProactiveShares(repositories);
   await processGoalLoopsJob(repositories);
 }
 
@@ -133,59 +130,6 @@ async function processSkillImprovementJob(repositories: ReturnType<typeof create
   }).catch(() => null);
   if (outcome && outcome.proposed > 0) {
     console.log(`Skill improvement: proposed ${outcome.proposed} pending revision(s).`);
-  }
-}
-
-async function processProactiveShares(repositories: ReturnType<typeof createRepositories>) {
-  const user = await repositories.users.ensureDefault();
-  const settings = await repositories.settings.get(user.id);
-  const sentToday = await repositories.proactiveTasks.countSentToday(user.id);
-  const latestShareAt = await repositories.proactiveTasks.latestByKind(user.id, "share");
-  const unansweredCount = await repositories.proactiveTasks.unansweredStreak(user.id);
-  const now = new Date();
-  if (unansweredCount >= 2) {
-    await recordEventReflection(repositories, {
-      userId: user.id,
-      event: "proactive_ignored",
-      summary: `主动消息连续 ${unansweredCount} 次没有收到用户回应。`,
-      source: { unansweredCount },
-      dedupeByEvent: true,
-      now,
-    }).catch(() => undefined);
-  }
-  const shouldShare = shouldCreateProactiveShare({
-    now,
-    latestShareAt,
-    quietStart: settings.proactivity.quietStart,
-    quietEnd: settings.proactivity.quietEnd,
-    sentToday,
-    maxPerDay: settings.proactivity.maxPerDay,
-    unansweredCount,
-  });
-  if (!shouldShare) return;
-
-  const memories = await repositories.memories.list(user.id);
-  const memory = memories.find((item) => item.kind === "profile") ?? memories[0];
-  if (!memory) return;
-
-  const conversations = await repositories.conversations.list(user.id);
-  const conversation = conversations[0] ?? (await repositories.conversations.getOrCreateDefault(user.id));
-
-  try {
-    const results = await searchWeb(`和这个偏好相关的最新信息：${memory.content}`);
-    const content = buildProactiveShareContent({
-      memory: memory.content,
-      searchSummary: summarizeSearchResults(results),
-    });
-    await repositories.proactiveTasks.create({
-      userId: user.id,
-      conversationId: conversation.id,
-      kind: "share",
-      content,
-      scheduledAt: now,
-    });
-  } catch {
-    return;
   }
 }
 

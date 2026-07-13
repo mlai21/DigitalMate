@@ -208,7 +208,7 @@ export function ChatShell({
     if (response.ok) await refreshSidebar();
   }
 
-  async function sendMessage(content: string, options?: { skillIds?: string[] }) {
+  async function sendMessage(content: string, options?: { skillIds?: string[]; searchEnabled?: boolean }) {
     let targetConversationId = activeConversationId;
     if (!targetConversationId) {
       try {
@@ -245,6 +245,7 @@ export function ChatShell({
           message: content,
           conversationId: targetConversationId,
           ...(options?.skillIds?.length ? { skillIds: options.skillIds } : {}),
+          ...(options?.searchEnabled ? { searchEnabled: true } : {}),
         }),
       });
       if (!response.ok || !response.body) throw new Error("chat_request_failed");
@@ -363,7 +364,12 @@ export function ChatShell({
           <div ref={scrollRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
 
-        <ChatInput shellRef={inputShellRef} disabled={Boolean(setupNotice) || isStreaming} onSubmit={sendMessage} />
+        <ChatInput
+          key={activeConversationId ?? "new-conversation"}
+          shellRef={inputShellRef}
+          disabled={Boolean(setupNotice) || isStreaming}
+          onSubmit={sendMessage}
+        />
       </section>
     </main>
   );

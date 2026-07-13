@@ -41,6 +41,8 @@ describe("database schema", () => {
     expect(schema).toMatch(/tool_registrations[\s\S]+mcp_tool_name text/);
     expect(schema).toMatch(/llm_usage_logs[\s\S]+total_tokens integer NOT NULL/);
     expect(schema).toMatch(/proactive_tasks[\s\S]+'share'/);
+    expect(schema).toContain("source_task_id uuid REFERENCES proactive_tasks(id) ON DELETE SET NULL");
+    expect(schema).toContain("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task");
   });
 
   it("defines goal mode tables for the loop ledger (P3-1)", async () => {

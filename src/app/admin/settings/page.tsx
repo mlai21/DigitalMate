@@ -85,14 +85,13 @@ export default async function SettingsPage() {
           单次最多分段
           <input name="maxSegments" type="number" min="1" max="20" defaultValue={settings.cadence.maxSegments ?? 5} />
         </label>
-        <label>
-          搜索积极度
-          <select name="searchAggressiveness" defaultValue={settings.search?.aggressiveness ?? "conservative"}>
-            <option value="conservative">保守（白名单 + 硬门控，默认）</option>
-            <option value="standard">标准（仅提示词约束）</option>
-            <option value="off">关闭（仅显式要求时搜索）</option>
-          </select>
-        </label>
+        <div className="form-inline-action">
+          <span>联网搜索</span>
+          <strong>仅显式触发</strong>
+        </div>
+        <p className="model-picker-hint">
+          仅当用户点亮聊天输入框的联网按钮，或在消息中明确要求搜索时，才允许当前回复联网。
+        </p>
         <p className="model-picker-hint">
           模型路由已移到<a href="/admin/models">「模型」页</a>选择。
         </p>

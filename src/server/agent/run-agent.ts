@@ -85,17 +85,21 @@ export type RunAgentInput = {
   explicitSkillIds?: string[];
   /** True when the user started the /create-skill guided creation flow this turn. */
   createSkillMode?: boolean;
+  /** True only when the user enabled web search for this message in the composer. */
+  webSearchEnabled?: boolean;
   /** Hard gate consulted before every web_search execution (PRD 5.4). */
   searchGate?: SearchGate;
   purpose?: LlmPurpose;
 };
 
 const maxToolIterations = 4;
+const rawSearchLeakFallback =
+  "我查到了相关信息，但这次结果还没有整理到可以直接发给你的程度。为了不把原始检索内容塞进对话里，我先不贴出来。";
 
 const webSearchTool: LlmTool = {
   name: "web_search",
   description:
-    "联网搜索实时信息。默认不使用：仅当用户明确要求搜索，或回答必须依赖当下实时数据（天气、新闻、股价、赛事、营业信息等），或问题明显超出你的知识截止时间时才调用。闲聊、常识问答、观点讨论、写作、翻译以及安装 skill、保存做法等操作类请求一律禁止调用。",
+    "联网搜索网页信息。默认禁止使用；只有用户在输入框中开启本轮搜索，或在消息中明确要求搜索/查询时才调用。天气、新闻、价格等实时问题本身不构成授权。",
   parameters: {
     type: "object",
     properties: {
@@ -195,18 +199,20 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     skills: autoSkills,
     explicitSkills,
     createSkillMode: input.createSkillMode,
+    webSearchEnabled: input.webSearchEnabled,
     reflectionSuggestions,
     enabledTools,
     history: input.history,
     userText: input.message,
   });
   let outputTokens = 0;
+  const searchEvidence = new Set<string>();
 
   for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
     const { text, toolCalls } = await collectTurn(input.llm.stream({ messages: activeMessages, model: input.model, tools }));
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
-      const visible = sanitizeAssistantText(text);
+      const visible = sanitizeSearchOutput(sanitizeAssistantText(text), searchEvidence);
       if (visible) {
         outputTokens += estimateTokenCount(visible);
         yield visible;
@@ -216,7 +222,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
 
     const toolMessages: LlmMessage[] = [];
     for (const toolCall of toolCalls) {
-      const result = await executeToolCall({ input, toolCall, enabledTools });
+      const result = await executeToolCall({ input, toolCall, enabledTools, searchEvidence });
       toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }
     activeMessages = [...activeMessages, { role: "assistant", content: text, toolCalls }, ...toolMessages];
@@ -270,6 +276,7 @@ async function executeToolCall(context: {
   input: RunAgentInput;
   toolCall: LlmToolCall;
   enabledTools: EnabledToolContext[];
+  searchEvidence: Set<string>;
 }): Promise<string> {
   const { input, toolCall } = context;
   const startedAt = Date.now();
@@ -290,24 +297,36 @@ async function executeToolCall(context: {
       });
       return "没有拿到有效的搜索词，本次没有搜索。如果确实需要联网信息，请带上明确的 query 重新调用；否则直接回答。";
     }
-    if (input.searchGate) {
-      const decision = await input.searchGate.evaluate(query);
-      // Both allow and deny decisions are logged for admin auditing (PRD 5.4).
+    if (!input.searchGate) {
       await input.repositories.toolLogs.create({
         userId: input.userId,
         conversationId: input.conversationId,
         toolName: "web_search_gate",
         inputSummary: query,
-        outputSummary: `${decision.allowed ? "放行" : "拦截"}（${decision.method}）：${decision.reason}`.slice(0, 500),
-        status: "success",
+        outputSummary: "拦截：调用方未提供联网授权门控",
+        status: "error",
         durationMs: Date.now() - startedAt,
+        error: "Missing search gate",
       });
-      if (!decision.allowed) {
-        return "本次判定不需要联网搜索（该问题不依赖实时信息）。请直接基于已有知识和记忆自然地回答用户，不要再尝试搜索，也不要向用户提及搜索被拦截。";
-      }
+      return "本轮没有可验证的联网授权。请直接基于已有知识和记忆自然回答，不要再尝试搜索，也不要向用户提及搜索被拦截。";
+    }
+    const decision = await input.searchGate.evaluate(query);
+    // Both allow and deny decisions are logged for admin auditing (PRD 5.4).
+    await input.repositories.toolLogs.create({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      toolName: "web_search_gate",
+      inputSummary: query,
+      outputSummary: `${decision.allowed ? "放行" : "拦截"}（${decision.method}）：${decision.reason}`.slice(0, 500),
+      status: "success",
+      durationMs: Date.now() - startedAt,
+    });
+    if (!decision.allowed) {
+      return "本轮没有获得联网授权。请直接基于已有知识和记忆自然回答，不要再尝试搜索，也不要向用户提及搜索被拦截。";
     }
     try {
       const result = await input.search.run(query);
+      collectSearchEvidence(context.searchEvidence, result);
       await input.repositories.toolLogs.create({
         userId: input.userId,
         conversationId: input.conversationId,
@@ -388,6 +407,44 @@ async function executeToolCall(context: {
     });
     return `工具执行失败：${message}`;
   }
+}
+
+function collectSearchEvidence(
+  evidence: Set<string>,
+  result: { summary: string; results: Array<{ title: string; url: string; snippet: string }> },
+): void {
+  evidence.add(result.summary.trim());
+  for (const line of result.summary.split("\n")) evidence.add(line.trim());
+  for (const item of result.results) {
+    evidence.add(item.title.trim());
+    evidence.add(item.url.trim());
+    evidence.add(item.snippet.trim());
+  }
+}
+
+function sanitizeSearchOutput(text: string, evidence: Set<string>): string {
+  if (evidence.size === 0 || !text) return text;
+  if (/https?:\/\/|www\./i.test(text)) return rawSearchLeakFallback;
+
+  const normalizedOutput = normalizeSearchLeakText(text);
+  for (const fragment of evidence) {
+    const normalized = fragment.trim();
+    if (normalized.length >= 8 && text.includes(normalized)) return rawSearchLeakFallback;
+
+    const normalizedEvidence = normalizeSearchLeakText(normalized);
+    const windowSize = 18;
+    if (normalizedEvidence.length < windowSize) continue;
+    for (let start = 0; start <= normalizedEvidence.length - windowSize; start += 1) {
+      if (normalizedOutput.includes(normalizedEvidence.slice(start, start + windowSize))) {
+        return rawSearchLeakFallback;
+      }
+    }
+  }
+  return text;
+}
+
+function normalizeSearchLeakText(text: string): string {
+  return text.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
 async function saveSkillFromToolCall(context: {
@@ -608,6 +665,7 @@ export function buildMessages(input: {
   skills?: SkillContext[];
   explicitSkills?: SkillContext[];
   createSkillMode?: boolean;
+  webSearchEnabled?: boolean;
   reflectionSuggestions?: string[];
   enabledTools?: EnabledToolContext[];
   history: LlmMessage[];
@@ -615,7 +673,9 @@ export function buildMessages(input: {
 }): LlmMessage[] {
   const contextParts = [
     buildPersonaPrompt(input.persona),
-    "联网搜索纪律（必须遵守）：web_search 默认禁止使用。仅以下三种情况允许调用：① 用户明确要求搜索/查询；② 回答必须依赖当下实时数据（天气、新闻、股价、赛事、营业信息、价格等）；③ 问题明显超出你的知识截止时间。闲聊、常识问答、观点讨论、写作、翻译、总结，以及安装 skill、保存做法等操作类请求，一律禁止搜索，直接基于已有知识与记忆回答；拿不准时不搜。",
+    input.webSearchEnabled
+      ? "用户已在输入框中显式开启本轮联网搜索：本轮可调用 web_search 获取网页信息；搜索结果仍只作内部依据，必须整理后再自然回答。"
+      : "联网搜索纪律（必须遵守）：本轮默认禁止 web_search。只有用户在文字中明确要求搜索/查询时才可调用；仅仅因为天气、新闻、价格等可能需要实时信息，也不能自行搜索。普通问候、闲聊、常识问答、观点讨论、写作、翻译、总结以及安装 Skill 等请求一律不得搜索。",
     "工具使用规则：用户明确要求记住某套做法、或本轮形成了值得复用的完整方法时可调用 save_skill 沉淀草稿（需用户后台确认才生效）；用户给出 GitHub 链接要求安装 skill 时调用 install_skill（会自动发现 SKILL.md 并做安全扫描，安装成功即可使用）；当用户以 /create-skill 发起创建流程时，先分轮引导用户说清 Skill 的名称、适用场景、执行步骤和注意事项，信息齐全后用自然语言在对话中给出草稿预览请用户确认，用户明确确认后才调用 create_skill（创建后立即生效），未确认前绝不调用；工具结果只作为你回答的依据，绝不向用户暴露工具调用过程，也绝不把搜索结果的标题、摘要、链接原样罗列给用户。",
     input.createSkillMode
       ? "当前用户刚通过 /create-skill 发起了新 Skill 的创建流程：本轮起你的首要任务是引导创建。若用户已附带说明想沉淀的做法，先复述你的理解并补问缺失信息；否则从『想让我学会什么』问起。"

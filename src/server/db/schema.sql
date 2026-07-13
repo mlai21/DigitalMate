@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS proactive_tasks (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS source_task_id uuid REFERENCES proactive_tasks(id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS channel_identities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -308,6 +311,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task ON messages(source_task_id) WHERE source_task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_user_active ON memory_entries(user_id, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_memory_entries_embedding ON memory_entries USING ivfflat (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;

@@ -110,6 +110,27 @@ describe("chat route", () => {
     expect(mocks.extractAndSaveFromMessage).not.toHaveBeenCalled();
   });
 
+  it("passes the per-message search authorization to the agent", async () => {
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "看看今天的新消息", searchEnabled: true }),
+      }),
+    );
+
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(mocks.runAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "看看今天的新消息",
+        webSearchEnabled: true,
+      }),
+    );
+  });
+
+
   it("rejects conversation ids that do not belong to the current user", async () => {
     const messagesCreate = vi.fn();
     mocks.createRepositories.mockReturnValueOnce({

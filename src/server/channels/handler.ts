@@ -161,15 +161,11 @@ export async function handleChannelMessage(input: {
     }
   }
 
-  const searchGate =
-    settings.search?.aggressiveness || input.lightLlm
-      ? createSearchGate({
-          aggressiveness: normalizeSearchAggressiveness(settings.search?.aggressiveness),
-          userMessage: input.message.text,
-          llm: input.lightLlm?.client,
-          model: input.lightLlm?.model,
-        })
-      : undefined;
+  const searchGate = createSearchGate({
+    aggressiveness: normalizeSearchAggressiveness(settings.search?.aggressiveness),
+    userMessage: input.message.text,
+    userEnabled: false,
+  });
 
   let answer = "";
   for await (const chunk of runAgent({
