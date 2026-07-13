@@ -30,10 +30,13 @@ describe("database schema", () => {
     }
 
     expect(schema).toContain("CREATE EXTENSION IF NOT EXISTS vector");
-    expect(schema).toMatch(/message_attachments[\s\S]+user_id uuid NOT NULL/);
-    expect(schema).toMatch(
-      /message_attachments[\s\S]+message_id uuid REFERENCES messages\(id\) ON DELETE CASCADE/,
-    );
+    const attachmentTable = schema.match(
+      /CREATE TABLE IF NOT EXISTS message_attachments \([\s\S]*?\n\);/,
+    )?.[0];
+    expect(attachmentTable).toBeDefined();
+    expect(attachmentTable).toContain("user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE");
+    expect(attachmentTable).toContain("message_id uuid REFERENCES messages(id) ON DELETE CASCADE");
+    expect(attachmentTable).toContain("'pending', 'ready', 'failed', 'deleting', 'bound'");
     expect(schema).toContain("idx_message_attachments_message");
     expect(schema).toContain("idx_message_attachments_stale");
     expect(schema).toMatch(/memory_entries[\s\S]+user_id uuid NOT NULL/);

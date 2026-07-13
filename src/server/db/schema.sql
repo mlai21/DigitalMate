@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS message_attachments (
   storage_key text NOT NULL UNIQUE,
   extracted_text text,
   text_truncated boolean NOT NULL DEFAULT false,
-  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'bound')),
+  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
   error_code text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),

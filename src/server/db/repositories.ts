@@ -105,11 +105,13 @@ export type DbMessageAttachment = {
   storageKey: string;
   extractedText: string | null;
   textTruncated: boolean;
-  status: AttachmentStatus;
+  status: DbAttachmentStatus;
   errorCode: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
+
+export type DbAttachmentStatus = AttachmentStatus | "deleting";
 
 export type DbMemoryEntry = RankableMemory & {
   kind: string;
@@ -342,7 +344,7 @@ export function createRepositories(pool: Pool = getPool()) {
           }
 
           const conversation = await client.query(
-            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
             [input.conversationId, input.userId],
           );
           if (!conversation.rows[0]) {
@@ -353,9 +355,10 @@ export function createRepositories(pool: Pool = getPool()) {
           if (input.attachmentIds.length > 0) {
             const locked = await client.query(
               `SELECT * FROM message_attachments
-               WHERE id = ANY($1::uuid[])
+               WHERE id = ANY($1::uuid[]) AND user_id = $2
+               ORDER BY id
                FOR UPDATE`,
-              [input.attachmentIds],
+              [input.attachmentIds, input.userId],
             );
             lockedAttachments = locked.rows.map(mapMessageAttachment);
 
@@ -539,16 +542,24 @@ export function createRepositories(pool: Pool = getPool()) {
         );
         return result.rows.length > 0;
       },
-      async listExpiredDrafts(hours: number, limit = 100): Promise<DbMessageAttachment[]> {
-        const safeHours = Math.max(1, hours);
-        const safeLimit = Math.min(100, Math.max(1, limit));
+      async claimExpiredDrafts(hours: number, limit = 100): Promise<DbMessageAttachment[]> {
+        const { safeHours, safeLimit } = validateAttachmentClaimLimit(hours, limit);
         const result = await pool.query(
-          `SELECT * FROM message_attachments
-           WHERE message_id IS NULL
-             AND status IN ('ready', 'failed')
-             AND created_at < now() - ($1 * interval '1 hour')
-           ORDER BY created_at ASC
-           LIMIT $2`,
+          `WITH candidates AS (
+             SELECT id
+             FROM message_attachments
+             WHERE message_id IS NULL
+               AND status IN ('ready', 'failed')
+               AND created_at < now() - ($1 * interval '1 hour')
+             ORDER BY id
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+           )
+           UPDATE message_attachments AS attachment
+           SET status = 'deleting', updated_at = now()
+           FROM candidates
+           WHERE attachment.id = candidates.id
+           RETURNING attachment.*`,
           [safeHours, safeLimit],
         );
         return result.rows.map(mapMessageAttachment);
@@ -557,7 +568,19 @@ export function createRepositories(pool: Pool = getPool()) {
         await pool.query(
           `UPDATE message_attachments
            SET status = 'failed', error_code = $3, updated_at = now()
-           WHERE user_id = $1 AND id = $2 AND message_id IS NULL`,
+           WHERE user_id = $1
+             AND id = $2
+             AND message_id IS NULL
+             AND status IN ('pending', 'ready', 'failed')`,
+          [userId, attachmentId, errorCode],
+        );
+      },
+      async releaseDeletionClaim(userId: string, attachmentId: string, errorCode: string): Promise<void> {
+        await pool.query(
+          `UPDATE message_attachments
+           SET status = 'failed', error_code = $3, updated_at = now()
+           WHERE user_id = $1 AND id = $2
+             AND message_id IS NULL AND status = 'deleting'`,
           [userId, attachmentId, errorCode],
         );
       },
@@ -1678,11 +1701,18 @@ function mapMessageAttachment(row: Record<string, unknown>): DbMessageAttachment
     storageKey: String(row.storage_key),
     extractedText: row.extracted_text === null || row.extracted_text === undefined ? null : String(row.extracted_text),
     textTruncated: Boolean(row.text_truncated),
-    status: row.status as AttachmentStatus,
+    status: row.status as DbAttachmentStatus,
     errorCode: row.error_code === null || row.error_code === undefined ? null : String(row.error_code),
     createdAt: row.created_at as Date,
     updatedAt: row.updated_at as Date,
   };
+}
+
+function validateAttachmentClaimLimit(hours: number, limit: number): { safeHours: number; safeLimit: number } {
+  if (!Number.isSafeInteger(hours) || hours <= 0 || !Number.isSafeInteger(limit) || limit <= 0) {
+    throw new RangeError("invalid_attachment_claim_limit");
+  }
+  return { safeHours: hours, safeLimit: Math.min(limit, 100) };
 }
 
 function mapGoal(row: Record<string, unknown>): DbGoal {

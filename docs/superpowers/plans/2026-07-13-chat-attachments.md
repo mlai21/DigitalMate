@@ -205,7 +205,7 @@ expect(schema).toMatch(/message_attachments[\s\S]+user_id uuid NOT NULL/);
 expect(schema).toMatch(/message_attachments[\s\S]+message_id uuid REFERENCES messages\(id\) ON DELETE CASCADE/);
 ```
 
-仓储测试验证：创建 ready 草稿；只按 userId 读取；`createWithAttachments` 在一个事务内创建 user 消息并把 ready 附件改为 bound；跨用户、failed 或已 bound 附件导致回滚；过期草稿查询只返回 24 小时前未绑定记录。
+仓储测试验证：创建 ready 草稿；只按 userId 读取；`createWithAttachments` 在一个事务内创建 user 消息并把 ready 附件改为 bound；跨用户、failed、deleting 或已 bound 附件导致回滚；过期草稿通过原子认领进入 deleting，避免清理与消息绑定竞态。
 
 - [ ] **步骤 2：运行测试确认失败**
 
@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS message_attachments (
   storage_key text NOT NULL UNIQUE,
   extracted_text text,
   text_truncated boolean NOT NULL DEFAULT false,
-  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'bound')),
+  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
   error_code text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -239,7 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(
 
 - [ ] **步骤 4：实现仓储事务**
 
-新增 `DbMessageAttachment` 和 `messageAttachments.createDraft/getForUser/listForMessages/deleteDraft/listExpiredDrafts/markFailed`。新增：
+新增 `DbMessageAttachment` 和 `messageAttachments.createDraft/getForUser/listForMessages/deleteDraft/claimExpiredDrafts/markFailed/releaseDeletionClaim`。`claimExpiredDrafts` 必须使用单条 CTE、`FOR UPDATE SKIP LOCKED` 和 `UPDATE ... RETURNING`，把未绑定的 ready/failed 过期草稿原子更新为 deleting；认领后不能再被消息绑定，清理失败通过 `releaseDeletionClaim` 回到 failed。新增：
 
 ```ts
 messages.createWithAttachments(input: {
@@ -583,7 +583,7 @@ git commit -m "feat(P0-10): 在聊天框上传并展示附件"
 
 - [ ] **步骤 1：编写 24 小时清理失败测试**
 
-模拟 `messageAttachments.listExpiredDrafts(24)` 返回 ready/failed 草稿，断言服务删除对应磁盘文件后调用 `deleteDraft`；单个文件缺失不阻断其他清理；bound 附件不会出现在清理查询。
+模拟 `messageAttachments.claimExpiredDrafts(24)` 原子返回 deleting 草稿，断言服务删除对应磁盘文件后调用 `deleteDraft`；单个文件缺失不阻断其他清理；删除失败调用 `releaseDeletionClaim` 恢复为 failed；bound 附件不会被认领。
 
 - [ ] **步骤 2：运行测试确认失败**
 
