@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
+import { ChatShell, mergeMessages, type ChatMessage } from "@/components/chat/chat-shell";
 import { ChatInput, filterSkillOptions } from "@/components/chat/chat-input";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { useChatScroll } from "@/components/chat/use-chat-scroll";
@@ -306,6 +306,100 @@ describe("useChatScroll", () => {
   });
 });
 
+describe("ChatShell scroll behavior", () => {
+  let scrollIntoView: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/messages?conversationId=conversation-a")) {
+          return {
+            ok: true,
+            json: async () => ({
+              messages: [
+                message(
+                  "assistant-new",
+                  "assistant",
+                  "轮询带来的新消息",
+                  "2026-07-14T10:00:05.000Z",
+                ),
+              ],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({}) };
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+
+  it("历史阅读位置收到轮询新消息时提示未读，点击后再平滑滚到底部", async () => {
+    render(
+      <ChatShell
+        conversationId="conversation-a"
+        initialMessages={[
+          message(
+            "history-1",
+            "assistant",
+            "已有历史消息",
+            "2026-07-14T10:00:00.000Z",
+          ),
+        ]}
+        initialConversations={[
+          {
+            id: "conversation-a",
+            title: "测试会话",
+            channel: "web",
+            projectId: null,
+            pinned: false,
+            updatedAt: "2026-07-14T10:00:00.000Z",
+            messageCount: 1,
+          },
+        ]}
+      />,
+    );
+    const container = document.querySelector<HTMLElement>(".messages");
+    expect(container).not.toBeNull();
+    setElementScrollMetrics(container!, {
+      scrollHeight: 1_000,
+      scrollTop: 0,
+      clientHeight: 500,
+    });
+    fireEvent.scroll(container!);
+    scrollIntoView.mockClear();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(screen.getByText("轮询带来的新消息")).toBeInTheDocument();
+    const newMessageButton = screen.queryByRole("button", { name: "查看 1 条新消息" });
+    expect.soft(newMessageButton).toBeInTheDocument();
+    expect.soft(scrollIntoView).not.toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
+    if (!newMessageButton) return;
+
+    fireEvent.click(newMessageButton);
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "end" });
+    expect(screen.queryByRole("button", { name: "查看 1 条新消息" })).toBeNull();
+  });
+});
+
 describe("MessageBubble", () => {
   it("does not render internal tool details", () => {
     render(<MessageBubble role="assistant" content='{"tool_call":"web_search"}最后结果' />);
@@ -505,6 +599,15 @@ describe("mergeMessages", () => {
 
 function message(id: string, role: ChatMessage["role"], content: string, createdAt: string): ChatMessage {
   return { id, role, content, createdAt };
+}
+
+function setElementScrollMetrics(
+  element: HTMLElement,
+  metrics: { scrollHeight: number; scrollTop: number; clientHeight: number },
+) {
+  for (const [key, value] of Object.entries(metrics)) {
+    Object.defineProperty(element, key, { configurable: true, value });
+  }
 }
 
 function ChatScrollHarness({

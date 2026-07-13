@@ -7,6 +7,7 @@ import { ChatInput } from "@/components/chat/chat-input";
 import { ChatSidebar, type ConversationItem, type ProjectItem } from "@/components/chat/chat-sidebar";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { TypingDots } from "@/components/chat/typing-dots";
+import { useChatScroll } from "@/components/chat/use-chat-scroll";
 
 export type ChatMessage = {
   id: string;
@@ -43,7 +44,9 @@ export function ChatShell({
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const stageRef = useRef<HTMLElement>(null);
   const inputShellRef = useRef<HTMLFormElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const messageIds = useMemo(() => messages.map((message) => message.id), [messages]);
+  const chatScroll = useChatScroll({ conversationId: activeConversationId, messageIds });
+  const { containerRef, endRef, unreadCount, jumpToLatest } = chatScroll;
   const latestMessageTime = useMemo(() => messages.at(-1)?.createdAt ?? new Date(0).toISOString(), [messages]);
 
   const activeConversation = conversations.find((conversation) => conversation.id === activeConversationId);
@@ -69,10 +72,6 @@ export function ChatShell({
       window.removeEventListener("resize", updateInputClearance);
     };
   }, []);
-
-  useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, isStreaming]);
 
   useEffect(() => {
     if (!activeConversationId) return;
@@ -340,7 +339,7 @@ export function ChatShell({
           <div />
         )}
 
-        <div className="messages">
+        <div ref={containerRef} className="messages">
           {setupNotice ? (
             <div className="setup-notice">
               <span>{setupNotice}</span>
@@ -361,8 +360,19 @@ export function ChatShell({
             <MessageBubble key={message.id} role={message.role} content={message.content} />
           ))}
           {isStreaming ? <TypingDots /> : null}
-          <div ref={scrollRef} className="chat-scroll-anchor" aria-hidden="true" />
+          <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
+
+        {unreadCount > 0 ? (
+          <button
+            className="new-message-button"
+            type="button"
+            aria-label={`查看 ${unreadCount} 条新消息`}
+            onClick={jumpToLatest}
+          >
+            ↓ {unreadCount} 条新消息
+          </button>
+        ) : null}
 
         <ChatInput
           key={activeConversationId ?? "new-conversation"}
