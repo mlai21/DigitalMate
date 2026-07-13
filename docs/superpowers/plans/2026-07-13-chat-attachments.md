@@ -382,7 +382,7 @@ export function supportsImageInput(modelId: string): boolean {
 
 - [ ] **步骤 4：实现两个映射器**
 
-只对 `role === "user"` 处理附件。OpenAI 图片使用 `data:${mimeType};base64,${base64}`；Anthropic 图片使用 `{ type: "image", source: { type: "base64", media_type: mimeType, data: base64 } }`。文档文本由共享 `formatDocumentAttachment` 生成，禁止把内容放入 system prompt。
+只对 `role === "user"` 处理附件。OpenAI 图片使用 `data:${mimeType};base64,${base64}`；Anthropic 图片使用 `{ type: "image", source: { type: "base64", media_type: mimeType, data: base64 } }`。同一消息的文档文本由共享 `formatDocumentAttachments` 批量生成，再按原附件相对顺序回填；禁止把内容放入 system prompt。
 
 - [ ] **步骤 5：运行测试并提交**
 

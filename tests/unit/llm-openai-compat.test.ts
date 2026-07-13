@@ -107,12 +107,19 @@ describe("OpenAiCompatClient", () => {
             role: "user",
             content: "看一下",
             attachments: [
-              { kind: "image", fileName: "cat.png", mimeType: "image/png", base64: "aGVsbG8=" },
               {
                 kind: "document",
                 fileName: "notes.md",
                 mimeType: "text/markdown",
                 text: "正文",
+                truncated: false,
+              },
+              { kind: "image", fileName: "cat.png", mimeType: "image/png", base64: "aGVsbG8=" },
+              {
+                kind: "document",
+                fileName: "table.csv",
+                mimeType: "text/csv",
+                text: "name,value\nA,1",
                 truncated: false,
               },
             ],
@@ -122,16 +129,28 @@ describe("OpenAiCompatClient", () => {
     );
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body.messages[0].content).toHaveLength(3);
+    expect(body.messages[0].content).toHaveLength(4);
+    expect(body.messages[0].content.map((part: { type: string }) => part.type)).toEqual([
+      "text",
+      "text",
+      "image_url",
+      "text",
+    ]);
     expect(body.messages[0].content[0]).toEqual({ type: "text", text: "看一下" });
     expect(body.messages[0].content[1]).toEqual({
+      type: "text",
+      text: expect.stringMatching(
+        /文件名：notes\.md[\s\S]*<<<DIGITALMATE_ATTACHMENT_([a-f0-9]{64})_START>>>[\s\S]*正文[\s\S]*<<<DIGITALMATE_ATTACHMENT_\1_END>>>/,
+      ),
+    });
+    expect(body.messages[0].content[2]).toEqual({
       type: "image_url",
       image_url: { url: "data:image/png;base64,aGVsbG8=" },
     });
-    expect(body.messages[0].content[2]).toEqual({
+    expect(body.messages[0].content[3]).toEqual({
       type: "text",
       text: expect.stringMatching(
-        /文件名：notes\.md[\s\S]*不可信用户数据[\s\S]*<<<DIGITALMATE_ATTACHMENT_([a-f0-9]{64})_START>>>[\s\S]*正文[\s\S]*<<<DIGITALMATE_ATTACHMENT_\1_END>>>/,
+        /文件名：table\.csv[\s\S]*不可信用户数据[\s\S]*<<<DIGITALMATE_ATTACHMENT_([a-f0-9]{64})_START>>>[\s\S]*name,value\nA,1[\s\S]*<<<DIGITALMATE_ATTACHMENT_\1_END>>>/,
       ),
     });
   });
