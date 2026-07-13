@@ -1,4 +1,5 @@
 import type { AppEnv } from "@/server/config/env";
+import { formatDocumentAttachment } from "@/server/llm/attachments";
 import type { LlmClient, LlmMessage, LlmStreamEvent, LlmStreamInput, LlmTool } from "@/server/llm/types";
 import { collectStreamText } from "@/server/llm/types";
 
@@ -110,6 +111,24 @@ function toOpenAiMessage(message: LlmMessage) {
         function: { name: call.name, arguments: call.arguments },
       })),
     };
+  }
+  if (message.role === "user" && message.attachments && message.attachments.length > 0) {
+    const content: Array<
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } }
+    > = [];
+    if (message.content) content.push({ type: "text", text: message.content });
+    for (const attachment of message.attachments) {
+      if (attachment.kind === "image") {
+        content.push({
+          type: "image_url",
+          image_url: { url: `data:${attachment.mimeType};base64,${attachment.base64}` },
+        });
+      } else {
+        content.push({ type: "text", text: formatDocumentAttachment(attachment) });
+      }
+    }
+    return { role: "user", content };
   }
   return { role: message.role, content: message.content };
 }

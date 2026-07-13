@@ -89,6 +89,90 @@ describe("OpenAiCompatClient", () => {
     expect(body.messages[2]).toEqual({ role: "tool", tool_call_id: "call_1", content: "北京晴" });
   });
 
+  it("serializes user image and document attachments as OpenAI content parts", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('data: {"choices":[{"delta":{"content":"好"}}]}\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    await collect(
+      client.stream({
+        model: "m",
+        messages: [
+          {
+            role: "user",
+            content: "看一下",
+            attachments: [
+              { kind: "image", fileName: "cat.png", mimeType: "image/png", base64: "aGVsbG8=" },
+              {
+                kind: "document",
+                fileName: "notes.md",
+                mimeType: "text/markdown",
+                text: "正文",
+                truncated: false,
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages[0].content).toHaveLength(3);
+    expect(body.messages[0].content[0]).toEqual({ type: "text", text: "看一下" });
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,aGVsbG8=" },
+    });
+    expect(body.messages[0].content[2]).toEqual({
+      type: "text",
+      text: expect.stringMatching(
+        /文件名：notes\.md[\s\S]*不可信用户数据[\s\S]*--- 附件内容开始 ---[\s\S]*正文[\s\S]*--- 附件内容结束 ---/,
+      ),
+    });
+  });
+
+  it("keeps legacy messages as strings and ignores non-user attachments", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('data: {"choices":[{"delta":{"content":"好"}}]}\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    await collect(
+      client.stream({
+        model: "m",
+        messages: [
+          { role: "user", content: "普通消息" },
+          {
+            role: "assistant",
+            content: "不要展开附件",
+            attachments: [
+              {
+                kind: "document",
+                fileName: "hidden.txt",
+                mimeType: "text/plain",
+                text: "不能进入载荷",
+                truncated: false,
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages).toEqual([
+      { role: "user", content: "普通消息" },
+      { role: "assistant", content: "不要展开附件" },
+    ]);
+  });
+
   it("throws when the provider returns a JSON error body", async () => {
     vi.stubGlobal(
       "fetch",

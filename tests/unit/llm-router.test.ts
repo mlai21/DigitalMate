@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readEnv } from "@/server/config/env";
+import { MODEL_CATALOG, supportsImageInput } from "@/server/llm/catalog";
 import { chooseLlmClientName, getLlmClient } from "@/server/llm/router";
 
 describe("chooseLlmClientName", () => {
@@ -38,5 +39,17 @@ describe("chooseLlmClientName", () => {
 
     expect(routed.client.constructor.name).toBe("MockLlmClient");
     expect(routed.model).toBe("mock-light");
+  });
+
+  it("declares image input support for every built-in main model", () => {
+    const mainModels = MODEL_CATALOG.filter((entry) => entry.recommendedFor.includes("main"));
+
+    expect(mainModels.length).toBeGreaterThan(0);
+    expect(mainModels.every((entry) => Object.hasOwn(entry, "supportsImageInput"))).toBe(true);
+    expect(mainModels.every((entry) => entry.supportsImageInput === true)).toBe(true);
+  });
+
+  it("does not assume that unknown custom models support image input", () => {
+    expect(supportsImageInput("custom-unlisted-model")).toBe(false);
   });
 });

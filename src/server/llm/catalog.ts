@@ -7,6 +7,7 @@ export type ModelCatalogEntry = {
   provider: "Anthropic" | "Google" | "OpenAI";
   description: string;
   recommendedFor: ModelPurposeTag[];
+  supportsImageInput: boolean;
 };
 
 /**
@@ -21,6 +22,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "Anthropic",
     description: "能力优先的旗舰模型，适合主对话与复杂任务。",
     recommendedFor: ["main"],
+    supportsImageInput: true,
   },
   {
     id: "claude-sonnet-4-6",
@@ -28,6 +30,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "Anthropic",
     description: "能力与成本均衡，可作为主对话的经济选项。",
     recommendedFor: ["main"],
+    supportsImageInput: true,
   },
   {
     id: "claude-haiku-4-5",
@@ -35,6 +38,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "Anthropic",
     description: "低延迟低成本，适合高频轻量调用。",
     recommendedFor: ["light"],
+    supportsImageInput: true,
   },
   {
     id: "gemini-3-5-pro-openai",
@@ -42,6 +46,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "Google",
     description: "多模态旗舰（OpenAI 兼容端点），适合主对话。",
     recommendedFor: ["main"],
+    supportsImageInput: true,
   },
   {
     id: "gemini-3-5-flash-openai",
@@ -49,6 +54,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "Google",
     description: "快速便宜（OpenAI 兼容端点），适合记忆抽取、复盘等轻量任务。",
     recommendedFor: ["light"],
+    supportsImageInput: true,
   },
   {
     id: "gpt-5-2-openai",
@@ -56,6 +62,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "OpenAI",
     description: "OpenAI 旗舰（OpenAI 兼容端点）。",
     recommendedFor: ["main"],
+    supportsImageInput: true,
   },
   {
     id: "gpt-5-2-mini-openai",
@@ -63,6 +70,7 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     provider: "OpenAI",
     description: "轻量版本，适合高频低成本调用。",
     recommendedFor: ["light"],
+    supportsImageInput: true,
   },
 ];
 
@@ -78,4 +86,8 @@ export function groupCatalogByProvider(): Array<{ provider: string; models: Mode
 
 export function isCatalogModel(modelId: string): boolean {
   return MODEL_CATALOG.some((entry) => entry.id === modelId);
+}
+
+export function supportsImageInput(modelId: string): boolean {
+  return MODEL_CATALOG.find((entry) => entry.id === modelId)?.supportsImageInput ?? false;
 }

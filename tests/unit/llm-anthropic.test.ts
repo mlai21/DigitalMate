@@ -95,6 +95,88 @@ describe("AnthropicClient", () => {
     });
   });
 
+  it("serializes user image and document attachments as Anthropic content blocks", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AnthropicClient(env());
+    await collect(
+      client.stream({
+        model: "claude-opus-4-8",
+        messages: [
+          {
+            role: "user",
+            content: "看一下",
+            attachments: [
+              { kind: "image", fileName: "cat.png", mimeType: "image/png", base64: "aGVsbG8=" },
+              {
+                kind: "document",
+                fileName: "notes.md",
+                mimeType: "text/markdown",
+                text: "正文",
+                truncated: false,
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages[0].content).toHaveLength(3);
+    expect(body.messages[0].content[0]).toEqual({ type: "text", text: "看一下" });
+    expect(body.messages[0].content[1]).toEqual({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+    });
+    expect(body.messages[0].content[2]).toEqual({
+      type: "text",
+      text: expect.stringMatching(
+        /文件名：notes\.md[\s\S]*不可信用户数据[\s\S]*--- 附件内容开始 ---[\s\S]*正文[\s\S]*--- 附件内容结束 ---/,
+      ),
+    });
+  });
+
+  it("keeps legacy messages as strings and ignores non-user attachments", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AnthropicClient(env());
+    await collect(
+      client.stream({
+        model: "claude-opus-4-8",
+        messages: [
+          {
+            role: "system",
+            content: "系统规则",
+            attachments: [
+              {
+                kind: "document",
+                fileName: "hidden.txt",
+                mimeType: "text/plain",
+                text: "不能进入系统提示",
+                truncated: false,
+              },
+            ],
+          },
+          { role: "user", content: "普通消息" },
+        ],
+      }),
+    );
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.system).toBe("系统规则");
+    expect(body.messages).toEqual([{ role: "user", content: "普通消息" }]);
+  });
+
   it("throws when KIE returns a JSON error body with HTTP 200", async () => {
     vi.stubGlobal(
       "fetch",
