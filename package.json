@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "npm run test:e2e:app && npm run test:e2e:scroll",
+    "test:e2e": "node scripts/run-e2e.mjs",
     "test:e2e:app": "playwright test",
     "test:e2e:scroll": "playwright test --config playwright.scroll.config.ts",
     "db:migrate": "tsx src/server/db/migrate.ts",

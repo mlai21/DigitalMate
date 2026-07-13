@@ -751,7 +751,7 @@ describe("chat attachment download route", () => {
     await expect(response.json()).resolves.toEqual({ error: "attachment_not_found" });
   });
 
-  it("downloads with private headers and an RFC 5987 encoded safe filename", async () => {
+  it("serves documents as attachments with private nosniff headers and a safe filename", async () => {
     mocks.getForUser.mockResolvedValueOnce({
       ...mocks.draft,
       fileName: "季度 报告's.md",
@@ -765,9 +765,49 @@ describe("chat attachment download route", () => {
     expect(response.headers.get("content-type")).toBe("text/markdown");
     expect(response.headers.get("content-length")).toBe("12");
     expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("content-disposition")).toBe(
       "attachment; filename*=UTF-8''%E5%AD%A3%E5%BA%A6%20%E6%8A%A5%E5%91%8A%27s.md",
     );
     await expect(response.text()).resolves.toBe("hello world\n");
+  });
+
+  it("serves allowlisted image attachments inline", async () => {
+    mocks.getForUser.mockResolvedValueOnce({
+      ...mocks.draft,
+      kind: "image",
+      fileName: "猫 图.png",
+      mimeType: "image/png",
+      messageId: "message-1",
+      status: "bound",
+    });
+
+    const response = await downloadAttachment(new Request("http://localhost"), attachmentContext());
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-disposition")).toBe(
+      "inline; filename*=UTF-8''%E7%8C%AB%20%E5%9B%BE.png",
+    );
+  });
+
+  it("does not serve a document disguised with an image MIME type inline", async () => {
+    mocks.getForUser.mockResolvedValueOnce({
+      ...mocks.draft,
+      kind: "document",
+      fileName: "伪装.png",
+      mimeType: "image/png",
+      messageId: "message-1",
+      status: "bound",
+    });
+
+    const response = await downloadAttachment(new Request("http://localhost"), attachmentContext());
+
+    expect(response.headers.get("content-disposition")).toBe(
+      "attachment; filename*=UTF-8''%E4%BC%AA%E8%A3%85.png",
+    );
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
   });
 });

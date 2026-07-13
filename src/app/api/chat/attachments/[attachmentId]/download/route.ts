@@ -7,6 +7,7 @@ import { createRepositories } from "@/server/db/repositories";
 export const runtime = "nodejs";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const INLINE_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 function errorResponse(error: string, status: number) {
   return NextResponse.json({ error }, { status });
@@ -58,12 +59,16 @@ export async function GET(
     return errorResponse("attachment_download_failed", 500);
   }
 
+  const disposition = attachment.kind === "image" && INLINE_IMAGE_MIME_TYPES.has(attachment.mimeType)
+    ? "inline"
+    : "attachment";
   return new Response(new Uint8Array(bytes), {
     headers: {
       "content-type": attachment.mimeType,
       "content-length": String(bytes.byteLength),
-      "content-disposition": `attachment; filename*=UTF-8''${encodeRfc5987FileName(attachment.fileName)}`,
+      "content-disposition": `${disposition}; filename*=UTF-8''${encodeRfc5987FileName(attachment.fileName)}`,
       "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
     },
   });
 }

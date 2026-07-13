@@ -141,3 +141,39 @@ test("the mobile new-message button keeps a 44px touch target above the composer
   expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(inputBox!.y);
   expect(844 - (inputBox!.y + inputBox!.height)).toBeGreaterThanOrEqual(12);
 });
+
+test("an image attachment opens inline in a new page while documents remain downloads", async ({ page }) => {
+  const imageUrl = "**/api/chat/attachments/image-e2e/download";
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+7n8pAAAAAElFTkSuQmCC",
+    "base64",
+  );
+  await page.context().route(imageUrl, async (route) => {
+    await route.fulfill({
+      status: 200,
+      body: png,
+      headers: {
+        "content-type": "image/png",
+        "content-disposition": "inline; filename*=UTF-8''cat.png",
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  });
+  let downloadStarted = false;
+  page.on("download", () => {
+    downloadStarted = true;
+  });
+
+  await page.goto("/");
+  const imageLink = page.getByRole("link", { name: /cat\.png/ });
+  await expect(imageLink).not.toHaveAttribute("download");
+  const popupPromise = page.waitForEvent("popup");
+  await imageLink.click();
+  const popup = await popupPromise;
+
+  await expect(popup).toHaveURL(/\/api\/chat\/attachments\/image-e2e\/download$/);
+  await expect(popup.locator("img")).toBeVisible();
+  expect(downloadStarted).toBe(false);
+  await expect(page.getByRole("link", { name: /notes\.md/ })).toHaveAttribute("download", "notes.md");
+});
