@@ -89,7 +89,7 @@ function sanitizeAttachmentFileName(fileName: string) {
 function hasDisguisedDoubleExtension(fileName: string) {
   const segments = fileName.toLowerCase().split(".");
   if (segments.length < 3) return false;
-  return DISGUISED_EXTENSIONS.has(segments.at(-2) ?? "");
+  return segments.slice(1, -1).some((segment) => DISGUISED_EXTENSIONS.has(segment));
 }
 
 function decodeUtf8(bytes: Buffer) {

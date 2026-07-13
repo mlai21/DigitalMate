@@ -38,6 +38,7 @@ export type AppEnv = ReturnType<typeof readEnv>;
 
 export function readEnv(source: Record<string, string | undefined> = process.env) {
   const parsed = envSchema.parse(source);
+  const attachmentStorageDir = parsed.ATTACHMENT_STORAGE_DIR?.trim();
 
   return {
     databaseUrl: parsed.DATABASE_URL,
@@ -70,6 +71,6 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     feishuVerificationToken: parsed.FEISHU_VERIFICATION_TOKEN,
     dingTalkRobotCode: parsed.DINGTALK_ROBOT_CODE,
     attachmentStorageDir:
-      parsed.ATTACHMENT_STORAGE_DIR ?? path.join(process.cwd(), "data", "attachments"),
+      attachmentStorageDir || path.join(process.cwd(), "data", "attachments"),
   };
 }

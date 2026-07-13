@@ -101,7 +101,7 @@ describe("attachment validation", () => {
     ).toBe("photo.png");
   });
 
-  it.each(["x.png.exe", "x.exe.png", "x.png.pdf"])(
+  it.each(["x.png.exe", "x.exe.png", "x.png.pdf", "x.exe.final.png"])(
     "rejects a disguised double extension: %s",
     (fileName) => {
       expect(() =>
@@ -130,6 +130,38 @@ describe("attachment validation", () => {
         bytes: Buffer.from("not-png"),
       }),
     ).toThrow("attachment_signature_mismatch");
+  });
+
+  it.each([
+    ["x.jpg", "image/jpeg", Buffer.from([0xff, 0xd8])],
+    ["x.png", "image/png", Buffer.from([0x89, 0x50, 0x4e, 0x47])],
+    ["x.webp", "image/webp", Buffer.from("RIFF0000NOPE")],
+    ["x.pdf", "application/pdf", Buffer.from("%PDF")],
+  ])("rejects a missing or incomplete binary signature for %s", (fileName, declaredMime, bytes) => {
+    expect(() => validateAttachmentFile({ fileName, declaredMime, bytes })).toThrow(
+      "attachment_signature_mismatch",
+    );
+  });
+
+  it("accepts the exact size limit and rejects one byte over it before content parsing", () => {
+    const exactLimit = Buffer.alloc(ATTACHMENT_LIMITS.maxFileBytes, 0x20);
+    exactLimit.set([0xff, 0xd8, 0xff], 0);
+
+    expect(
+      validateAttachmentFile({
+        fileName: "large.jpg",
+        declaredMime: "image/jpeg",
+        bytes: exactLimit,
+      }).sizeBytes,
+    ).toBe(ATTACHMENT_LIMITS.maxFileBytes);
+
+    expect(() =>
+      validateAttachmentFile({
+        fileName: "large.jpg",
+        declaredMime: "image/jpeg",
+        bytes: Buffer.alloc(ATTACHMENT_LIMITS.maxFileBytes + 1),
+      }),
+    ).toThrow("attachment_file_too_large");
   });
 
   it.each([
