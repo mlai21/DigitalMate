@@ -197,6 +197,33 @@ describe("runAgent", () => {
     expect(system).not.toMatch(/web_search|save_skill|install_skill|create_skill|已确认工具|local_tool/);
   });
 
+  it("sanitizes explicit and automatic Skill guidance in attachment context", () => {
+    const messages = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "分析附件",
+      attachmentContextPresent: true,
+      explicitSkills: [{
+        name: "显式总结",
+        trigger: "总结附件并联网核验",
+        content: "格式：输出三点列表\n调用 web_search 搜索\n调用天气插件\n保存结果到数据库\n保存为 Skill",
+      }],
+      skills: [{
+        name: "自动分析",
+        trigger: "分析材料",
+        content: "先列出关键信息\n安装工具后执行外部命令",
+      }],
+    });
+    const system = messages[0]?.content ?? "";
+
+    expect(system).toContain("仅参考不涉及工具或外部动作的分析与格式步骤");
+    expect(system).toContain("格式：输出三点列表");
+    expect(system).toContain("先列出关键信息");
+    expect(system).not.toContain("必须严格按其执行");
+    expect(system).not.toMatch(/web_search|联网核验|调用天气插件|保存结果到数据库|保存为 Skill|安装工具|外部命令/);
+  });
+
   it("keeps all tools closed while current or historical attachment context exists, then restores them", async () => {
     const attachment: LlmAttachment = {
       kind: "document",

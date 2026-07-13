@@ -102,7 +102,7 @@ export async function POST(request: Request) {
     const code = error instanceof Error ? error.message : "attachment_context_invalid";
     return NextResponse.json({ error: code }, { status: 400 });
   }
-  const history = attachHistoryFiles(historyRows, attachmentContext.history);
+  const history = attachHistoryFiles(historyRows, orderedHistoricalAttachments, attachmentContext.history);
   const currentLlmAttachments = attachmentContext.current;
 
   let userMessage;
@@ -315,11 +315,17 @@ function orderAttachmentsByMessage(
 
 function attachHistoryFiles(
   historyRows: Array<{ role: "user" | "assistant"; content: string; id?: string }>,
+  originalAttachments: DbMessageAttachment[],
   loadedAttachments: Array<{
     attachment: DbMessageAttachment;
     llmAttachment: NonNullable<LlmMessage["attachments"]>[number];
   }>,
 ): LlmMessage[] {
+  const messagesWithOriginalAttachments = new Set(
+    originalAttachments
+      .map((attachment) => attachment.messageId)
+      .filter((messageId): messageId is string => messageId !== null),
+  );
   const byMessage = new Map<string, NonNullable<LlmMessage["attachments"]>>();
   loadedAttachments.forEach(({ attachment, llmAttachment }) => {
     if (!attachment.messageId) return;
@@ -327,11 +333,21 @@ function attachHistoryFiles(
     list.push(llmAttachment);
     byMessage.set(attachment.messageId, list);
   });
-  return historyRows.map((message) => ({
-    role: message.role,
-    content: message.content,
-    ...(message.id && byMessage.has(message.id) ? { attachments: byMessage.get(message.id) } : {}),
-  }));
+  return historyRows.map((message) => {
+    const attachments = message.id ? byMessage.get(message.id) : undefined;
+    const needsCroppedAttachmentPlaceholder =
+      message.role === "user"
+      && message.content.trim().length === 0
+      && Boolean(message.id && messagesWithOriginalAttachments.has(message.id))
+      && !attachments?.length;
+    return {
+      role: message.role,
+      content: needsCroppedAttachmentPlaceholder
+        ? "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]"
+        : message.content,
+      ...(attachments?.length ? { attachments } : {}),
+    };
+  });
 }
 
 function toSse(payload: unknown): string {

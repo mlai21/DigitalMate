@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/chat/route";
 import type { DbMessageAttachment } from "@/server/db/repositories";
+import { AnthropicClient } from "@/server/llm/anthropic";
+import type { AppEnv } from "@/server/config/env";
+import type { LlmMessage } from "@/server/llm/types";
 
 type HistoryRow = { id: string; role: "user" | "assistant"; content: string };
 
@@ -368,7 +371,7 @@ describe("chat route", () => {
     const historyRows = Array.from({ length: 5 }, (_, index) => ({
       id: `20000000-0000-4000-8000-00000000000${index + 1}`,
       role: "user" as const,
-      content: `历史 ${index + 1}`,
+      content: index === 4 ? "   " : "",
     }));
     const historyAttachments: DbMessageAttachment[] = historyRows.map((message, index) => ({
       ...mocks.readyDocument,
@@ -418,6 +421,8 @@ describe("chat route", () => {
       "history-4.md",
       "history-5.md",
     ]);
+    expect(firstHistory[0]?.content).toBe("[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]");
+    assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(firstHistory as LlmMessage[]));
     const secondHistory = agentCalls[1]?.[0].history as Array<{
       attachments?: Array<{ fileName: string }>;
     }>;
@@ -512,7 +517,7 @@ describe("chat route", () => {
     });
     const historyMessageId = "22000000-0000-4000-8000-000000000001";
     mocks.recentHistory.mockResolvedValueOnce([
-      { id: historyMessageId, role: "user", content: "上一轮图片" },
+      { id: historyMessageId, role: "user", content: "" },
     ]);
     mocks.listAttachmentsForMessages.mockResolvedValueOnce([{
       ...mocks.readyImage,
@@ -531,11 +536,43 @@ describe("chat route", () => {
 
     expect(response.status).toBe(200);
     const input = (mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0];
-    expect(input?.history).toEqual([{ role: "user", content: "上一轮图片" }]);
+    expect(input?.history).toEqual([{
+      role: "user",
+      content: "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]",
+    }]);
+    assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(input?.history as LlmMessage[]));
     expect(mocks.readAttachment).not.toHaveBeenCalled();
     expect(mocks.messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ role: "user", content: "继续纯文本聊天" }),
     );
+  });
+
+  it("uses the safe placeholder when an empty historical document cannot be reconstructed", async () => {
+    const historyMessageId = "23000000-0000-4000-8000-000000000001";
+    mocks.recentHistory.mockResolvedValueOnce([{ id: historyMessageId, role: "user", content: "" }]);
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce([{
+      ...mocks.readyDocument,
+      messageId: historyMessageId,
+      extractedText: null,
+      status: "bound",
+    }]);
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "继续" }),
+      }),
+    );
+    await response.text();
+
+    expect(response.status).toBe(200);
+    const input = (mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0];
+    expect(input?.history).toEqual([{
+      role: "user",
+      content: "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]",
+    }]);
+    assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(input?.history as LlmMessage[]));
   });
 
   it("never exposes an upstream error payload through SSE", async () => {
@@ -700,3 +737,43 @@ describe("chat route", () => {
     );
   });
 });
+
+async function captureAnthropicBody(history: LlmMessage[]) {
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}\n', {
+      headers: { "content-type": "text/event-stream" },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new AnthropicClient({
+    kieAiBaseUrl: "https://api.kie.ai",
+    claudeEndpoint: "/claude/v1/messages",
+    kieAiApiKey: "test-key",
+    anthropicVersion: "2023-06-01",
+  } as AppEnv);
+  try {
+    for await (const event of client.stream({
+      model: "claude-opus-4-8",
+      messages: [{ role: "system", content: "系统规则" }, ...history, { role: "user", content: "继续" }],
+    })) void event;
+    return JSON.parse(fetchMock.mock.calls[0][1].body) as {
+      messages: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }>;
+    };
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}
+
+function assertAnthropicHasNoEmptyUserContent(body: {
+  messages: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }>;
+}) {
+  for (const message of body.messages.filter((item) => item.role === "user")) {
+    if (typeof message.content === "string") {
+      expect(message.content.trim()).not.toBe("");
+      continue;
+    }
+    for (const block of message.content) {
+      if (block.type === "text") expect(block.text?.trim()).not.toBe("");
+    }
+  }
+}

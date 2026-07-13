@@ -135,7 +135,7 @@ function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
       );
       let documentIndex = 0;
       const blocks: AnthropicContentBlock[] = [];
-      if (message.content) blocks.push({ type: "text", text: message.content });
+      if (message.content.trim()) blocks.push({ type: "text", text: message.content });
       for (const attachment of message.attachments) {
         if (attachment.kind === "image") {
           blocks.push({

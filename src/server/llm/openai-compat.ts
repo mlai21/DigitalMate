@@ -121,7 +121,7 @@ function toOpenAiMessage(message: LlmMessage) {
       | { type: "text"; text: string }
       | { type: "image_url"; image_url: { url: string } }
     > = [];
-    if (message.content) content.push({ type: "text", text: message.content });
+    if (message.content.trim()) content.push({ type: "text", text: message.content });
     for (const attachment of message.attachments) {
       if (attachment.kind === "image") {
         content.push({
