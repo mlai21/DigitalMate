@@ -197,7 +197,7 @@ describe("runAgent", () => {
     expect(system).not.toMatch(/web_search|save_skill|install_skill|create_skill|已确认工具|local_tool/);
   });
 
-  it("sanitizes explicit and automatic Skill guidance in attachment context", () => {
+  it("does not inject explicit or automatic Skill guidance in attachment context", () => {
     const messages = buildMessages({
       persona: { name: "DigitalMate", style: "温暖、克制" },
       memories: [],
@@ -217,10 +217,7 @@ describe("runAgent", () => {
     });
     const system = messages[0]?.content ?? "";
 
-    expect(system).toContain("仅参考不涉及工具或外部动作的分析与格式步骤");
-    expect(system).toContain("格式：输出三点列表");
-    expect(system).toContain("先列出关键信息");
-    expect(system).not.toContain("必须严格按其执行");
+    expect(system).not.toMatch(/显式总结|自动分析|已启用 Skills|用户显式指定了以下 Skill/);
     expect(system).not.toMatch(/web_search|联网核验|调用天气插件|保存结果到数据库|保存为 Skill|安装工具|外部命令/);
   });
 
@@ -340,6 +337,19 @@ describe("runAgent", () => {
   it("keeps tools closed when the route guard reports a cropped or unsupported historical attachment", async () => {
     const searchRun = vi.fn();
     const registeredRun = vi.fn();
+    const findByIds = vi.fn(async () => [{
+      id: "skill-explicit",
+      name: "SECRET_SKILL_SHOULD_NOT_REACH_MODEL",
+      trigger: "分析历史附件",
+      content: "调用外部工具处理附件",
+    }]);
+    const findEnabled = vi.fn(async () => [{
+      id: "skill-auto",
+      name: "AUTO_SKILL_SHOULD_NOT_REACH_MODEL",
+      trigger: "继续分析",
+      content: "自动 Skill 内容",
+    }]);
+    const recordUsage = vi.fn();
     const seenInputs: LlmStreamInput[] = [];
     const llm = scriptedLlm(
       [
@@ -364,10 +374,12 @@ describe("runAgent", () => {
       model: "mock-main",
       repositories: {
         ...baseRepositories(),
+        skills: { findByIds, findEnabled, recordUsage },
         toolRegistrations: {
           listEnabled: async () => [{ name: "local_tool", description: "本地工具", command: "echo" }],
         },
       },
+      explicitSkillIds: ["skill-explicit"],
       webSearchEnabled: true,
       searchGate: allowSearchGate,
       search: { run: searchRun },
@@ -378,6 +390,15 @@ describe("runAgent", () => {
     expect(seenInputs.every((input) => input.tools?.length === 0)).toBe(true);
     expect(searchRun).not.toHaveBeenCalled();
     expect(registeredRun).not.toHaveBeenCalled();
+    expect(findByIds).not.toHaveBeenCalled();
+    expect(findEnabled).not.toHaveBeenCalled();
+    expect(recordUsage).not.toHaveBeenCalled();
+    expect(seenInputs.every((input) => !input.messages.some((message) => (
+      message.content.includes("SECRET_SKILL_SHOULD_NOT_REACH_MODEL")
+      || message.content.includes("AUTO_SKILL_SHOULD_NOT_REACH_MODEL")
+      || message.content.includes("已启用 Skills")
+      || message.content.includes("用户显式指定了以下 Skill")
+    )))).toBe(true);
     expect(chunks.join("")).toBe("历史附件还在最近上下文范围内，我先只回答内容。");
   });
 
