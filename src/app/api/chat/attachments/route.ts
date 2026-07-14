@@ -85,15 +85,23 @@ export async function POST(request: Request) {
     return errorResponse("unauthorized", 401);
   }
 
-  let upload: ParsedAttachmentUpload;
+  const repositories = createRepositories();
+  let releaseMutationLock: (() => Promise<void>) | undefined;
   try {
-    upload = await parseAttachmentMultipart(request);
-  } catch (error) {
-    const mapped = statusForUploadError(error);
-    return errorResponse(mapped.error, mapped.status);
+    releaseMutationLock = await repositories.messageAttachments.acquireUserMutationLock(user.id);
+  } catch {
+    return errorResponse("attachment_upload_failed", 500);
   }
 
   try {
+    let upload: ParsedAttachmentUpload;
+    try {
+      upload = await parseAttachmentMultipart(request);
+    } catch (error) {
+      const mapped = statusForUploadError(error);
+      return errorResponse(mapped.error, mapped.status);
+    }
+
     const validated = validateAttachmentFile({
       fileName: upload.fileName,
       declaredMime: upload.declaredMime,
@@ -108,7 +116,7 @@ export async function POST(request: Request) {
       : null;
     const storageKey = createAttachmentStorageKey();
     const storageRoot = readEnv().attachmentStorageDir;
-    const attachments = createRepositories().messageAttachments;
+    const attachments = repositories.messageAttachments;
     const draft = await attachments.createDraft({
       userId: user.id,
       kind: validated.kind,
@@ -136,5 +144,11 @@ export async function POST(request: Request) {
   } catch (error) {
     const mapped = statusForUploadError(error);
     return errorResponse(mapped.error, mapped.status);
+  } finally {
+    if (releaseMutationLock) {
+      await releaseMutationLock().catch(() => {
+        console.error("attachment_mutation_lock_release_failed", { code: "attachment_mutation_lock_release_failed" });
+      });
+    }
   }
 }

@@ -46,6 +46,8 @@ const mocks = vi.hoisted(() => {
     releaseDeletionClaim: vi.fn(async () => undefined),
     saveAttachment: vi.fn(async () => undefined),
     deleteStoredAttachment: vi.fn(async () => undefined),
+    acquireUserMutationLock: vi.fn(async () => vi.fn(async () => undefined)),
+    releaseUserMutationLock: vi.fn(async () => undefined),
     readAttachment: vi.fn(async () => Buffer.from("hello world\n")),
   };
 });
@@ -68,6 +70,7 @@ vi.mock("@/server/db/repositories", () => ({
       deleteDraft: mocks.deleteDraft,
       getForUser: mocks.getForUser,
       releaseDeletionClaim: mocks.releaseDeletionClaim,
+      acquireUserMutationLock: mocks.acquireUserMutationLock,
     },
   })),
 }));
@@ -168,12 +171,16 @@ describe("chat attachment upload route", () => {
     mocks.markFailed.mockReset();
     mocks.saveAttachment.mockReset();
     mocks.deleteStoredAttachment.mockReset();
+    mocks.acquireUserMutationLock.mockReset();
+    mocks.releaseUserMutationLock.mockReset();
     mocks.requireCurrentUser.mockResolvedValue({ id: mocks.draft.userId });
     mocks.createDraft.mockResolvedValue({ ...mocks.draft, status: "pending" });
     mocks.markReady.mockResolvedValue({ ...mocks.draft, status: "ready" });
     mocks.markFailed.mockResolvedValue(undefined);
     mocks.saveAttachment.mockResolvedValue(undefined);
     mocks.deleteStoredAttachment.mockResolvedValue(undefined);
+    mocks.acquireUserMutationLock.mockImplementation(async () => mocks.releaseUserMutationLock);
+    mocks.releaseUserMutationLock.mockResolvedValue(undefined);
   });
 
   it("rejects unauthenticated uploads before reading the request body", async () => {
@@ -196,6 +203,8 @@ describe("chat attachment upload route", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "attachment_file_required" });
     expect(mocks.saveAttachment).not.toHaveBeenCalled();
+    expect(mocks.acquireUserMutationLock).toHaveBeenCalledWith(mocks.draft.userId);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an empty file without creating a database draft", async () => {

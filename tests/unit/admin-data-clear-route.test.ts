@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   requireCurrentUser: vi.fn(async () => ({ id: USER_ID })),
   listAttachmentStorageKeys: vi.fn(async () => [OWNED_KEY]),
   clear: vi.fn(async () => undefined),
+  acquireUserMutationLock: vi.fn(async () => vi.fn(async () => undefined)),
+  releaseUserMutationLock: vi.fn(async () => undefined),
   deleteArtifactTree: vi.fn(async () => undefined),
   createRepositories: vi.fn(),
 }));
@@ -42,12 +44,17 @@ describe("admin personal data clear route", () => {
     vi.clearAllMocks();
     mocks.listAttachmentStorageKeys.mockResolvedValue([OWNED_KEY]);
     mocks.clear.mockResolvedValue(undefined);
+    mocks.acquireUserMutationLock.mockImplementation(async () => mocks.releaseUserMutationLock);
+    mocks.releaseUserMutationLock.mockResolvedValue(undefined);
     mocks.deleteArtifactTree.mockResolvedValue(undefined);
     mocks.requireCurrentUser.mockResolvedValue({ id: USER_ID });
     mocks.createRepositories.mockReturnValue({
       personalData: {
         listAttachmentStorageKeys: mocks.listAttachmentStorageKeys,
         clear: mocks.clear,
+      },
+      messageAttachments: {
+        acquireUserMutationLock: mocks.acquireUserMutationLock,
       },
     });
   });
@@ -58,7 +65,7 @@ describe("admin personal data clear route", () => {
     }
   });
 
-  it("deletes only the authenticated user's listed attachment files after database clear", async () => {
+  it("deletes only the authenticated user's listed attachment files before database clear", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
     roots.push(root);
     mocks.attachmentStorageDir = root;
@@ -70,6 +77,8 @@ describe("admin personal data clear route", () => {
     expect(response.status).toBe(303);
     expect(mocks.listAttachmentStorageKeys).toHaveBeenCalledWith(USER_ID);
     expect(mocks.clear).toHaveBeenCalledWith(USER_ID);
+    expect(mocks.acquireUserMutationLock).toHaveBeenCalledWith(USER_ID);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
     await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readAttachment(root, OTHER_KEY)).resolves.toEqual(Buffer.from("other-user"));
   });
@@ -86,11 +95,12 @@ describe("admin personal data clear route", () => {
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "personal_data_clear_failed" });
     expect(response.headers.get("location")).toBeNull();
-    expect(mocks.clear).toHaveBeenCalledWith(USER_ID);
+    expect(mocks.clear).not.toHaveBeenCalled();
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
     consoleError.mockRestore();
   });
 
-  it("does not touch files when database clear fails", async () => {
+  it("deletes attachment files first so a database failure remains safely retryable", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
     roots.push(root);
     mocks.attachmentStorageDir = root;
@@ -101,8 +111,9 @@ describe("admin personal data clear route", () => {
     const response = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
 
     expect(response.status).toBe(500);
-    await expect(readAttachment(root, OWNED_KEY)).resolves.toEqual(Buffer.from("owned"));
+    await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     expect(mocks.deleteArtifactTree).not.toHaveBeenCalled();
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
     consoleError.mockRestore();
   });
 });

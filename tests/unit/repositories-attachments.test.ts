@@ -846,6 +846,24 @@ describe("message attachment PostgreSQL concurrency", () => {
     await releaseSecond();
   });
 
+  it("serializes attachment uploads and personal-data clearing for one user", async () => {
+    const repositories = createRepositories(databasePool);
+    const userId = "50000000-0000-4000-8000-000000000010";
+    const releaseUpload = await repositories.messageAttachments.acquireUserMutationLock(userId);
+    let clearLockAcquired = false;
+    const clearLock = repositories.messageAttachments.acquireUserMutationLock(userId).then((release) => {
+      clearLockAcquired = true;
+      return release;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(clearLockAcquired).toBe(false);
+    await releaseUpload();
+    const releaseClear = await clearLock;
+    expect(clearLockAcquired).toBe(true);
+    await releaseClear();
+  });
+
   it("keeps the business pool available while many copies wait for one turn lock", async () => {
     const repositories = createRepositories(databasePool);
     const userId = "50000000-0000-4000-8000-000000000006";

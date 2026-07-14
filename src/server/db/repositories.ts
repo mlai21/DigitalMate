@@ -724,6 +724,47 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     messageAttachments: {
+      async acquireUserMutationLock(userId: string): Promise<() => Promise<void>> {
+        const lockKey = `attachment-mutation:${userId}`;
+        while (true) {
+          const client = await turnLockPool.connect();
+          let locked = false;
+          try {
+            const result = await client.query<{ locked: boolean }>(
+              "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+              [lockKey],
+            );
+            locked = result.rows[0]?.locked === true;
+          } catch (error) {
+            client.release(true);
+            throw error;
+          }
+          if (!locked) {
+            client.release();
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
+
+          let released = false;
+          return async () => {
+            if (released) return;
+            released = true;
+            try {
+              const result = await client.query<{ unlocked: boolean }>(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
+                [lockKey],
+              );
+              if (result.rows[0]?.unlocked !== true) {
+                throw new Error("attachment_mutation_lock_not_held");
+              }
+              client.release();
+            } catch (error) {
+              client.release(true);
+              throw error;
+            }
+          };
+        }
+      },
       async createDraft(input: {
         userId: string;
         kind: AttachmentKind;
