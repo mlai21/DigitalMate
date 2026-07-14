@@ -41,6 +41,67 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_id uuid;
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_execution_started_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS message_attachments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_id uuid REFERENCES messages(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('image', 'document')),
+  file_name text NOT NULL,
+  mime_type text NOT NULL,
+  size_bytes integer NOT NULL CHECK (size_bytes > 0),
+  storage_key text NOT NULL UNIQUE,
+  extracted_text text,
+  text_truncated boolean NOT NULL DEFAULT false,
+  status text NOT NULL,
+  error_code text,
+  deletion_claim_token uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT message_attachments_status_check
+    CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound')),
+  CONSTRAINT message_attachments_binding_check CHECK (
+    (status = 'bound' AND message_id IS NOT NULL)
+    OR (status <> 'bound' AND message_id IS NULL)
+  )
+);
+
+ALTER TABLE IF EXISTS message_attachments
+  ADD COLUMN IF NOT EXISTS deletion_claim_token uuid;
+
+DO $message_attachments_status$
+DECLARE
+  current_definition text;
+BEGIN
+  SELECT pg_get_constraintdef(constraint_row.oid)
+  INTO current_definition
+  FROM pg_constraint AS constraint_row
+  JOIN pg_class AS table_row ON table_row.oid = constraint_row.conrelid
+  JOIN pg_namespace AS namespace_row ON namespace_row.oid = table_row.relnamespace
+  WHERE namespace_row.nspname = current_schema()
+    AND table_row.relname = 'message_attachments'
+    AND constraint_row.conname = 'message_attachments_status_check';
+
+  IF current_definition IS NULL THEN
+    ALTER TABLE message_attachments
+      ADD CONSTRAINT message_attachments_status_check
+      CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound'));
+  ELSIF position('deleting' IN current_definition) = 0 THEN
+    ALTER TABLE message_attachments
+      DROP CONSTRAINT message_attachments_status_check;
+    ALTER TABLE message_attachments
+      ADD CONSTRAINT message_attachments_status_check
+      CHECK (status IN ('pending', 'ready', 'failed', 'deleting', 'bound'));
+  END IF;
+END
+$message_attachments_status$;
+
 CREATE TABLE IF NOT EXISTS conversation_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -311,7 +372,12 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role
+  ON messages(user_id, client_turn_id, role)
+  WHERE client_turn_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task ON messages(source_task_id) WHERE source_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(status, created_at) WHERE message_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_user_active ON memory_entries(user_id, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_memory_entries_embedding ON memory_entries USING ivfflat (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;

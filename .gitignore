@@ -20,6 +20,9 @@ coverage
 playwright-report
 test-results
 data/artifacts
+data/attachments/
+.superpowers/
+.worktrees/
 
 # Logs
 npm-debug.log*

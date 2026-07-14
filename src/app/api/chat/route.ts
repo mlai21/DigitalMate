@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { generateConversationTitle } from "@/server/agent/conversation-title";
@@ -6,22 +7,34 @@ import { runAgent } from "@/server/agent/run-agent";
 import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
 import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
+import { loadAttachmentContext } from "@/server/attachments/context";
+import { readAttachment } from "@/server/attachments/storage";
+import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories } from "@/server/db/repositories";
+import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { recordTurnReview } from "@/server/evolution/turn-review";
+import { supportsImageInput } from "@/server/llm/catalog";
+import type { LlmMessage } from "@/server/llm/types";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
 
 export const runtime = "nodejs";
 
-const requestSchema = z.object({
-  message: z.string().min(1).max(8000),
-  conversationId: z.string().uuid().optional(),
-  skillIds: z.array(z.string().uuid()).max(3).optional(),
-  searchEnabled: z.boolean().optional(),
-});
+const requestSchema = z
+  .object({
+    message: z.string().max(8000).default(""),
+    attachmentIds: z.array(z.string().uuid()).max(ATTACHMENT_LIMITS.maxCount).default([]),
+    clientTurnId: z.string().uuid(),
+    conversationId: z.string().uuid().optional(),
+    skillIds: z.array(z.string().uuid()).max(3).optional(),
+    searchEnabled: z.boolean().optional(),
+  })
+  .refine(
+    (value) => value.message.trim().length > 0 || value.attachmentIds.length > 0,
+    "message_or_attachment_required",
+  );
 
 export async function POST(request: Request) {
   let user;
@@ -44,24 +57,163 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
   const conversationId = conversation.id;
-  const userMessage = await repositories.messages.create({
-    userId: user.id,
+  const clientTurnId = body.data.clientTurnId;
+  const payloadHash = hashClientTurnPayload({
     conversationId,
-    role: "user",
-    content: body.data.message,
+    message: body.data.message,
+    attachmentIds: body.data.attachmentIds,
+    skillIds: body.data.skillIds ?? [],
+    searchEnabled: body.data.searchEnabled === true,
   });
-  await recordEventReflection(repositories, {
-    userId: user.id,
-    event: "user_dissatisfaction",
-    summary: body.data.message,
-    source: { conversationId, messageId: userMessage.id },
-  }).catch(() => undefined);
+
+  const existingUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+  const encoder = new TextEncoder();
+  let userTurn: Awaited<ReturnType<typeof repositories.messages.createIdempotentUserTurn>> | undefined;
+  if (existingUserMessage) {
+    try {
+      userTurn = await repositories.messages.createIdempotentUserTurn({
+        userId: user.id,
+        conversationId,
+        clientTurnId,
+        payloadHash,
+        content: body.data.message,
+        attachmentIds: body.data.attachmentIds,
+      });
+    } catch (error) {
+      return createClientTurnErrorResponse(error);
+    }
+
+    const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+    if (existingAssistant) {
+      return createReplayResponse({
+        encoder,
+        conversationId,
+        clientTurnId,
+        userMessageId: userTurn.message.id,
+        assistantMessageId: existingAssistant.id,
+        content: existingAssistant.content,
+      });
+    }
+  }
+
+  // Read history before creating the current turn so it cannot be appended
+  // twice by buildMessages (once in history and once as the current user turn).
+  const historyRows = await repositories.messages.recentHistory(conversationId, 12, clientTurnId);
   const settings = await repositories.settings.get(user.id);
-  const history = await repositories.messages.recentHistory(conversationId);
   const env = readEnv();
   const { client, model } = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
-  const encoder = new TextEncoder();
+  let currentAttachments = await loadTurnAttachments({
+    repositories,
+    userId: user.id,
+    attachmentIds: body.data.attachmentIds,
+    existingUserMessageId: existingUserMessage?.id,
+  });
+  if (!currentAttachments && !existingUserMessage) {
+    const racedUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+    if (racedUserMessage) {
+      try {
+        userTurn = await repositories.messages.createIdempotentUserTurn({
+          userId: user.id,
+          conversationId,
+          clientTurnId,
+          payloadHash,
+          content: body.data.message,
+          attachmentIds: body.data.attachmentIds,
+        });
+      } catch (error) {
+        return createClientTurnErrorResponse(error);
+      }
+      const racedAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+      if (racedAssistant) {
+        return createReplayResponse({
+          encoder,
+          conversationId,
+          clientTurnId,
+          userMessageId: userTurn.message.id,
+          assistantMessageId: racedAssistant.id,
+          content: racedAssistant.content,
+        });
+      }
+      currentAttachments = await loadTurnAttachments({
+        repositories,
+        userId: user.id,
+        attachmentIds: body.data.attachmentIds,
+        existingUserMessageId: racedUserMessage.id,
+      });
+    }
+  }
+  if (!currentAttachments) {
+    return NextResponse.json({ error: "attachment_not_bindable" }, { status: 400 });
+  }
+
+  const historyMessageIds = historyRows
+    .map((message) => ("id" in message && typeof message.id === "string" ? message.id : null))
+    .filter((id): id is string => id !== null);
+  const historicalAttachments = historyMessageIds.length > 0
+    ? await repositories.messageAttachments.listForMessages(user.id, historyMessageIds)
+    : [];
+  const orderedHistoricalAttachments = orderAttachmentsByMessage(historyMessageIds, historicalAttachments);
+  const imageInputSupported = supportsImageInput(model);
+  if (currentAttachments.some((attachment) => attachment.kind === "image") && !imageInputSupported) {
+    return NextResponse.json(
+      {
+        error: "image_model_not_supported",
+        message: "当前模型暂不支持图片理解，请切换到支持图片的模型后重试。",
+      },
+      { status: 422 },
+    );
+  }
+
+  let attachmentContext;
+  try {
+    attachmentContext = await loadAttachmentContext({
+      currentAttachments,
+      historicalAttachments: orderedHistoricalAttachments,
+      storage: { read: (storageKey) => readAttachment(env.attachmentStorageDir, storageKey) },
+      includeHistoricalImages: imageInputSupported,
+    });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "attachment_context_invalid";
+    return NextResponse.json({ error: code }, { status: 400 });
+  }
+  const history = attachHistoryFiles(historyRows, orderedHistoricalAttachments, attachmentContext.history);
+  const currentLlmAttachments = attachmentContext.current;
+
+  if (!userTurn) {
+    try {
+      userTurn = await repositories.messages.createIdempotentUserTurn({
+        userId: user.id,
+        conversationId,
+        clientTurnId,
+        payloadHash,
+        content: body.data.message,
+        attachmentIds: body.data.attachmentIds,
+      });
+    } catch (error) {
+      return createClientTurnErrorResponse(error);
+    }
+  }
+  const userMessage = userTurn.message;
+  if (userTurn.created) {
+    await recordEventReflection(repositories, {
+      userId: user.id,
+      event: "user_dissatisfaction",
+      summary: body.data.message,
+      source: { conversationId, messageId: userMessage.id },
+    }).catch(() => undefined);
+  }
+  const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+  if (existingAssistant) {
+    return createReplayResponse({
+      encoder,
+      conversationId,
+      clientTurnId,
+      userMessageId: userMessage.id,
+      assistantMessageId: existingAssistant.id,
+      content: existingAssistant.content,
+    });
+  }
 
   // Explicit skill invocation (P1-11) and the /create-skill flow (P1-12):
   // skill cards arrive as structured skillIds; typed slash commands are parsed
@@ -90,12 +242,72 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       let assistantText = "";
+      let executionAccepted = false;
+      let releaseExecutionLock: (() => Promise<void>) | undefined;
       try {
+        releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(user.id, clientTurnId);
+      } catch {
+        console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
+        safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
+        safeClose(controller);
+        return;
+      }
+      try {
+        const acceptExecution = () => {
+          executionAccepted = true;
+          safeEnqueue(controller, encoder, {
+            type: "accepted",
+            conversationId,
+            userMessageId: userMessage.id,
+            clientTurnId,
+          });
+        };
+        const assistantAfterLock = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+        if (assistantAfterLock) {
+          acceptExecution();
+          safeEnqueue(controller, encoder, { type: "chunk", content: assistantAfterLock.content });
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            assistantMessageId: assistantAfterLock.id,
+          });
+          safeClose(controller);
+          return;
+        }
+
+        const executionClaimed = await repositories.messages.claimClientTurnExecution(user.id, clientTurnId);
+        if (!executionClaimed) {
+          const interruptedText = "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
+          const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn({
+            userId: user.id,
+            conversationId,
+            clientTurnId,
+            content: interruptedText,
+          });
+          acceptExecution();
+          safeEnqueue(controller, encoder, { type: "chunk", content: interruptedTurn.message.content });
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            assistantMessageId: interruptedTurn.message.id,
+            degraded: true,
+          });
+          safeClose(controller);
+          return;
+        }
+
+        acceptExecution();
         for await (const chunk of runAgent({
           userId: user.id,
           conversationId,
           message: agentMessage,
+          attachments: currentLlmAttachments,
           history,
+          attachmentToolGuard: currentAttachments.length > 0 || historicalAttachments.length > 0,
           persona: settings.persona,
           llm: client,
           model,
@@ -122,51 +334,66 @@ export async function POST(request: Request) {
           },
         })) {
           assistantText += chunk;
-          controller.enqueue(encoder.encode(toSse({ type: "chunk", content: chunk })));
+          safeEnqueue(controller, encoder, { type: "chunk", content: chunk });
         }
 
         if (!assistantText.trim()) {
           assistantText = "我这边刚才没顺利想出来，等一下我们再试一次。";
-          controller.enqueue(encoder.encode(toSse({ type: "chunk", content: assistantText })));
+          safeEnqueue(controller, encoder, { type: "chunk", content: assistantText });
         }
 
-        await repositories.messages.create({
+        const assistantTurn = await repositories.messages.createIdempotentAssistantTurn({
           userId: user.id,
           conversationId,
-          role: "assistant",
+          clientTurnId,
           content: assistantText,
         });
+        const assistantMessage = assistantTurn.message;
+        if (!assistantTurn.created && assistantMessage.content !== assistantText) {
+          safeEnqueue(controller, encoder, { type: "replace", content: assistantMessage.content });
+          assistantText = assistantMessage.content;
+        }
 
-        const reminder = parseReminder(body.data.message);
-        if (reminder) {
-          await repositories.proactiveTasks.create({
-            userId: user.id,
-            conversationId,
-            kind: "reminder",
-            content: reminder.content,
-            scheduledAt: reminder.scheduledAt,
-            metadata: { urgent: reminder.urgent },
-          });
-        } else {
-          const followUp = parseFollowUp(body.data.message);
-          if (followUp) {
+        if (assistantTurn.created) try {
+          const reminder = parseReminder(body.data.message);
+          if (reminder) {
             await repositories.proactiveTasks.create({
               userId: user.id,
               conversationId,
-              kind: "follow_up",
-              content: followUp.content,
-              scheduledAt: followUp.scheduledAt,
+              kind: "reminder",
+              content: reminder.content,
+              scheduledAt: reminder.scheduledAt,
+              metadata: { urgent: reminder.urgent },
             });
+          } else {
+            const followUp = parseFollowUp(body.data.message);
+            if (followUp) {
+              await repositories.proactiveTasks.create({
+                userId: user.id,
+                conversationId,
+                kind: "follow_up",
+                content: followUp.content,
+                scheduledAt: followUp.scheduledAt,
+              });
+            }
           }
+        } catch {
+          console.error("chat_proactive_task_failed", { code: "proactive_task_create_failed" });
         }
 
-        controller.enqueue(encoder.encode(toSse({ type: "done", conversationId })));
-        controller.close();
+        safeEnqueue(controller, encoder, {
+          type: "done",
+          conversationId,
+          clientTurnId,
+          userMessageId: userMessage.id,
+          assistantMessageId: assistantMessage.id,
+        });
+        safeClose(controller);
 
         // Post-turn background work on the light model: auto-title new
         // conversations and run the Hermes-style per-turn review. Neither may
         // block or fail the reply.
-        setTimeout(() => {
+        if (assistantTurn.created) setTimeout(() => {
           void runPostTurnTasks({
             repositories,
             userId: user.id,
@@ -179,18 +406,66 @@ export async function POST(request: Request) {
           });
         }, 0);
       } catch (error) {
-        const content = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
-        await repositories.messages.create({ userId: user.id, conversationId, role: "assistant", content });
-        controller.enqueue(encoder.encode(toSse({ type: "chunk", content })));
-        controller.enqueue(
-          encoder.encode(
-            toSse({
-              type: "error",
-              message: error instanceof Error ? error.message : "unknown_error",
-            }),
-          ),
-        );
-        controller.close();
+        if (!executionAccepted) {
+          console.error("chat_turn_admission_failed", {
+            code: "turn_admission_failed",
+            errorType: error instanceof Error ? "Error" : "NonError",
+          });
+          safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
+          safeClose(controller);
+          return;
+        }
+        const fallback = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
+        const suffix = assistantText.trim() ? `\n\n${fallback}` : fallback;
+        const content = `${assistantText}${suffix}`;
+        console.error("chat_agent_failed", {
+          code: "agent_response_failed",
+          errorType: error instanceof Error ? "Error" : "NonError",
+        });
+        let fallbackTurn;
+        try {
+          fallbackTurn = await repositories.messages.createIdempotentAssistantTurn({
+            userId: user.id,
+            conversationId,
+            clientTurnId,
+            content,
+          });
+        } catch (fallbackError) {
+          console.error("chat_fallback_persist_failed", {
+            code: "fallback_persist_failed",
+            errorType: fallbackError instanceof Error ? "Error" : "NonError",
+          });
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            degraded: true,
+          });
+          safeClose(controller);
+          return;
+        }
+        const fallbackMessage = fallbackTurn.message;
+        if (fallbackTurn.created) {
+          safeEnqueue(controller, encoder, { type: "chunk", content: suffix });
+        } else {
+          safeEnqueue(controller, encoder, { type: "replace", content: fallbackMessage.content });
+        }
+        safeEnqueue(controller, encoder, {
+          type: "done",
+          conversationId,
+          clientTurnId,
+          userMessageId: userMessage.id,
+          assistantMessageId: fallbackMessage.id,
+          degraded: true,
+        });
+        safeClose(controller);
+      } finally {
+        if (releaseExecutionLock) {
+          await releaseExecutionLock().catch(() => {
+            console.error("chat_turn_lock_release_failed", { code: "turn_lock_release_failed" });
+          });
+        }
       }
     },
   });
@@ -204,8 +479,173 @@ export async function POST(request: Request) {
   });
 }
 
+async function loadTurnAttachments(input: {
+  repositories: ReturnType<typeof createRepositories>;
+  userId: string;
+  attachmentIds: string[];
+  existingUserMessageId?: string;
+}): Promise<DbMessageAttachment[] | null> {
+  if (new Set(input.attachmentIds).size !== input.attachmentIds.length) return null;
+  const attachments = await Promise.all(
+    input.attachmentIds.map((attachmentId) => input.repositories.messageAttachments.getForUser(input.userId, attachmentId)),
+  );
+  if (
+    attachments.some(
+      (attachment) =>
+        !attachment
+        || !(
+          (attachment.status === "ready" && attachment.messageId === null)
+          || (
+            attachment.status === "bound"
+            && Boolean(input.existingUserMessageId)
+            && attachment.messageId === input.existingUserMessageId
+          )
+        ),
+    )
+  ) {
+    return null;
+  }
+  const bindable = attachments as DbMessageAttachment[];
+  const totalSize = bindable.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+  return totalSize <= ATTACHMENT_LIMITS.maxMessageBytes ? bindable : null;
+}
+
+function orderAttachmentsByMessage(
+  messageIds: string[],
+  attachments: DbMessageAttachment[],
+): DbMessageAttachment[] {
+  const order = new Map(messageIds.map((messageId, index) => [messageId, index]));
+  return [...attachments].sort(
+    (left, right) => (order.get(left.messageId ?? "") ?? Number.MAX_SAFE_INTEGER)
+      - (order.get(right.messageId ?? "") ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+function attachHistoryFiles(
+  historyRows: Array<{ role: "user" | "assistant"; content: string; id?: string }>,
+  originalAttachments: DbMessageAttachment[],
+  loadedAttachments: Array<{
+    attachment: DbMessageAttachment;
+    llmAttachment: NonNullable<LlmMessage["attachments"]>[number];
+  }>,
+): LlmMessage[] {
+  const messagesWithOriginalAttachments = new Set(
+    originalAttachments
+      .map((attachment) => attachment.messageId)
+      .filter((messageId): messageId is string => messageId !== null),
+  );
+  const byMessage = new Map<string, NonNullable<LlmMessage["attachments"]>>();
+  loadedAttachments.forEach(({ attachment, llmAttachment }) => {
+    if (!attachment.messageId) return;
+    const list = byMessage.get(attachment.messageId) ?? [];
+    list.push(llmAttachment);
+    byMessage.set(attachment.messageId, list);
+  });
+  return historyRows.map((message) => {
+    const attachments = message.id ? byMessage.get(message.id) : undefined;
+    const needsCroppedAttachmentPlaceholder =
+      message.role === "user"
+      && message.content.trim().length === 0
+      && Boolean(message.id && messagesWithOriginalAttachments.has(message.id))
+      && !attachments?.length;
+    return {
+      role: message.role,
+      content: needsCroppedAttachmentPlaceholder
+        ? "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]"
+        : message.content,
+      ...(attachments?.length ? { attachments } : {}),
+    };
+  });
+}
+
 function toSse(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function safeEnqueue(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  payload: unknown,
+): boolean {
+  try {
+    controller.enqueue(encoder.encode(toSse(payload)));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeClose(controller: ReadableStreamDefaultController<Uint8Array>): void {
+  try {
+    controller.close();
+  } catch {
+    // The client may have cancelled after persistence; transport closure is best-effort.
+  }
+}
+
+function createClientTurnErrorResponse(error: unknown): NextResponse {
+  const code = error instanceof Error ? error.message : "chat_turn_create_failed";
+  if (code === "client_turn_conflict") {
+    return NextResponse.json({ error: code }, { status: 409 });
+  }
+  if (code === "conversation_not_found") {
+    return NextResponse.json({ error: code }, { status: 404 });
+  }
+  if (
+    code === "attachment_not_bindable"
+    || code === "attachment_count_exceeded"
+    || code === "attachment_total_size_exceeded"
+  ) {
+    return NextResponse.json({ error: code }, { status: 400 });
+  }
+  console.error("chat_turn_create_failed", { code: "turn_persist_failed" });
+  return NextResponse.json({ error: "chat_turn_create_failed" }, { status: 500 });
+}
+
+function createReplayResponse(input: {
+  encoder: TextEncoder;
+  conversationId: string;
+  clientTurnId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  content: string;
+}): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      safeEnqueue(controller, input.encoder, {
+        type: "accepted",
+        conversationId: input.conversationId,
+        clientTurnId: input.clientTurnId,
+        userMessageId: input.userMessageId,
+      });
+      safeEnqueue(controller, input.encoder, { type: "chunk", content: input.content });
+      safeEnqueue(controller, input.encoder, {
+        type: "done",
+        conversationId: input.conversationId,
+        clientTurnId: input.clientTurnId,
+        userMessageId: input.userMessageId,
+        assistantMessageId: input.assistantMessageId,
+      });
+      safeClose(controller);
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    },
+  });
+}
+
+function hashClientTurnPayload(input: {
+  conversationId: string;
+  message: string;
+  attachmentIds: string[];
+  skillIds: string[];
+  searchEnabled: boolean;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 async function runPostTurnTasks(input: {

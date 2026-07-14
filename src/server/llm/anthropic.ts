@@ -1,9 +1,14 @@
 import type { AppEnv } from "@/server/config/env";
+import { formatDocumentAttachments } from "@/server/llm/attachments";
 import type { LlmClient, LlmMessage, LlmStreamEvent, LlmStreamInput, LlmTool } from "@/server/llm/types";
 import { collectStreamText } from "@/server/llm/types";
 
 type AnthropicContentBlock =
   | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/webp"; data: string };
+    }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; tool_use_id: string; content: string };
 
@@ -122,6 +127,27 @@ function toAnthropicMessages(messages: LlmMessage[]): AnthropicMessage[] {
         blocks.push({ type: "tool_use", id: call.id, name: call.name, input: safeParseJson(call.arguments) });
       }
       result.push({ role: "assistant", content: blocks });
+      continue;
+    }
+    if (message.role === "user" && message.attachments && message.attachments.length > 0) {
+      const formattedDocuments = formatDocumentAttachments(
+        message.attachments.filter((attachment) => attachment.kind === "document"),
+      );
+      let documentIndex = 0;
+      const blocks: AnthropicContentBlock[] = [];
+      if (message.content.trim()) blocks.push({ type: "text", text: message.content });
+      for (const attachment of message.attachments) {
+        if (attachment.kind === "image") {
+          blocks.push({
+            type: "image",
+            source: { type: "base64", media_type: attachment.mimeType, data: attachment.base64 },
+          });
+        } else {
+          blocks.push({ type: "text", text: formattedDocuments[documentIndex] });
+          documentIndex += 1;
+        }
+      }
+      result.push({ role: "user", content: blocks });
       continue;
     }
     result.push({ role: message.role, content: message.content });

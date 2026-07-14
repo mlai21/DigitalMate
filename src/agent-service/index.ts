@@ -2,8 +2,10 @@ import { buildConversationSummary, shouldCompactConversation } from "@/server/ag
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
+import { cleanupStaleAttachments, startAttachmentCleanupScheduler } from "@/server/attachments/cleanup";
 import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
+import { closePool } from "@/server/db/client";
 import { createRepositories } from "@/server/db/repositories";
 import { createSkillDraft } from "@/server/evolution/skills";
 import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
@@ -21,16 +23,39 @@ let lastSkillImprovementAt = 0;
 async function main() {
   const repositories = createRepositories();
   await repositories.users.ensureDefault();
+
+  const env = readEnv();
+  const cleanupScheduler = startAttachmentCleanupScheduler({
+    run: () => cleanupStaleAttachments({
+      repositories,
+      storageDirectory: env.attachmentStorageDir,
+    }),
+  });
+  const shutdown = new AbortController();
+  const requestShutdown = () => shutdown.abort();
+  process.once("SIGINT", requestShutdown);
+  process.once("SIGTERM", requestShutdown);
   console.log("DigitalMate agent service started.");
 
-  if (process.env.AGENT_ONCE === "1") {
-    await tick(repositories);
-    return;
-  }
+  try {
+    await cleanupScheduler.initialRun;
+    if (process.env.AGENT_ONCE === "1") {
+      await tick(repositories);
+      return;
+    }
 
-  while (true) {
-    await tick(repositories);
-    await sleep(intervalMs);
+    while (!shutdown.signal.aborted) {
+      await tick(repositories);
+      await sleep(intervalMs, shutdown.signal);
+    }
+  } finally {
+    process.removeListener("SIGINT", requestShutdown);
+    process.removeListener("SIGTERM", requestShutdown);
+    try {
+      await cleanupScheduler.stop();
+    } finally {
+      await closePool();
+    }
   }
 }
 
@@ -235,8 +260,19 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, ms);
+    const abort = () => finish();
+    signal?.addEventListener("abort", abort, { once: true });
+
+    function finish() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }
+  });
 }
 
 main().catch((error) => {

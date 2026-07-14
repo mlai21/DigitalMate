@@ -3,5 +3,12 @@
 # 配置域名后 Caddy 自动向 Let's Encrypt 申请并续期证书，HTTP 自动 301 到 HTTPS。
 # 未配置时 DOMAIN 回退为 ":80"，行为与之前的纯 HTTP 部署一致。
 {$DOMAIN} {
+	@attachmentUpload {
+		method POST
+		path /api/chat/attachments
+	}
+	request_body @attachmentUpload {
+		max_size 11MB
+	}
 	reverse_proxy web:3000
 }

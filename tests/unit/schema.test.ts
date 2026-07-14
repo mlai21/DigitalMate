@@ -10,6 +10,7 @@ describe("database schema", () => {
       "users",
       "conversations",
       "messages",
+      "message_attachments",
       "conversation_summaries",
       "memory_entries",
       "tool_call_logs",
@@ -29,6 +30,29 @@ describe("database schema", () => {
     }
 
     expect(schema).toContain("CREATE EXTENSION IF NOT EXISTS vector");
+    const attachmentTable = schema.match(
+      /CREATE TABLE IF NOT EXISTS message_attachments \([\s\S]*?\n\);/,
+    )?.[0];
+    expect(attachmentTable).toBeDefined();
+    expect(attachmentTable).toContain("user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE");
+    expect(attachmentTable).toContain("message_id uuid REFERENCES messages(id) ON DELETE CASCADE");
+    expect(attachmentTable).toContain("CONSTRAINT message_attachments_status_check");
+    expect(attachmentTable).toContain("CONSTRAINT message_attachments_binding_check");
+    expect(attachmentTable).toContain("deletion_claim_token uuid");
+    expect(attachmentTable).toContain("'pending', 'ready', 'failed', 'deleting', 'bound'");
+    const statusMigration = schema.match(
+      /DO \$message_attachments_status\$[\s\S]*?\$message_attachments_status\$;/,
+    )?.[0];
+    expect(statusMigration).toBeDefined();
+    expect(statusMigration).toContain("pg_get_constraintdef");
+    expect(statusMigration).toContain("IF current_definition IS NULL THEN");
+    expect(statusMigration).toContain("ELSIF position('deleting' IN current_definition) = 0 THEN");
+    expect(statusMigration).toContain("DROP CONSTRAINT message_attachments_status_check");
+    expect(schema).toMatch(
+      /ALTER TABLE IF EXISTS message_attachments\s+ADD COLUMN IF NOT EXISTS deletion_claim_token uuid/,
+    );
+    expect(schema).toContain("idx_message_attachments_message");
+    expect(schema).toContain("idx_message_attachments_stale");
     expect(schema).toMatch(/memory_entries[\s\S]+user_id uuid NOT NULL/);
     expect(schema).toMatch(/conversation_summaries[\s\S]+conversation_id uuid NOT NULL/);
     expect(schema).toContain("idx_memory_entries_embedding");

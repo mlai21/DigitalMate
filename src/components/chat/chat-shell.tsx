@@ -2,22 +2,35 @@
 
 import Link from "next/link";
 import { Menu, Settings, SquarePen, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChatInput } from "@/components/chat/chat-input";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChatInput, type ChatInputSubmitOptions } from "@/components/chat/chat-input";
 import { ChatSidebar, type ConversationItem, type ProjectItem } from "@/components/chat/chat-sidebar";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { TypingDots } from "@/components/chat/typing-dots";
+import { useChatScroll } from "@/components/chat/use-chat-scroll";
+import type { ChatAttachment } from "@/server/attachments/types";
 
 export type ChatMessage = {
   id: string;
+  uiId?: string;
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments?: ChatAttachment[];
 };
 
 type SsePayload =
+  | { type: "accepted"; conversationId: string; clientTurnId: string; userMessageId: string }
   | { type: "chunk"; content: string }
-  | { type: "done"; conversationId: string }
+  | { type: "replace"; content: string }
+  | {
+      type: "done";
+      conversationId: string;
+      clientTurnId: string;
+      userMessageId: string;
+      assistantMessageId?: string;
+      degraded?: boolean;
+    }
   | { type: "error"; message: string };
 
 export function ChatShell({
@@ -39,18 +52,41 @@ export function ChatShell({
   const [conversations, setConversations] = useState<ConversationItem[]>(initialConversations);
   const [projects, setProjects] = useState<ProjectItem[]>(initialProjects);
   const [activeConversationId, setActiveConversationId] = useState(conversationId);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingConversationIds, setStreamingConversationIds] = useState<Set<string>>(() => new Set());
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [inputShellNode, setInputShellNode] = useState<HTMLFormElement | null>(null);
+  const [composerVersion, setComposerVersion] = useState(0);
   const stageRef = useRef<HTMLElement>(null);
-  const inputShellRef = useRef<HTMLFormElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const activeConversationIdRef = useRef(conversationId);
+  const inputShellRef = useCallback((node: HTMLFormElement | null) => setInputShellNode(node), []);
+  const messageIds = useMemo(() => messages.map(getChatMessageUiId), [messages]);
+  const chatScroll = useChatScroll({ conversationId: activeConversationId, messageIds });
+  const { containerRef, endRef, unreadCount, jumpToLatest } = chatScroll;
   const latestMessageTime = useMemo(() => messages.at(-1)?.createdAt ?? new Date(0).toISOString(), [messages]);
+  const isActiveConversationStreaming = Boolean(
+    activeConversationId && streamingConversationIds.has(activeConversationId),
+  );
 
   const activeConversation = conversations.find((conversation) => conversation.id === activeConversationId);
 
+  function activateConversation(nextConversationId: string | undefined) {
+    activeConversationIdRef.current = nextConversationId;
+    setActiveConversationId(nextConversationId);
+  }
+
+  function updateActiveConversationMessages(
+    targetConversationId: string,
+    update: (current: ChatMessage[]) => ChatMessage[],
+  ) {
+    if (activeConversationIdRef.current !== targetConversationId) return;
+    setMessages((current) =>
+      activeConversationIdRef.current === targetConversationId ? update(current) : current,
+    );
+  }
+
   useEffect(() => {
     const stage = stageRef.current;
-    const input = inputShellRef.current;
+    const input = inputShellNode;
     if (!stage || !input) return;
 
     const updateInputClearance = () => {
@@ -68,22 +104,22 @@ export function ChatShell({
       observer?.disconnect();
       window.removeEventListener("resize", updateInputClearance);
     };
-  }, []);
-
-  useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, isStreaming]);
+  }, [inputShellNode]);
 
   useEffect(() => {
     if (!activeConversationId) return;
+    const pollingConversationId = activeConversationId;
     const timer = window.setInterval(async () => {
       const response = await fetch(
-        `/api/messages?conversationId=${activeConversationId}&after=${encodeURIComponent(latestMessageTime)}`,
+        `/api/messages?conversationId=${pollingConversationId}&after=${encodeURIComponent(latestMessageTime)}`,
       );
       if (!response.ok) return;
       const data = (await response.json()) as { messages?: ChatMessage[] };
       if (!data.messages?.length) return;
-      setMessages((current) => mergeMessages(current, data.messages ?? []));
+      updateActiveConversationMessages(
+        pollingConversationId,
+        (current) => mergeMessages(current, data.messages ?? []),
+      );
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [activeConversationId, latestMessageTime]);
@@ -105,14 +141,15 @@ export function ChatShell({
       setMobileSidebarOpen(false);
       return;
     }
-    setActiveConversationId(id);
+    activateConversation(id);
+    setComposerVersion((version) => version + 1);
     setMobileSidebarOpen(false);
     setMessages([]);
     try {
       const response = await fetch(`/api/conversations/${id}/messages`);
       if (!response.ok) return;
       const data = (await response.json()) as { messages?: ChatMessage[] };
-      setMessages(data.messages ?? []);
+      updateActiveConversationMessages(id, () => data.messages ?? []);
     } catch {
       // keep the empty state; polling will backfill when possible
     }
@@ -128,8 +165,9 @@ export function ChatShell({
       if (!response.ok) return;
       const data = (await response.json()) as { conversation: ConversationItem };
       setConversations((current) => [data.conversation, ...current]);
-      setActiveConversationId(data.conversation.id);
+      activateConversation(data.conversation.id);
       setMessages([]);
+      setComposerVersion((version) => version + 1);
       setMobileSidebarOpen(false);
     } catch {
       // ignore; user can retry
@@ -183,8 +221,9 @@ export function ChatShell({
       if (next) {
         await selectConversation(next.id);
       } else {
-        setActiveConversationId(undefined);
+        activateConversation(undefined);
         setMessages([]);
+        setComposerVersion((version) => version + 1);
       }
     }
   }
@@ -208,8 +247,9 @@ export function ChatShell({
     if (response.ok) await refreshSidebar();
   }
 
-  async function sendMessage(content: string, options?: { skillIds?: string[]; searchEnabled?: boolean }) {
-    let targetConversationId = activeConversationId;
+  async function sendMessage(content: string, options: ChatInputSubmitOptions): Promise<boolean> {
+    const activeConversationIdAtSubmit = activeConversationIdRef.current;
+    let targetConversationId = activeConversationIdAtSubmit;
     if (!targetConversationId) {
       try {
         const response = await fetch("/api/conversations", {
@@ -217,64 +257,190 @@ export function ChatShell({
           headers: { "content-type": "application/json" },
           body: JSON.stringify({}),
         });
-        if (!response.ok) return;
+        if (!response.ok) return false;
         const data = (await response.json()) as { conversation: ConversationItem };
         targetConversationId = data.conversation.id;
         setConversations((current) => [data.conversation, ...current]);
-        setActiveConversationId(targetConversationId);
+        if (activeConversationIdRef.current === activeConversationIdAtSubmit) {
+          activateConversation(targetConversationId);
+        }
       } catch {
-        return;
+        return false;
       }
     }
+    const turnConversationId = targetConversationId;
 
     const now = new Date().toISOString();
-    const userMessage: ChatMessage = { id: `local-user-${now}`, role: "user", content, createdAt: now };
-    const draftId = `assistant-${now}`;
-    setMessages((current) => [
+    const clientTurnId = options.clientTurnId;
+    const userMessage: ChatMessage = {
+      id: `local-user-${clientTurnId}`,
+      role: "user",
+      content,
+      createdAt: now,
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
+    };
+    const draftId = `assistant-${clientTurnId}`;
+    updateActiveConversationMessages(turnConversationId, (current) => [
       ...current,
       userMessage,
       { id: draftId, role: "assistant", content: "", createdAt: now },
     ]);
-    setIsStreaming(true);
+    setStreamingConversationIds((current) => {
+      const next = new Set(current);
+      next.add(turnConversationId);
+      return next;
+    });
 
+    let completed = false;
+    let accepted = false;
+    let acceptedUserMessageId: string | undefined;
+    let assistantMessageId: string | undefined;
+    const requestBody = JSON.stringify({
+      message: content,
+      conversationId: turnConversationId,
+      clientTurnId,
+      ...(options.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
+      ...(options.skillIds?.length ? { skillIds: options.skillIds } : {}),
+      ...(options.searchEnabled ? { searchEnabled: true } : {}),
+    });
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          message: content,
-          conversationId: targetConversationId,
-          ...(options?.skillIds?.length ? { skillIds: options.skillIds } : {}),
-          ...(options?.searchEnabled ? { searchEnabled: true } : {}),
-        }),
-      });
-      if (!response.ok || !response.body) throw new Error("chat_request_failed");
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt += 1) {
+        let interrupted = false;
+        try {
+          const response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: requestBody,
+          });
+          if (!response.ok) throw new ChatSubmitError(await readChatError(response));
+          if (!response.body) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
 
-      for await (const payload of readSse(response.body)) {
-        if (payload.type === "chunk") {
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === draftId ? { ...message, content: `${message.content}${payload.content}` } : message,
-            ),
-          );
+          for await (const payload of readSse(response.body)) {
+            if (payload.type === "accepted") {
+              accepted = true;
+              acceptedUserMessageId = payload.userMessageId;
+              updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
+                current,
+                userMessage.id,
+                payload.userMessageId,
+                (message) => ({
+                  ...message,
+                  attachments: message.attachments?.map((attachment) => ({ ...attachment, status: "bound" })),
+                }),
+              ));
+            }
+            if (payload.type === "chunk") {
+              updateActiveConversationMessages(turnConversationId, (current) =>
+                current.map((message) =>
+                  getChatMessageUiId(message) === draftId
+                    ? { ...message, content: `${message.content}${payload.content}` }
+                    : message,
+                ),
+              );
+            }
+            if (payload.type === "replace") {
+              updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
+                getChatMessageUiId(message) === draftId
+                  ? { ...message, content: payload.content }
+                  : message,
+              ));
+            }
+            if (payload.type === "done") {
+              completed = true;
+              assistantMessageId = payload.assistantMessageId;
+              if (payload.assistantMessageId) {
+                const persistedAssistantId = payload.assistantMessageId;
+                updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
+                  current,
+                  draftId,
+                  persistedAssistantId,
+                  (message) => message,
+                ));
+              }
+            }
+            if (payload.type === "error") throw new ChatSubmitError(payload.message);
+          }
+        } catch (error) {
+          if (accepted && !completed && requestAttempt === 0 && !(error instanceof ChatSubmitError)) {
+            interrupted = true;
+          } else {
+            throw error;
+          }
         }
-        if (payload.type === "done") {
-          setActiveConversationId(payload.conversationId);
-        }
+
+        if (accepted && !completed && requestAttempt === 0) interrupted = true;
+        if (!interrupted) break;
+
+        updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
+          getChatMessageUiId(message) === draftId ? { ...message, content: "" } : message,
+        ));
+      }
+      if (!accepted) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
+      if (!completed) {
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return reconciled;
+      }
+      if (!assistantMessageId) {
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return reconciled;
       }
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
       window.setTimeout(() => void refreshSidebar(), 6_000);
+      return true;
     } catch {
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === draftId
-            ? { ...message, content: "我这边刚才没连上。等你把服务和数据库都启动好，我们再继续。" }
-            : message,
-        ),
-      );
+      if (accepted) {
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return reconciled;
+      }
+      updateActiveConversationMessages(turnConversationId, (current) => current.filter((message) => {
+        const uiId = getChatMessageUiId(message);
+        return uiId !== userMessage.id && uiId !== draftId;
+      }));
+      return false;
     } finally {
-      setIsStreaming(false);
+      setStreamingConversationIds((current) => {
+        const next = new Set(current);
+        next.delete(turnConversationId);
+        return next;
+      });
+    }
+
+    async function reconcileAcceptedTurn(
+      targetConversationId: string,
+      assistantDraftId: string,
+      persistedUserMessageId?: string,
+    ): Promise<boolean> {
+      updateActiveConversationMessages(
+        targetConversationId,
+        (current) => current.filter((message) => getChatMessageUiId(message) !== assistantDraftId),
+      );
+      try {
+        const response = await fetch(`/api/conversations/${targetConversationId}/messages`);
+        if (!response.ok) return false;
+        const data = (await response.json()) as { messages?: ChatMessage[] };
+        const persistedMessages = data.messages ?? [];
+        updateActiveConversationMessages(
+          targetConversationId,
+          (current) => mergeMessages(current, persistedMessages),
+        );
+        if (!persistedUserMessageId) return false;
+        const userIndex = persistedMessages.findIndex((message) => message.id === persistedUserMessageId);
+        if (userIndex < 0) return false;
+        const following = persistedMessages.slice(userIndex + 1);
+        const nextUserIndex = following.findIndex((message) => message.role === "user");
+        const sameTurnWindow = nextUserIndex < 0 ? following : following.slice(0, nextUserIndex);
+        return sameTurnWindow.some((message) => message.role === "assistant");
+      } catch {
+        // Polling will retry reconciliation without resubmitting the accepted turn.
+        return false;
+      }
     }
   }
 
@@ -340,7 +506,7 @@ export function ChatShell({
           <div />
         )}
 
-        <div className="messages">
+        <div ref={containerRef} className="messages">
           {setupNotice ? (
             <div className="setup-notice">
               <span>{setupNotice}</span>
@@ -358,21 +524,53 @@ export function ChatShell({
             </div>
           ) : null}
           {messages.map((message) => (
-            <MessageBubble key={message.id} role={message.role} content={message.content} />
+            <MessageBubble
+              key={getChatMessageUiId(message)}
+              role={message.role}
+              content={message.content}
+              attachments={message.attachments}
+            />
           ))}
-          {isStreaming ? <TypingDots /> : null}
-          <div ref={scrollRef} className="chat-scroll-anchor" aria-hidden="true" />
+          {isActiveConversationStreaming ? <TypingDots /> : null}
+          <div ref={endRef} className="chat-scroll-anchor" aria-hidden="true" />
         </div>
 
+        <div className="chat-new-message-status" role="status" aria-live="polite" aria-atomic="true">
+          {unreadCount > 0 ? `${unreadCount} 条新消息` : ""}
+        </div>
+
+        {unreadCount > 0 ? (
+          <button
+            className="new-message-button"
+            type="button"
+            aria-label={`查看 ${unreadCount} 条新消息`}
+            onClick={jumpToLatest}
+          >
+            ↓ {unreadCount} 条新消息
+          </button>
+        ) : null}
+
         <ChatInput
-          key={activeConversationId ?? "new-conversation"}
+          key={`composer-${composerVersion}`}
           shellRef={inputShellRef}
-          disabled={Boolean(setupNotice) || isStreaming}
+          disabled={Boolean(setupNotice) || isActiveConversationStreaming}
           onSubmit={sendMessage}
         />
       </section>
     </main>
   );
+}
+
+class ChatSubmitError extends Error {}
+
+async function readChatError(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as { message?: unknown };
+    if (typeof data.message === "string" && data.message.trim()) return data.message;
+  } catch {
+    // Fall through to the stable user-facing message.
+  }
+  return "消息发送失败，请稍后重试。";
 }
 
 async function* readSse(stream: ReadableStream<Uint8Array>): AsyncIterable<SsePayload> {
@@ -395,14 +593,15 @@ async function* readSse(stream: ReadableStream<Uint8Array>): AsyncIterable<SsePa
 }
 
 export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  const seen = new Set(current.map((message) => message.id));
-  const next = [...current];
+  const next = dedupeMessagesById(current);
+  const seen = new Set(next.map((message) => message.id));
   for (const message of incoming) {
     if (seen.has(message.id)) continue;
     const optimisticIndex = next.findIndex((candidate) => isMatchingOptimisticMessage(candidate, message));
     if (optimisticIndex >= 0) {
-      seen.delete(next[optimisticIndex].id);
-      next[optimisticIndex] = message;
+      const candidate = next[optimisticIndex];
+      seen.delete(candidate.id);
+      next[optimisticIndex] = { ...message, uiId: getChatMessageUiId(candidate) };
       seen.add(message.id);
       continue;
     }
@@ -410,6 +609,34 @@ export function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): 
     seen.add(message.id);
   }
   return next;
+}
+
+function reconcileOptimisticMessageId(
+  current: ChatMessage[],
+  optimisticUiId: string,
+  persistedId: string,
+  update: (message: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  const optimistic = current.find((message) => getChatMessageUiId(message) === optimisticUiId);
+  const stableUiId = optimistic ? getChatMessageUiId(optimistic) : optimisticUiId;
+  const reconciled = current.map((message) => {
+    if (getChatMessageUiId(message) !== optimisticUiId && message.id !== persistedId) return message;
+    return update({ ...message, id: persistedId, uiId: stableUiId });
+  });
+  return dedupeMessagesById(reconciled);
+}
+
+function dedupeMessagesById(messages: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>();
+  return messages.filter((message) => {
+    if (seen.has(message.id)) return false;
+    seen.add(message.id);
+    return true;
+  });
+}
+
+function getChatMessageUiId(message: ChatMessage): string {
+  return message.uiId ?? message.id;
 }
 
 function isMatchingOptimisticMessage(candidate: ChatMessage, persisted: ChatMessage): boolean {

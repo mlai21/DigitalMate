@@ -2,6 +2,11 @@
 
 import { Globe2, Send, Sparkles, X } from "lucide-react";
 import { FormEvent, KeyboardEvent, Ref, useEffect, useRef, useState } from "react";
+import {
+  AttachmentPicker,
+  type UploadingAttachment,
+} from "@/components/chat/attachment-picker";
+import type { ChatAttachment } from "@/server/attachments/types";
 
 export type SkillOption = {
   id: string;
@@ -15,6 +20,14 @@ type PickerItem =
 
 const CREATE_SKILL_COMMAND = "/create-skill";
 const MAX_SELECTED_SKILLS = 3;
+
+export type ChatInputSubmitOptions = {
+  clientTurnId: string;
+  skillIds?: string[];
+  searchEnabled?: boolean;
+  attachmentIds?: string[];
+  attachments?: ChatAttachment[];
+};
 
 export function filterSkillOptions(options: SkillOption[], query: string): SkillOption[] {
   const normalized = query.trim().toLowerCase();
@@ -31,22 +44,35 @@ export function ChatInput({
   shellRef,
 }: {
   disabled?: boolean;
-  onSubmit: (value: string, options?: { skillIds?: string[]; searchEnabled?: boolean }) => void;
+  onSubmit: (value: string, options: ChatInputSubmitOptions) => Promise<boolean>;
   shellRef?: Ref<HTMLFormElement>;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const [clientTurnId, setClientTurnId] = useState(createClientTurnId);
   const [value, setValue] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<SkillOption[]>([]);
   const [searchEnabled, setSearchEnabled] = useState(false);
   const [skillOptions, setSkillOptions] = useState<SkillOption[] | null>(null);
   const [pickerDismissed, setPickerDismissed] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [attachments, setAttachments] = useState<UploadingAttachment[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  function invalidateClientTurn() {
+    setClientTurnId(createClientTurnId());
+    setSubmitError(null);
+  }
 
   const slashQuery =
     value.startsWith("/") && !value.includes("\n") && !value.startsWith(`${CREATE_SKILL_COMMAND} `)
       ? value.slice(1)
       : null;
   const pickerOpen = slashQuery !== null && !pickerDismissed;
+
+  useEffect(() => {
+    if (pickerOpen) document.dispatchEvent(new Event("chat-skill-picker-open"));
+  }, [pickerOpen]);
 
   useEffect(() => {
     if (!pickerOpen || skillOptions !== null) return;
@@ -77,6 +103,7 @@ export function ChatInput({
     : [];
 
   function pickItem(item: PickerItem) {
+    invalidateClientTurn();
     if (item.kind === "create") {
       setValue(`${CREATE_SKILL_COMMAND} `);
     } else {
@@ -90,24 +117,55 @@ export function ChatInput({
     setActiveIndex(0);
   }
 
-  function submit(event: FormEvent) {
+  async function submit(event: FormEvent) {
     event.preventDefault();
     const text = value.trim();
     const skillIds = selectedSkills.map((skill) => skill.id);
+    const readyAttachments = attachments.filter(
+      (attachment): attachment is UploadingAttachment & { id: string; status: "ready" } =>
+        attachment.status === "ready" && Boolean(attachment.id),
+    );
     const content =
       text || (selectedSkills.length > 0 ? `使用 Skill：${selectedSkills.map((skill) => skill.name).join("、")}` : "");
-    if (!content || disabled) return;
-    if (skillIds.length > 0 || searchEnabled) {
-      onSubmit(content, {
-        ...(skillIds.length > 0 ? { skillIds } : {}),
-        ...(searchEnabled ? { searchEnabled: true } : {}),
-      });
-    } else {
-      onSubmit(content);
+    const hasPendingUpload = attachments.some((attachment) => attachment.status === "uploading");
+    const hasFailedUpload = attachments.some((attachment) => attachment.status === "failed");
+    if (
+      (!content && readyAttachments.length === 0)
+      || disabled
+      || isSubmitting
+      || hasPendingUpload
+      || hasFailedUpload
+    ) return;
+    const options: ChatInputSubmitOptions = {
+      clientTurnId,
+      ...(skillIds.length > 0 ? { skillIds } : {}),
+      ...(searchEnabled ? { searchEnabled: true } : {}),
+      ...(readyAttachments.length > 0
+        ? {
+            attachmentIds: readyAttachments.map((attachment) => attachment.id),
+            attachments: readyAttachments.map(toSafeChatAttachment),
+          }
+        : {}),
+    };
+    setSubmitError(null);
+    setIsSubmitting(true);
+    let succeeded = false;
+    try {
+      succeeded = await onSubmit(content, options);
+    } catch {
+      succeeded = false;
+    } finally {
+      setIsSubmitting(false);
     }
+    if (!succeeded) {
+      setSubmitError("发送失败，请重试。");
+      return;
+    }
+    setClientTurnId(createClientTurnId());
     setValue("");
     setSelectedSkills([]);
     setSearchEnabled(false);
+    setAttachments([]);
     setPickerDismissed(false);
     if (ref.current) ref.current.style.height = "";
   }
@@ -142,7 +200,16 @@ export function ChatInput({
   }
 
   return (
-    <form ref={shellRef} className="chat-input-shell" onSubmit={submit}>
+    <form
+      ref={shellRef}
+      className="chat-input-shell"
+      onSubmit={submit}
+      onClickCapture={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-attachment-picker-trigger]")) {
+          setPickerDismissed(true);
+        }
+      }}
+    >
       {pickerOpen ? (
         <div className="skill-picker-panel" role="listbox" aria-label="Skill 列表">
           {pickerItems.length === 0 ? (
@@ -182,7 +249,17 @@ export function ChatInput({
         </div>
       ) : null}
 
+      {submitError ? <div className="chat-submit-error" role="alert">{submitError}</div> : null}
+
       <div className="chat-input-stack">
+        <AttachmentPicker
+          attachments={attachments}
+          disabled={disabled || isSubmitting}
+          onChange={(nextAttachments) => {
+            invalidateClientTurn();
+            setAttachments(nextAttachments);
+          }}
+        />
         {selectedSkills.length > 0 ? (
           <div className="skill-chip-row">
             {selectedSkills.map((skill) => (
@@ -193,9 +270,10 @@ export function ChatInput({
                   type="button"
                   className="skill-chip-remove"
                   aria-label={`移除 Skill ${skill.name}`}
-                  onClick={() =>
+                  onClick={() => {
+                    invalidateClientTurn();
                     setSelectedSkills((current) => current.filter((item) => item.id !== skill.id))
-                  }
+                  }}
                 >
                   <X size={12} />
                 </button>
@@ -214,6 +292,7 @@ export function ChatInput({
             value={value}
             onKeyDown={handleKeyDown}
             onChange={(event) => {
+              invalidateClientTurn();
               setValue(event.target.value);
               if (!event.target.value.startsWith("/")) setPickerDismissed(false);
             }}
@@ -225,22 +304,56 @@ export function ChatInput({
           />
         </div>
         <div className="chat-input-toolbar">
+          <div className="chat-input-toolbar-left">
+            <button
+              type="button"
+              className={`search-toggle${searchEnabled ? " active" : ""}`}
+              aria-label={searchEnabled ? "关闭联网搜索" : "开启联网搜索"}
+              aria-pressed={searchEnabled}
+              disabled={disabled || isSubmitting}
+              onClick={() => {
+                invalidateClientTurn();
+                setSearchEnabled((enabled) => !enabled);
+              }}
+            >
+              <Globe2 size={18} strokeWidth={2} aria-hidden="true" />
+              {searchEnabled ? <span>搜索</span> : null}
+            </button>
+          </div>
           <button
-            type="button"
-            className={`search-toggle${searchEnabled ? " active" : ""}`}
-            aria-label={searchEnabled ? "关闭联网搜索" : "开启联网搜索"}
-            aria-pressed={searchEnabled}
-            disabled={disabled}
-            onClick={() => setSearchEnabled((enabled) => !enabled)}
+            className="send-button"
+            type="submit"
+            disabled={
+              disabled
+              || isSubmitting
+              || attachments.some((attachment) => attachment.status === "uploading")
+              || attachments.some((attachment) => attachment.status === "failed")
+              || (!value.trim() && selectedSkills.length === 0 && !attachments.some((attachment) => attachment.status === "ready"))
+            }
+            aria-label="发送"
           >
-            <Globe2 size={18} strokeWidth={2} aria-hidden="true" />
-            {searchEnabled ? <span>搜索</span> : null}
-          </button>
-          <button className="send-button" type="submit" disabled={disabled} aria-label="发送">
             <Send size={18} strokeWidth={2.2} />
           </button>
         </div>
       </div>
     </form>
   );
+}
+
+function toSafeChatAttachment(
+  attachment: UploadingAttachment & { id: string; status: "ready" },
+): ChatAttachment {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    fileName: attachment.fileName,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    status: "ready",
+    downloadUrl: `/api/chat/attachments/${attachment.id}/download`,
+  };
+}
+
+function createClientTurnId(): string {
+  return globalThis.crypto.randomUUID();
 }

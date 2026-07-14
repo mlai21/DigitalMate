@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GET as listConversations, POST as createConversation } from "@/app/api/conversations/route";
 import { DELETE as deleteConversation, PATCH as patchConversation } from "@/app/api/conversations/[conversationId]/route";
+import { GET as listConversationMessages } from "@/app/api/conversations/[conversationId]/messages/route";
 import { POST as createProject } from "@/app/api/projects/route";
 
 const mocks = vi.hoisted(() => {
@@ -20,6 +21,41 @@ const mocks = vi.hoisted(() => {
     description: "",
     updatedAt: new Date("2026-07-08T10:00:00+08:00"),
   };
+  const message = {
+    id: "00000000-0000-4000-8000-000000000003",
+    userId: "user-1",
+    conversationId: conversation.id,
+    role: "user" as const,
+    content: "看看附件",
+    createdAt: new Date("2026-07-08T10:01:00+08:00"),
+    clientTurnId: "00000000-0000-4000-8000-000000000005",
+    clientTurnPayloadHash: "private-payload-hash",
+    internalSecret: "message-private-secret",
+  };
+  const internalMessage = {
+    ...message,
+    id: "00000000-0000-4000-8000-000000000099",
+    role: "system" as const,
+    content: "internal system message",
+  };
+  const boundAttachment = {
+    id: "00000000-0000-4000-8000-000000000004",
+    userId: "user-1",
+    messageId: message.id,
+    kind: "document" as const,
+    fileName: "notes.md",
+    mimeType: "text/markdown",
+    sizeBytes: 12,
+    storageKey: "private-storage-key",
+    extractedText: "private extracted text",
+    textTruncated: false,
+    status: "bound" as const,
+    errorCode: "private_error",
+    deletionClaimToken: "private-deletion-token",
+    createdAt: new Date("2026-07-08T10:00:30+08:00"),
+    updatedAt: new Date("2026-07-08T10:01:00+08:00"),
+  };
+  const listAttachmentsForMessages = vi.fn(async () => [boundAttachment]);
   const repositories = {
     conversations: {
       listWithStats: vi.fn(async () => [{ ...conversation, messageCount: 3, lastMessageAt: conversation.updatedAt }]),
@@ -33,10 +69,20 @@ const mocks = vi.hoisted(() => {
       create: vi.fn(async () => project),
       getForUser: vi.fn(async () => project),
     },
+    messages: {
+      list: vi.fn(async () => [message, internalMessage]),
+    },
+    messageAttachments: {
+      listForMessages: listAttachmentsForMessages,
+    },
   };
   return {
     conversation,
     project,
+    message,
+    internalMessage,
+    boundAttachment,
+    listAttachmentsForMessages,
     repositories,
     createRepositories: vi.fn(() => repositories),
     requireCurrentUser: vi.fn(async () => ({ id: "user-1", displayName: "Tang" })),
@@ -68,6 +114,101 @@ describe("conversations API", () => {
       messageCount: 3,
     });
     expect(body.projects[0]).toMatchObject({ id: mocks.project.id, name: "AI 学习" });
+  });
+
+  it("returns safe attachment card data when loading a conversation", async () => {
+    const response = await listConversationMessages(
+      new Request(`http://localhost/api/conversations/${mocks.conversation.id}/messages`),
+      { params: Promise.resolve({ conversationId: mocks.conversation.id }) },
+    );
+    const body = await response.json();
+    const serialized = JSON.stringify(body);
+
+    expect(response.status).toBe(200);
+    expect(body.messages).toEqual([{
+      id: mocks.message.id,
+      role: "user",
+      content: "看看附件",
+      createdAt: "2026-07-08T02:01:00.000Z",
+      attachments: [{
+        id: mocks.boundAttachment.id,
+        kind: "document",
+        fileName: "notes.md",
+        mimeType: "text/markdown",
+        sizeBytes: 12,
+        status: "bound",
+        downloadUrl: `/api/chat/attachments/${mocks.boundAttachment.id}/download`,
+      }],
+    }]);
+    expect(Object.keys(body.messages[0]).sort()).toEqual([
+      "attachments",
+      "content",
+      "createdAt",
+      "id",
+      "role",
+    ]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [mocks.message.id]);
+    expect(serialized).not.toContain("userId");
+    expect(serialized).not.toContain("conversationId");
+    expect(serialized).not.toContain("internalSecret");
+    expect(serialized).not.toContain("message-private-secret");
+    expect(serialized).not.toContain("clientTurnId");
+    expect(serialized).not.toContain("clientTurnPayloadHash");
+    expect(serialized).not.toContain("private-payload-hash");
+    expect(serialized).not.toContain(mocks.internalMessage.id);
+    expect(serialized).not.toContain("storageKey");
+    expect(serialized).not.toContain("private-storage-key");
+    expect(serialized).not.toContain("extractedText");
+    expect(serialized).not.toContain("private extracted text");
+    expect(serialized).not.toContain("textTruncated");
+    expect(serialized).not.toContain("errorCode");
+    expect(serialized).not.toContain("deletionClaimToken");
+    expect(serialized).not.toContain("private-deletion-token");
+  });
+
+  it("does not query attachments when a conversation has no messages", async () => {
+    mocks.repositories.messages.list.mockResolvedValueOnce([]);
+
+    const response = await listConversationMessages(
+      new Request(`http://localhost/api/conversations/${mocks.conversation.id}/messages`),
+      { params: Promise.resolve({ conversationId: mocks.conversation.id }) },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ messages: [] });
+    expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("does not query messages or attachments for an unowned conversation", async () => {
+    mocks.repositories.conversations.getForUser.mockResolvedValueOnce(null as never);
+
+    const response = await listConversationMessages(
+      new Request("http://localhost/api/conversations/unowned/messages"),
+      { params: Promise.resolve({ conversationId: "unowned" }) },
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "conversation_not_found" });
+    expect(mocks.repositories.messages.list).not.toHaveBeenCalled();
+    expect(mocks.listAttachmentsForMessages).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when conversation attachment loading fails", async () => {
+    mocks.listAttachmentsForMessages.mockRejectedValueOnce(
+      new Error("secret-token=abc /private/attachments/hidden"),
+    );
+
+    const response = await listConversationMessages(
+      new Request(`http://localhost/api/conversations/${mocks.conversation.id}/messages`),
+      { params: Promise.resolve({ conversationId: mocks.conversation.id }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body).toEqual({ error: "messages_load_failed" });
+    expect(JSON.stringify(body)).not.toContain("secret-token");
+    expect(JSON.stringify(body)).not.toContain("/private/attachments");
   });
 
   it("creates a conversation, optionally inside a project", async () => {

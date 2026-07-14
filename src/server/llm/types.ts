@@ -7,9 +7,26 @@ export type LlmToolCall = {
   arguments: string;
 };
 
+export type LlmAttachment =
+  | {
+      kind: "image";
+      fileName: string;
+      mimeType: "image/jpeg" | "image/png" | "image/webp";
+      base64: string;
+    }
+  | {
+      kind: "document";
+      fileName: string;
+      mimeType: string;
+      text: string;
+      truncated: boolean;
+    };
+
 export type LlmMessage = {
   role: LlmRole;
   content: string;
+  /** User-provided attachments supplied as structured model input. */
+  attachments?: LlmAttachment[];
   /** Present on assistant turns that requested tool calls. */
   toolCalls?: LlmToolCall[];
   /** Present on tool-result turns; links the result to the originating call. */

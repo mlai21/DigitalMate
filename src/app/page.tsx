@@ -1,5 +1,6 @@
 import { ChatShell, type ChatMessage } from "@/components/chat/chat-shell";
 import type { ConversationItem, ProjectItem } from "@/components/chat/chat-sidebar";
+import { serializeChatMessages } from "@/server/attachments/presentation";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -69,13 +70,23 @@ async function loadChatPageData(): Promise<{
       return { initialMessages: [], initialConversations, initialProjects };
     }
 
-    const messages = await repositories.messages.list(active.id);
-    const initialMessages: ChatMessage[] = messages.map((message) => ({
-      id: message.id,
-      role: message.role === "user" ? "user" : "assistant",
-      content: message.content,
-      createdAt: message.createdAt.toISOString(),
-    }));
+    let initialMessages: ChatMessage[];
+    try {
+      const messages = await repositories.messages.list(active.id);
+      initialMessages = await serializeChatMessages(
+        user.id,
+        messages,
+        repositories.messageAttachments.listForMessages,
+      );
+    } catch {
+      return {
+        conversationId: active.id,
+        initialMessages: [],
+        initialConversations,
+        initialProjects,
+        setupNotice: "聊天记录暂时加载失败，请稍后刷新。",
+      };
+    }
 
     if (!initialConversations.some((conversation) => conversation.id === active.id)) {
       initialConversations.unshift({
