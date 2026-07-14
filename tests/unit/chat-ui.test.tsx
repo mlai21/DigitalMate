@@ -721,36 +721,49 @@ describe("ChatShell attachment submit", () => {
     expect(screen.getAllByRole("link", { name: /cat\.png/ })).toHaveLength(1);
   });
 
-  it("treats a stream disconnect after accepted as committed and removes the empty assistant draft", async () => {
+  it("retries an interrupted accepted stream once with the identical turn body and without re-uploading", async () => {
     const conversationId = "00000000-0000-4000-8000-000000000010";
+    const chatBodies: string[] = [];
     let pullCount = 0;
-    const stream = new ReadableStream<Uint8Array>({
+    const interruptedStream = new ReadableStream<Uint8Array>({
       pull(controller) {
         pullCount += 1;
         if (pullCount === 1) {
           controller.enqueue(new TextEncoder().encode(
-            `data: ${JSON.stringify({ type: "accepted", conversationId, userMessageId: "message-user" })}\n\n`,
+            [
+              `data: ${JSON.stringify({ type: "accepted", conversationId, userMessageId: "message-user" })}`,
+              `data: ${JSON.stringify({ type: "chunk", content: "未完成" })}`,
+              "",
+            ].join("\n\n"),
           ));
           return;
         }
         controller.error(new Error("connection_lost"));
       },
     });
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url === "/api/chat/attachments") return uploadResponse(imageAttachment());
       if (url === "/api/chat") {
-        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
-      }
-      if (url === `/api/conversations/${conversationId}/messages`) {
-        return new Response(JSON.stringify({
-          messages: [{
-            id: "message-user",
-            role: "user",
-            content: "断线也只提交一次",
-            createdAt: "2026-07-14T10:00:00.000Z",
-            attachments: [],
-          }],
-        }), { status: 200 });
+        chatBodies.push(String(init?.body));
+        if (chatBodies.length === 1) {
+          return new Response(interruptedStream, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        const clientTurnId = String((JSON.parse(chatBodies[0]) as { clientTurnId: string }).clientTurnId);
+        return sseResponse([
+          { type: "accepted", conversationId, clientTurnId, userMessageId: "message-user" },
+          { type: "chunk", content: "恢复后的唯一回复" },
+          {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: "message-user",
+            assistantMessageId: "message-assistant",
+          },
+        ]);
       }
       return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
     });
@@ -764,15 +777,28 @@ describe("ChatShell attachment submit", () => {
     );
 
     fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), {
-      target: { value: "断线也只提交一次" },
+      target: { value: "断线后恢复原事务" },
     });
+    fireEvent.change(screen.getByLabelText("选择图片"), {
+      target: { files: [new File(["png"], "cat.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
-    expect(screen.getAllByText("断线也只提交一次")).toHaveLength(1);
-    expect(document.querySelector(".message-row-assistant")).toBeNull();
-    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
-    expect(fetchMock).toHaveBeenCalledWith(`/api/conversations/${conversationId}/messages`);
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[1]).toBe(chatBodies[0]);
+    expect(JSON.parse(chatBodies[0])).toMatchObject({
+      message: "断线后恢复原事务",
+      conversationId,
+      clientTurnId: expect.any(String),
+      attachmentIds: ["00000000-0000-4000-8000-000000000001"],
+    });
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat/attachments")).toHaveLength(1);
+    expect(messageTexts("断线后恢复原事务")).toHaveLength(1);
+    expect(messageTexts("恢复后的唯一回复")).toHaveLength(1);
+    expect(screen.queryByText("未完成恢复后的唯一回复")).toBeNull();
+    expect(screen.getAllByRole("link", { name: /cat\.png/ })).toHaveLength(1);
   });
 
   it("keeps a new-conversation draft mounted when the chat request fails before accepted", async () => {
@@ -917,6 +943,7 @@ describe("ChatShell attachment submit", () => {
 
   it("commits an auto-created conversation when accepted is followed by a disconnect", async () => {
     const conversation = conversationItem();
+    const chatBodies: string[] = [];
     let pullCount = 0;
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -939,6 +966,7 @@ describe("ChatShell attachment submit", () => {
         return new Response(JSON.stringify({ conversation }), { status: 201 });
       }
       if (url === "/api/chat") {
+        chatBodies.push(String(init?.body));
         return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       if (url === `/api/conversations/${conversation.id}/messages`) {
@@ -961,7 +989,11 @@ describe("ChatShell attachment submit", () => {
     await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
     expect(messageTexts("自动会话断流")).toHaveLength(1);
     expect(document.querySelector(".message-row-assistant")).toBeNull();
-    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/chat")).toHaveLength(1);
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[1]).toBe(chatBodies[0]);
+    expect(fetchMock.mock.calls.filter(([input, init]) =>
+      String(input) === "/api/conversations" && init?.method === "POST",
+    )).toHaveLength(1);
   });
 
   it("does not duplicate an accepted turn when polling wins the race with done", async () => {

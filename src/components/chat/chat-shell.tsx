@@ -294,65 +294,84 @@ export function ChatShell({
     let completed = false;
     let accepted = false;
     let assistantMessageId: string | undefined;
+    const requestBody = JSON.stringify({
+      message: content,
+      conversationId: turnConversationId,
+      clientTurnId,
+      ...(options.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
+      ...(options.skillIds?.length ? { skillIds: options.skillIds } : {}),
+      ...(options.searchEnabled ? { searchEnabled: true } : {}),
+    });
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          message: content,
-          conversationId: turnConversationId,
-          clientTurnId,
-          ...(options.attachmentIds?.length ? { attachmentIds: options.attachmentIds } : {}),
-          ...(options.skillIds?.length ? { skillIds: options.skillIds } : {}),
-          ...(options.searchEnabled ? { searchEnabled: true } : {}),
-        }),
-      });
-      if (!response.ok) throw new ChatSubmitError(await readChatError(response));
-      if (!response.body) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
+      for (let requestAttempt = 0; requestAttempt < 2; requestAttempt += 1) {
+        let interrupted = false;
+        try {
+          const response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: requestBody,
+          });
+          if (!response.ok) throw new ChatSubmitError(await readChatError(response));
+          if (!response.body) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
 
-      for await (const payload of readSse(response.body)) {
-        if (payload.type === "accepted") {
-          accepted = true;
-          updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
-            current,
-            userMessage.id,
-            payload.userMessageId,
-            (message) => ({
-              ...message,
-              attachments: message.attachments?.map((attachment) => ({ ...attachment, status: "bound" })),
-            }),
-          ));
-        }
-        if (payload.type === "chunk") {
-          updateActiveConversationMessages(turnConversationId, (current) =>
-            current.map((message) =>
-              getChatMessageUiId(message) === draftId
-                ? { ...message, content: `${message.content}${payload.content}` }
-                : message,
-            ),
-          );
-        }
-        if (payload.type === "replace") {
-          updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
-            getChatMessageUiId(message) === draftId
-              ? { ...message, content: payload.content }
-              : message,
-          ));
-        }
-        if (payload.type === "done") {
-          completed = true;
-          assistantMessageId = payload.assistantMessageId;
-          if (payload.assistantMessageId) {
-            const persistedAssistantId = payload.assistantMessageId;
-            updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
-              current,
-              draftId,
-              persistedAssistantId,
-              (message) => message,
-            ));
+          for await (const payload of readSse(response.body)) {
+            if (payload.type === "accepted") {
+              accepted = true;
+              updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
+                current,
+                userMessage.id,
+                payload.userMessageId,
+                (message) => ({
+                  ...message,
+                  attachments: message.attachments?.map((attachment) => ({ ...attachment, status: "bound" })),
+                }),
+              ));
+            }
+            if (payload.type === "chunk") {
+              updateActiveConversationMessages(turnConversationId, (current) =>
+                current.map((message) =>
+                  getChatMessageUiId(message) === draftId
+                    ? { ...message, content: `${message.content}${payload.content}` }
+                    : message,
+                ),
+              );
+            }
+            if (payload.type === "replace") {
+              updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
+                getChatMessageUiId(message) === draftId
+                  ? { ...message, content: payload.content }
+                  : message,
+              ));
+            }
+            if (payload.type === "done") {
+              completed = true;
+              assistantMessageId = payload.assistantMessageId;
+              if (payload.assistantMessageId) {
+                const persistedAssistantId = payload.assistantMessageId;
+                updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
+                  current,
+                  draftId,
+                  persistedAssistantId,
+                  (message) => message,
+                ));
+              }
+            }
+            if (payload.type === "error") throw new ChatSubmitError(payload.message);
+          }
+        } catch (error) {
+          if (accepted && !completed && requestAttempt === 0 && !(error instanceof ChatSubmitError)) {
+            interrupted = true;
+          } else {
+            throw error;
           }
         }
-        if (payload.type === "error") throw new ChatSubmitError(payload.message);
+
+        if (accepted && !completed && requestAttempt === 0) interrupted = true;
+        if (!interrupted) break;
+
+        updateActiveConversationMessages(turnConversationId, (current) => current.map((message) =>
+          getChatMessageUiId(message) === draftId ? { ...message, content: "" } : message,
+        ));
       }
       if (!accepted) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
       if (!completed || !assistantMessageId) {
