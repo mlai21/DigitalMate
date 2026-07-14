@@ -73,11 +73,27 @@ export function truncateAttachmentText(
   text: string,
   maxCharacters = ATTACHMENT_TEXT_MAX_CHARACTERS,
 ): ExtractedAttachmentText {
-  const characters = Array.from(text);
-  if (characters.length <= maxCharacters) {
+  const characterLimit = Math.max(0, Math.trunc(maxCharacters));
+  let end = 0;
+  let characterCount = 0;
+
+  while (end < text.length && characterCount < characterLimit) {
+    const firstCodeUnit = text.charCodeAt(end);
+    const nextCodeUnit = text.charCodeAt(end + 1);
+    const isSurrogatePair =
+      firstCodeUnit >= 0xd800 &&
+      firstCodeUnit <= 0xdbff &&
+      nextCodeUnit >= 0xdc00 &&
+      nextCodeUnit <= 0xdfff;
+
+    end += isSurrogatePair ? 2 : 1;
+    characterCount += 1;
+  }
+
+  if (end === text.length) {
     return { text, truncated: false };
   }
-  return { text: characters.slice(0, maxCharacters).join(""), truncated: true };
+  return { text: text.slice(0, end), truncated: true };
 }
 
 /**

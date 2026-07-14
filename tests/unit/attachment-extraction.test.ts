@@ -49,12 +49,46 @@ afterEach(() => {
 });
 
 describe("attachment text extraction", () => {
-  it("truncates by Unicode code point without splitting a surrogate pair", () => {
-    expect(truncateAttachmentText("a".repeat(120_000), 100_000)).toEqual({
-      text: "a".repeat(100_000),
+  it("only scans the bounded prefix needed to truncate a near-10-MiB ASCII document", () => {
+    const text = "a".repeat(10 * 1024 * 1024);
+    const originalIterator = String.prototype[Symbol.iterator];
+    let iteratedCharacters = 0;
+
+    String.prototype[Symbol.iterator] = function* boundedStringIterator(): Generator<
+      string,
+      undefined,
+      unknown
+    > {
+      for (const character of originalIterator.call(this)) {
+        iteratedCharacters += 1;
+        if (iteratedCharacters > 100_001) {
+          throw new Error("truncateAttachmentText scanned beyond its bounded prefix");
+        }
+        yield character;
+      }
+      return undefined;
+    };
+
+    try {
+      expect(truncateAttachmentText(text, 100_000)).toEqual({
+        text: "a".repeat(100_000),
+        truncated: true,
+      });
+    } finally {
+      String.prototype[Symbol.iterator] = originalIterator;
+    }
+  });
+
+  it("truncates by Unicode code point without splitting a surrogate pair at the boundary", () => {
+    const text = `${"a".repeat(99_999)}😀tail`;
+
+    expect(truncateAttachmentText(text, 100_000)).toEqual({
+      text: `${"a".repeat(99_999)}😀`,
       truncated: true,
     });
-    expect(truncateAttachmentText("😀😀", 1)).toEqual({ text: "😀", truncated: true });
+  });
+
+  it("returns a short text unchanged with an accurate non-truncated marker", () => {
     expect(truncateAttachmentText("short", 100_000)).toEqual({
       text: "short",
       truncated: false,
