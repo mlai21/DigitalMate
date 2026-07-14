@@ -767,6 +767,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         );
         return result.rows.map(mapMessageAttachment);
       },
+      async listExistingStorageKeys(storageKeys: string[]): Promise<string[]> {
+        if (storageKeys.length === 0) return [];
+        const result = await pool.query<{ storage_key: string }>(
+          "SELECT storage_key FROM message_attachments WHERE storage_key = ANY($1::text[])",
+          [storageKeys],
+        );
+        return result.rows.map((row) => row.storage_key);
+      },
       async claimDraftForDeletion(
         userId: string,
         attachmentId: string,

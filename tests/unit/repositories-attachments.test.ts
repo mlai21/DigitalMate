@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +6,7 @@ import EmbeddedPostgres from "embedded-postgres";
 import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
+import { cleanupStaleAttachments } from "@/server/attachments/cleanup";
 import { createRepositories } from "@/server/db/repositories";
 
 const createdAt = new Date("2026-07-14T00:00:00Z");
@@ -151,6 +152,19 @@ describe("message attachments repository", () => {
 
     await expect(repositories.messageAttachments.listForMessages(USER_1, [])).resolves.toEqual([]);
     expect(query).not.toHaveBeenCalled();
+  });
+
+  it("lists only storage keys that still have attachment rows", async () => {
+    const query = vi.fn(async () => ({ rows: [{ storage_key: "stored-key" }] }));
+    const repositories = createRepositories(createPool(query));
+
+    await expect(
+      repositories.messageAttachments.listExistingStorageKeys(["stored-key", "orphan-key"]),
+    ).resolves.toEqual(["stored-key"]);
+
+    const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
+    expect(sql).toContain("storage_key = ANY($1::text[])");
+    expect(params).toEqual([["stored-key", "orphan-key"]]);
   });
 
   it("atomically fences one owned unbound draft for interactive deletion", async () => {
@@ -617,7 +631,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     storageKey: string;
     createdAt?: Date;
     updatedAt?: Date;
-    status?: "ready" | "failed" | "deleting";
+    status?: "pending" | "ready" | "failed" | "deleting";
   }): Promise<void> {
     const createdAt = input.createdAt ?? new Date();
     await databasePool.query(
@@ -1006,6 +1020,43 @@ describe("message attachment PostgreSQL concurrency", () => {
     expect(Boolean(stored.rows[0].message_id)).toBe(bindSucceeded);
   });
 
+  it("claims an expired pending upload while excluding an old bound attachment", async () => {
+    const userId = "40000000-0000-4000-8000-000000000008";
+    const conversationId = "41000000-0000-4000-8000-000000000008";
+    const pendingId = "42000000-0000-4000-8000-000000000070";
+    const boundId = "42000000-0000-4000-8000-000000000071";
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await seedConversation(userId, conversationId);
+    await seedAttachment({
+      id: pendingId,
+      userId,
+      storageKey: "pg-expired-pending",
+      createdAt: old,
+      updatedAt: old,
+      status: "pending",
+    });
+    await seedAttachment({
+      id: boundId,
+      userId,
+      storageKey: "pg-old-bound",
+      createdAt: old,
+      updatedAt: old,
+    });
+    const repositories = createRepositories(databasePool);
+    await repositories.messages.createWithAttachments({
+      userId,
+      conversationId,
+      content: "bind old attachment",
+      attachmentIds: [boundId],
+    });
+
+    const claimed = await repositories.messageAttachments.claimExpiredDrafts(24, 10);
+
+    expect(claimed.map((attachment) => attachment.id)).toEqual([pendingId]);
+    const bound = await repositories.messageAttachments.getForUser(userId, boundId);
+    expect(bound).toMatchObject({ status: "bound", messageId: expect.any(String) });
+  });
+
   it("lets two cleanup workers claim disjoint batches", async () => {
     const userId = "40000000-0000-4000-8000-000000000004";
     const conversationId = "41000000-0000-4000-8000-000000000004";
@@ -1099,5 +1150,41 @@ describe("message attachment PostgreSQL concurrency", () => {
     );
     const retryClaim = await repositories.messageAttachments.claimExpiredDrafts(24, 1);
     expect(retryClaim.map((attachment) => attachment.id)).toEqual([failedLowId]);
+  });
+
+  it("removes a safely aged private file only after confirming PostgreSQL has no attachment row", async () => {
+    const userId = "40000000-0000-4000-8000-000000000009";
+    const conversationId = "41000000-0000-4000-8000-000000000009";
+    const attachmentId = "42000000-0000-4000-8000-000000000080";
+    const referencedKey = "43000000-0000-4000-8000-000000000080";
+    const orphanKey = "43000000-0000-4000-8000-000000000081";
+    const storageRoot = await mkdtemp(path.join(os.tmpdir(), "digitalmate-orphan-cleanup-"));
+    try {
+      await seedConversation(userId, conversationId);
+      await seedAttachment({ id: attachmentId, userId, storageKey: referencedKey });
+      await Promise.all([
+        writeFile(path.join(storageRoot, referencedKey), "referenced"),
+        writeFile(path.join(storageRoot, orphanKey), "orphan"),
+      ]);
+      const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+      await Promise.all([
+        utimes(path.join(storageRoot, referencedKey), old, old),
+        utimes(path.join(storageRoot, orphanKey), old, old),
+      ]);
+
+      const result = await cleanupStaleAttachments({
+        repositories: createRepositories(databasePool),
+        storageDirectory: storageRoot,
+        logger: { info: vi.fn(), error: vi.fn() },
+      });
+
+      expect((await readdir(storageRoot)).sort()).toEqual([referencedKey]);
+      expect(result.orphanedFiles).toEqual({ deleted: 1, failed: 0 });
+      await expect(
+        createRepositories(databasePool).messageAttachments.getForUser(userId, attachmentId),
+      ).resolves.toMatchObject({ storageKey: referencedKey });
+    } finally {
+      await rm(storageRoot, { recursive: true, force: true });
+    }
   });
 });
