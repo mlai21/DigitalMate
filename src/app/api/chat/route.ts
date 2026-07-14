@@ -277,6 +277,7 @@ export async function POST(request: Request) {
           message: agentMessage,
           attachments: currentLlmAttachments,
           history,
+          attachmentToolGuard: currentAttachments.length > 0 || historicalAttachments.length > 0,
           persona: settings.persona,
           llm: client,
           model,

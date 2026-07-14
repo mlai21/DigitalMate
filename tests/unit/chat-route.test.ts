@@ -1091,6 +1091,7 @@ describe("chat route", () => {
           { role: "assistant", content: "看过了" },
         ],
         attachments: [expect.objectContaining({ kind: "image", fileName: "cat.png" })],
+        attachmentToolGuard: true,
       }),
     );
   });
@@ -1150,6 +1151,7 @@ describe("chat route", () => {
       "history-5.md",
     ]);
     expect(firstHistory[0]?.content).toBe("[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]");
+    expect(agentCalls[0]?.[0].attachmentToolGuard).toBe(true);
     assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(firstHistory as LlmMessage[]));
     const secondHistory = agentCalls[1]?.[0].history as Array<{
       attachments?: Array<{ fileName: string }>;
@@ -1159,6 +1161,7 @@ describe("chat route", () => {
       "history-4.md",
       "history-5.md",
     ]);
+    expect(agentCalls[1]?.[0].attachmentToolGuard).toBe(true);
     expect(mocks.messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ role: "user", content: "继续一轮" }),
     );
@@ -1268,11 +1271,32 @@ describe("chat route", () => {
       role: "user",
       content: "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]",
     }]);
+    expect(input?.attachmentToolGuard).toBe(true);
     assertAnthropicHasNoEmptyUserContent(await captureAnthropicBody(input?.history as LlmMessage[]));
     expect(mocks.readAttachment).not.toHaveBeenCalled();
     expect(mocks.messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ role: "user", content: "继续纯文本聊天" }),
     );
+  });
+
+  it("restores tools only after attachment messages leave recent history", async () => {
+    mocks.recentHistory.mockResolvedValueOnce([
+      { id: "24000000-0000-4000-8000-000000000001", role: "user", content: "最近已无附件" },
+    ]);
+    mocks.listAttachmentsForMessages.mockResolvedValueOnce([]);
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(withClientTurn({ message: "现在帮我搜索" })),
+      }),
+    );
+    await response.text();
+
+    expect(response.status).toBe(200);
+    const input = (mocks.runAgent.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0];
+    expect(input?.attachmentToolGuard).toBe(false);
   });
 
   it("uses the safe placeholder when an empty historical document cannot be reconstructed", async () => {

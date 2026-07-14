@@ -90,6 +90,8 @@ export type RunAgentInput = {
   webSearchEnabled?: boolean;
   /** Hard gate consulted before every web_search execution (PRD 5.4). */
   searchGate?: SearchGate;
+  /** Keeps every tool closed while a recent DB message still owns an attachment, even if its payload was cropped. */
+  attachmentToolGuard?: boolean;
   purpose?: LlmPurpose;
 };
 
@@ -190,7 +192,8 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   }
 
   const hasAttachmentContext =
-    (input.attachments?.length ?? 0) > 0
+    input.attachmentToolGuard === true
+    || (input.attachments?.length ?? 0) > 0
     || input.history.some((message) => (message.attachments?.length ?? 0) > 0);
   const tools = hasAttachmentContext ? [] : buildTools(enabledTools, {
     includeSaveSkill: Boolean(input.repositories.skills?.create),

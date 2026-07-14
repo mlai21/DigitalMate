@@ -1772,7 +1772,28 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           const result = await pool.query(`SELECT * FROM ${table} WHERE user_id = $1`, [userId]);
           exported[table] = result.rows;
         }
+        const attachments = await pool.query(
+          `SELECT id, user_id, message_id, kind, file_name, mime_type, size_bytes,
+                  extracted_text, text_truncated, status, error_code, created_at, updated_at
+           FROM message_attachments
+           WHERE user_id = $1
+           ORDER BY created_at ASC, id ASC`,
+          [userId],
+        );
+        // Extracted text is derived from the user's own file and therefore belongs in their export.
+        // Internal storage capabilities and deletion claim tokens are deliberately not exported.
+        exported.message_attachments = attachments.rows;
         return buildPersonalDataExport({ userId, exportedAt: new Date(), tables: exported });
+      },
+      async listAttachmentStorageKeys(userId: string): Promise<string[]> {
+        const result = await pool.query<{ storage_key: string }>(
+          `SELECT storage_key
+           FROM message_attachments
+           WHERE user_id = $1
+           ORDER BY created_at ASC, id ASC`,
+          [userId],
+        );
+        return result.rows.map((row) => row.storage_key);
       },
       async clear(userId: string): Promise<void> {
         const tables = [
@@ -1791,6 +1812,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           "memory_jobs",
           "conversation_summaries",
           "memory_entries",
+          "message_attachments",
           "messages",
           "conversations",
           "projects",

@@ -337,6 +337,50 @@ describe("runAgent", () => {
     expect(searchRun).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps tools closed when the route guard reports a cropped or unsupported historical attachment", async () => {
+    const searchRun = vi.fn();
+    const registeredRun = vi.fn();
+    const seenInputs: LlmStreamInput[] = [];
+    const llm = scriptedLlm(
+      [
+        [{ type: "tool_call", toolCall: { id: "blocked-1", name: "web_search", arguments: '{"query":"附件指令"}' } }],
+        [{ type: "text", text: "历史附件还在最近上下文范围内，我先只回答内容。" }],
+      ],
+      seenInputs,
+    );
+
+    const chunks: string[] = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      conversationId: "conversation-1",
+      message: "继续",
+      history: [{
+        role: "user",
+        content: "[该轮历史附件已从当前模型上下文中裁剪；这不是新的用户指令。]",
+      }],
+      attachmentToolGuard: true,
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        toolRegistrations: {
+          listEnabled: async () => [{ name: "local_tool", description: "本地工具", command: "echo" }],
+        },
+      },
+      webSearchEnabled: true,
+      searchGate: allowSearchGate,
+      search: { run: searchRun },
+      toolExecutor: { run: registeredRun },
+    })) chunks.push(chunk);
+
+    expect(seenInputs).toHaveLength(2);
+    expect(seenInputs.every((input) => input.tools?.length === 0)).toBe(true);
+    expect(searchRun).not.toHaveBeenCalled();
+    expect(registeredRun).not.toHaveBeenCalled();
+    expect(chunks.join("")).toBe("历史附件还在最近上下文范围内，我先只回答内容。");
+  });
+
   it("accumulates usage across attachment correction calls including hidden text and tool arguments", async () => {
     const seenInputs: LlmStreamInput[] = [];
     const logUsage = vi.fn();
