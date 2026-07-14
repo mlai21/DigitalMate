@@ -45,6 +45,8 @@ ALTER TABLE IF EXISTS messages
   ADD COLUMN IF NOT EXISTS client_turn_id uuid;
 ALTER TABLE IF EXISTS messages
   ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;
+ALTER TABLE IF EXISTS messages
+  ADD COLUMN IF NOT EXISTS client_turn_execution_started_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS message_attachments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

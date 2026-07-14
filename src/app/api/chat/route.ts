@@ -242,6 +242,7 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       let assistantText = "";
+      let executionAccepted = false;
       let releaseExecutionLock: (() => Promise<void>) | undefined;
       try {
         releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(user.id, clientTurnId);
@@ -251,15 +252,19 @@ export async function POST(request: Request) {
         safeClose(controller);
         return;
       }
-      safeEnqueue(controller, encoder, {
-        type: "accepted",
-        conversationId,
-        userMessageId: userMessage.id,
-        clientTurnId,
-      });
       try {
+        const acceptExecution = () => {
+          executionAccepted = true;
+          safeEnqueue(controller, encoder, {
+            type: "accepted",
+            conversationId,
+            userMessageId: userMessage.id,
+            clientTurnId,
+          });
+        };
         const assistantAfterLock = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
         if (assistantAfterLock) {
+          acceptExecution();
           safeEnqueue(controller, encoder, { type: "chunk", content: assistantAfterLock.content });
           safeEnqueue(controller, encoder, {
             type: "done",
@@ -271,6 +276,31 @@ export async function POST(request: Request) {
           safeClose(controller);
           return;
         }
+
+        const executionClaimed = await repositories.messages.claimClientTurnExecution(user.id, clientTurnId);
+        if (!executionClaimed) {
+          const interruptedText = "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
+          const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn({
+            userId: user.id,
+            conversationId,
+            clientTurnId,
+            content: interruptedText,
+          });
+          acceptExecution();
+          safeEnqueue(controller, encoder, { type: "chunk", content: interruptedTurn.message.content });
+          safeEnqueue(controller, encoder, {
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            assistantMessageId: interruptedTurn.message.id,
+            degraded: true,
+          });
+          safeClose(controller);
+          return;
+        }
+
+        acceptExecution();
         for await (const chunk of runAgent({
           userId: user.id,
           conversationId,
@@ -376,6 +406,15 @@ export async function POST(request: Request) {
           });
         }, 0);
       } catch (error) {
+        if (!executionAccepted) {
+          console.error("chat_turn_admission_failed", {
+            code: "turn_admission_failed",
+            errorType: error instanceof Error ? "Error" : "NonError",
+          });
+          safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
+          safeClose(controller);
+          return;
+        }
         const fallback = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
         const suffix = assistantText.trim() ? `\n\n${fallback}` : fallback;
         const content = `${assistantText}${suffix}`;

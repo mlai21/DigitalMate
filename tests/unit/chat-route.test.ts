@@ -96,6 +96,7 @@ const mocks = vi.hoisted(() => {
     createdAt: Date;
   } | null>>(async () => null);
   const acquireClientTurnExecutionLock = vi.fn(async () => vi.fn(async () => undefined));
+  const claimClientTurnExecution = vi.fn(async () => true);
   const proactiveTaskCreate = vi.fn(async () => undefined);
   const getAttachmentForUser = vi.fn<
     (userId: string, attachmentId: string) => Promise<DbMessageAttachment | null>
@@ -118,6 +119,7 @@ const mocks = vi.hoisted(() => {
     messagesCreateIdempotentAssistantTurn,
     findByClientTurn,
     acquireClientTurnExecutionLock,
+    claimClientTurnExecution,
     proactiveTaskCreate,
     getAttachmentForUser,
     listAttachmentsForMessages,
@@ -137,6 +139,7 @@ const mocks = vi.hoisted(() => {
         createIdempotentAssistantTurn: messagesCreateIdempotentAssistantTurn,
         findByClientTurn,
         acquireClientTurnExecutionLock,
+        claimClientTurnExecution,
         recentHistory,
         list: listMessages,
         listAfter: listMessagesAfter,
@@ -245,6 +248,7 @@ describe("chat route", () => {
     }));
     mocks.findByClientTurn.mockReset().mockResolvedValue(null);
     mocks.acquireClientTurnExecutionLock.mockReset().mockImplementation(async () => vi.fn(async () => undefined));
+    mocks.claimClientTurnExecution.mockReset().mockResolvedValue(true);
     mocks.proactiveTaskCreate.mockReset().mockResolvedValue(undefined);
     mocks.getLlmClient.mockReturnValue({
       client: {
@@ -694,6 +698,7 @@ describe("chat route", () => {
       },
     ]);
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.claimClientTurnExecution).toHaveBeenCalledTimes(1);
     expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledTimes(2);
     expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
   });
@@ -752,7 +757,37 @@ describe("chat route", () => {
     await Promise.all([firstText, secondText]);
 
     expect(mocks.acquireClientTurnExecutionLock).toHaveBeenCalledTimes(2);
+    expect(mocks.claimClientTurnExecution).toHaveBeenCalledTimes(1);
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rerun the agent after a process restart interrupted an already claimed turn", async () => {
+    mocks.messagesCreateIdempotentUserTurn.mockResolvedValueOnce({
+      message: persistedMessage("user", "不要重复执行"),
+      attachments: [],
+      created: false,
+    });
+    mocks.claimClientTurnExecution.mockResolvedValueOnce(false);
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "不要重复执行" })),
+    }));
+    const events = parseSseEvents(await response.text());
+
+    expect(events[0]).toMatchObject({
+      type: "accepted",
+      clientTurnId: DEFAULT_CLIENT_TURN_ID,
+    });
+    expect(events[1]).toEqual({
+      type: "chunk",
+      content: "刚才没能完整回复，你把那条消息再发一次，我重新接着看。",
+    });
+    expect(events.at(-1)).toMatchObject({ type: "done", degraded: true });
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+    expect(mocks.proactiveTaskCreate).not.toHaveBeenCalled();
     expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
   });
 
@@ -913,9 +948,31 @@ describe("chat route", () => {
     const events = parseSseEvents(await response.text());
 
     expect(events).toEqual([{ type: "error", message: "消息暂时没有受理，请重试。" }]);
+    expect(mocks.claimClientTurnExecution).not.toHaveBeenCalled();
     expect(mocks.runAgent).not.toHaveBeenCalled();
     expect(mocks.messagesCreateIdempotentAssistantTurn).not.toHaveBeenCalled();
     expect(consoleError).toHaveBeenCalledWith("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
+    consoleError.mockRestore();
+  });
+
+  it("does not accept or run a turn when its durable execution claim fails", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.claimClientTurnExecution.mockRejectedValueOnce(new Error("claim_backend_unavailable"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "持久化受理失败" })),
+    }));
+    const events = parseSseEvents(await response.text());
+
+    expect(events).toEqual([{ type: "error", message: "消息暂时没有受理，请重试。" }]);
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+    expect(mocks.messagesCreateIdempotentAssistantTurn).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith("chat_turn_admission_failed", {
+      code: "turn_admission_failed",
+      errorType: "Error",
+    });
     consoleError.mockRestore();
   });
 
@@ -1534,6 +1591,7 @@ describe("chat route", () => {
           created: true,
         })),
         acquireClientTurnExecutionLock: vi.fn(async () => vi.fn(async () => undefined)),
+        claimClientTurnExecution: vi.fn(async () => true),
       },
       messageAttachments: {
         listForMessages: vi.fn(async () => []),

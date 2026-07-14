@@ -631,6 +631,19 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           };
         }
       },
+      async claimClientTurnExecution(userId: string, clientTurnId: string): Promise<boolean> {
+        const result = await pool.query(
+          `UPDATE messages
+           SET client_turn_execution_started_at = now()
+           WHERE user_id = $1
+             AND client_turn_id = $2
+             AND role = 'user'
+             AND client_turn_execution_started_at IS NULL
+           RETURNING id`,
+          [userId, clientTurnId],
+        );
+        return result.rows.length === 1;
+      },
       async findByClientTurn(
         userId: string,
         clientTurnId: string,

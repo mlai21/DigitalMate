@@ -485,7 +485,7 @@ async function readAttachmentClaimTokenMigration(): Promise<string> {
 async function readClientTurnMigration(): Promise<string> {
   const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
   const columnMigration = schema.match(
-    /ALTER TABLE IF EXISTS messages\s+ADD COLUMN IF NOT EXISTS client_turn_id uuid;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;/,
+    /ALTER TABLE IF EXISTS messages\s+ADD COLUMN IF NOT EXISTS client_turn_id uuid;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_execution_started_at timestamptz;/,
   )?.[0];
   const uniqueIndex = schema.match(
     /CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role[\s\S]*?WHERE client_turn_id IS NOT NULL;/,
@@ -669,10 +669,11 @@ describe("message attachment PostgreSQL concurrency", () => {
       `SELECT column_name FROM information_schema.columns
        WHERE table_schema = current_schema()
          AND table_name = 'messages'
-         AND column_name IN ('client_turn_id', 'client_turn_payload_hash')
+         AND column_name IN ('client_turn_id', 'client_turn_payload_hash', 'client_turn_execution_started_at')
        ORDER BY column_name`,
     );
     expect(columns.rows.map((row) => row.column_name)).toEqual([
+      "client_turn_execution_started_at",
       "client_turn_id",
       "client_turn_payload_hash",
     ]);
@@ -711,6 +712,37 @@ describe("message attachment PostgreSQL concurrency", () => {
       [userId, clientTurnId],
     );
     expect(Number(count.rows[0].count)).toBe(1);
+  });
+
+  it("durably lets only the first process claim one client turn execution", async () => {
+    const userId = "50000000-0000-4000-8000-000000000009";
+    const conversationId = "51000000-0000-4000-8000-000000000009";
+    const clientTurnId = "52000000-0000-4000-8000-000000000009";
+    await seedConversation(userId, conversationId);
+    const firstRepositories = createRepositories(databasePool);
+    await firstRepositories.messages.createIdempotentUserTurn({
+      userId,
+      conversationId,
+      clientTurnId,
+      payloadHash: "durable-execution-claim",
+      content: "服务重启也不能重复执行",
+      attachmentIds: [],
+    });
+
+    await expect(
+      firstRepositories.messages.claimClientTurnExecution(userId, clientTurnId),
+    ).resolves.toBe(true);
+
+    const restartedRepositories = createRepositories(databasePool);
+    await expect(
+      restartedRepositories.messages.claimClientTurnExecution(userId, clientTurnId),
+    ).resolves.toBe(false);
+    const persisted = await databasePool.query<{ client_turn_execution_started_at: Date | null }>(
+      `SELECT client_turn_execution_started_at FROM messages
+       WHERE user_id = $1 AND client_turn_id = $2 AND role = 'user'`,
+      [userId, clientTurnId],
+    );
+    expect(persisted.rows[0]?.client_turn_execution_started_at).toBeInstanceOf(Date);
   });
 
   it("makes concurrent copies of one turn share a user row and bound attachment", async () => {
