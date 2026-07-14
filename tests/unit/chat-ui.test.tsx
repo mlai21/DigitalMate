@@ -1030,6 +1030,53 @@ describe("ChatShell attachment submit", () => {
     )).toHaveLength(1);
   });
 
+  it("keeps the original turn when degraded done has no durable assistant", async () => {
+    const conversationId = "00000000-0000-4000-8000-000000000010";
+    const chatBodies: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/chat") {
+        chatBodies.push(String(init?.body));
+        const { clientTurnId } = JSON.parse(chatBodies[0]) as { clientTurnId: string };
+        return sseResponse([
+          { type: "accepted", conversationId, clientTurnId, userMessageId: "message-user-degraded" },
+          { type: "done", conversationId, clientTurnId, userMessageId: "message-user-degraded", degraded: true },
+        ]);
+      }
+      if (url === `/api/conversations/${conversationId}/messages`) {
+        return new Response(JSON.stringify({
+          messages: [{
+            id: "message-user-degraded",
+            role: "user",
+            content: "降级也没有落库",
+            createdAt: "2026-07-14T10:00:00.000Z",
+            attachments: [],
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ conversations: [], projects: [], messages: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ChatShell
+        conversationId={conversationId}
+        initialMessages={[]}
+        initialConversations={[conversationItem()]}
+      />,
+    );
+
+    fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), {
+      target: { value: "降级也没有落库" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByText("发送失败，请重试。");
+    expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue("降级也没有落库");
+    expect(chatBodies).toHaveLength(1);
+    expect(messageTexts("降级也没有落库")).toHaveLength(1);
+    expect(document.querySelector(".message-row-assistant")).toBeNull();
+  });
+
   it("does not duplicate an accepted turn when polling wins the race with done", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const conversationId = "00000000-0000-4000-8000-000000000010";

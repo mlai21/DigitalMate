@@ -383,7 +383,10 @@ export function ChatShell({
         return reconciled;
       }
       if (!assistantMessageId) {
-        await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return reconciled;
       }
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
