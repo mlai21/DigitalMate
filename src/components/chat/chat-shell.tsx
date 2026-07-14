@@ -293,6 +293,7 @@ export function ChatShell({
 
     let completed = false;
     let accepted = false;
+    let acceptedUserMessageId: string | undefined;
     let assistantMessageId: string | undefined;
     const requestBody = JSON.stringify({
       message: content,
@@ -317,6 +318,7 @@ export function ChatShell({
           for await (const payload of readSse(response.body)) {
             if (payload.type === "accepted") {
               accepted = true;
+              acceptedUserMessageId = payload.userMessageId;
               updateActiveConversationMessages(turnConversationId, (current) => reconcileOptimisticMessageId(
                 current,
                 userMessage.id,
@@ -374,8 +376,14 @@ export function ChatShell({
         ));
       }
       if (!accepted) throw new ChatSubmitError("回复暂时没有送达，请稍后重试。");
-      if (!completed || !assistantMessageId) {
-        await reconcileAcceptedTurn(turnConversationId, draftId);
+      if (!completed) {
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
+        void refreshSidebar();
+        window.setTimeout(() => void refreshSidebar(), 6_000);
+        return reconciled;
+      }
+      if (!assistantMessageId) {
+        await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
       }
       // pick up auto-generated titles and reordering after the turn
       void refreshSidebar();
@@ -383,10 +391,10 @@ export function ChatShell({
       return true;
     } catch {
       if (accepted) {
-        await reconcileAcceptedTurn(turnConversationId, draftId);
+        const reconciled = await reconcileAcceptedTurn(turnConversationId, draftId, acceptedUserMessageId);
         void refreshSidebar();
         window.setTimeout(() => void refreshSidebar(), 6_000);
-        return true;
+        return reconciled;
       }
       updateActiveConversationMessages(turnConversationId, (current) => current.filter((message) => {
         const uiId = getChatMessageUiId(message);
@@ -404,21 +412,31 @@ export function ChatShell({
     async function reconcileAcceptedTurn(
       targetConversationId: string,
       assistantDraftId: string,
-    ) {
+      persistedUserMessageId?: string,
+    ): Promise<boolean> {
       updateActiveConversationMessages(
         targetConversationId,
         (current) => current.filter((message) => getChatMessageUiId(message) !== assistantDraftId),
       );
       try {
         const response = await fetch(`/api/conversations/${targetConversationId}/messages`);
-        if (!response.ok) return;
+        if (!response.ok) return false;
         const data = (await response.json()) as { messages?: ChatMessage[] };
+        const persistedMessages = data.messages ?? [];
         updateActiveConversationMessages(
           targetConversationId,
-          (current) => mergeMessages(current, data.messages ?? []),
+          (current) => mergeMessages(current, persistedMessages),
         );
+        if (!persistedUserMessageId) return false;
+        const userIndex = persistedMessages.findIndex((message) => message.id === persistedUserMessageId);
+        if (userIndex < 0) return false;
+        const following = persistedMessages.slice(userIndex + 1);
+        const nextUserIndex = following.findIndex((message) => message.role === "user");
+        const sameTurnWindow = nextUserIndex < 0 ? following : following.slice(0, nextUserIndex);
+        return sameTurnWindow.some((message) => message.role === "assistant");
       } catch {
         // Polling will retry reconciliation without resubmitting the accepted turn.
+        return false;
       }
     }
   }

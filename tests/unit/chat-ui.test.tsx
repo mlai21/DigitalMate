@@ -941,25 +941,9 @@ describe("ChatShell attachment submit", () => {
     expect(new Set(Array.from(document.querySelectorAll(".message-row")).map((row) => row.textContent)).size).toBe(2);
   });
 
-  it("commits an auto-created conversation when accepted is followed by a disconnect", async () => {
+  it("keeps the original turn retryable when both automatic recovery attempts miss a restarting service", async () => {
     const conversation = conversationItem();
     const chatBodies: string[] = [];
-    let pullCount = 0;
-    const stream = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        pullCount += 1;
-        if (pullCount === 1) {
-          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
-            type: "accepted",
-            conversationId: conversation.id,
-            clientTurnId: "70000000-0000-4000-8000-000000000001",
-            userMessageId: "message-user-auto",
-          })}\n\n`));
-          return;
-        }
-        controller.error(new Error("disconnect_after_accept"));
-      },
-    });
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === "/api/conversations" && init?.method === "POST") {
@@ -967,7 +951,46 @@ describe("ChatShell attachment submit", () => {
       }
       if (url === "/api/chat") {
         chatBodies.push(String(init?.body));
-        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+        const body = JSON.parse(chatBodies.at(-1)!) as { clientTurnId: string };
+        if (chatBodies.length <= 2) {
+          let pullCount = 0;
+          const interruptedStream = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              pullCount += 1;
+              if (pullCount === 1) {
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+                  type: "accepted",
+                  conversationId: conversation.id,
+                  clientTurnId: body.clientTurnId,
+                  userMessageId: "message-user-auto",
+                })}\n\n`));
+                return;
+              }
+              controller.error(new Error("service_restarting"));
+            },
+          });
+          return new Response(interruptedStream, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return sseResponse([
+          {
+            type: "accepted",
+            conversationId: conversation.id,
+            clientTurnId: body.clientTurnId,
+            userMessageId: "message-user-auto",
+          },
+          { type: "chunk", content: "刚才中断了，请再发一次。" },
+          {
+            type: "done",
+            conversationId: conversation.id,
+            clientTurnId: body.clientTurnId,
+            userMessageId: "message-user-auto",
+            assistantMessageId: "message-assistant-recovery",
+            degraded: true,
+          },
+        ]);
       }
       if (url === `/api/conversations/${conversation.id}/messages`) {
         return new Response(JSON.stringify({ messages: [{
@@ -986,11 +1009,22 @@ describe("ChatShell attachment submit", () => {
     fireEvent.input(screen.getByRole("textbox", { name: "输入消息" }), { target: { value: "自动会话断流" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    await screen.findByText("发送失败，请重试。");
+    expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue("自动会话断流");
     expect(messageTexts("自动会话断流")).toHaveLength(1);
     expect(document.querySelector(".message-row-assistant")).toBeNull();
     expect(chatBodies).toHaveLength(2);
     expect(chatBodies[1]).toBe(chatBodies[0]);
+    expect(fetchMock.mock.calls.filter(([input, init]) =>
+      String(input) === "/api/conversations" && init?.method === "POST",
+    )).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""));
+    expect(chatBodies).toHaveLength(3);
+    expect(chatBodies[2]).toBe(chatBodies[0]);
+    expect(messageTexts("自动会话断流")).toHaveLength(1);
+    expect(messageTexts("刚才中断了，请再发一次。")).toHaveLength(1);
     expect(fetchMock.mock.calls.filter(([input, init]) =>
       String(input) === "/api/conversations" && init?.method === "POST",
     )).toHaveLength(1);
