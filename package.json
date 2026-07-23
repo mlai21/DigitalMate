@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "npm run console:build && next build",
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
@@ -17,6 +17,7 @@
     "console:verify-upstream": "node scripts/qwenpaw-console/verify-upstream.mjs",
     "console:prepare": "node scripts/qwenpaw-console/prepare.mjs",
     "console:test": "node scripts/qwenpaw-console/test.mjs",
+    "console:build": "node scripts/qwenpaw-console/build.mjs",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:seed": "tsx src/server/db/seed.ts",
     "agent": "tsx src/agent-service/index.ts"

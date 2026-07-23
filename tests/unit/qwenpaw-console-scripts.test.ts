@@ -18,6 +18,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import nextConfig from "../../next.config";
+import {
+  BUILD_COMMANDS as CONSOLE_BUILD_COMMANDS,
+  __testing as buildTesting,
+  buildConsole,
+} from "../../scripts/qwenpaw-console/build.mjs";
 import {
   PATCHES,
   __testing as prepareTesting,
@@ -1720,5 +1726,485 @@ describe("QwenPaw Console isolated test runner", () => {
         },
       }),
     ).rejects.toBe(cleanupError);
+  });
+});
+
+type ConsoleBuildTestingInterface = {
+  publishConsoleBuild: (
+    distRoot: string,
+    options: {
+      publicRoot: string;
+      fileOperations?: {
+        cp?: typeof cp;
+        lstat?: typeof lstat;
+        mkdtemp?: typeof mkdtemp;
+        mkdir?: typeof mkdir;
+        readdir?: typeof readdir;
+        rename?: typeof rename;
+        rm?: typeof rm;
+      };
+    },
+  ) => Promise<{ publishRoot: string }>;
+};
+
+async function createConsoleBuildFixture(options?: {
+  existingPublish?: boolean;
+}): Promise<{
+  distRoot: string;
+  preparedRoot: string;
+  publicRoot: string;
+  publishRoot: string;
+  temporaryRoot: string;
+}> {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "dm-qwenpaw-build-"),
+  );
+  const preparedRoot = path.join(temporaryRoot, "prepared");
+  const distRoot = path.join(preparedRoot, "dist");
+  const assetsRoot = path.join(distRoot, "assets");
+  const publicRoot = path.join(temporaryRoot, "public");
+  const publishRoot = path.join(publicRoot, "_admin-console");
+  await mkdir(assetsRoot, { recursive: true });
+  await mkdir(publicRoot, { recursive: true });
+  await writeFile(
+    path.join(distRoot, "index.html"),
+    [
+      '<script type="module" src="/_admin-console/assets/app-abc12345.js"></script>',
+      '<img src="/_admin-console/digitalmate-logo.svg">',
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(
+    path.join(distRoot, "digitalmate-logo.svg"),
+    "<svg></svg>\n",
+    "utf8",
+  );
+  await writeFile(
+    path.join(assetsRoot, "app-abc12345.js"),
+    'console.log("new console");\n',
+    "utf8",
+  );
+  if (options?.existingPublish !== false) {
+    await mkdir(publishRoot);
+    await writeFile(path.join(publishRoot, "old.txt"), "old console\n", "utf8");
+  }
+  return {
+    distRoot,
+    preparedRoot,
+    publicRoot,
+    publishRoot,
+    temporaryRoot,
+  };
+}
+
+function requireBuildTestingInterface(): ConsoleBuildTestingInterface {
+  expect(buildTesting).toBeDefined();
+  return buildTesting as ConsoleBuildTestingInterface;
+}
+
+async function listConsolePublicationResidue(publicRoot: string) {
+  return (await readdir(publicRoot))
+    .filter(
+      (entry) =>
+        entry.startsWith(".admin-console-staging") ||
+        entry.startsWith(".admin-console-backup"),
+    )
+    .sort();
+}
+
+describe("QwenPaw Console atomic static build", () => {
+  it("固定安装与生产构建命令，构建失败时不发布并清理准备目录", async () => {
+    expect(CONSOLE_BUILD_COMMANDS).toEqual([
+      ["npm", "ci"],
+      ["npm", "run", "build:prod"],
+    ]);
+
+    const fixture = await createConsoleBuildFixture();
+    const publishCalls: string[] = [];
+    const commands: string[] = [];
+    const commandErrorCode = 29;
+
+    try {
+      await expect(
+        buildConsole({
+          prepare: async () => ({
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          }),
+          runCommand: async (command, args) => {
+            commands.push([command, ...args].join(" "));
+            return {
+              exitCode:
+                commands.length === CONSOLE_BUILD_COMMANDS.length
+                  ? commandErrorCode
+                  : 0,
+              signal: null,
+            };
+          },
+          publishBuild: async (distRoot: string) => {
+            publishCalls.push(distRoot);
+            return { publishRoot: fixture.publishRoot };
+          },
+          publicRoot: fixture.publicRoot,
+        }),
+      ).rejects.toMatchObject({
+        command: "npm run build:prod",
+        exitCode: commandErrorCode,
+      });
+
+      expect(commands).toEqual(["npm ci", "npm run build:prod"]);
+      expect(publishCalls).toEqual([]);
+      await expect(readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+      await expectPathMissing(fixture.preparedRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("dist 校验失败时不发布且总是清理准备目录", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const validationError = new Error("invalid dist fixture");
+    let publishCount = 0;
+
+    try {
+      await expect(
+        buildConsole({
+          prepare: async () => ({
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          }),
+          runCommand: async () => ({ exitCode: 0, signal: null }),
+          validateBuild: async () => {
+            throw validationError;
+          },
+          publishBuild: async () => {
+            publishCount += 1;
+            return { publishRoot: fixture.publishRoot };
+          },
+          publicRoot: fixture.publicRoot,
+        }),
+      ).rejects.toBe(validationError);
+
+      expect(publishCount).toBe(0);
+      await expect(readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+      await expectPathMissing(fixture.preparedRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("成功时在 public 同文件系统原子替换旧产物且无临时残留", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+
+    try {
+      await expect(
+        publishConsoleBuild(fixture.distRoot, {
+          publicRoot: fixture.publicRoot,
+        }),
+      ).resolves.toEqual({ publishRoot: fixture.publishRoot });
+
+      await expectPathMissing(path.join(fixture.publishRoot, "old.txt"));
+      await expect(
+        readFile(
+          path.join(fixture.publishRoot, "assets", "app-abc12345.js"),
+          "utf8",
+        ),
+      ).resolves.toContain("new console");
+      expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual([]);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("安装新产物失败时回滚旧产物并清理 staging 与 backup", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+    const installError = new Error("injected install failure");
+
+    try {
+      await expect(
+        publishConsoleBuild(fixture.distRoot, {
+          publicRoot: fixture.publicRoot,
+          fileOperations: {
+            rename: async (source, destination) => {
+              if (
+                path
+                  .basename(String(source))
+                  .startsWith(".admin-console-staging") &&
+                destination === fixture.publishRoot
+              ) {
+                throw installError;
+              }
+              await rename(source, destination);
+            },
+          },
+        }),
+      ).rejects.toBe(installError);
+
+      await expect(readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+      expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual([]);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("并发目标阻止回滚时保留唯一 backup 并报告状态与路径", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+    const installError = new Error("injected concurrent install failure");
+    let caughtError: unknown;
+
+    try {
+      await publishConsoleBuild(fixture.distRoot, {
+        publicRoot: fixture.publicRoot,
+        fileOperations: {
+          rename: async (source, destination) => {
+            if (
+              path
+                .basename(String(source))
+                .startsWith(".admin-console-staging") &&
+              destination === fixture.publishRoot
+            ) {
+              await mkdir(fixture.publishRoot);
+              await writeFile(
+                path.join(fixture.publishRoot, "concurrent.txt"),
+                "concurrent publish\n",
+                "utf8",
+              );
+              throw installError;
+            }
+            await rename(source, destination);
+          },
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    try {
+      expect(caughtError).toBeInstanceOf(Error);
+      expect(caughtError).toMatchObject({
+        publishState: "rollback-blocked",
+      });
+      const backupPath = Reflect.get(
+        caughtError as object,
+        "backupPath",
+      ) as string;
+      expect(path.dirname(backupPath)).toBe(fixture.publicRoot);
+      expect(path.basename(backupPath)).toMatch(/^\.admin-console-backup-/);
+      await expect(readFile(path.join(backupPath, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+      await expect(
+        readFile(path.join(fixture.publishRoot, "concurrent.txt"), "utf8"),
+      ).resolves.toBe("concurrent publish\n");
+      expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual([
+        path.basename(backupPath),
+      ]);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("没有旧产物时安装失败不会留下半成品", async () => {
+    const fixture = await createConsoleBuildFixture({
+      existingPublish: false,
+    });
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+    const installError = new Error("injected first install failure");
+
+    try {
+      await expect(
+        publishConsoleBuild(fixture.distRoot, {
+          publicRoot: fixture.publicRoot,
+          fileOperations: {
+            rename: async (source, destination) => {
+              if (
+                path
+                  .basename(String(source))
+                  .startsWith(".admin-console-staging") &&
+                destination === fixture.publishRoot
+              ) {
+                throw installError;
+              }
+              await rename(source, destination);
+            },
+          },
+        }),
+      ).rejects.toBe(installError);
+
+      await expectPathMissing(fixture.publishRoot);
+      expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual([]);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("复制失败不触碰旧产物，且 staging 清理错误不掩盖主错误", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+    const copyError = new Error("injected copy failure");
+    const cleanupError = new Error("injected staging cleanup failure");
+
+    try {
+      let caughtError: unknown;
+      try {
+        await publishConsoleBuild(fixture.distRoot, {
+          publicRoot: fixture.publicRoot,
+          fileOperations: {
+            cp: async () => {
+              throw copyError;
+            },
+            rm: async (target, options) => {
+              if (
+                path
+                  .basename(String(target))
+                  .startsWith(".admin-console-staging")
+              ) {
+                throw cleanupError;
+              }
+              await rm(target, options);
+            },
+          },
+        });
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBe(copyError);
+      expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+        cleanupError,
+      );
+      await expect(readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("拒绝 dist 中的符号链接与缺少内容哈希 assets，旧产物保持不变", async () => {
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+
+    for (const variant of ["symlink", "unhashed-assets"] as const) {
+      const fixture = await createConsoleBuildFixture();
+      try {
+        if (variant === "symlink") {
+          await symlink(
+            "../digitalmate-logo.svg",
+            path.join(fixture.distRoot, "assets", "linked.svg"),
+          );
+        } else {
+          await rename(
+            path.join(fixture.distRoot, "assets", "app-abc12345.js"),
+            path.join(fixture.distRoot, "assets", "app.js"),
+          );
+        }
+
+        await expect(
+          publishConsoleBuild(fixture.distRoot, {
+            publicRoot: fixture.publicRoot,
+          }),
+        ).rejects.toThrow(
+          variant === "symlink"
+            ? "symbolic link not allowed"
+            : "content-hashed build asset missing",
+        );
+        await expect(
+          readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"),
+        ).resolves.toBe("old console\n");
+        expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual(
+          [],
+        );
+      } finally {
+        await rm(fixture.temporaryRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("命令主错误优先于 prepared cleanup 错误", async () => {
+    const commandErrorCode = 51;
+    const cleanupError = new Error("injected prepared cleanup failure");
+    let caughtError: unknown;
+
+    try {
+      await buildConsole({
+        prepare: async () => ({
+          workdir: "/virtual/prepared-console",
+          applied: [...PATCHES],
+        }),
+        runCommand: async () => ({
+          exitCode: commandErrorCode,
+          signal: null,
+        }),
+        cleanupPrepared: async () => {
+          throw cleanupError;
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toMatchObject({
+      command: "npm ci",
+      exitCode: commandErrorCode,
+    });
+    expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+      cleanupError,
+    );
+  });
+
+  it("根脚本、忽略规则、缓存头与镜像归因范围精确", async () => {
+    const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+    expect(packageJson.scripts["console:build"]).toBe(
+      "node scripts/qwenpaw-console/build.mjs",
+    );
+    expect(packageJson.scripts.build).toBe(
+      "npm run console:build && next build",
+    );
+
+    const gitignore = await readFile(".gitignore", "utf8");
+    expect(gitignore).toMatch(/^public\/_admin-console\/$/m);
+    expect(gitignore).toMatch(/^public\/\.admin-console-staging\*\/$/m);
+    expect(gitignore).toMatch(/^\.generated\/$/m);
+    expect(gitignore).not.toMatch(/^public\/?$/m);
+    expect(gitignore).not.toMatch(/^public\/\*$/m);
+
+    const configuredHeaders = await nextConfig.headers?.();
+    expect(configuredHeaders).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source: "/home/:path+" }),
+        {
+          source: "/_admin-console/assets/:path+",
+          headers: [
+            {
+              key: "Cache-Control",
+              value: "public, max-age=31536000, immutable",
+            },
+          ],
+        },
+        {
+          source: "/_admin-console/index.html",
+          headers: [{ key: "Cache-Control", value: "no-store" }],
+        },
+      ]),
+    );
+
+    const dockerfile = await readFile("Dockerfile", "utf8");
+    expect(dockerfile).toContain(
+      "COPY --from=builder /app/public ./public",
+    );
+    expect(dockerfile).toContain(
+      "COPY --from=builder /app/vendor/qwenpaw-console/LICENSE ./third-party/qwenpaw-console/LICENSE",
+    );
+    expect(dockerfile).toContain(
+      "COPY --from=builder /app/vendor/qwenpaw-console/UPSTREAM.md ./third-party/qwenpaw-console/UPSTREAM.md",
+    );
+    expect(dockerfile).not.toContain(
+      "/app/vendor/qwenpaw-console/reference",
+    );
+    expect(dockerfile).not.toContain("/app/src/qwenpaw");
   });
 });

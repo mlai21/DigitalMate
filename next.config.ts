@@ -8,6 +8,13 @@ const LONG_CACHE = [
   },
 ];
 
+const NO_STORE = [
+  {
+    key: "Cache-Control",
+    value: "no-store",
+  },
+];
+
 const nextConfig: NextConfig = {
   allowedDevOrigins: ["127.0.0.1"],
   async headers() {
@@ -16,6 +23,14 @@ const nextConfig: NextConfig = {
       { source: "/home/:path+", headers: LONG_CACHE },
       { source: "/mate-avatar.png", headers: LONG_CACHE },
       { source: "/digitalmate-icon.png", headers: LONG_CACHE },
+      {
+        source: "/_admin-console/assets/:path+",
+        headers: LONG_CACHE,
+      },
+      {
+        source: "/_admin-console/index.html",
+        headers: NO_STORE,
+      },
     ];
   },
 };

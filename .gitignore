@@ -17,6 +17,10 @@ node_modules
 out
 build
 coverage
+public/_admin-console/
+public/.admin-console-staging*/
+public/.admin-console-backup*/
+.generated/
 playwright-report
 test-results
 data/artifacts
