@@ -2455,6 +2455,121 @@ describe("QwenPaw Console isolated test runner", () => {
   });
 
   it.each([
+    { label: "null 结果", prepared: null },
+    { label: "undefined 结果", prepared: undefined },
+    { label: "空字符串结果", prepared: "" },
+    { label: "空 workdir", prepared: { workdir: "", applied: [] } },
+  ])(
+    "prepare 返回 $label 时在任何 npm 命令前拒绝",
+    async ({ prepared }) => {
+      let commandCount = 0;
+      let validationCount = 0;
+      let cleanupCount = 0;
+
+      await expect(
+        runPreparedConsoleTests({
+          prepare: async () => prepared as never,
+          runCommand: async () => {
+            commandCount += 1;
+            return { exitCode: 0, signal: null };
+          },
+          validateBuild: async () => {
+            validationCount += 1;
+            return { indexPath: "", logoPath: "", resourceUrls: [] };
+          },
+          cleanup: async () => {
+            cleanupCount += 1;
+          },
+        }),
+      ).rejects.toThrow(
+        "Console preparation did not return a workdir",
+      );
+      expect(commandCount).toBe(0);
+      expect(validationCount).toBe(0);
+      expect(cleanupCount).toBe(0);
+    },
+  );
+
+  it.each([
+    {
+      label: "非零 outcome",
+      runTests: async () => ({
+        cleanupError: Object.assign(new Error("cleanup failed"), {
+          cleanupErrors: [
+            {
+              stage: "prepared",
+              path: "/safe/tmp/qwenpaw-console-test",
+              error: new Error("prepared removal failed"),
+            },
+          ],
+        }),
+        exitCode: 23,
+        signal: null,
+      }),
+      terminalEvent: "exit:23",
+      firstLine: null,
+    },
+    {
+      label: "异常 rejection",
+      runTests: async () => {
+        throw Object.assign(new Error("tests failed"), {
+          cleanupErrors: [
+            {
+              stage: "prepared",
+              path: "/safe/tmp/qwenpaw-console-test",
+              error: new Error("prepared removal failed"),
+            },
+          ],
+        });
+      },
+      terminalEvent: "exit:1",
+      firstLine: "stderr:tests failed",
+    },
+  ])(
+    "console:test CLI 在$label时输出 cleanup 阶段、路径与 message",
+    async ({ runTests, terminalEvent, firstLine }) => {
+      const testing = Reflect.get(
+        consoleTestScript,
+        "__testing",
+      ) as unknown as
+        | {
+            runTestCli?: (options: {
+              resendSignal: (signal: string) => void;
+              runTests: () => Promise<unknown>;
+              setExitCode: (exitCode: number) => void;
+              writeStderr: (line: string) => void;
+            }) => Promise<void>;
+          }
+        | undefined;
+      const runTestCli = testing?.runTestCli;
+      const events: string[] = [];
+
+      expect(runTestCli).toBeTypeOf("function");
+      if (typeof runTestCli !== "function") {
+        return;
+      }
+      await runTestCli({
+        resendSignal: (signal) => {
+          events.push(`signal:${signal}`);
+        },
+        runTests,
+        setExitCode: (exitCode) => {
+          events.push(`exit:${exitCode}`);
+        },
+        writeStderr: (line) => {
+          events.push(`stderr:${line}`);
+        },
+      });
+
+      expect(events).toEqual([
+        ...(firstLine ? [firstLine] : []),
+        "stderr:Console cleanup failed at prepared (/safe/tmp/qwenpaw-console-test): prepared removal failed",
+        terminalEvent,
+      ]);
+    },
+  );
+
+  it.each([
     {
       label: "非空字面量加号前缀",
       source: 'const loader = "assets" + "/loader.js";\n',
@@ -3771,6 +3886,456 @@ setInterval(() => {
 
     expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
     expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  });
+
+  it("POSIX runner 在 child pid 无效且永不关闭时有界拒绝并保留首信号", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      kill() {
+        return false;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+    let timedOut = false;
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(timedOut).toBe(false);
+      if (!raced.timedOut) {
+        expect(raced).toMatchObject({
+          error: {
+            code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            signal: "SIGTERM",
+          },
+        });
+      }
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      const diagnosticCount = lifecycle.diagnostics.length;
+      child.emit("close", null, "SIGKILL");
+      expect(lifecycle.diagnostics).toHaveLength(diagnosticCount);
+    } finally {
+      if (timedOut) {
+        child.emit("close", null, "SIGKILL");
+        await running.catch(() => {});
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX runner 在 group 与 direct kill 持续 EPERM 且 child 永不关闭时有界拒绝", async () => {
+    const killCalls: Array<{
+      pid: number;
+      signal: string | number;
+    }> = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6363,
+      kill() {
+        return false;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      killProcess: (pid: number, signal: string | number = 0) => {
+        killCalls.push({ pid, signal });
+        throw Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+    let timedOut = false;
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(timedOut).toBe(false);
+      if (!raced.timedOut) {
+        expect(raced).toMatchObject({
+          error: {
+            code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            signal: "SIGTERM",
+          },
+        });
+      }
+      expect(killCalls).toEqual(
+        expect.arrayContaining([
+          { pid: -6363, signal: "SIGTERM" },
+          { pid: 6363, signal: "SIGTERM" },
+          { pid: -6363, signal: "SIGKILL" },
+          { pid: 6363, signal: "SIGKILL" },
+        ]),
+      );
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    } finally {
+      if (timedOut) {
+        child.emit("close", null, "SIGKILL");
+        await running.catch(() => {});
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX runner 在 child 已关闭但 PGID 持续不可确认退出时拒绝而非成功", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6464,
+      kill() {
+        return false;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      killProcess: () => {
+        throw Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+
+      expect(raced).toMatchObject({
+        error: {
+          code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+          signal: "SIGTERM",
+        },
+        timedOut: false,
+      });
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX 同步 close 不会与 watchdog/settle 双跑后误报成功", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6465,
+      kill() {
+        return false;
+      },
+    });
+    let emittedClose = false;
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      killProcess: (pid: number, signal: string | number = 0) => {
+        if (
+          !emittedClose &&
+          pid === -6465 &&
+          signal === "SIGTERM"
+        ) {
+          emittedClose = true;
+          child.emit("close", null, "SIGTERM");
+        }
+        throw Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(running).rejects.toMatchObject({
+        code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+        signal: "SIGTERM",
+      });
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX maxBuffer 终止失败时保留 overflow 主错误与空信号并附 terminationError", async () => {
+    const overflowError = Object.assign(
+      new Error("stdout maxBuffer length exceeded (1024)"),
+      {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        killed: true,
+        signal: null,
+      },
+    );
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6565,
+      kill() {
+        return false;
+      },
+    });
+    let completeCommand:
+      | ((error: Error, stdout: string, stderr: string) => void)
+      | undefined;
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      killProcess: () => {
+        throw Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedExecFile("fake-command", [], {
+      execFileProcess: ((
+        _command: string,
+        _args: string[],
+        options: {
+          onMaxBuffer?: (target: typeof child, error: Error) => void;
+        },
+        callback: (
+          error: Error,
+          stdout: string,
+          stderr: string,
+        ) => void,
+      ) => {
+        completeCommand = callback;
+        queueMicrotask(() =>
+          options.onMaxBuffer?.(child, overflowError),
+        );
+        return child;
+      }) as never,
+      maxBuffer: 1_024,
+      signalLifecycle: lifecycle,
+    });
+    let timedOut = false;
+
+    try {
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(timedOut).toBe(false);
+      if (!raced.timedOut) {
+        expect("error" in raced).toBe(true);
+        if ("error" in raced) {
+          expect(raced.error).toBe(overflowError);
+          expect(raced.error).toMatchObject({
+            code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+            killed: true,
+            signal: null,
+            terminationError: {
+              code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            },
+          });
+        }
+      }
+      expect(lifecycle.signal).toBeNull();
+      expect(child.listenerCount("error")).toBe(0);
+    } finally {
+      if (timedOut) {
+        completeCommand?.(overflowError, "", "");
+        await running.catch(() => {});
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX maxBuffer 回调先完成但 PGID 未退出时仍附 terminationError", async () => {
+    const overflowError = Object.assign(
+      new Error("stdout maxBuffer length exceeded (1024)"),
+      {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        killed: true,
+        signal: null,
+      },
+    );
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6566,
+      kill() {
+        return false;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 10,
+      killProcess: () => {
+        throw Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedExecFile("fake-command", [], {
+      execFileProcess: ((
+        _command: string,
+        _args: string[],
+        options: {
+          onMaxBuffer?: (target: typeof child, error: Error) => void;
+        },
+        callback: (
+          error: Error,
+          stdout: string,
+          stderr: string,
+        ) => void,
+      ) => {
+        queueMicrotask(() => {
+          options.onMaxBuffer?.(child, overflowError);
+          queueMicrotask(() =>
+            callback(overflowError, "", ""),
+          );
+        });
+        return child;
+      }) as never,
+      maxBuffer: 1_024,
+      signalLifecycle: lifecycle,
+    });
+
+    try {
+      const caught = await running.catch((error) => error);
+
+      expect(caught).toBe(overflowError);
+      expect(caught).toMatchObject({
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        killed: true,
+        signal: null,
+        terminationError: {
+          code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+        },
+      });
+      expect(lifecycle.signal).toBeNull();
+      expect(child.listenerCount("error")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("POSIX runner 正常 graceful close 且 PGID 消失时保持首信号结果", async () => {
+    let groupAlive = true;
+    const child = Object.assign(new EventEmitter(), {
+      pid: 6666,
+      kill() {
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 50,
+      killProcess: (pid: number, signal: string | number = 0) => {
+        if (signal === 0) {
+          if (!groupAlive) {
+            throw Object.assign(new Error("missing"), {
+              code: "ESRCH",
+            });
+          }
+          return true;
+        }
+        if (pid === -6666 && signal === "SIGTERM") {
+          groupAlive = false;
+          queueMicrotask(() =>
+            child.emit("close", null, "SIGTERM"),
+          );
+        }
+        return true;
+      },
+      platform: "linux",
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(running).resolves.toEqual({
+        exitCode: 1,
+        signal: "SIGTERM",
+      });
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
   });
 
   it("Windows 进程树终止命令始终含 /T，强杀阶段额外含 /F", () => {

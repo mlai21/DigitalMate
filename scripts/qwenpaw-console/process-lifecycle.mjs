@@ -578,8 +578,8 @@ export function createSignalLifecycle({
   let forceTermination = null;
   let closedChild = null;
   let watchedChild = null;
-  let windowsWatchdogChild = null;
-  let windowsWatchdogPromise = null;
+  let terminationWatchdogChild = null;
+  let terminationWatchdogPromise = null;
   let terminationFailure = null;
   let installed = false;
   const childResolutionWaiters = new Set();
@@ -711,16 +711,16 @@ export function createSignalLifecycle({
       platform !== "win32" ||
       watchedChild !== child ||
       activeChild !== child ||
-      windowsWatchdogChild === child
+      terminationWatchdogChild === child
     ) {
-      return windowsWatchdogPromise;
+      return terminationWatchdogPromise;
     }
     if (!gracefulTermination && !forceTermination) {
       return null;
     }
 
-    windowsWatchdogChild = child;
-    windowsWatchdogPromise = (async () => {
+    terminationWatchdogChild = child;
+    terminationWatchdogPromise = (async () => {
       const pid = child?.pid;
       try {
         if (gracefulTermination) {
@@ -865,8 +865,196 @@ export function createSignalLifecycle({
         );
       }
     })();
-    return windowsWatchdogPromise;
+    return terminationWatchdogPromise;
   };
+
+  const waitForPosixTreeExit = async (child, pid, timeoutMs) => {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return {
+        exited: false,
+        invalidPid: true,
+        lastProbeError: null,
+      };
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let lastProbeError = null;
+    while (activeChild === child) {
+      const groupState = getProcessGroupState(pid, { killProcess });
+      lastProbeError = groupState.error ?? lastProbeError;
+      if (closedChild === child && !groupState.alive) {
+        return {
+          exited: true,
+          invalidPid: false,
+          lastProbeError,
+        };
+      }
+      if (Date.now() >= deadline) {
+        return {
+          exited: false,
+          invalidPid: false,
+          lastProbeError,
+        };
+      }
+      await waitForTimer(
+        timerOperations,
+        Math.min(TREE_EXIT_POLL_INTERVAL_MS, deadline - Date.now()),
+      );
+    }
+
+    return {
+      detached: true,
+      exited: false,
+      invalidPid: false,
+      lastProbeError,
+    };
+  };
+
+  const startPosixWatchdog = (child) => {
+    if (
+      platform === "win32" ||
+      watchedChild !== child ||
+      activeChild !== child ||
+      terminationWatchdogChild === child
+    ) {
+      return terminationWatchdogPromise;
+    }
+    if (!gracefulTermination && !forceTermination) {
+      return null;
+    }
+
+    terminationWatchdogChild = child;
+    terminationWatchdogPromise = (async () => {
+      const pid = child?.pid;
+      try {
+        if (gracefulTermination) {
+          const gracefulOutcome = await gracefulTermination.completion;
+          if (activeChild !== child) {
+            return;
+          }
+          if (gracefulOutcome?.ok) {
+            const gracefulExit = await waitForPosixTreeExit(
+              child,
+              pid,
+              forceKillTimeoutMs,
+            );
+            if (gracefulExit.exited || gracefulExit.detached) {
+              return;
+            }
+          }
+        }
+
+        if (activeChild !== child) {
+          return;
+        }
+        const activeForceTermination =
+          forceTermination ?? beginForceTermination(child);
+        await activeForceTermination?.completion;
+        if (activeChild !== child) {
+          return;
+        }
+
+        let treeExit = await waitForPosixTreeExit(
+          child,
+          pid,
+          treeExitTimeoutMs,
+        );
+        if (treeExit.exited || treeExit.detached) {
+          return;
+        }
+
+        let directKillAccepted = false;
+        if (closedChild !== child) {
+          try {
+            if (typeof child?.kill !== "function") {
+              throw new Error("managed child does not expose kill()");
+            }
+            directKillAccepted = child.kill("SIGKILL") !== false;
+            if (!directKillAccepted) {
+              throw new Error(
+                "managed child did not accept direct SIGKILL",
+              );
+            }
+          } catch (error) {
+            attachDiagnostic(reportDiagnostic, {
+              action: "direct-child-fallback",
+              error,
+              pid: pid ?? null,
+              target: "direct-child",
+            });
+          }
+        }
+
+        if (directKillAccepted) {
+          treeExit = await waitForPosixTreeExit(
+            child,
+            pid,
+            treeExitTimeoutMs,
+          );
+          if (treeExit.exited || treeExit.detached) {
+            return;
+          }
+        }
+
+        if (treeExit.lastProbeError) {
+          attachDiagnostic(reportDiagnostic, {
+            action: "probe",
+            error: treeExit.lastProbeError,
+            pid: pid ?? null,
+            target: "process-group",
+          });
+        }
+        attachDiagnostic(reportDiagnostic, {
+          action: "settle-timeout",
+          error: new Error(
+            treeExit.invalidPid
+              ? "managed child has no valid pid"
+              : "timed out waiting for process group and child to exit",
+          ),
+          pid: pid ?? null,
+          target: treeExit.invalidPid
+            ? "direct-child"
+            : "process-group",
+        });
+        notifyTerminationFailure(
+          child,
+          createTerminationTimeoutError(
+            child,
+            treeExit.invalidPid
+              ? "managed child has no valid pid"
+              : closedChild === child
+                ? "the child closed but its process group did not exit"
+                : directKillAccepted
+                  ? "direct SIGKILL was accepted but the process tree did not exit"
+                  : "process-group and direct SIGKILL both failed",
+          ),
+        );
+      } catch (error) {
+        attachDiagnostic(reportDiagnostic, {
+          action: "watchdog",
+          error,
+          pid: pid ?? null,
+          target: "process-tree",
+        });
+        notifyTerminationFailure(
+          child,
+          attachErrorDetails(
+            error,
+            {
+              code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            },
+            "Console process termination watchdog failed",
+          ),
+        );
+      }
+    })();
+    return terminationWatchdogPromise;
+  };
+
+  const startTerminationWatchdog = (child) =>
+    platform === "win32"
+      ? startWindowsWatchdog(child)
+      : startPosixWatchdog(child);
 
   const forwardToActiveTree = (force) => {
     if (!firstSignal || !activeChild) {
@@ -874,7 +1062,7 @@ export function createSignalLifecycle({
     }
     if (force) {
       beginForceTermination(activeChild);
-      startWindowsWatchdog(activeChild);
+      startTerminationWatchdog(activeChild);
       return;
     } else {
       if (gracefulForwardedChild === activeChild) {
@@ -896,7 +1084,7 @@ export function createSignalLifecycle({
     } else {
       gracefulTermination = termination;
     }
-    startWindowsWatchdog(activeChild);
+    startTerminationWatchdog(activeChild);
 
     if (!force && forceKillTimeoutMs >= 0) {
       clearForceTimer();
@@ -937,9 +1125,8 @@ export function createSignalLifecycle({
       forceTermination = null;
       closedChild = null;
       watchedChild = null;
-      windowsWatchdogChild = null;
-      windowsWatchdogPromise = null;
-      terminationFailure = null;
+      terminationWatchdogChild = null;
+      terminationWatchdogPromise = null;
       terminationFailureListeners.clear();
     }
   };
@@ -949,16 +1136,23 @@ export function createSignalLifecycle({
       return;
     }
     markChildClosed(child);
+    await Promise.resolve();
+
+    const watchdogPromise =
+      terminationWatchdogChild === child
+        ? terminationWatchdogPromise
+        : null;
+    if (watchdogPromise) {
+      await watchdogPromise;
+      const failure = terminationFailure;
+      detachChild(child);
+      if (failure) {
+        throw failure;
+      }
+      return;
+    }
 
     try {
-      if (
-        platform === "win32" &&
-        windowsWatchdogChild === child &&
-        windowsWatchdogPromise
-      ) {
-        await windowsWatchdogPromise;
-        return;
-      }
       if (
         !firstSignal &&
         internalForceForwardedChild !== child
@@ -1123,8 +1317,8 @@ export function createSignalLifecycle({
       forceTermination = null;
       closedChild = null;
       watchedChild = null;
-      windowsWatchdogChild = null;
-      windowsWatchdogPromise = null;
+      terminationWatchdogChild = null;
+      terminationWatchdogPromise = null;
       terminationFailure = null;
       terminationFailureListeners.clear();
       if (firstSignal) {
@@ -1167,7 +1361,7 @@ export function createSignalLifecycle({
         signal: firstSignal,
         spawnProcess,
       });
-      startWindowsWatchdog(child);
+      startTerminationWatchdog(child);
       return forceTermination.completion;
     },
     watchChildTermination(child, listener) {
@@ -1182,7 +1376,7 @@ export function createSignalLifecycle({
       if (terminationFailure) {
         queueMicrotask(() => listener(terminationFailure));
       } else {
-        startWindowsWatchdog(child);
+        startTerminationWatchdog(child);
       }
       return () => {
         terminationFailureListeners.delete(listener);
@@ -1367,13 +1561,19 @@ export function runManagedExecFile(
             resolve({ stdout, stderr });
           }
         },
-        (settleError) =>
+        (settleError) => {
+          const primaryError = pendingPrimaryError
+            ? attachErrorDetails(pendingPrimaryError, {
+                terminationError: settleError,
+              })
+            : error ?? settleError;
           reject(
             attachSignalToError(
-              error ?? settleError,
+              primaryError,
               managedLifecycle?.signal,
             ),
-          ),
+          );
+        },
       );
     };
 

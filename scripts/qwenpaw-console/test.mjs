@@ -6,6 +6,7 @@ import {
   appendCleanupError,
   attachSignalToError,
   createSignalLifecycle,
+  formatCleanupErrorDetails,
   formatSignalLifecycleDiagnostic,
   runManagedSpawn,
 } from "./process-lifecycle.mjs";
@@ -51,7 +52,18 @@ export async function runPreparedConsoleTests({
         keep: true,
         signalLifecycle,
       });
-      workdir = prepared.workdir;
+      const preparedWorkdir =
+        prepared &&
+        typeof prepared === "object" &&
+        typeof prepared.workdir === "string"
+          ? prepared.workdir
+          : undefined;
+      if (!preparedWorkdir || preparedWorkdir.trim().length === 0) {
+        throw new Error(
+          "Console preparation did not return a workdir",
+        );
+      }
+      workdir = preparedWorkdir;
 
       if (signalLifecycle.signal) {
         outcome = { exitCode: 1, signal: signalLifecycle.signal };
@@ -130,7 +142,74 @@ export async function runPreparedConsoleTests({
   }
 }
 
+async function runTestCli({
+  resendSignal = (signal) => process.kill(process.pid, signal),
+  runTests = () =>
+    runPreparedConsoleTests({
+      createLifecycle: () =>
+        createSignalLifecycle({
+          onDiagnostic: (diagnostic) => {
+            console.error(formatSignalLifecycleDiagnostic(diagnostic));
+          },
+        }),
+    }),
+  setExitCode = (exitCode) => {
+    process.exitCode = exitCode;
+  },
+  writeStderr = (line) => {
+    console.error(line);
+  },
+} = {}) {
+  const writeCleanupDetails = (error) => {
+    const details = formatCleanupErrorDetails(error);
+    if (details.length > 0) {
+      for (const detail of details) {
+        writeStderr(detail);
+      }
+      return;
+    }
+    const cleanupError =
+      error && typeof error === "object"
+        ? Reflect.get(error, "cleanupError")
+        : undefined;
+    if (cleanupError) {
+      writeStderr(
+        cleanupError instanceof Error
+          ? `Console cleanup failed: ${cleanupError.message}`
+          : "Console cleanup failed",
+      );
+    }
+  };
+
+  try {
+    const { exitCode, signal, cleanupError } = await runTests();
+    if (cleanupError) {
+      writeCleanupDetails(cleanupError);
+    }
+    if (signal) {
+      resendSignal(signal);
+      return;
+    }
+    setExitCode(exitCode);
+  } catch (error) {
+    const signal =
+      error && typeof error === "object"
+        ? Reflect.get(error, "signal")
+        : undefined;
+    writeStderr(
+      error instanceof Error ? error.message : "Console tests failed",
+    );
+    writeCleanupDetails(error);
+    if (signal) {
+      resendSignal(signal);
+      return;
+    }
+    setExitCode(1);
+  }
+}
+
 export const __testing = Object.freeze({
+  runTestCli,
   validateConsoleBuild,
 });
 
@@ -139,52 +218,5 @@ const isMain =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
-  runPreparedConsoleTests({
-    createLifecycle: () =>
-      createSignalLifecycle({
-        onDiagnostic: (diagnostic) => {
-          console.error(formatSignalLifecycleDiagnostic(diagnostic));
-        },
-      }),
-  }).then(
-    ({ exitCode, signal, cleanupError }) => {
-      if (cleanupError) {
-        console.error(
-          cleanupError instanceof Error
-            ? `Console cleanup failed: ${cleanupError.message}`
-            : "Console cleanup failed",
-        );
-      }
-      if (signal) {
-        process.kill(process.pid, signal);
-        return;
-      }
-      process.exitCode = exitCode;
-    },
-    (error) => {
-      const cleanupError =
-        error && typeof error === "object"
-          ? Reflect.get(error, "cleanupError")
-          : undefined;
-      const signal =
-        error && typeof error === "object"
-          ? Reflect.get(error, "signal")
-          : undefined;
-      console.error(
-        error instanceof Error ? error.message : "Console tests failed",
-      );
-      if (cleanupError) {
-        console.error(
-          cleanupError instanceof Error
-            ? `Console cleanup failed: ${cleanupError.message}`
-            : "Console cleanup failed",
-        );
-      }
-      if (signal) {
-        process.kill(process.pid, signal);
-        return;
-      }
-      process.exitCode = 1;
-    },
-  );
+  void runTestCli();
 }
