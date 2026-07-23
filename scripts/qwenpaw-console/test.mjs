@@ -71,7 +71,7 @@ function getHtmlResourceReferences(source) {
   );
 }
 
-function createSignalLifecycle() {
+export function createSignalLifecycle() {
   let signal = null;
   let activeChild = null;
   let forwardedChild = null;
@@ -323,7 +323,7 @@ async function requireRegularFile(filePath, description) {
   }
 }
 
-async function validateConsoleBuild(workdir) {
+export async function validateConsoleBuild(workdir) {
   const distRoot = path.join(workdir, "dist");
   const indexPath = path.join(distRoot, "index.html");
   await requireRegularFile(indexPath, "build entry");

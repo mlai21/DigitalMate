@@ -377,6 +377,340 @@ if (outcome.signal) {
   }
 }
 
+async function runRealConsoleBuildSignalTest(
+  phase: "prepare" | "publish" | "cleanup",
+  signal: "SIGINT" | "SIGTERM",
+): Promise<{
+  exitCode: number | null;
+  outcome: {
+    commandCount: number;
+    error: null | {
+      message: string;
+      signal: NodeJS.Signals | null;
+    };
+    listenerCounts: { sigint: number; sigterm: number };
+    result: null | {
+      publishRoot: string | null;
+      signal: NodeJS.Signals | null;
+    };
+  };
+  preparedRoot: string;
+  publicRoot: string;
+  publishRoot: string;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  temporaryRoot: string;
+}> {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), `dm-qwenpaw-build-${phase}-signal-`),
+  );
+  const fixturePath = path.join(temporaryRoot, "build-signal-fixture.mjs");
+  const outcomePath = path.join(temporaryRoot, "outcome.json");
+  const preparedRoot = path.join(
+    temporaryRoot,
+    "digitalmate-qwenpaw-console-fixture",
+  );
+  const publicRoot = path.join(temporaryRoot, "public");
+  const publishRoot = path.join(publicRoot, "_admin-console");
+  const buildModuleUrl = pathToFileURL(
+    path.resolve("scripts/qwenpaw-console/build.mjs"),
+  ).href;
+  await mkdir(publishRoot, { recursive: true });
+  await writeFile(path.join(publishRoot, "old.txt"), "old console\n", "utf8");
+  await writeFile(
+    fixturePath,
+    `
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { buildConsole, __testing } from ${JSON.stringify(buildModuleUrl)};
+
+const phase = ${JSON.stringify(phase)};
+const signal = ${JSON.stringify(signal)};
+const preparedRoot = ${JSON.stringify(preparedRoot)};
+const publicRoot = ${JSON.stringify(publicRoot)};
+const publishRoot = ${JSON.stringify(publishRoot)};
+const outcomePath = ${JSON.stringify(outcomePath)};
+const waitForSignal = () => new Promise((resolve) => setTimeout(resolve, 700));
+let commandCount = 0;
+let result = null;
+let caughtError = null;
+
+const prepare = async () => {
+  const assetsRoot = path.join(preparedRoot, "dist", "assets");
+  await mkdir(assetsRoot, { recursive: true });
+  await writeFile(
+    path.join(preparedRoot, "dist", "index.html"),
+    '<script src="/_admin-console/assets/app-abc12345.js"></script>\\n',
+  );
+  await writeFile(
+    path.join(preparedRoot, "dist", "digitalmate-logo.svg"),
+    "<svg></svg>\\n",
+  );
+  await writeFile(
+    path.join(assetsRoot, "app-abc12345.js"),
+    'console.log("new console");\\n',
+  );
+  if (phase === "prepare") {
+    process.stdout.write("READY:prepare\\n");
+    await waitForSignal();
+  }
+  return { workdir: preparedRoot, applied: [] };
+};
+
+const publishBuild = (distRoot, options) =>
+  __testing.publishConsoleBuild(distRoot, {
+    ...options,
+    fileOperations:
+      phase === "publish"
+        ? {
+            rename: async (source, destination) => {
+              await rename(source, destination);
+              if (source === publishRoot) {
+                process.stdout.write("READY:publish\\n");
+                await waitForSignal();
+              }
+            },
+          }
+        : undefined,
+  });
+
+try {
+  result = await buildConsole({
+    prepare,
+    runCommand: async () => {
+      commandCount += 1;
+      return { exitCode: 0, signal: null };
+    },
+    validateBuild: async () => undefined,
+    publishBuild,
+    cleanupPrepared: async (target) => {
+      if (phase === "cleanup") {
+        process.stdout.write("READY:cleanup\\n");
+        await waitForSignal();
+      }
+      await rm(target, { recursive: true, force: true });
+    },
+    publicRoot,
+  });
+} catch (error) {
+  caughtError = error;
+}
+
+const recordedSignal =
+  result?.signal ??
+  (caughtError && typeof caughtError === "object"
+    ? Reflect.get(caughtError, "signal")
+    : null);
+await writeFile(
+  outcomePath,
+  JSON.stringify({
+    commandCount,
+    error: caughtError
+      ? {
+          message:
+            caughtError instanceof Error ? caughtError.message : String(caughtError),
+          signal: recordedSignal,
+        }
+      : null,
+    listenerCounts: {
+      sigint: process.listenerCount("SIGINT"),
+      sigterm: process.listenerCount("SIGTERM"),
+    },
+    result,
+  }),
+);
+if (recordedSignal) {
+  process.kill(process.pid, recordedSignal);
+} else if (caughtError) {
+  process.exitCode = 1;
+}
+`,
+    "utf8",
+  );
+
+  const child = spawn(process.execPath, [fixturePath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    const marker = `READY:${phase}\n`;
+    const timeout = setTimeout(
+      () => reject(new Error(`build fixture did not reach ${phase}`)),
+      10_000,
+    );
+    const inspect = () => {
+      if (stdout.includes(marker)) {
+        clearTimeout(timeout);
+        child.stdout.off("data", inspect);
+        resolve();
+      }
+    };
+    child.stdout.on("data", inspect);
+    child.once("exit", (exitCode, exitSignal) => {
+      if (!stdout.includes(marker)) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            `build fixture exited before ${phase}: ${exitCode}/${exitSignal}`,
+          ),
+        );
+      }
+    });
+  });
+
+  try {
+    await ready;
+    expect(child.kill(signal)).toBe(true);
+    const closed = await new Promise<{
+      exitCode: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (exitCode, exitSignal) =>
+        resolve({ exitCode, signal: exitSignal }),
+      );
+    });
+    const outcome = JSON.parse(await readFile(outcomePath, "utf8"));
+    return {
+      ...closed,
+      outcome,
+      preparedRoot,
+      publicRoot,
+      publishRoot,
+      stderr,
+      temporaryRoot,
+    };
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function runRealConsoleBuildCliSignalTest(): Promise<{
+  exitCode: number | null;
+  fakeNpmPid: number;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  temporaryRoot: string;
+}> {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "dm-qwenpaw-build-cli-signal-"),
+  );
+  const fakeBinRoot = path.join(temporaryRoot, "bin");
+  const fakeNpmPath = path.join(fakeBinRoot, "npm");
+  const fakeNpmPidPath = path.join(temporaryRoot, "fake-npm.pid");
+  await mkdir(fakeBinRoot);
+  await writeFile(
+    fakeNpmPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(fakeNpmPidPath)}, String(process.pid));
+const finish = (signal) => {
+  fs.appendFileSync(${JSON.stringify(fakeNpmPidPath)}, "\\n" + signal);
+  process.exit(128);
+};
+process.on("SIGINT", () => finish("SIGINT"));
+process.on("SIGTERM", () => finish("SIGTERM"));
+process.stdout.write("READY:fake-npm\\n");
+setInterval(() => {}, 1000);
+`,
+    "utf8",
+  );
+  await chmod(fakeNpmPath, 0o755);
+
+  const child = spawn(
+    process.execPath,
+    [path.resolve("scripts/qwenpaw-console/build.mjs")],
+    {
+      cwd: path.resolve("."),
+      env: {
+        ...process.env,
+        PATH: `${fakeBinRoot}${path.delimiter}${process.env.PATH ?? ""}`,
+        TMPDIR: temporaryRoot,
+        TMP: temporaryRoot,
+        TEMP: temporaryRoot,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Console build CLI did not start fake npm")),
+      30_000,
+    );
+    const inspect = () => {
+      if (stdout.includes("READY:fake-npm\n")) {
+        clearTimeout(timeout);
+        child.stdout.off("data", inspect);
+        resolve();
+      }
+    };
+    child.stdout.on("data", inspect);
+    child.once("exit", (exitCode, exitSignal) => {
+      if (!stdout.includes("READY:fake-npm\n")) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            `Console build CLI exited early: ${exitCode}/${exitSignal}\n${stderr}`,
+          ),
+        );
+      }
+    });
+  });
+
+  try {
+    await ready;
+    expect(child.kill("SIGTERM")).toBe(true);
+    const closed = await new Promise<{
+      exitCode: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (exitCode, exitSignal) =>
+        resolve({ exitCode, signal: exitSignal }),
+      );
+    });
+    const [pidLine] = (await readFile(fakeNpmPidPath, "utf8")).split("\n");
+    return {
+      ...closed,
+      fakeNpmPid: Number(pidLine),
+      stderr,
+      temporaryRoot,
+    };
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 describe("QwenPaw Console sync", () => {
   it("无网络同步 8 个精确来源映射", async () => {
     await withFakeUpstream(async ({ destinationRoot }) => {
@@ -1730,11 +2064,13 @@ describe("QwenPaw Console isolated test runner", () => {
 });
 
 type ConsoleBuildTestingInterface = {
+  formatErrorDetails: (error: unknown) => string[];
   publishConsoleBuild: (
     distRoot: string,
     options: {
       publicRoot: string;
       fileOperations?: {
+        chmod?: typeof chmod;
         cp?: typeof cp;
         lstat?: typeof lstat;
         mkdtemp?: typeof mkdtemp;
@@ -1913,6 +2249,21 @@ describe("QwenPaw Console atomic static build", () => {
           "utf8",
         ),
       ).resolves.toContain("new console");
+      expect((await lstat(fixture.publishRoot)).mode & 0o777).toBe(0o755);
+      expect(
+        (await lstat(path.join(fixture.publishRoot, "assets"))).mode & 0o777,
+      ).toBe(0o755);
+      expect(
+        (
+          await lstat(
+            path.join(
+              fixture.publishRoot,
+              "assets",
+              "app-abc12345.js",
+            ),
+          )
+        ).mode & 0o777,
+      ).toBe(0o644);
       expect(await listConsolePublicationResidue(fixture.publicRoot)).toEqual([]);
     } finally {
       await rm(fixture.temporaryRoot, { recursive: true, force: true });
@@ -2088,7 +2439,11 @@ describe("QwenPaw Console atomic static build", () => {
   it("拒绝 dist 中的符号链接与缺少内容哈希 assets，旧产物保持不变", async () => {
     const { publishConsoleBuild } = requireBuildTestingInterface();
 
-    for (const variant of ["symlink", "unhashed-assets"] as const) {
+    for (const variant of [
+      "symlink",
+      "unhashed-assets",
+      "mixed-unhashed-assets",
+    ] as const) {
       const fixture = await createConsoleBuildFixture();
       try {
         if (variant === "symlink") {
@@ -2096,10 +2451,16 @@ describe("QwenPaw Console atomic static build", () => {
             "../digitalmate-logo.svg",
             path.join(fixture.distRoot, "assets", "linked.svg"),
           );
-        } else {
+        } else if (variant === "unhashed-assets") {
           await rename(
             path.join(fixture.distRoot, "assets", "app-abc12345.js"),
             path.join(fixture.distRoot, "assets", "app.js"),
+          );
+        } else {
+          await writeFile(
+            path.join(fixture.distRoot, "assets", "runtime.js"),
+            "console.log('unhashed runtime');\n",
+            "utf8",
           );
         }
 
@@ -2110,7 +2471,7 @@ describe("QwenPaw Console atomic static build", () => {
         ).rejects.toThrow(
           variant === "symlink"
             ? "symbolic link not allowed"
-            : "content-hashed build asset missing",
+            : "unhashed build asset not allowed",
         );
         await expect(
           readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"),
@@ -2154,6 +2515,388 @@ describe("QwenPaw Console atomic static build", () => {
     expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
       cleanupError,
     );
+  });
+
+  it("同时累计 staging 与 prepared 清理错误且不覆盖发布主错误", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const { publishConsoleBuild } = requireBuildTestingInterface();
+    const copyError = new Error("injected publish copy failure");
+    const stagingCleanupError = new Error("injected staging cleanup failure");
+    const preparedCleanupError = new Error("injected prepared cleanup failure");
+    let caughtError: unknown;
+
+    try {
+      try {
+        await buildConsole({
+          prepare: async () => ({
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          }),
+          runCommand: async () => ({ exitCode: 0, signal: null }),
+          validateBuild: async () => ({
+            indexPath: "",
+            logoPath: "",
+            resourceUrls: [],
+          }),
+          publishBuild: (distRoot: string) =>
+            publishConsoleBuild(distRoot, {
+              publicRoot: fixture.publicRoot,
+              fileOperations: {
+                cp: async () => {
+                  throw copyError;
+                },
+                rm: async (target, options) => {
+                  if (
+                    path
+                      .basename(String(target))
+                      .startsWith(".admin-console-staging")
+                  ) {
+                    throw stagingCleanupError;
+                  }
+                  await rm(target, options);
+                },
+              },
+            }),
+          cleanupPrepared: async () => {
+            throw preparedCleanupError;
+          },
+          publicRoot: fixture.publicRoot,
+        });
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBe(copyError);
+      expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+        stagingCleanupError,
+      );
+      expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+        {
+          stage: "staging",
+          path: expect.stringContaining(".admin-console-staging-"),
+          error: stagingCleanupError,
+        },
+        {
+          stage: "prepared",
+          path: fixture.preparedRoot,
+          error: preparedCleanupError,
+        },
+      ]);
+      await expect(readFile(path.join(fixture.publishRoot, "old.txt"), "utf8"))
+        .resolves.toBe("old console\n");
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("共享正式导出 validator 与 signal lifecycle，生产构建不依赖 __testing", async () => {
+    expect(Reflect.get(consoleTestScript, "validateConsoleBuild")).toBeTypeOf(
+      "function",
+    );
+    expect(Reflect.get(consoleTestScript, "createSignalLifecycle")).toBeTypeOf(
+      "function",
+    );
+    const buildSource = await readFile(
+      "scripts/qwenpaw-console/build.mjs",
+      "utf8",
+    );
+    expect(buildSource).not.toContain(
+      "consoleTestTesting.validateConsoleBuild",
+    );
+    expect(buildSource).not.toMatch(
+      /import\s*\{\s*__testing\b[^}]*\}\s*from\s*["']\.\/test\.mjs["']/,
+    );
+  });
+
+  it("CLI 错误详情同时包含回滚 backup 路径与每个 cleanup 阶段路径", () => {
+    const { formatErrorDetails } = requireBuildTestingInterface();
+    const stagingCleanup = new Error("staging cleanup failed");
+    const preparedCleanup = new Error("prepared cleanup failed");
+    const error = Object.assign(new Error("publish failed"), {
+      publishState: "rollback-blocked",
+      backupPath: "/safe/public/.admin-console-backup-fixture",
+      cleanupErrors: [
+        {
+          stage: "staging",
+          path: "/safe/public/.admin-console-staging-fixture",
+          error: stagingCleanup,
+        },
+        {
+          stage: "prepared",
+          path: "/safe/tmp/digitalmate-qwenpaw-console-fixture",
+          error: preparedCleanup,
+        },
+      ],
+    });
+
+    expect(formatErrorDetails).toBeTypeOf("function");
+    expect(formatErrorDetails(error)).toEqual([
+      "Console publish recovery: state=rollback-blocked backup=/safe/public/.admin-console-backup-fixture",
+      "Console cleanup failed at staging (/safe/public/.admin-console-staging-fixture): staging cleanup failed",
+      "Console cleanup failed at prepared (/safe/tmp/digitalmate-qwenpaw-console-fixture): prepared cleanup failed",
+    ]);
+  });
+
+  it("signal lifecycle 只记录首个信号且不会向同一 child 重复转发", () => {
+    const createLifecycle = Reflect.get(
+      consoleTestScript,
+      "createSignalLifecycle",
+    ) as
+      | (() => {
+          signal: NodeJS.Signals | null;
+          install: () => void;
+          remove: () => void;
+          attachChild: (child: {
+            killed: boolean;
+            kill: (signal: NodeJS.Signals) => boolean;
+          }) => void;
+          detachChild: (child: object) => void;
+        })
+      | undefined;
+    expect(createLifecycle).toBeTypeOf("function");
+    if (!createLifecycle) {
+      return;
+    }
+    const forwardedSignals: NodeJS.Signals[] = [];
+    const child = {
+      killed: false,
+      kill(signal: NodeJS.Signals) {
+        forwardedSignals.push(signal);
+        return true;
+      },
+    };
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+    const lifecycle = createLifecycle();
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      process.emit("SIGINT", "SIGINT");
+      expect(lifecycle.signal).toBe("SIGTERM");
+      expect(forwardedSignals).toEqual(["SIGTERM"]);
+      lifecycle.detachChild(child);
+    } finally {
+      lifecycle.remove();
+    }
+
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  });
+
+  it("prepare 返回前收到信号时不启动命令、校验或发布并等待清理", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const calls: string[] = [];
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+
+    try {
+      const outcome = await buildConsole({
+        prepare: async () => {
+          process.emit("SIGTERM", "SIGTERM");
+          return {
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          };
+        },
+        runCommand: async () => {
+          calls.push("command");
+          return { exitCode: 0, signal: null };
+        },
+        validateBuild: async () => {
+          calls.push("validate");
+          return {
+            indexPath: "",
+            logoPath: "",
+            resourceUrls: [],
+          };
+        },
+        publishBuild: async () => {
+          calls.push("publish");
+          return { publishRoot: fixture.publishRoot };
+        },
+        publicRoot: fixture.publicRoot,
+      });
+
+      expect(outcome).toEqual({
+        publishRoot: null,
+        signal: "SIGTERM",
+      });
+      expect(calls).toEqual([]);
+      await expectPathMissing(fixture.preparedRoot);
+      expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+      expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { phase: "prepare", signal: "SIGINT", expectedCommands: 0 },
+    { phase: "publish", signal: "SIGTERM", expectedCommands: 2 },
+    { phase: "cleanup", signal: "SIGINT", expectedCommands: 2 },
+  ] as const)(
+    "$phase 阶段收到真实 $signal 后完成安全收尾并按原信号退出",
+    async ({ phase, signal, expectedCommands }) => {
+      const result = await runRealConsoleBuildSignalTest(phase, signal);
+
+      try {
+        expect(result).toMatchObject({
+          exitCode: null,
+          signal,
+          stderr: "",
+        });
+        expect(result.outcome).toEqual({
+          commandCount: expectedCommands,
+          error: null,
+          listenerCounts: { sigint: 0, sigterm: 0 },
+          result: {
+            publishRoot:
+              phase === "prepare" ? null : result.publishRoot,
+            signal,
+          },
+        });
+        await expectPathMissing(result.preparedRoot);
+        expect(
+          await listConsolePublicationResidue(result.publicRoot),
+        ).toEqual([]);
+        if (phase === "prepare") {
+          await expect(
+            readFile(path.join(result.publishRoot, "old.txt"), "utf8"),
+          ).resolves.toBe("old console\n");
+          await expectPathMissing(
+            path.join(
+              result.publishRoot,
+              "assets",
+              "app-abc12345.js",
+            ),
+          );
+        } else {
+          await expectPathMissing(path.join(result.publishRoot, "old.txt"));
+          await expect(
+            readFile(
+              path.join(
+                result.publishRoot,
+                "assets",
+                "app-abc12345.js",
+              ),
+              "utf8",
+            ),
+          ).resolves.toContain("new console");
+        }
+      } finally {
+        await rm(result.temporaryRoot, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  it("真实 CLI 在 command 阶段转发 SIGTERM、清理 prepared 且无孤儿 npm", async () => {
+    const result = await runRealConsoleBuildCliSignalTest();
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGTERM",
+        stderr: "",
+      });
+      const pidLog = await readFile(
+        path.join(result.temporaryRoot, "fake-npm.pid"),
+        "utf8",
+      );
+      expect(pidLog).toContain("\nSIGTERM");
+      expect(() => process.kill(result.fakeNpmPid, 0)).toThrow();
+      const temporaryEntries = await readdir(result.temporaryRoot);
+      expect(
+        temporaryEntries.filter((entry) =>
+          entry.startsWith("digitalmate-qwenpaw-console-"),
+        ),
+      ).toEqual([]);
+      expect(
+        await listConsolePublicationResidue(path.resolve("public")),
+      ).toEqual([]);
+    } finally {
+      try {
+        process.kill(result.fakeNpmPid, "SIGKILL");
+      } catch {
+        // The expected path: the forwarded signal already reaped fake npm.
+      }
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it("spawn error 会 detach child、清理 prepared 并移除信号监听器", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const previousPath = process.env.PATH;
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+
+    process.env.PATH = "";
+    try {
+      await expect(
+        buildConsole({
+          prepare: async () => ({
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          }),
+          publicRoot: fixture.publicRoot,
+        }),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expectPathMissing(fixture.preparedRoot);
+      expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+      expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("信号、命令主错误与 prepared cleanup 错误同时发生时保留完整优先级", async () => {
+    const fixture = await createConsoleBuildFixture();
+    const commandError = new Error("injected command exception");
+    const cleanupError = new Error("injected prepared cleanup exception");
+    let caughtError: unknown;
+
+    try {
+      try {
+        await buildConsole({
+          prepare: async () => ({
+            workdir: fixture.preparedRoot,
+            applied: [...PATCHES],
+          }),
+          runCommand: async () => {
+            process.emit("SIGTERM", "SIGTERM");
+            throw commandError;
+          },
+          cleanupPrepared: async () => {
+            throw cleanupError;
+          },
+          publicRoot: fixture.publicRoot,
+        });
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBe(commandError);
+      expect(Reflect.get(caughtError as object, "signal")).toBe("SIGTERM");
+      expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+        cleanupError,
+      );
+      expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+        {
+          stage: "prepared",
+          path: fixture.preparedRoot,
+          error: cleanupError,
+        },
+      ]);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
   });
 
   it("根脚本、忽略规则、缓存头与镜像归因范围精确", async () => {
