@@ -35,6 +35,7 @@ import {
   createSignalLifecycle as createProcessSignalLifecycle,
   formatSignalLifecycleDiagnostic,
   getWindowsTreeKillCommand,
+  runManagedExecFile,
   runManagedSpawn,
 } from "../../scripts/qwenpaw-console/process-lifecycle.mjs";
 import * as qwenpawSync from "../../scripts/qwenpaw-console/sync.mjs";
@@ -661,52 +662,175 @@ async function waitForProcessTargetsToExit(
   }
 }
 
-async function forceCleanupRecordedProcessTree(pidPath: string) {
+type ProcessIdentity = {
+  pid: number;
+  pgid: number;
+  command: string;
+};
+
+type RecordedProcessTree = {
+  identityToken: string;
+  leaderPid: number;
+  descendantPids: number[];
+};
+
+async function readProcessTable(): Promise<ProcessIdentity[]> {
+  const { stdout } = await execFileAsync("ps", [
+    "-axo",
+    "pid=,pgid=,command=",
+  ]);
+  return stdout
+    .split("\n")
+    .map((line) => {
+      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!match) {
+        return null;
+      }
+      return {
+        pid: Number(match[1]),
+        pgid: Number(match[2]),
+        command: match[3],
+      };
+    })
+    .filter((entry): entry is ProcessIdentity => entry !== null);
+}
+
+function parseRecordedProcessTree(source: string): RecordedProcessTree | null {
+  try {
+    const parsed = JSON.parse(source.split("\n", 1)[0]) as Partial<
+      RecordedProcessTree
+    >;
+    const descendantPids = Array.isArray(parsed.descendantPids)
+      ? parsed.descendantPids.filter(
+          (pid): pid is number => Number.isInteger(pid) && pid > 0,
+        )
+      : [];
+    if (
+      typeof parsed.identityToken !== "string" ||
+      parsed.identityToken.length < 8 ||
+      !Number.isInteger(parsed.leaderPid) ||
+      (parsed.leaderPid ?? 0) <= 0
+    ) {
+      return null;
+    }
+    return {
+      identityToken: parsed.identityToken,
+      leaderPid: parsed.leaderPid as number,
+      descendantPids,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function processTreeIdentityMatches(
+  record: RecordedProcessTree,
+  processTable: ProcessIdentity[],
+) {
+  const targetPids = new Set([
+    record.leaderPid,
+    ...record.descendantPids,
+  ]);
+  const targetRows = processTable.filter((entry) =>
+    targetPids.has(entry.pid),
+  );
+  const groupRows = processTable.filter(
+    (entry) => entry.pgid === record.leaderPid,
+  );
+  const observedRows = new Set([...targetRows, ...groupRows]);
+
+  return [...observedRows].every(
+    (entry) =>
+      entry.pgid === record.leaderPid &&
+      entry.command.includes(record.identityToken),
+  );
+}
+
+async function forceCleanupRecordedProcessTree(
+  pidPath: string,
+  {
+    killProcess = process.kill.bind(process),
+    readProcessTable: inspectProcesses = readProcessTable,
+    waitForExit = waitForProcessTargetsToExit,
+  }: {
+    killProcess?: typeof process.kill;
+    readProcessTable?: () => Promise<ProcessIdentity[]>;
+    waitForExit?: (
+      leaderPid: number,
+      descendantPids: number[],
+    ) => Promise<boolean>;
+  } = {},
+) {
   let source: string;
   try {
     source = await readFile(pidPath, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { descendantPids: [], leaderPid: 0 };
+      return {
+        descendantPids: [],
+        identityMatched: true,
+        leaderPid: 0,
+      };
     }
     throw error;
   }
 
-  const [leaderPid, ...descendantPids] = source
-    .split(/\s+/)
-    .map(Number)
-    .filter((pid) => Number.isInteger(pid) && pid > 0);
-  const targets = [leaderPid, ...descendantPids].filter(
-    (pid): pid is number => Number.isInteger(pid) && pid > 0,
-  );
-
-  if (leaderPid) {
-    try {
-      process.kill(-leaderPid, "SIGKILL");
-    } catch {
-      // The process group may already be gone; direct PID fallbacks follow.
-    }
+  const record = parseRecordedProcessTree(source);
+  if (!record) {
+    throw new Error(`recorded process tree identity invalid: ${pidPath}`);
   }
-  for (const pid of targets) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // The process may already have exited.
-    }
-  }
-
-  if (
-    leaderPid &&
-    !(await waitForProcessTargetsToExit(
-      leaderPid,
-      descendantPids,
-    ))
-  ) {
+  const { descendantPids, identityToken, leaderPid } = record;
+  let processTable = await inspectProcesses();
+  if (!processTreeIdentityMatches(record, processTable)) {
     throw new Error(
-      `recorded process tree did not exit: ${targets.join(", ")}`,
+      `recorded process tree identity mismatch: ${leaderPid}`,
     );
   }
-  return { descendantPids, leaderPid: leaderPid ?? 0 };
+
+  const groupRows = processTable.filter(
+    (entry) => entry.pgid === leaderPid,
+  );
+  if (groupRows.length > 0) {
+    try {
+      killProcess(-leaderPid, "SIGKILL");
+    } catch (groupError) {
+      if ((groupError as NodeJS.ErrnoException).code !== "ESRCH") {
+        processTable = await inspectProcesses();
+        if (!processTreeIdentityMatches(record, processTable)) {
+          throw new Error(
+            `recorded process tree identity changed: ${leaderPid}`,
+          );
+        }
+        for (const pid of [leaderPid, ...descendantPids]) {
+          const identity = processTable.find(
+            (entry) => entry.pid === pid,
+          );
+          if (
+            identity &&
+            identity.pgid === leaderPid &&
+            identity.command.includes(identityToken)
+          ) {
+            killProcess(pid, "SIGKILL");
+          }
+        }
+      }
+    }
+  }
+
+  if (!(await waitForExit(leaderPid, descendantPids))) {
+    throw new Error(
+      `recorded process tree did not exit: ${[
+        leaderPid,
+        ...descendantPids,
+      ].join(", ")}`,
+    );
+  }
+  await rm(pidPath, { force: true });
+  return {
+    descendantPids,
+    identityMatched: true,
+    leaderPid,
+  };
 }
 
 async function forceCloseCliProcess(child: ReturnType<typeof spawn>) {
@@ -736,6 +860,7 @@ async function runRealConsoleBuildCliSignalTest({
   fakeNpmPid: number;
   grandchildLogPath: string;
   grandchildPid: number;
+  pidPath: string;
   signal: NodeJS.Signals | null;
   stderr: string;
   temporaryRoot: string;
@@ -748,6 +873,7 @@ async function runRealConsoleBuildCliSignalTest({
   const fakeNpmPidPath = path.join(temporaryRoot, "fake-npm.pid");
   const grandchildLogPath = path.join(temporaryRoot, "grandchild.log");
   const grandchildReadyPath = path.join(temporaryRoot, "grandchild.ready");
+  const identityToken = path.basename(temporaryRoot);
   await mkdir(fakeBinRoot);
   await writeFile(
     fakeNpmPath,
@@ -777,7 +903,11 @@ setInterval(() => {}, 1000);
 );
 fs.writeFileSync(
   ${JSON.stringify(fakeNpmPidPath)},
-  process.pid + "\\n" + grandchild.pid,
+  JSON.stringify({
+    identityToken: ${JSON.stringify(identityToken)},
+    leaderPid: process.pid,
+    descendantPids: [grandchild.pid],
+  }),
 );
 const finish = (signal) => {
   fs.appendFileSync(
@@ -873,14 +1003,18 @@ setInterval(() => {}, 1000);
         resolve({ exitCode, signal: exitSignal });
       });
     });
-    const [pidLine, grandchildPidLine] = (
-      await readFile(fakeNpmPidPath, "utf8")
-    ).split("\n");
+    const record = parseRecordedProcessTree(
+      await readFile(fakeNpmPidPath, "utf8"),
+    );
+    if (!record) {
+      throw new Error("fake npm did not write a valid identity record");
+    }
     return {
       ...closed,
-      fakeNpmPid: Number(pidLine),
+      fakeNpmPid: record.leaderPid,
       grandchildLogPath,
-      grandchildPid: Number(grandchildPidLine),
+      grandchildPid: record.descendantPids[0],
+      pidPath: fakeNpmPidPath,
       stderr,
       temporaryRoot,
     };
@@ -921,6 +1055,7 @@ async function runRealConsolePrepareCliForceKillTest(): Promise<{
   const pidPath = path.join(temporaryRoot, "fake-git.pid");
   const readyPath = path.join(temporaryRoot, "fake-git.ready");
   const signalLogPath = path.join(temporaryRoot, "fake-git-signals.log");
+  const identityToken = path.basename(temporaryRoot);
   await mkdir(fakeBinRoot);
   await writeFile(
     fakeGitPath,
@@ -945,7 +1080,11 @@ setInterval(() => {}, 1000);
 );
 fs.writeFileSync(
   ${JSON.stringify(pidPath)},
-  process.pid + "\\n" + grandchild.pid,
+  JSON.stringify({
+    identityToken: ${JSON.stringify(identityToken)},
+    leaderPid: process.pid,
+    descendantPids: [grandchild.pid],
+  }),
 );
 const record = (signal) =>
   fs.appendFileSync(
@@ -1013,15 +1152,16 @@ setInterval(() => {}, 1000);
         resolve({ exitCode, signal });
       });
     });
-    const [fakeGitPid, grandchildPid] = (
-      await readFile(pidPath, "utf8")
-    )
-      .split(/\s+/)
-      .map(Number);
+    const record = parseRecordedProcessTree(
+      await readFile(pidPath, "utf8"),
+    );
+    if (!record) {
+      throw new Error("fake git did not write a valid identity record");
+    }
     return {
       ...closed,
-      fakeGitPid,
-      grandchildPid,
+      fakeGitPid: record.leaderPid,
+      grandchildPid: record.descendantPids[0],
       pidPath,
       signalLogPath,
       stderr,
@@ -1946,11 +2086,184 @@ describe("QwenPaw Console patch preparation", () => {
     }
   });
 
+  it("prepare 的冻结主错误、首信号与清理错误共存时包装原错并保留完整诊断", async () => {
+    const temporaryParent = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-prepare-frozen-error-"),
+    );
+    const patchPath = path.resolve(
+      "patches/qwenpaw-console/0001-brand.patch",
+    );
+    const originalError = new Error("frozen git failure");
+    Object.defineProperty(originalError, "signal", {
+      configurable: false,
+      enumerable: true,
+      value: "SIGKILL",
+    });
+    Object.preventExtensions(originalError);
+    const cleanupError = new Error("prepared removal failed");
+    const lifecycle = createProcessSignalLifecycle();
+    let caughtError: unknown;
+
+    lifecycle.install();
+    try {
+      try {
+        await prepareTesting.prepareConsoleWithDependencies(
+          { keep: true, signalLifecycle: lifecycle },
+          {
+            patchPaths: [patchPath],
+            remove: async () => {
+              throw cleanupError;
+            },
+            runExecFile: async () => {
+              process.emit("SIGTERM", "SIGTERM");
+              throw originalError;
+            },
+            temporaryParent,
+            verify: async () => ({
+              files: 1,
+              commit: UPSTREAM.commit,
+            }),
+          },
+        );
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(Error);
+      expect(caughtError).not.toBeInstanceOf(TypeError);
+      expect(caughtError).not.toBe(originalError);
+      expect(Reflect.get(caughtError as object, "cause")).toBe(
+        originalError,
+      );
+      expect(Reflect.get(caughtError as object, "signal")).toBe(
+        "SIGTERM",
+      );
+      expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+        cleanupError,
+      );
+      expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+        {
+          stage: "prepared",
+          path: expect.stringContaining(
+            "digitalmate-qwenpaw-console-",
+          ),
+          error: cleanupError,
+        },
+      ]);
+    } finally {
+      lifecycle.remove();
+      await rm(temporaryParent, { recursive: true, force: true });
+    }
+  });
+
+  it("prepare 的纯清理失败包含 prepared 阶段与残留路径且不重复记录", async () => {
+    const temporaryParent = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-prepare-cleanup-visible-"),
+    );
+    const cleanupError = Object.freeze(
+      new Error("injected prepared cleanup failure"),
+    );
+    let caughtError: unknown;
+
+    try {
+      try {
+        await prepareTesting.prepareConsoleWithDependencies(
+          { keep: false },
+          {
+            patchPaths: [],
+            remove: async () => {
+              throw cleanupError;
+            },
+            temporaryParent,
+            verify: async () => ({
+              files: 1,
+              commit: UPSTREAM.commit,
+            }),
+          },
+        );
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(Error);
+      expect(caughtError).not.toBeInstanceOf(TypeError);
+      expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+        cleanupError,
+      );
+      expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+        {
+          stage: "prepared",
+          path: expect.stringContaining(
+            "digitalmate-qwenpaw-console-",
+          ),
+          error: cleanupError,
+        },
+      ]);
+    } finally {
+      await rm(temporaryParent, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { signal: "SIGTERM", terminalEvent: "signal:SIGTERM" },
+    { signal: null, terminalEvent: "exit:1" },
+  ] as const)(
+    "prepare CLI 在$terminalEvent前依次输出主错与 cleanup 阶段、路径、message",
+    async ({ signal, terminalEvent }) => {
+      const cleanupError = new Error("prepared path retained");
+      const cliError = Object.assign(new Error("prepare failed"), {
+        cleanupError,
+        cleanupErrors: [
+          {
+            stage: "prepared",
+            path: "/safe/tmp/digitalmate-qwenpaw-console-residue",
+            error: cleanupError,
+          },
+        ],
+        ...(signal ? { signal } : {}),
+      });
+      const events: string[] = [];
+      const runPrepareCli = Reflect.get(
+        prepareTesting,
+        "runPrepareCli",
+      );
+
+      expect(runPrepareCli).toBeTypeOf("function");
+      if (typeof runPrepareCli !== "function") {
+        return;
+      }
+      await runPrepareCli({
+        prepare: async () => {
+          throw cliError;
+        },
+        resendSignal: (receivedSignal: string) => {
+          events.push(`signal:${receivedSignal}`);
+        },
+        setExitCode: (exitCode: number) => {
+          events.push(`exit:${exitCode}`);
+        },
+        writeStderr: (line: string) => {
+          events.push(`stderr:${line}`);
+        },
+        writeStdout: (line: string) => {
+          events.push(`stdout:${line}`);
+        },
+      });
+
+      expect(events).toEqual([
+        "stderr:prepare failed",
+        "stderr:Console cleanup failed at prepared (/safe/tmp/digitalmate-qwenpaw-console-residue): prepared path retained",
+        terminalEvent,
+      ]);
+    },
+  );
+
   it("git apply --check 活动进程收到组信号后停止后续 apply 并清理 workdir", async () => {
     const temporaryParent = await mkdtemp(
       path.join(tmpdir(), "dm-qwenpaw-prepare-signal-"),
     );
     const childPidPath = path.join(temporaryParent, "git-child.pid");
+    const identityToken = path.basename(temporaryParent);
     const patchPath = path.resolve(
       "patches/qwenpaw-console/0001-brand.patch",
     );
@@ -1976,9 +2289,18 @@ describe("QwenPaw Console patch preparation", () => {
                 process.execPath,
                 [
                   "-e",
-                  `require("node:fs").writeFileSync(${JSON.stringify(
-                    childPidPath,
-                  )}, String(process.pid)); setInterval(() => {}, 1000);`,
+                  `
+const identityToken = ${JSON.stringify(identityToken)};
+require("node:fs").writeFileSync(
+  ${JSON.stringify(childPidPath)},
+  JSON.stringify({
+    identityToken,
+    leaderPid: process.pid,
+    descendantPids: [],
+  }),
+);
+setInterval(() => identityToken.length, 1000);
+`,
                 ],
                 {
                   signalLifecycle: options.signalLifecycle,
@@ -1988,7 +2310,10 @@ describe("QwenPaw Console patch preparation", () => {
               const deadline = Date.now() + 5_000;
               while (Date.now() < deadline) {
                 try {
-                  childPid = Number(await readFile(childPidPath, "utf8"));
+                  childPid =
+                    parseRecordedProcessTree(
+                      await readFile(childPidPath, "utf8"),
+                    )?.leaderPid ?? 0;
                   break;
                 } catch {
                   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -2020,13 +2345,7 @@ describe("QwenPaw Console patch preparation", () => {
       expect(await readdir(temporaryParent)).toEqual(["git-child.pid"]);
     } finally {
       lifecycle.remove();
-      if (childPid) {
-        try {
-          process.kill(childPid, "SIGKILL");
-        } catch {
-          // Expected: process-group forwarding already reaped the child.
-        }
-      }
+      await forceCleanupRecordedProcessTree(childPidPath);
       await rm(temporaryParent, { recursive: true, force: true });
     }
   }, 20_000);
@@ -2417,6 +2736,54 @@ describe("QwenPaw Console isolated test runner", () => {
       }),
     ).rejects.toBe(primaryError);
     expect(Reflect.get(primaryError, "cleanupError")).toBe(cleanupError);
+  });
+
+  it("test runner 的冻结主错误、首信号与清理错误共存时不被 TypeError 掩盖", async () => {
+    const originalError = new Error("frozen test command failure");
+    Object.defineProperty(originalError, "signal", {
+      configurable: false,
+      enumerable: true,
+      value: "SIGKILL",
+    });
+    Object.preventExtensions(originalError);
+    const cleanupError = new Error("test prepared cleanup failed");
+    let caughtError: unknown;
+
+    try {
+      await runPreparedConsoleTests({
+        prepare: async () => ({
+          workdir: "/virtual/frozen-test-console",
+          applied: [],
+        }),
+        runCommand: async () => {
+          process.emit("SIGTERM", "SIGTERM");
+          throw originalError;
+        },
+        cleanup: async () => {
+          throw cleanupError;
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(Error);
+    expect(caughtError).not.toBeInstanceOf(TypeError);
+    expect(caughtError).not.toBe(originalError);
+    expect(Reflect.get(caughtError as object, "cause")).toBe(
+      originalError,
+    );
+    expect(Reflect.get(caughtError as object, "signal")).toBe("SIGTERM");
+    expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+      cleanupError,
+    );
+    expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+      {
+        stage: "prepared",
+        path: "/virtual/frozen-test-console",
+        error: cleanupError,
+      },
+    ]);
   });
 
   it("非零退出和清理异常同时发生时保留原退出码", async () => {
@@ -3218,6 +3585,127 @@ describe("QwenPaw Console atomic static build", () => {
     expect(Reflect.get(originalError, "signal")).toBe("SIGKILL");
   });
 
+  it.each([
+    { outputStream: "stdout", withLifecycle: true },
+    { outputStream: "stderr", withLifecycle: false },
+  ] as const)(
+    "真实 exec $outputStream 超过 maxBuffer 时强杀完整 detached 进程组且不伪造首信号",
+    async ({ outputStream, withLifecycle }) => {
+      if (process.platform === "win32") {
+        return;
+      }
+
+      const temporaryRoot = await mkdtemp(
+        path.join(tmpdir(), "dm-qwenpaw-max-buffer-"),
+      );
+      const pidPath = path.join(temporaryRoot, "fixture.pid");
+      const identityToken = path.basename(temporaryRoot);
+      const maxBuffer = 1_024;
+      const lifecycle = withLifecycle
+        ? createProcessSignalLifecycle({
+            forceKillTimeoutMs: 100,
+            treeExitTimeoutMs: 5_000,
+          })
+        : undefined;
+      let caughtError: unknown;
+
+      try {
+        try {
+          await runManagedExecFile(
+            process.execPath,
+            [
+              "-e",
+              `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const identityToken = ${JSON.stringify(identityToken)};
+const grandchild = spawn(
+  process.execPath,
+  [
+    "-e",
+    ${JSON.stringify(`
+const identityToken = ${JSON.stringify(identityToken)};
+process.on("SIGINT", () => {});
+process.on("SIGTERM", () => {});
+setInterval(() => identityToken.length, 1000);
+`)},
+  ],
+  { stdio: "ignore" },
+);
+fs.writeFileSync(
+  ${JSON.stringify(pidPath)},
+  JSON.stringify({
+    identityToken,
+    leaderPid: process.pid,
+    descendantPids: [grandchild.pid],
+  }),
+);
+const output = process.${outputStream};
+const payload = Buffer.alloc(64 * 1024, "x");
+setInterval(() => {
+  output.write(payload);
+}, 0);
+`,
+            ],
+            {
+              maxBuffer,
+              ...(lifecycle ? { signalLifecycle: lifecycle } : {}),
+            },
+          );
+        } catch (error) {
+          caughtError = error;
+        }
+
+        const record = parseRecordedProcessTree(
+          await readFile(pidPath, "utf8"),
+        );
+        expect(record).not.toBeNull();
+        expect.soft(caughtError).toMatchObject({
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+          cmd: expect.stringContaining(process.execPath),
+          killed: true,
+          signal: null,
+        });
+        expect.soft(caughtError).toBeInstanceOf(Error);
+        expect.soft((caughtError as Error).message).toContain(
+          `${outputStream} maxBuffer`,
+        );
+        const retainedStdout = Reflect.get(
+          caughtError as object,
+          "stdout",
+        );
+        const retainedStderr = Reflect.get(
+          caughtError as object,
+          "stderr",
+        );
+        expect
+          .soft(Buffer.byteLength(retainedStdout ?? ""))
+          .toBeLessThanOrEqual(
+          maxBuffer,
+        );
+        expect
+          .soft(Buffer.byteLength(retainedStderr ?? ""))
+          .toBeLessThanOrEqual(
+          maxBuffer,
+        );
+        expect(lifecycle?.signal ?? null).toBeNull();
+        expect(
+          await waitForProcessTargetsToExit(
+            record!.leaderPid,
+            record!.descendantPids,
+            100,
+          ),
+        ).toBe(true);
+        expect(processTargetExists(record!.leaderPid, true)).toBe(false);
+      } finally {
+        await forceCleanupRecordedProcessTree(pidPath);
+        lifecycle?.remove();
+        await rm(temporaryRoot, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
   it("进程组终止与探测失败只记诊断，仍会清理定时器和监听器", async () => {
     const beforeSigint = process.listenerCount("SIGINT");
     const beforeSigterm = process.listenerCount("SIGTERM");
@@ -3426,6 +3914,389 @@ describe("QwenPaw Console atomic static build", () => {
     }
   });
 
+  it("Windows graceful 与 force taskkill helper 均挂起时会终止并有界回收各 helper", async () => {
+    const commands: string[][] = [];
+    const helpers: Array<
+      EventEmitter & {
+        kill: (signal?: NodeJS.Signals) => boolean;
+      }
+    > = [];
+    const helperKillCalls: Array<{
+      index: number;
+      signal: NodeJS.Signals | undefined;
+    }> = [];
+    const reportedDiagnostics: string[] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      onDiagnostic: (diagnostic) => {
+        reportedDiagnostics.push(
+          formatSignalLifecycleDiagnostic(diagnostic),
+        );
+      },
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const index = helpers.length;
+        const killer = Object.assign(new EventEmitter(), {
+          kill: (signal?: NodeJS.Signals) => {
+            helperKillCalls.push({ index, signal });
+            return true;
+          },
+        });
+        commands.push([command, ...args]);
+        helpers.push(killer);
+        return killer as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const child = { pid: 7676 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      const startedAt = Date.now();
+      await lifecycle.settleChild(child);
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(elapsedMs).toBeLessThan(500);
+      expect(commands).toEqual([
+        ["taskkill", "/PID", "7676", "/T"],
+        ["taskkill", "/PID", "7676", "/T", "/F"],
+      ]);
+      expect(helperKillCalls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ index: 0 }),
+          expect.objectContaining({ index: 1 }),
+        ]),
+      );
+      expect(lifecycle.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "graceful-timeout",
+            pid: 7676,
+          }),
+          expect.objectContaining({
+            action: "settle-timeout",
+            pid: 7676,
+          }),
+        ]),
+      );
+      expect(reportedDiagnostics).toEqual(
+        expect.arrayContaining([
+          "Console process cleanup graceful-timeout failed for process-tree pid=7676: timed out waiting for taskkill",
+          "Console process cleanup settle-timeout failed for process-tree pid=7676: timed out waiting for taskkill",
+        ]),
+      );
+      for (const helper of helpers) {
+        expect(helper.listenerCount("error")).toBe(0);
+        expect(helper.listenerCount("close")).toBe(0);
+      }
+      const diagnosticCount = lifecycle.diagnostics.length;
+      for (const helper of helpers) {
+        helper.emit("close", 0, null);
+      }
+      expect(lifecycle.diagnostics).toHaveLength(diagnosticCount);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows lifecycle 直接 detach 时终止并移除仍在途的 taskkill helper", () => {
+    const helper = Object.assign(new EventEmitter(), {
+      killCalls: [] as Array<NodeJS.Signals | undefined>,
+      kill(signal?: NodeJS.Signals) {
+        this.killCalls.push(signal);
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      platform: "win32",
+      spawnProcess: () =>
+        helper as unknown as ReturnType<typeof spawn>,
+    });
+    const child = { pid: 7777 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      expect(helper.listenerCount("error")).toBe(1);
+      expect(helper.listenerCount("close")).toBe(1);
+
+      lifecycle.detachChild(child);
+
+      expect(helper.killCalls).toEqual(
+        expect.arrayContaining(["SIGKILL"]),
+      );
+      expect(helper.listenerCount("error")).toBe(0);
+      expect(helper.listenerCount("close")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows runner 在 child 与 taskkill helpers 都不退出时独立 watchdog 回落 direct kill", async () => {
+    const taskkillCommands: string[][] = [];
+    const helperKillCalls: Array<{
+      index: number;
+      signal: NodeJS.Signals | undefined;
+    }> = [];
+    const helpers: EventEmitter[] = [];
+    const childKillCalls: NodeJS.Signals[] = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 7878,
+      kill(signal: NodeJS.Signals) {
+        childKillCalls.push(signal);
+        if (signal === "SIGKILL") {
+          queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+        }
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 20,
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const index = taskkillCommands.length;
+        const helper = Object.assign(new EventEmitter(), {
+          kill(signal?: NodeJS.Signals) {
+            helperKillCalls.push({ index, signal });
+            return true;
+          },
+        });
+        taskkillCommands.push([command, ...args]);
+        helpers.push(helper);
+        return helper as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then((outcome) => ({ outcome, timedOut: false })),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+
+      expect(raced).toEqual({
+        outcome: { exitCode: 1, signal: "SIGTERM" },
+        timedOut: false,
+      });
+      expect(taskkillCommands).toEqual([
+        ["taskkill", "/PID", "7878", "/T"],
+        ["taskkill", "/PID", "7878", "/T", "/F"],
+      ]);
+      expect(helperKillCalls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ index: 0 }),
+          expect.objectContaining({ index: 1 }),
+        ]),
+      );
+      expect(childKillCalls).toContain("SIGKILL");
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      for (const helper of helpers) {
+        expect(helper.listenerCount("error")).toBe(0);
+        expect(helper.listenerCount("close")).toBe(0);
+      }
+    } finally {
+      if (childKillCalls.length === 0) {
+        child.emit("close", null, "SIGKILL");
+        await running;
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows runner 在 taskkill 与 direct kill 均失败时有界返回显式终止错误", async () => {
+    const childKillCalls: NodeJS.Signals[] = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 7979,
+      kill(signal: NodeJS.Signals) {
+        childKillCalls.push(signal);
+        return false;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 20,
+      platform: "win32",
+      spawnProcess: () =>
+        Object.assign(new EventEmitter(), {
+          kill() {
+            return true;
+          },
+        }) as unknown as ReturnType<typeof spawn>,
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+    let timedOut = false;
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(timedOut).toBe(false);
+      if (!raced.timedOut) {
+        expect(raced).toMatchObject({
+          error: {
+            code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            signal: "SIGTERM",
+          },
+        });
+      }
+      expect(childKillCalls).toContain("SIGKILL");
+      expect(lifecycle.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "direct-child-fallback",
+            pid: 7979,
+          }),
+          expect.objectContaining({
+            action: "runner-timeout",
+            pid: 7979,
+          }),
+        ]),
+      );
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      const diagnosticCount = lifecycle.diagnostics.length;
+      child.emit("close", null, "SIGKILL");
+      expect(lifecycle.diagnostics).toHaveLength(diagnosticCount);
+    } finally {
+      if (timedOut) {
+        child.emit("close", null, "SIGKILL");
+        await running;
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows maxBuffer 内部取消在 taskkill helper 挂起时仍有界拒绝且不伪造信号", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-win-max-buffer-watchdog-"),
+    );
+    const readyPath = path.join(temporaryRoot, "ready");
+    const stopPath = path.join(temporaryRoot, "stop");
+    const helperKillCalls: NodeJS.Signals[] = [];
+    const helpers: EventEmitter[] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      platform: "win32",
+      spawnProcess: () => {
+        const helper = Object.assign(new EventEmitter(), {
+          kill(signal: NodeJS.Signals) {
+            helperKillCalls.push(signal);
+            return true;
+          },
+        });
+        helpers.push(helper);
+        return helper as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedExecFile(
+      process.execPath,
+      [
+        "-e",
+        `
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(readyPath)}, "ready");
+const payload = Buffer.alloc(64 * 1024, "x");
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(stopPath)})) {
+    process.exit(0);
+  }
+  process.stdout.write(payload);
+}, 1);
+`,
+      ],
+      {
+        maxBuffer: 1_024,
+        signalLifecycle: lifecycle,
+      },
+    );
+    let caughtError: unknown;
+    let timedOut = false;
+
+    try {
+      const readyDeadline = Date.now() + 3_000;
+      while (Date.now() < readyDeadline) {
+        try {
+          await access(readyPath);
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      }
+      await access(readyPath);
+      const raced = await Promise.race([
+        running.then(
+          () => ({ error: undefined, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+      if (!raced.timedOut) {
+        caughtError = raced.error;
+      }
+
+      expect(timedOut).toBe(false);
+      expect(caughtError).toMatchObject({
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        killed: true,
+        signal: null,
+      });
+      expect(lifecycle.signal).toBeNull();
+      expect(helperKillCalls).toEqual(
+        expect.arrayContaining(["SIGTERM", "SIGKILL"]),
+      );
+      for (const helper of helpers) {
+        expect(helper.listenerCount("error")).toBe(0);
+        expect(helper.listenerCount("close")).toBe(0);
+      }
+    } finally {
+      if (timedOut) {
+        await writeFile(stopPath, "stop", "utf8");
+        await running.catch(() => {});
+      }
+      lifecycle.remove();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it("prepare 返回前收到信号时不启动命令、校验或发布并等待清理", async () => {
     const fixture = await createConsoleBuildFixture();
     const calls: string[] = [];
@@ -3538,6 +4409,7 @@ describe("QwenPaw Console atomic static build", () => {
       path.join(tmpdir(), "dm-qwenpaw-helper-cleanup-"),
     );
     const pidPath = path.join(temporaryRoot, "fixture.pid");
+    const identityToken = path.basename(temporaryRoot);
     let leaderPid = 0;
     let grandchildPid = 0;
 
@@ -3551,12 +4423,23 @@ const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const grandchild = spawn(
   process.execPath,
-  ["-e", "setInterval(() => {}, 1000)"],
+  [
+    "-e",
+    ${JSON.stringify(
+      `const identityToken = ${JSON.stringify(
+        identityToken,
+      )}; setInterval(() => identityToken.length, 1000);`,
+    )},
+  ],
   { stdio: "ignore" },
 );
 fs.writeFileSync(
   ${JSON.stringify(pidPath)},
-  process.pid + "\\n" + grandchild.pid,
+  JSON.stringify({
+    identityToken: ${JSON.stringify(identityToken)},
+    leaderPid: process.pid,
+    descendantPids: [grandchild.pid],
+  }),
 );
 setInterval(() => {}, 1000);
 `,
@@ -3571,12 +4454,10 @@ setInterval(() => {}, 1000);
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
         try {
-          const [, recordedGrandchildPid] = (
-            await readFile(pidPath, "utf8")
-          )
-            .split(/\s+/)
-            .map(Number);
-          grandchildPid = recordedGrandchildPid;
+          const record = parseRecordedProcessTree(
+            await readFile(pidPath, "utf8"),
+          );
+          grandchildPid = record?.descendantPids[0] ?? 0;
           break;
         } catch {
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -3591,21 +4472,127 @@ setInterval(() => {}, 1000);
       await expect(
         processPidIsActive(grandchildPid),
       ).resolves.toBe(false);
+      await expectPathMissing(pidPath);
     } finally {
-      try {
-        await forceCleanupRecordedProcessTree(pidPath);
-      } catch {
-        for (const pid of [leaderPid, grandchildPid]) {
-          try {
-            process.kill(pid, "SIGKILL");
-          } catch {
-            // Best-effort final fallback for a broken cleanup assertion.
-          }
-        }
-      }
+      await forceCleanupRecordedProcessTree(pidPath);
       await rm(temporaryRoot, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("CLI helper 遇到 PID/PGID 复用或组内身份不一致时不发送任何信号", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-helper-identity-mismatch-"),
+    );
+    const pidPath = path.join(temporaryRoot, "fixture.pid");
+    const identityToken = "dm-fixture-token-mismatch";
+    const killCalls: Array<{
+      pid: number;
+      signal: string | number;
+    }> = [];
+
+    try {
+      await writeFile(
+        pidPath,
+        JSON.stringify({
+          identityToken,
+          leaderPid: 7101,
+          descendantPids: [7102],
+        }),
+        "utf8",
+      );
+
+      await expect(
+        forceCleanupRecordedProcessTree(pidPath, {
+          killProcess: (pid, signal = 0) => {
+            killCalls.push({ pid, signal });
+            return true;
+          },
+          readProcessTable: async () => [
+            {
+              pid: 7101,
+              pgid: 7101,
+              command: `${process.execPath} fixture ${identityToken}`,
+            },
+            {
+              pid: 7102,
+              pgid: 7101,
+              command: `${process.execPath} child ${identityToken}`,
+            },
+            {
+              pid: 7199,
+              pgid: 7101,
+              command: `${process.execPath} unrelated-reused-process`,
+            },
+          ],
+          waitForExit: async () => true,
+        }),
+      ).rejects.toThrow("identity mismatch");
+
+      expect(killCalls).toEqual([]);
+      await expect(readFile(pidPath, "utf8")).resolves.toContain(
+        identityToken,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("CLI helper 仅在整个记录进程组身份匹配后组杀并删除 PID 记录", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-helper-identity-match-"),
+    );
+    const pidPath = path.join(temporaryRoot, "fixture.pid");
+    const identityToken = "dm-fixture-token-match";
+    const killCalls: Array<{
+      pid: number;
+      signal: string | number;
+    }> = [];
+
+    try {
+      await writeFile(
+        pidPath,
+        JSON.stringify({
+          identityToken,
+          leaderPid: 7201,
+          descendantPids: [7202],
+        }),
+        "utf8",
+      );
+
+      await expect(
+        forceCleanupRecordedProcessTree(pidPath, {
+          killProcess: (pid, signal = 0) => {
+            killCalls.push({ pid, signal });
+            return true;
+          },
+          readProcessTable: async () => [
+            {
+              pid: 7201,
+              pgid: 7201,
+              command: `${process.execPath} fixture ${identityToken}`,
+            },
+            {
+              pid: 7202,
+              pgid: 7201,
+              command: `${process.execPath} child ${identityToken}`,
+            },
+          ],
+          waitForExit: async () => true,
+        }),
+      ).resolves.toEqual({
+        descendantPids: [7202],
+        identityMatched: true,
+        leaderPid: 7201,
+      });
+
+      expect(killCalls).toEqual([
+        { pid: -7201, signal: "SIGKILL" },
+      ]);
+      await expectPathMissing(pidPath);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
 
   it("真实 CLI 向 npm 进程组转发 SIGTERM 且不遗留 npm 或 grandchild", async () => {
     const result = await runRealConsoleBuildCliSignalTest();
@@ -3633,16 +4620,7 @@ setInterval(() => {}, 1000);
         await listConsolePublicationResidue(path.resolve("public")),
       ).toEqual([]);
     } finally {
-      try {
-        process.kill(result.fakeNpmPid, "SIGKILL");
-      } catch {
-        // The expected path: the forwarded signal already reaped fake npm.
-      }
-      try {
-        process.kill(result.grandchildPid, "SIGKILL");
-      } catch {
-        // The expected path: the process-group signal reaped the grandchild.
-      }
+      await forceCleanupRecordedProcessTree(result.pidPath);
       await rm(result.temporaryRoot, { recursive: true, force: true });
     }
   }, 40_000);
@@ -3669,13 +4647,7 @@ setInterval(() => {}, 1000);
         ),
       ).toEqual([]);
     } finally {
-      for (const pid of [result.fakeNpmPid, result.grandchildPid]) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Expected after settleChild force-kills the remaining process group.
-        }
-      }
+      await forceCleanupRecordedProcessTree(result.pidPath);
       await rm(result.temporaryRoot, { recursive: true, force: true });
     }
   }, 40_000);
@@ -3708,13 +4680,7 @@ setInterval(() => {}, 1000);
         ),
       ).toEqual([]);
     } finally {
-      for (const pid of [result.fakeNpmPid, result.grandchildPid]) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Expected after the second signal kills the detached process group.
-        }
-      }
+      await forceCleanupRecordedProcessTree(result.pidPath);
       await rm(result.temporaryRoot, { recursive: true, force: true });
     }
   }, 40_000);
@@ -3790,6 +4756,54 @@ setInterval(() => {}, 1000);
     } finally {
       await rm(fixture.temporaryRoot, { recursive: true, force: true });
     }
+  });
+
+  it("build 的冻结主错误、首信号与清理错误共存时包装原错且普通链路不抛 TypeError", async () => {
+    const originalError = new Error("frozen build command failure");
+    Object.defineProperty(originalError, "signal", {
+      configurable: false,
+      enumerable: true,
+      value: "SIGKILL",
+    });
+    Object.freeze(originalError);
+    const cleanupError = new Error("build prepared cleanup failed");
+    let caughtError: unknown;
+
+    try {
+      await buildConsole({
+        prepare: async () => ({
+          workdir: "/virtual/frozen-build-console",
+          applied: [...PATCHES],
+        }),
+        runCommand: async () => {
+          process.emit("SIGTERM", "SIGTERM");
+          throw originalError;
+        },
+        cleanupPrepared: async () => {
+          throw cleanupError;
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(Error);
+    expect(caughtError).not.toBeInstanceOf(TypeError);
+    expect(caughtError).not.toBe(originalError);
+    expect(Reflect.get(caughtError as object, "cause")).toBe(
+      originalError,
+    );
+    expect(Reflect.get(caughtError as object, "signal")).toBe("SIGTERM");
+    expect(Reflect.get(caughtError as object, "cleanupError")).toBe(
+      cleanupError,
+    );
+    expect(Reflect.get(caughtError as object, "cleanupErrors")).toEqual([
+      {
+        stage: "prepared",
+        path: "/virtual/frozen-build-console",
+        error: cleanupError,
+      },
+    ]);
   });
 
   it("根脚本、忽略规则、缓存头与镜像归因范围精确", async () => {

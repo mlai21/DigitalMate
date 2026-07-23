@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  appendCleanupError,
   attachSignalToError,
   createSignalLifecycle,
+  formatCleanupErrorDetails,
   formatSignalLifecycleDiagnostic,
   runManagedExecFile,
   throwIfSignalRecorded,
@@ -47,19 +49,40 @@ async function applyPatch(
   throwIfSignalRecorded(signalLifecycle, "patch-applied");
 }
 
-async function removePreparedDirectory(workdir, originalError) {
-  try {
-    await rm(workdir, { recursive: true, force: true });
-  } catch (cleanupError) {
-    if (originalError && typeof originalError === "object") {
-      Object.defineProperty(originalError, "cleanupError", {
-        configurable: true,
-        value: cleanupError,
-      });
-      return;
-    }
-    throw cleanupError;
+function hasPreparedCleanupEntry(error, workdir) {
+  if (!error || typeof error !== "object") {
+    return false;
   }
+  const cleanupErrors = Reflect.get(error, "cleanupErrors");
+  return (
+    Array.isArray(cleanupErrors) &&
+    cleanupErrors.some(
+      (cleanupEntry) =>
+        cleanupEntry?.stage === "prepared" &&
+        cleanupEntry?.path === workdir,
+    )
+  );
+}
+
+async function removePreparedDirectory(
+  workdir,
+  originalError,
+  remove = rm,
+) {
+  try {
+    await remove(workdir, { recursive: true, force: true });
+  } catch (cleanupError) {
+    const cleanupEntry = {
+      stage: "prepared",
+      path: workdir,
+      error: cleanupError,
+    };
+    if (originalError !== undefined) {
+      return appendCleanupError(originalError, cleanupEntry);
+    }
+    throw appendCleanupError(cleanupError, cleanupEntry);
+  }
+  return originalError;
 }
 
 /**
@@ -72,6 +95,7 @@ async function prepareConsoleWithDependencies(
   { keep = false, signalLifecycle } = {},
   {
     patchPaths = DEFAULT_PATCH_PATHS,
+    remove = rm,
     runExecFile = runManagedExecFile,
     temporaryParent = os.tmpdir(),
     verify = () => verifySnapshot(SNAPSHOT_ROOT),
@@ -105,17 +129,23 @@ async function prepareConsoleWithDependencies(
     await verify();
     throwIfSignalRecorded(signalLifecycle, "final-verification");
     if (!keep) {
-      await removePreparedDirectory(workdir);
+      await removePreparedDirectory(workdir, undefined, remove);
       throwIfSignalRecorded(signalLifecycle, "prepared-cleanup");
       return { workdir: null, applied: [...applied] };
     }
     return { workdir, applied: [...applied] };
   } catch (error) {
-    const interruptedError = attachSignalToError(
+    let interruptedError = attachSignalToError(
       error,
       signalLifecycle?.signal,
     );
-    await removePreparedDirectory(workdir, interruptedError);
+    if (!hasPreparedCleanupEntry(interruptedError, workdir)) {
+      interruptedError = await removePreparedDirectory(
+        workdir,
+        interruptedError,
+        remove,
+      );
+    }
     throw interruptedError;
   }
 }
@@ -145,8 +175,47 @@ export async function prepareConsole(options = {}) {
   }
 }
 
+async function runPrepareCli({
+  prepare = prepareConsole,
+  resendSignal = (signal) => {
+    process.kill(process.pid, signal);
+  },
+  setExitCode = (exitCode) => {
+    process.exitCode = exitCode;
+  },
+  writeStderr = console.error,
+  writeStdout = console.log,
+} = {}) {
+  try {
+    const { applied } = await prepare({
+      onDiagnostic: (diagnostic) => {
+        writeStderr(formatSignalLifecycleDiagnostic(diagnostic));
+      },
+    });
+    writeStdout(`Console patches verified: ${applied.join(", ")}`);
+  } catch (error) {
+    writeStderr(
+      error instanceof Error ? error.message : "Console preparation failed",
+    );
+    for (const detailLine of formatCleanupErrorDetails(error)) {
+      writeStderr(detailLine);
+    }
+    const signal =
+      error && typeof error === "object"
+        ? Reflect.get(error, "signal")
+        : undefined;
+    if (signal) {
+      resendSignal(signal);
+    } else {
+      setExitCode(1);
+    }
+  }
+}
+
 export const __testing = Object.freeze({
+  formatCleanupErrorDetails,
   prepareConsoleWithDependencies,
+  runPrepareCli,
 });
 
 const isMain =
@@ -154,26 +223,5 @@ const isMain =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
-  prepareConsole({
-    onDiagnostic: (diagnostic) => {
-      console.error(formatSignalLifecycleDiagnostic(diagnostic));
-    },
-  })
-    .then(({ applied }) => {
-      console.log(`Console patches verified: ${applied.join(", ")}`);
-    })
-    .catch((error) => {
-      console.error(
-        error instanceof Error ? error.message : "Console preparation failed",
-      );
-      const signal =
-        error && typeof error === "object"
-          ? Reflect.get(error, "signal")
-          : undefined;
-      if (signal) {
-        process.kill(process.pid, signal);
-      } else {
-        process.exitCode = 1;
-      }
-    });
+  void runPrepareCli();
 }

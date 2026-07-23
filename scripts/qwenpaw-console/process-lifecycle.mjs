@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 5_000;
 const DEFAULT_TREE_EXIT_TIMEOUT_MS = 2_000;
 const TREE_EXIT_POLL_INTERVAL_MS = 20;
+const MANAGED_PROCESS_DISPOSE = Symbol("managedProcessDispose");
 
 /**
  * @typedef {object} SignalLifecycleDiagnostic
@@ -64,36 +65,137 @@ export function formatSignalLifecycleDiagnostic(diagnostic) {
   return `Console process cleanup ${action} failed for ${target}: ${reason}`;
 }
 
+function createMutableErrorWrapper(error, fallbackMessage) {
+  const wrapped = new Error(
+    error instanceof Error ? error.message : fallbackMessage,
+    { cause: error },
+  );
+  if (error instanceof Error) {
+    wrapped.name = error.name;
+  }
+  if (!error || typeof error !== "object") {
+    return wrapped;
+  }
+
+  for (const property of Reflect.ownKeys(error)) {
+    if (
+      property === "cause" ||
+      property === "message" ||
+      property === "name" ||
+      property === "stack"
+    ) {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(error, property);
+    if (!descriptor) {
+      continue;
+    }
+    try {
+      if ("value" in descriptor) {
+        Object.defineProperty(wrapped, property, {
+          configurable: true,
+          enumerable: descriptor.enumerable,
+          value: descriptor.value,
+          writable: true,
+        });
+      } else {
+        Object.defineProperty(wrapped, property, {
+          configurable: true,
+          enumerable: descriptor.enumerable,
+          get: descriptor.get,
+          set: descriptor.set,
+        });
+      }
+    } catch {
+      // Individual diagnostic fields must not prevent preserving the error.
+    }
+  }
+  return wrapped;
+}
+
+export function attachErrorDetails(
+  error,
+  details,
+  fallbackMessage = "Console operation failed",
+) {
+  let target =
+    error && typeof error === "object"
+      ? error
+      : createMutableErrorWrapper(error, fallbackMessage);
+  const attach = (candidate) => {
+    for (const property of Reflect.ownKeys(details)) {
+      Object.defineProperty(candidate, property, {
+        configurable: true,
+        enumerable: true,
+        value: Reflect.get(details, property),
+        writable: true,
+      });
+    }
+    return candidate;
+  };
+
+  try {
+    return attach(target);
+  } catch {
+    target = createMutableErrorWrapper(error, fallbackMessage);
+    return attach(target);
+  }
+}
+
+function readErrorDetail(error, property) {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  try {
+    return Reflect.get(error, property);
+  } catch {
+    return undefined;
+  }
+}
+
+export function appendCleanupError(error, cleanupEntry) {
+  const existingCleanupErrors = readErrorDetail(
+    error,
+    "cleanupErrors",
+  );
+  const cleanupErrors = Array.isArray(existingCleanupErrors)
+    ? [...existingCleanupErrors, cleanupEntry]
+    : [cleanupEntry];
+  const existingCleanupError = readErrorDetail(error, "cleanupError");
+  return attachErrorDetails(error, {
+    cleanupError:
+      existingCleanupError === undefined
+        ? cleanupEntry.error
+        : existingCleanupError,
+    cleanupErrors,
+  });
+}
+
+export function formatCleanupErrorDetails(error) {
+  const cleanupErrors = readErrorDetail(error, "cleanupErrors");
+  if (!Array.isArray(cleanupErrors)) {
+    return [];
+  }
+  return cleanupErrors.map(
+    (cleanupEntry) =>
+      `Console cleanup failed at ${cleanupEntry.stage} (${cleanupEntry.path}): ${
+        cleanupEntry.error instanceof Error
+          ? cleanupEntry.error.message
+          : "unknown cleanup error"
+      }`,
+  );
+}
+
 export function attachSignalToError(error, signal) {
   if (!signal) {
     return error;
   }
 
-  if (error && typeof error === "object") {
-    try {
-      Object.defineProperty(error, "signal", {
-        configurable: true,
-        enumerable: true,
-        value: signal,
-      });
-      return error;
-    } catch {
-      // A frozen or non-configurable error is wrapped below.
-    }
-  }
-
-  const wrapped = new Error(
-    error instanceof Error
-      ? error.message
-      : "Console operation interrupted",
-    { cause: error },
+  return attachErrorDetails(
+    error,
+    { signal },
+    "Console operation interrupted",
   );
-  Object.defineProperty(wrapped, "signal", {
-    configurable: true,
-    enumerable: true,
-    value: signal,
-  });
-  return wrapped;
 }
 
 function attachDiagnostic(reportDiagnostic, diagnostic) {
@@ -121,13 +223,44 @@ function terminateProcessTree(
       error,
       pid: pid ?? null,
     });
-    return Promise.resolve({ error, ok: false });
+    return {
+      abort() {},
+      completion: Promise.resolve({ error, ok: false }),
+      helper: null,
+      settled: true,
+      suppressDiagnostics() {},
+    };
   }
 
   if (platform === "win32") {
     const { command, args } = getWindowsTreeKillCommand(pid, { force });
-    return new Promise((resolve) => {
-      let settled = false;
+    let helper = null;
+    let settled = false;
+    let abortTermination = () => {};
+    let suppressTerminationDiagnostics = () => {};
+    const completion = new Promise((resolve) => {
+      let diagnosticsSuppressed = false;
+      let onClose;
+      let onError;
+      const removeHelperListeners = () => {
+        if (!helper) {
+          return;
+        }
+        if (onError) {
+          helper.off?.("error", onError);
+        }
+        if (onClose) {
+          helper.off?.("close", onClose);
+        }
+      };
+      const settle = (outcome) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        removeHelperListeners();
+        resolve(outcome);
+      };
       const finish = ({
         error,
         exitCode,
@@ -136,27 +269,30 @@ function terminateProcessTree(
         if (settled) {
           return;
         }
-        settled = true;
         let outcome;
         if (error) {
-          attachDiagnostic(reportDiagnostic, {
-            action: force ? "force" : "graceful",
-            command: [command, ...args].join(" "),
-            error,
-            pid,
-          });
+          if (!diagnosticsSuppressed) {
+            attachDiagnostic(reportDiagnostic, {
+              action: force ? "force" : "graceful",
+              command: [command, ...args].join(" "),
+              error,
+              pid,
+            });
+          }
           outcome = { error, ok: false };
         } else if (
           (typeof exitCode === "number" && exitCode !== 0) ||
           exitSignal
         ) {
-          attachDiagnostic(reportDiagnostic, {
-            action: force ? "force" : "graceful",
-            command: [command, ...args].join(" "),
-            exitCode: exitCode ?? null,
-            pid,
-            signal: exitSignal ?? null,
-          });
+          if (!diagnosticsSuppressed) {
+            attachDiagnostic(reportDiagnostic, {
+              action: force ? "force" : "graceful",
+              command: [command, ...args].join(" "),
+              exitCode: exitCode ?? null,
+              pid,
+              signal: exitSignal ?? null,
+            });
+          }
           outcome = {
             exitCode: exitCode ?? null,
             ok: false,
@@ -169,35 +305,59 @@ function terminateProcessTree(
             signal: null,
           };
         }
-        resolve(outcome);
+        settle(outcome);
+      };
+      abortTermination = () => {
+        settle({ aborted: true, ok: false });
+      };
+      suppressTerminationDiagnostics = () => {
+        diagnosticsSuppressed = true;
       };
 
       try {
-        const killer = spawnProcess(command, args, {
+        helper = spawnProcess(command, args, {
           stdio: "ignore",
           windowsHide: true,
         });
-        killer.once("error", (error) => {
+        onError = (error) => {
           finish({
             error,
           });
-        });
-        killer.once("close", (exitCode, exitSignal) => {
+        };
+        onClose = (exitCode, exitSignal) => {
           finish({ exitCode, signal: exitSignal });
-        });
-        killer.unref?.();
+        };
+        helper.once("error", onError);
+        helper.once("close", onClose);
       } catch (error) {
         finish({
           error,
         });
       }
     });
+    return {
+      abort: () => abortTermination(),
+      completion,
+      get helper() {
+        return helper;
+      },
+      get settled() {
+        return settled;
+      },
+      suppressDiagnostics: () => suppressTerminationDiagnostics(),
+    };
   }
 
   const forwardedSignal = force ? "SIGKILL" : signal;
   try {
     killProcess(-pid, forwardedSignal);
-    return Promise.resolve({ ok: true });
+    return {
+      abort() {},
+      completion: Promise.resolve({ ok: true }),
+      helper: null,
+      settled: true,
+      suppressDiagnostics() {},
+    };
   } catch (groupError) {
     attachDiagnostic(reportDiagnostic, {
       action: force ? "force" : "graceful",
@@ -207,11 +367,17 @@ function terminateProcessTree(
     });
     try {
       killProcess(pid, forwardedSignal);
-      return Promise.resolve({
-        error: groupError,
-        fallback: "direct-child",
-        ok: false,
-      });
+      return {
+        abort() {},
+        completion: Promise.resolve({
+          error: groupError,
+          fallback: "direct-child",
+          ok: false,
+        }),
+        helper: null,
+        settled: true,
+        suppressDiagnostics() {},
+      };
     } catch (childError) {
       attachDiagnostic(reportDiagnostic, {
         action: force ? "force" : "graceful",
@@ -219,11 +385,17 @@ function terminateProcessTree(
         pid,
         target: "direct-child-fallback",
       });
-      return Promise.resolve({
-        error: childError,
-        groupError,
-        ok: false,
-      });
+      return {
+        abort() {},
+        completion: Promise.resolve({
+          error: childError,
+          groupError,
+          ok: false,
+        }),
+        helper: null,
+        settled: true,
+        suppressDiagnostics() {},
+      };
     }
   }
 }
@@ -275,6 +447,83 @@ function waitWithTimeout(promise, timeoutMs, timerOperations) {
   });
 }
 
+async function stopTerminationHelper(
+  termination,
+  {
+    action,
+    pid,
+    reportDiagnostic,
+    timeoutMs,
+    timerOperations,
+  },
+) {
+  const helper = termination?.helper;
+  if (termination?.settled) {
+    return;
+  }
+  if (!helper) {
+    termination?.abort?.();
+    return;
+  }
+
+  termination.suppressDiagnostics?.();
+  const stopHelper = (signal) => {
+    try {
+      const killed = helper.kill?.(signal);
+      if (killed === false || typeof helper.kill !== "function") {
+        attachDiagnostic(reportDiagnostic, {
+          action: `${action}-helper-kill`,
+          error: new Error("taskkill helper did not accept termination"),
+          pid,
+          target: "taskkill-helper",
+        });
+      }
+    } catch (error) {
+      attachDiagnostic(reportDiagnostic, {
+        action: `${action}-helper-kill`,
+        error,
+        pid,
+        target: "taskkill-helper",
+      });
+    }
+  };
+
+  stopHelper("SIGTERM");
+  let stopped = await waitWithTimeout(
+    termination.completion,
+    timeoutMs,
+    timerOperations,
+  );
+  if (!stopped.timedOut) {
+    return;
+  }
+
+  stopHelper("SIGKILL");
+  stopped = await waitWithTimeout(
+    termination.completion,
+    timeoutMs,
+    timerOperations,
+  );
+  if (stopped.timedOut) {
+    termination.abort?.();
+    helper.unref?.();
+  }
+}
+
+function abortTerminationHelper(termination) {
+  if (!termination || termination.settled) {
+    return;
+  }
+  termination.suppressDiagnostics?.();
+  try {
+    termination.helper?.kill?.("SIGKILL");
+  } catch {
+    // Direct detach must remain synchronous and best-effort.
+  }
+  termination.abort?.();
+  termination.helper?.unref?.();
+}
+
 /**
  * @param {{
  *   forceKillTimeoutMs?: number,
@@ -324,9 +573,17 @@ export function createSignalLifecycle({
   let forceTimer = null;
   let gracefulForwardedChild = null;
   let gracefulTermination = null;
+  let internalForceForwardedChild = null;
   let forceForwardedChild = null;
   let forceTermination = null;
+  let closedChild = null;
+  let watchedChild = null;
+  let windowsWatchdogChild = null;
+  let windowsWatchdogPromise = null;
+  let terminationFailure = null;
   let installed = false;
+  const childResolutionWaiters = new Set();
+  const terminationFailureListeners = new Set();
   const diagnostics = [];
   const reportDiagnostic = createDiagnosticReporter(
     diagnostics,
@@ -340,16 +597,304 @@ export function createSignalLifecycle({
     }
   };
 
+  const resolveChildWaiters = (child, outcome) => {
+    for (const waiter of [...childResolutionWaiters]) {
+      if (waiter.child === child) {
+        waiter.finish(outcome);
+      }
+    }
+  };
+
+  const waitForChildResolution = (child, timeoutMs) => {
+    if (closedChild === child) {
+      return Promise.resolve({ closed: true });
+    }
+    if (activeChild !== child) {
+      return Promise.resolve({ detached: true });
+    }
+
+    return new Promise((resolve) => {
+      let timeout = null;
+      let settled = false;
+      const waiter = {
+        child,
+        finish(outcome) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          childResolutionWaiters.delete(waiter);
+          if (timeout !== null) {
+            timerOperations.clearTimeout(timeout);
+          }
+          resolve(outcome);
+        },
+      };
+      childResolutionWaiters.add(waiter);
+      timeout = timerOperations.setTimeout(
+        () => waiter.finish({ timedOut: true }),
+        timeoutMs,
+      );
+      timeout?.unref?.();
+    });
+  };
+
+  const markChildClosed = (child) => {
+    if (activeChild !== child) {
+      return;
+    }
+    closedChild = child;
+    resolveChildWaiters(child, { closed: true });
+  };
+
+  const beginForceTermination = (child) => {
+    if (activeChild !== child) {
+      return null;
+    }
+    if (
+      forceForwardedChild === child &&
+      forceTermination
+    ) {
+      return forceTermination;
+    }
+
+    forceForwardedChild = child;
+    forceRequested = true;
+    clearForceTimer();
+    forceTermination = terminateProcessTree(child, {
+      force: true,
+      killProcess,
+      platform,
+      reportDiagnostic,
+      signal: firstSignal,
+      spawnProcess,
+    });
+    return forceTermination;
+  };
+
+  const notifyTerminationFailure = (child, error) => {
+    if (
+      activeChild !== child ||
+      terminationFailure
+    ) {
+      return;
+    }
+    terminationFailure = error;
+    attachDiagnostic(reportDiagnostic, {
+      action: "runner-timeout",
+      error,
+      pid: child?.pid ?? null,
+      target: "process-tree",
+    });
+    for (const listener of [...terminationFailureListeners]) {
+      try {
+        listener(error);
+      } catch {
+        // Runner failure listeners must not interrupt lifecycle cleanup.
+      }
+    }
+    detachChild(child);
+  };
+
+  const createTerminationTimeoutError = (child, reason) =>
+    attachErrorDetails(
+      new Error(
+        `Console managed process ${child?.pid ?? "unknown"} did not terminate: ${reason}`,
+      ),
+      {
+        code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+      },
+    );
+
+  const startWindowsWatchdog = (child) => {
+    if (
+      platform !== "win32" ||
+      watchedChild !== child ||
+      activeChild !== child ||
+      windowsWatchdogChild === child
+    ) {
+      return windowsWatchdogPromise;
+    }
+    if (!gracefulTermination && !forceTermination) {
+      return null;
+    }
+
+    windowsWatchdogChild = child;
+    windowsWatchdogPromise = (async () => {
+      const pid = child?.pid;
+      try {
+        if (gracefulTermination) {
+          const gracefulResult = await waitWithTimeout(
+            gracefulTermination.completion,
+            treeExitTimeoutMs,
+            timerOperations,
+          );
+          if (gracefulResult.timedOut) {
+            attachDiagnostic(reportDiagnostic, {
+              action: "graceful-timeout",
+              error: new Error("timed out waiting for taskkill"),
+              pid: pid ?? null,
+              target: "process-tree",
+            });
+            await stopTerminationHelper(gracefulTermination, {
+              action: "graceful",
+              pid: pid ?? null,
+              reportDiagnostic,
+              timeoutMs: treeExitTimeoutMs,
+              timerOperations,
+            });
+          }
+          if (activeChild !== child || closedChild === child) {
+            return;
+          }
+
+          if (
+            !gracefulResult.timedOut &&
+            gracefulResult.outcome?.ok &&
+            !forceTermination
+          ) {
+            const childResult = await waitForChildResolution(
+              child,
+              treeExitTimeoutMs,
+            );
+            if (childResult.closed || childResult.detached) {
+              return;
+            }
+            notifyTerminationFailure(
+              child,
+              createTerminationTimeoutError(
+                child,
+                "graceful taskkill completed but the child did not close",
+              ),
+            );
+            return;
+          }
+        }
+
+        if (activeChild !== child || closedChild === child) {
+          return;
+        }
+        const activeForceTermination =
+          forceTermination ?? beginForceTermination(child);
+        if (!activeForceTermination) {
+          return;
+        }
+        const forceResult = await waitWithTimeout(
+          activeForceTermination.completion,
+          treeExitTimeoutMs,
+          timerOperations,
+        );
+        if (forceResult.timedOut) {
+          attachDiagnostic(reportDiagnostic, {
+            action: "settle-timeout",
+            error: new Error("timed out waiting for taskkill"),
+            pid: pid ?? null,
+            target: "process-tree",
+          });
+          await stopTerminationHelper(activeForceTermination, {
+            action: "force",
+            pid: pid ?? null,
+            reportDiagnostic,
+            timeoutMs: treeExitTimeoutMs,
+            timerOperations,
+          });
+        }
+        if (activeChild !== child || closedChild === child) {
+          return;
+        }
+
+        if (activeChild !== child || closedChild === child) {
+          return;
+        }
+        if (
+          !forceResult.timedOut &&
+          forceResult.outcome?.ok
+        ) {
+          const childResult = await waitForChildResolution(
+            child,
+            treeExitTimeoutMs,
+          );
+          if (childResult.closed || childResult.detached) {
+            return;
+          }
+          notifyTerminationFailure(
+            child,
+            createTerminationTimeoutError(
+              child,
+              "forced taskkill completed but the child did not close",
+            ),
+          );
+          return;
+        }
+
+        let directKillAccepted = false;
+        try {
+          if (typeof child?.kill !== "function") {
+            throw new Error("managed child does not expose kill()");
+          }
+          directKillAccepted = child.kill("SIGKILL") !== false;
+          if (!directKillAccepted) {
+            throw new Error(
+              "managed child did not accept direct SIGKILL",
+            );
+          }
+        } catch (error) {
+          attachDiagnostic(reportDiagnostic, {
+            action: "direct-child-fallback",
+            error,
+            pid: pid ?? null,
+            target: "direct-child",
+          });
+        }
+
+        if (directKillAccepted) {
+          const childResult = await waitForChildResolution(
+            child,
+            treeExitTimeoutMs,
+          );
+          if (childResult.closed || childResult.detached) {
+            return;
+          }
+        }
+        notifyTerminationFailure(
+          child,
+          createTerminationTimeoutError(
+            child,
+            directKillAccepted
+              ? "direct SIGKILL was accepted but the child did not close"
+              : "taskkill and direct SIGKILL both failed",
+          ),
+        );
+      } catch (error) {
+        attachDiagnostic(reportDiagnostic, {
+          action: "watchdog",
+          error,
+          pid: pid ?? null,
+          target: "process-tree",
+        });
+        notifyTerminationFailure(
+          child,
+          attachErrorDetails(
+            error,
+            {
+              code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            },
+            "Console process termination watchdog failed",
+          ),
+        );
+      }
+    })();
+    return windowsWatchdogPromise;
+  };
+
   const forwardToActiveTree = (force) => {
     if (!firstSignal || !activeChild) {
       return;
     }
     if (force) {
-      if (forceForwardedChild === activeChild) {
-        return;
-      }
-      forceForwardedChild = activeChild;
-      clearForceTimer();
+      beginForceTermination(activeChild);
+      startWindowsWatchdog(activeChild);
+      return;
     } else {
       if (gracefulForwardedChild === activeChild) {
         return;
@@ -370,6 +915,7 @@ export function createSignalLifecycle({
     } else {
       gracefulTermination = termination;
     }
+    startWindowsWatchdog(activeChild);
 
     if (!force && forceKillTimeoutMs >= 0) {
       clearForceTimer();
@@ -397,11 +943,23 @@ export function createSignalLifecycle({
   const detachChild = (child) => {
     if (activeChild === child) {
       clearForceTimer();
+      abortTerminationHelper(gracefulTermination);
+      if (forceTermination !== gracefulTermination) {
+        abortTerminationHelper(forceTermination);
+      }
+      resolveChildWaiters(child, { detached: true });
       activeChild = null;
       gracefulForwardedChild = null;
       gracefulTermination = null;
+      internalForceForwardedChild = null;
       forceForwardedChild = null;
       forceTermination = null;
+      closedChild = null;
+      watchedChild = null;
+      windowsWatchdogChild = null;
+      windowsWatchdogPromise = null;
+      terminationFailure = null;
+      terminationFailureListeners.clear();
     }
   };
 
@@ -409,9 +967,21 @@ export function createSignalLifecycle({
     if (activeChild !== child) {
       return;
     }
+    markChildClosed(child);
 
     try {
-      if (!firstSignal) {
+      if (
+        platform === "win32" &&
+        windowsWatchdogChild === child &&
+        windowsWatchdogPromise
+      ) {
+        await windowsWatchdogPromise;
+        return;
+      }
+      if (
+        !firstSignal &&
+        internalForceForwardedChild !== child
+      ) {
         return;
       }
 
@@ -429,15 +999,16 @@ export function createSignalLifecycle({
       clearForceTimer();
 
       if (platform === "win32") {
-        if (!forceTermination && gracefulTermination) {
+        if (gracefulTermination) {
           const gracefulResult = await waitWithTimeout(
-            gracefulTermination,
+            gracefulTermination.completion,
             treeExitTimeoutMs,
             timerOperations,
           );
           if (
             !gracefulResult.timedOut &&
-            gracefulResult.outcome?.ok
+            gracefulResult.outcome?.ok &&
+            !forceTermination
           ) {
             return;
           }
@@ -447,6 +1018,13 @@ export function createSignalLifecycle({
               error: new Error("timed out waiting for taskkill"),
               pid,
               target: "process-tree",
+            });
+            await stopTerminationHelper(gracefulTermination, {
+              action: "graceful",
+              pid,
+              reportDiagnostic,
+              timeoutMs: treeExitTimeoutMs,
+              timerOperations,
             });
           }
         }
@@ -463,7 +1041,7 @@ export function createSignalLifecycle({
           });
         }
         const forceResult = await waitWithTimeout(
-          forceTermination,
+          forceTermination.completion,
           treeExitTimeoutMs,
           timerOperations,
         );
@@ -473,6 +1051,13 @@ export function createSignalLifecycle({
             error: new Error("timed out waiting for taskkill"),
             pid,
             target: "process-tree",
+          });
+          await stopTerminationHelper(forceTermination, {
+            action: "force",
+            pid,
+            reportDiagnostic,
+            timeoutMs: treeExitTimeoutMs,
+            timerOperations,
           });
         }
         return;
@@ -492,7 +1077,7 @@ export function createSignalLifecycle({
         reportDiagnostic,
         signal: firstSignal,
         spawnProcess,
-      });
+      }).completion;
 
       const deadline = Date.now() + treeExitTimeoutMs;
       while (true) {
@@ -552,8 +1137,15 @@ export function createSignalLifecycle({
       activeChild = child;
       gracefulForwardedChild = null;
       gracefulTermination = null;
+      internalForceForwardedChild = null;
       forceForwardedChild = null;
       forceTermination = null;
+      closedChild = null;
+      watchedChild = null;
+      windowsWatchdogChild = null;
+      windowsWatchdogPromise = null;
+      terminationFailure = null;
+      terminationFailureListeners.clear();
       if (firstSignal) {
         forwardToActiveTree(forceRequested);
       }
@@ -575,6 +1167,45 @@ export function createSignalLifecycle({
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
       clearForceTimer();
+    },
+    forceTerminateChild(child) {
+      if (activeChild !== child) {
+        throw new Error("cannot terminate an unmanaged child");
+      }
+      if (internalForceForwardedChild === child) {
+        return forceTermination?.completion;
+      }
+      internalForceForwardedChild = child;
+      forceForwardedChild = child;
+      clearForceTimer();
+      forceTermination = terminateProcessTree(child, {
+        force: true,
+        killProcess,
+        platform,
+        reportDiagnostic,
+        signal: firstSignal,
+        spawnProcess,
+      });
+      startWindowsWatchdog(child);
+      return forceTermination.completion;
+    },
+    watchChildTermination(child, listener) {
+      if (activeChild !== child) {
+        throw new Error("cannot watch an unmanaged child");
+      }
+      if (typeof listener !== "function") {
+        throw new Error("termination failure listener must be a function");
+      }
+      watchedChild = child;
+      terminationFailureListeners.add(listener);
+      if (terminationFailure) {
+        queueMicrotask(() => listener(terminationFailure));
+      } else {
+        startWindowsWatchdog(child);
+      }
+      return () => {
+        terminationFailureListeners.delete(listener);
+      };
     },
     settleChild,
   };
@@ -605,11 +1236,40 @@ export function runManagedSpawn(
 ) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let stopWatchingTermination = () => {};
+    let onChildClose;
+    let onChildError;
     const child = spawnProcess(command, args, {
       ...spawnOptions,
       detached: shouldDetachCommand(signalLifecycle),
     });
+    const removeChildListeners = () => {
+      if (onChildError) {
+        child.off?.("error", onChildError);
+      }
+      if (onChildClose) {
+        child.off?.("close", onChildClose);
+      }
+    };
     signalLifecycle?.attachChild(child);
+    stopWatchingTermination =
+      signalLifecycle?.watchChildTermination?.(
+        child,
+        (terminationError) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          stopWatchingTermination();
+          removeChildListeners();
+          reject(
+            attachSignalToError(
+              terminationError,
+              signalLifecycle?.signal,
+            ),
+          );
+        },
+      ) ?? stopWatchingTermination;
 
     const settleLifecycle = async () => {
       if (typeof signalLifecycle?.settleChild === "function") {
@@ -618,9 +1278,11 @@ export function runManagedSpawn(
         signalLifecycle?.detachChild(child);
       }
     };
-    child.once("error", (error) => {
+    onChildError = (error) => {
       if (!settled) {
         settled = true;
+        stopWatchingTermination();
+        removeChildListeners();
         void settleLifecycle().then(
           () =>
             reject(
@@ -635,15 +1297,17 @@ export function runManagedSpawn(
                 error,
                 signalLifecycle?.signal,
               ),
-            ),
+          ),
         );
       }
-    });
-    child.once("close", (exitCode, signal) => {
+    };
+    onChildClose = (exitCode, signal) => {
       if (settled) {
         return;
       }
       settled = true;
+      stopWatchingTermination();
+      removeChildListeners();
       void settleLifecycle().then(() => {
         const interruptedSignal = signalLifecycle?.signal ?? signal;
         resolve({
@@ -658,7 +1322,9 @@ export function runManagedSpawn(
           ),
         );
       });
-    });
+    };
+    child.once("error", onChildError);
+    child.once("close", onChildClose);
   });
 }
 
@@ -679,14 +1345,25 @@ export function runManagedExecFile(
     ...execFileOptions
   } = {},
 ) {
+  const managedLifecycle =
+    signalLifecycle ?? createSignalLifecycle();
   return new Promise((resolve, reject) => {
     let child;
     let settled = false;
+    let pendingPrimaryError = null;
+    let stopWatchingTermination = () => {};
+    let onChildError;
+    const removeChildListeners = () => {
+      if (onChildError) {
+        child?.off?.("error", onChildError);
+      }
+      child?.[MANAGED_PROCESS_DISPOSE]?.();
+    };
     const settleLifecycle = async () => {
-      if (typeof signalLifecycle?.settleChild === "function") {
-        await signalLifecycle.settleChild(child);
+      if (typeof managedLifecycle?.settleChild === "function") {
+        await managedLifecycle.settleChild(child);
       } else {
-        signalLifecycle?.detachChild(child);
+        managedLifecycle?.detachChild(child);
       }
     };
     const finish = (error, stdout, stderr) => {
@@ -694,13 +1371,15 @@ export function runManagedExecFile(
         return;
       }
       settled = true;
+      stopWatchingTermination();
+      removeChildListeners();
       void settleLifecycle().then(
         () => {
           if (error) {
             reject(
               attachSignalToError(
                 error,
-                signalLifecycle?.signal,
+                managedLifecycle?.signal,
               ),
             );
           } else {
@@ -711,7 +1390,7 @@ export function runManagedExecFile(
           reject(
             attachSignalToError(
               error ?? settleError,
-              signalLifecycle?.signal,
+              managedLifecycle?.signal,
             ),
           ),
       );
@@ -722,12 +1401,43 @@ export function runManagedExecFile(
       args,
       {
         ...execFileOptions,
-        detached: shouldDetachCommand(signalLifecycle),
+        detached: shouldDetachCommand(managedLifecycle),
+        onMaxBuffer: (overflowedChild, overflowError) => {
+          pendingPrimaryError = overflowError;
+          return managedLifecycle.forceTerminateChild(
+            overflowedChild,
+          );
+        },
       },
       finish,
     );
-    signalLifecycle?.attachChild(child);
-    child.once("error", (error) => finish(error));
+    managedLifecycle.attachChild(child);
+    stopWatchingTermination =
+      managedLifecycle.watchChildTermination?.(
+        child,
+        (terminationError) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          stopWatchingTermination();
+          removeChildListeners();
+          managedLifecycle.detachChild(child);
+          const primaryError = pendingPrimaryError
+            ? attachErrorDetails(pendingPrimaryError, {
+                terminationError,
+              })
+            : terminationError;
+          reject(
+            attachSignalToError(
+              primaryError,
+              managedLifecycle.signal,
+            ),
+          );
+        },
+      ) ?? stopWatchingTermination;
+    onChildError = (error) => finish(error);
+    child.once("error", onChildError);
   });
 }
 
@@ -737,6 +1447,7 @@ function spawnExecFileProcess(
   {
     encoding = "utf8",
     maxBuffer = 1024 * 1024,
+    onMaxBuffer,
     ...spawnOptions
   },
   callback,
@@ -747,37 +1458,96 @@ function spawnExecFileProcess(
   });
   const stdoutChunks = [];
   const stderrChunks = [];
-  let bufferedBytes = 0;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
   let bufferError = null;
+  const commandLine = [command, ...args].join(" ");
+  const decodeChunks = (chunks) => {
+    const buffer = Buffer.concat(chunks);
+    return encoding === "buffer" || encoding === null
+      ? buffer
+      : buffer.toString(encoding);
+  };
 
-  const collect = (chunks) => (chunk) => {
+  const collect = (streamName, chunks) => (chunk) => {
+    if (bufferError) {
+      return;
+    }
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    chunks.push(buffer);
-    bufferedBytes += buffer.byteLength;
-    if (!bufferError && bufferedBytes > maxBuffer) {
+    const bufferedBytes =
+      streamName === "stdout" ? stdoutBytes : stderrBytes;
+    const remainingBytes = Math.max(0, maxBuffer - bufferedBytes);
+    if (remainingBytes > 0) {
+      chunks.push(buffer.subarray(0, remainingBytes));
+    }
+    const nextBufferedBytes = bufferedBytes + buffer.byteLength;
+    if (streamName === "stdout") {
+      stdoutBytes = Math.min(nextBufferedBytes, maxBuffer);
+    } else {
+      stderrBytes = Math.min(nextBufferedBytes, maxBuffer);
+    }
+    if (nextBufferedBytes > maxBuffer) {
       bufferError = new Error(
-        `Console command output exceeded maxBuffer (${maxBuffer})`,
+        `${streamName} maxBuffer length exceeded (${maxBuffer})`,
       );
-      child.kill("SIGKILL");
+      Object.defineProperty(bufferError, "code", {
+        configurable: true,
+        enumerable: true,
+        value: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      });
+      Object.defineProperties(bufferError, {
+        cmd: {
+          configurable: true,
+          enumerable: true,
+          value: commandLine,
+        },
+        killed: {
+          configurable: true,
+          enumerable: true,
+          value: true,
+        },
+        signal: {
+          configurable: true,
+          enumerable: true,
+          value: null,
+        },
+        stderr: {
+          configurable: true,
+          enumerable: true,
+          value: decodeChunks(stderrChunks),
+        },
+        stdout: {
+          configurable: true,
+          enumerable: true,
+          value: decodeChunks(stdoutChunks),
+        },
+      });
+      try {
+        onMaxBuffer?.(child, bufferError);
+      } catch {
+        child.kill("SIGKILL");
+      }
     }
   };
-  child.stdout.on("data", collect(stdoutChunks));
-  child.stderr.on("data", collect(stderrChunks));
-  child.once("close", (exitCode, signal) => {
-    const stdoutBuffer = Buffer.concat(stdoutChunks);
-    const stderrBuffer = Buffer.concat(stderrChunks);
-    const stdout =
-      encoding === "buffer" || encoding === null
-        ? stdoutBuffer
-        : stdoutBuffer.toString(encoding);
-    const stderr =
-      encoding === "buffer" || encoding === null
-        ? stderrBuffer
-        : stderrBuffer.toString(encoding);
+  const onStdoutData = collect("stdout", stdoutChunks);
+  const onStderrData = collect("stderr", stderrChunks);
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    child.stdout?.off?.("data", onStdoutData);
+    child.stderr?.off?.("data", onStderrData);
+    child.off?.("close", onClose);
+  };
+  const onClose = (exitCode, signal) => {
+    dispose();
+    const stdout = decodeChunks(stdoutChunks);
+    const stderr = decodeChunks(stderrChunks);
     let error = bufferError;
 
     if (!error && (exitCode !== 0 || signal)) {
-      const commandLine = [command, ...args].join(" ");
       error = new Error(
         signal
           ? `Command failed by ${signal}: ${commandLine}\n${stderr}`
@@ -816,8 +1586,44 @@ function spawnExecFileProcess(
         },
       });
     }
+    if (bufferError && error === bufferError) {
+      Object.defineProperties(error, {
+        cmd: {
+          configurable: true,
+          enumerable: true,
+          value: commandLine,
+        },
+        killed: {
+          configurable: true,
+          enumerable: true,
+          value: true,
+        },
+        signal: {
+          configurable: true,
+          enumerable: true,
+          value: null,
+        },
+        stderr: {
+          configurable: true,
+          enumerable: true,
+          value: stderr,
+        },
+        stdout: {
+          configurable: true,
+          enumerable: true,
+          value: stdout,
+        },
+      });
+    }
     callback(error, stdout, stderr);
+  };
+  Object.defineProperty(child, MANAGED_PROCESS_DISPOSE, {
+    configurable: true,
+    value: dispose,
   });
+  child.stdout.on("data", onStdoutData);
+  child.stderr.on("data", onStderrData);
+  child.once("close", onClose);
   return child;
 }
 

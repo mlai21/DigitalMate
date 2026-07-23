@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareConsole } from "./prepare.mjs";
 import {
+  appendCleanupError,
   attachSignalToError,
   createSignalLifecycle,
   formatSignalLifecycleDiagnostic,
@@ -29,15 +30,6 @@ function spawnCommand(command, args, options) {
 
 async function removePreparedConsole(workdir) {
   await rm(workdir, { recursive: true, force: true });
-}
-
-function attachCleanupError(primaryError, cleanupError) {
-  if (primaryError && typeof primaryError === "object") {
-    Object.defineProperty(primaryError, "cleanupError", {
-      configurable: true,
-      value: cleanupError,
-    });
-  }
 }
 
 export async function runPreparedConsoleTests({
@@ -104,7 +96,11 @@ export async function runPreparedConsoleTests({
 
     if (primaryError !== undefined) {
       if (cleanupError !== undefined) {
-        attachCleanupError(primaryError, cleanupError);
+        primaryError = appendCleanupError(primaryError, {
+          stage: "prepared",
+          path: workdir,
+          error: cleanupError,
+        });
       }
       if (signalLifecycle.signal) {
         primaryError = attachSignalToError(
@@ -115,10 +111,18 @@ export async function runPreparedConsoleTests({
       throw primaryError;
     }
     if (cleanupError !== undefined) {
+      const decoratedCleanupError = appendCleanupError(cleanupError, {
+        stage: "prepared",
+        path: workdir,
+        error: cleanupError,
+      });
       if (outcome.exitCode !== 0 || outcome.signal) {
-        return { ...outcome, cleanupError };
+        return {
+          ...outcome,
+          cleanupError: decoratedCleanupError,
+        };
       }
-      throw cleanupError;
+      throw decoratedCleanupError;
     }
     return outcome;
   } finally {

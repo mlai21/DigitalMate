@@ -13,8 +13,11 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { prepareConsole } from "./prepare.mjs";
 import {
+  appendCleanupError,
+  attachErrorDetails,
   attachSignalToError,
   createSignalLifecycle,
+  formatCleanupErrorDetails,
   formatSignalLifecycleDiagnostic,
   runManagedSpawn,
 } from "./process-lifecycle.mjs";
@@ -53,53 +56,34 @@ function spawnCommand(command, args, options) {
   });
 }
 
-function attachErrorDetail(error, property, value) {
-  if (error && typeof error === "object") {
-    Object.defineProperty(error, property, {
-      configurable: true,
-      enumerable: true,
-      value,
-    });
-  }
-}
-
-function appendCleanupError(primaryError, cleanupEntry) {
-  if (!primaryError || typeof primaryError !== "object") {
-    return;
-  }
-  const existing = Reflect.get(primaryError, "cleanupErrors");
-  const cleanupErrors = Array.isArray(existing) ? [...existing] : [];
-  cleanupErrors.push(cleanupEntry);
-  attachErrorDetail(primaryError, "cleanupErrors", cleanupErrors);
-  if (Reflect.get(primaryError, "cleanupError") === undefined) {
-    attachErrorDetail(primaryError, "cleanupError", cleanupEntry.error);
-  }
-}
-
 function createCommandError(command, args, outcome) {
   const commandLine = [command, ...args].join(" ");
-  const error = new Error(
-    outcome.signal
-      ? `Console command interrupted by ${outcome.signal}: ${commandLine}`
-      : `Console command failed with exit code ${outcome.exitCode}: ${commandLine}`,
+  return attachErrorDetails(
+    new Error(
+      outcome.signal
+        ? `Console command interrupted by ${outcome.signal}: ${commandLine}`
+        : `Console command failed with exit code ${outcome.exitCode}: ${commandLine}`,
+    ),
+    {
+      command: commandLine,
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+    },
   );
-  attachErrorDetail(error, "command", commandLine);
-  attachErrorDetail(error, "exitCode", outcome.exitCode);
-  attachErrorDetail(error, "signal", outcome.signal);
-  return error;
 }
 
 function createRollbackBlockedError(installError, backupPath, rollbackError) {
-  const error = new Error(
-    `Console publish state rollback-blocked; backup preserved at ${backupPath}`,
-    { cause: installError },
+  return attachErrorDetails(
+    new Error(
+      `Console publish state rollback-blocked; backup preserved at ${backupPath}`,
+      { cause: installError },
+    ),
+    {
+      backupPath,
+      publishState: "rollback-blocked",
+      ...(rollbackError !== undefined ? { rollbackError } : {}),
+    },
   );
-  attachErrorDetail(error, "publishState", "rollback-blocked");
-  attachErrorDetail(error, "backupPath", backupPath);
-  if (rollbackError !== undefined) {
-    attachErrorDetail(error, "rollbackError", rollbackError);
-  }
-  return error;
 }
 
 async function pathExists(targetPath, fileOperations) {
@@ -247,12 +231,11 @@ async function cleanupPath(
       error: cleanupError,
     };
     if (primaryError !== undefined) {
-      appendCleanupError(primaryError, cleanupEntry);
-      return;
+      return appendCleanupError(primaryError, cleanupEntry);
     }
-    appendCleanupError(cleanupError, cleanupEntry);
-    throw cleanupError;
+    throw appendCleanupError(cleanupError, cleanupEntry);
   }
+  return primaryError;
 }
 
 async function publishConsoleBuild(
@@ -313,7 +296,9 @@ async function publishConsoleBuild(
           } else {
             try {
               await fileOperations.rename(backupRoot, publishRoot);
-              attachErrorDetail(installError, "publishState", "rolled-back");
+              installError = attachErrorDetails(installError, {
+                publishState: "rolled-back",
+              });
             } catch (rollbackError) {
               rollbackBlockedError = createRollbackBlockedError(
                 installError,
@@ -343,12 +328,10 @@ async function publishConsoleBuild(
           force: false,
         });
       } catch (backupCleanupError) {
-        attachErrorDetail(
-          backupCleanupError,
-          "publishState",
-          "published-backup-retained",
-        );
-        attachErrorDetail(backupCleanupError, "backupPath", backupRoot);
+        backupCleanupError = attachErrorDetails(backupCleanupError, {
+          backupPath: backupRoot,
+          publishState: "published-backup-retained",
+        });
         throw backupCleanupError;
       }
     }
@@ -357,12 +340,18 @@ async function publishConsoleBuild(
     primaryError = error;
     throw error;
   } finally {
-    await cleanupPath(
+    const decoratedPrimaryError = await cleanupPath(
       stagingRoot,
       fileOperations,
       primaryError,
       "staging",
     );
+    if (
+      primaryError !== undefined &&
+      decoratedPrimaryError !== primaryError
+    ) {
+      throw decoratedPrimaryError;
+    }
   }
 }
 
@@ -435,10 +424,15 @@ export async function buildConsole(dependencies = defaultDependencies) {
           error: cleanupError,
         };
         if (primaryError !== undefined) {
-          appendCleanupError(primaryError, cleanupEntry);
+          primaryError = appendCleanupError(
+            primaryError,
+            cleanupEntry,
+          );
         } else {
-          appendCleanupError(cleanupError, cleanupEntry);
-          primaryError = cleanupError;
+          primaryError = appendCleanupError(
+            cleanupError,
+            cleanupEntry,
+          );
         }
       }
     }
@@ -491,21 +485,7 @@ function formatErrorDetails(error) {
       }`,
     );
   }
-  const cleanupErrors =
-    error && typeof error === "object"
-      ? Reflect.get(error, "cleanupErrors")
-      : undefined;
-  if (Array.isArray(cleanupErrors)) {
-    for (const cleanupEntry of cleanupErrors) {
-      lines.push(
-        `Console cleanup failed at ${cleanupEntry.stage} (${cleanupEntry.path}): ${
-          cleanupEntry.error instanceof Error
-            ? cleanupEntry.error.message
-            : "unknown cleanup error"
-        }`,
-      );
-    }
-  }
+  lines.push(...formatCleanupErrorDetails(error));
   return lines;
 }
 
