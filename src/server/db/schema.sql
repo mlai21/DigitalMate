@@ -407,6 +407,12 @@ INSERT INTO digital_agents (user_id, slug, display_name, persona, is_default)
 SELECT users.id, 'digitalmate', 'DigitalMate', COALESCE(settings.persona, '{}'::jsonb), true
 FROM users
 LEFT JOIN settings ON settings.user_id = users.id
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM digital_agents AS selected_default
+  WHERE selected_default.user_id = users.id
+    AND selected_default.is_default = true
+)
 ON CONFLICT (user_id, slug) DO UPDATE
 SET is_default = true,
     updated_at = now();

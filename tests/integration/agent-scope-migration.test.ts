@@ -33,6 +33,9 @@ const AGENT_SCOPED_TABLES = [
 
 const USER_A = "10000000-0000-4000-8000-000000000001";
 const USER_B = "20000000-0000-4000-8000-000000000002";
+const USER_C = "30000000-0000-4000-8000-000000000003";
+const USER_D = "40000000-0000-4000-8000-000000000004";
+const USER_E = "50000000-0000-4000-8000-000000000005";
 const PROJECT_A = "10000000-0000-4000-8000-000000000011";
 const PROJECT_B = "20000000-0000-4000-8000-000000000012";
 const CONVERSATION_A = "10000000-0000-4000-8000-000000000021";
@@ -127,6 +130,18 @@ describe("default digital agent PostgreSQL migration", () => {
       await freshPool.query(migratedSchema);
       const columns = await readAgentColumns(freshPool);
       expect([...columns.keys()].sort()).toEqual([...AGENT_SCOPED_TABLES].sort());
+      await freshPool.query("INSERT INTO users (id, display_name) VALUES ($1, 'Seed User')", [USER_C]);
+      await freshPool.query(
+        `INSERT INTO settings (user_id, persona)
+         VALUES ($1, '{"name":"Seed Agent"}'::jsonb)`,
+        [USER_C],
+      );
+      await freshPool.query(
+        `INSERT INTO digital_agents (user_id, slug, display_name, is_default)
+         VALUES ($1, 'digitalmate', 'DigitalMate', false)`,
+        [USER_C],
+      );
+      await Promise.all([runSeed(databaseUrl, freshSchemaName), runSeed(databaseUrl, freshSchemaName)]);
       await runSeed(databaseUrl, freshSchemaName);
       await runSeed(databaseUrl, freshSchemaName);
       const seedCounts = await freshPool.query<{
@@ -216,6 +231,46 @@ describe("default digital agent PostgreSQL migration", () => {
     }
   });
 
+  it("preserves an existing custom default and only promotes DigitalMate when no default exists", async () => {
+    await databasePool.query(
+      "INSERT INTO users (id, display_name) VALUES ($1, 'User C'), ($2, 'User D'), ($3, 'User E')",
+      [USER_C, USER_D, USER_E],
+    );
+    await databasePool.query(
+      `INSERT INTO settings (user_id, persona)
+       VALUES
+         ($1, '{"name":"Agent C"}'::jsonb),
+         ($2, '{"name":"Agent D"}'::jsonb),
+         ($3, '{"name":"Agent E"}'::jsonb)`,
+      [USER_C, USER_D, USER_E],
+    );
+    await databasePool.query(
+      `INSERT INTO digital_agents (user_id, slug, display_name, is_default)
+       VALUES
+         ($1, 'digitalmate', 'DigitalMate', false),
+         ($2, 'digitalmate', 'DigitalMate', false),
+         ($2, 'custom', 'Custom D', true)`,
+      [USER_C, USER_D],
+    );
+
+    await databasePool.query(migratedSchema);
+    await databasePool.query(migratedSchema);
+
+    const defaults = await databasePool.query<{ user_id: string; slug: string }>(
+      `SELECT user_id, slug
+       FROM digital_agents
+       WHERE user_id = ANY($1::uuid[])
+         AND is_default = true
+       ORDER BY user_id`,
+      [[USER_C, USER_D, USER_E]],
+    );
+    expect(defaults.rows).toEqual([
+      { user_id: USER_C, slug: "digitalmate" },
+      { user_id: USER_D, slug: "custom" },
+      { user_id: USER_E, slug: "digitalmate" },
+    ]);
+  });
+
   it("rejects cross-user ownership and parent rows from another agent", async () => {
     const agents = await readDefaultAgents(databasePool);
     const agentA = agents.find((row) => row.user_id === USER_A)!.id;
@@ -280,6 +335,14 @@ describe("default digital agent PostgreSQL migration", () => {
       ),
     ).rejects.toMatchObject({ code: "23503" });
 
+    await expect(
+      databasePool.query(
+        `INSERT INTO goals (user_id, agent_id, title, conversation_id)
+         VALUES ($1, $2, 'same user, wrong nullable parent', $3)`,
+        [USER_A, agentA, secondConversation],
+      ),
+    ).rejects.toMatchObject({ code: "23503" });
+
     await databasePool.query(
       `INSERT INTO messages (user_id, agent_id, conversation_id, role, content, client_turn_id)
        VALUES
@@ -317,7 +380,22 @@ describe("default digital agent PostgreSQL migration", () => {
       databasePool.query("UPDATE digital_agents SET is_default = true WHERE id = $1", [secondAgent]),
     ).rejects.toMatchObject({ code: "23505" });
 
+    const defaultSwitchClient = await databasePool.connect();
+    try {
+      await defaultSwitchClient.query("BEGIN");
+      await defaultSwitchClient.query("UPDATE digital_agents SET is_default = false WHERE id = $1", [agentA]);
+      await defaultSwitchClient.query("UPDATE digital_agents SET is_default = true WHERE id = $1", [secondAgent]);
+      await defaultSwitchClient.query("COMMIT");
+    } catch (error) {
+      await defaultSwitchClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      defaultSwitchClient.release();
+    }
     await databasePool.query(migratedSchema);
+    await databasePool.query(migratedSchema);
+    await runSeed(databaseUrl, schemaName);
+    await runSeed(databaseUrl, schemaName);
     const agentCounts = await databasePool.query<{ total: string; defaults: string }>(
       `SELECT
          count(*) AS total,
@@ -327,6 +405,11 @@ describe("default digital agent PostgreSQL migration", () => {
       [USER_A],
     );
     expect(agentCounts.rows[0]).toEqual({ total: "2", defaults: "1" });
+    const selectedDefault = await databasePool.query<{ id: string }>(
+      "SELECT id FROM digital_agents WHERE user_id = $1 AND is_default = true",
+      [USER_A],
+    );
+    expect(selectedDefault.rows).toEqual([{ id: secondAgent }]);
   });
 });
 

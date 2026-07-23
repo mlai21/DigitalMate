@@ -124,6 +124,9 @@ describe("database schema", () => {
     expect(schema).toContain("ON messages(user_id, agent_id, client_turn_id, role)");
     expect(schema).toContain("idx_channel_identities_agent_external_user");
     expect(schema).toContain("idx_channel_messages_agent_external_message");
+    expect(schema).toMatch(
+      /INSERT INTO digital_agents[\s\S]+WHERE NOT EXISTS \([\s\S]+is_default = true[\s\S]+ON CONFLICT \(user_id, slug\)/,
+    );
     expect(schema.indexOf("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role")).toBeLessThan(
       schema.indexOf("DROP INDEX IF EXISTS idx_messages_client_turn_role"),
     );
@@ -141,5 +144,11 @@ describe("database schema", () => {
     expect(seed.indexOf("INSERT INTO digital_agents")).toBeLessThan(seed.indexOf("INSERT INTO conversations"));
     expect(seed).not.toContain("repositories.agents");
     expect(seed).not.toContain("getOrCreateDefault(user.id)");
+    expect(seed).toContain("pg_advisory_xact_lock");
+    expect(seed).toContain("BEGIN");
+    expect(seed).toContain("COMMIT");
+    expect(seed.indexOf("WHERE user_id = $1 AND is_default = true")).toBeLessThan(
+      seed.indexOf("INSERT INTO digital_agents"),
+    );
   });
 });
