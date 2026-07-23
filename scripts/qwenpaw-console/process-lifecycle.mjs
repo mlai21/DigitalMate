@@ -1,8 +1,20 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 5_000;
 const DEFAULT_TREE_EXIT_TIMEOUT_MS = 2_000;
 const TREE_EXIT_POLL_INTERVAL_MS = 20;
+
+/**
+ * @typedef {object} SignalLifecycleDiagnostic
+ * @property {string} action
+ * @property {string} [command]
+ * @property {unknown} [error]
+ * @property {number | null} [exitCode]
+ * @property {number | null} [pid]
+ * @property {string | null} [signal]
+ * @property {string} [target]
+ * @property {number} [timestamp]
+ */
 
 export function getWindowsTreeKillCommand(pid, { force = false } = {}) {
   return {
@@ -16,44 +28,148 @@ export function getWindowsTreeKillCommand(pid, { force = false } = {}) {
   };
 }
 
-function attachDiagnostic(diagnostics, diagnostic) {
-  diagnostics.push({
+function createDiagnosticReporter(diagnostics, onDiagnostic) {
+  return (diagnostic) => {
+    const entry = {
+      ...diagnostic,
+      timestamp: Date.now(),
+    };
+    diagnostics.push(entry);
+    if (typeof onDiagnostic === "function") {
+      try {
+        onDiagnostic(entry);
+      } catch {
+        // Diagnostic reporting must never interrupt process-tree cleanup.
+      }
+    }
+  };
+}
+
+/** @param {SignalLifecycleDiagnostic} diagnostic */
+export function formatSignalLifecycleDiagnostic(diagnostic) {
+  const action = diagnostic?.action ?? "unknown";
+  const target = diagnostic?.command
+    ? diagnostic.command
+    : `${diagnostic?.target ?? "process-tree"}${
+        diagnostic?.pid ? ` pid=${diagnostic.pid}` : ""
+      }`;
+  let reason = "unknown failure";
+  if (diagnostic?.exitCode !== undefined && diagnostic.exitCode !== null) {
+    reason = `exit code ${diagnostic.exitCode}`;
+  } else if (diagnostic?.signal) {
+    reason = `signal ${diagnostic.signal}`;
+  } else if (diagnostic?.error instanceof Error) {
+    reason = diagnostic.error.message;
+  }
+  return `Console process cleanup ${action} failed for ${target}: ${reason}`;
+}
+
+export function attachSignalToError(error, signal) {
+  if (!signal) {
+    return error;
+  }
+
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "signal", {
+        configurable: true,
+        enumerable: true,
+        value: signal,
+      });
+      return error;
+    } catch {
+      // A frozen or non-configurable error is wrapped below.
+    }
+  }
+
+  const wrapped = new Error(
+    error instanceof Error
+      ? error.message
+      : "Console operation interrupted",
+    { cause: error },
+  );
+  Object.defineProperty(wrapped, "signal", {
+    configurable: true,
+    enumerable: true,
+    value: signal,
+  });
+  return wrapped;
+}
+
+function attachDiagnostic(reportDiagnostic, diagnostic) {
+  reportDiagnostic({
     ...diagnostic,
-    timestamp: Date.now(),
   });
 }
 
 function terminateProcessTree(
   child,
   {
-    diagnostics,
     force,
     killProcess,
     platform,
+    reportDiagnostic,
     signal,
     spawnProcess,
   },
 ) {
   const pid = child?.pid;
   if (!Number.isInteger(pid) || pid <= 0) {
-    attachDiagnostic(diagnostics, {
+    const error = new Error("managed child has no valid pid");
+    attachDiagnostic(reportDiagnostic, {
       action: force ? "force" : "graceful",
-      error: new Error("managed child has no valid pid"),
+      error,
       pid: pid ?? null,
     });
-    return Promise.resolve();
+    return Promise.resolve({ error, ok: false });
   }
 
   if (platform === "win32") {
     const { command, args } = getWindowsTreeKillCommand(pid, { force });
     return new Promise((resolve) => {
       let settled = false;
-      const finish = () => {
+      const finish = ({
+        error,
+        exitCode,
+        signal: exitSignal,
+      } = {}) => {
         if (settled) {
           return;
         }
         settled = true;
-        resolve();
+        let outcome;
+        if (error) {
+          attachDiagnostic(reportDiagnostic, {
+            action: force ? "force" : "graceful",
+            command: [command, ...args].join(" "),
+            error,
+            pid,
+          });
+          outcome = { error, ok: false };
+        } else if (
+          (typeof exitCode === "number" && exitCode !== 0) ||
+          exitSignal
+        ) {
+          attachDiagnostic(reportDiagnostic, {
+            action: force ? "force" : "graceful",
+            command: [command, ...args].join(" "),
+            exitCode: exitCode ?? null,
+            pid,
+            signal: exitSignal ?? null,
+          });
+          outcome = {
+            exitCode: exitCode ?? null,
+            ok: false,
+            signal: exitSignal ?? null,
+          };
+        } else {
+          outcome = {
+            exitCode: exitCode ?? 0,
+            ok: true,
+            signal: null,
+          };
+        }
+        resolve(outcome);
       };
 
       try {
@@ -62,23 +178,18 @@ function terminateProcessTree(
           windowsHide: true,
         });
         killer.once("error", (error) => {
-          attachDiagnostic(diagnostics, {
-            action: force ? "force" : "graceful",
-            command: [command, ...args].join(" "),
+          finish({
             error,
-            pid,
           });
-          finish();
         });
-        killer.once("close", finish);
+        killer.once("close", (exitCode, exitSignal) => {
+          finish({ exitCode, signal: exitSignal });
+        });
+        killer.unref?.();
       } catch (error) {
-        attachDiagnostic(diagnostics, {
-          action: force ? "force" : "graceful",
-          command: [command, ...args].join(" "),
+        finish({
           error,
-          pid,
         });
-        finish();
       }
     });
   }
@@ -86,8 +197,9 @@ function terminateProcessTree(
   const forwardedSignal = force ? "SIGKILL" : signal;
   try {
     killProcess(-pid, forwardedSignal);
+    return Promise.resolve({ ok: true });
   } catch (groupError) {
-    attachDiagnostic(diagnostics, {
+    attachDiagnostic(reportDiagnostic, {
       action: force ? "force" : "graceful",
       error: groupError,
       pid,
@@ -95,37 +207,40 @@ function terminateProcessTree(
     });
     try {
       killProcess(pid, forwardedSignal);
+      return Promise.resolve({
+        error: groupError,
+        fallback: "direct-child",
+        ok: false,
+      });
     } catch (childError) {
-      attachDiagnostic(diagnostics, {
+      attachDiagnostic(reportDiagnostic, {
         action: force ? "force" : "graceful",
         error: childError,
         pid,
         target: "direct-child-fallback",
       });
+      return Promise.resolve({
+        error: childError,
+        groupError,
+        ok: false,
+      });
     }
   }
-  return Promise.resolve();
 }
 
 function isMissingProcessError(error) {
   return error?.code === "ESRCH";
 }
 
-function isProcessGroupAlive(pid, { diagnostics, killProcess }) {
+function getProcessGroupState(pid, { killProcess }) {
   try {
     killProcess(-pid, 0);
-    return true;
+    return { alive: true, error: null };
   } catch (error) {
     if (isMissingProcessError(error)) {
-      return false;
+      return { alive: false, error: null };
     }
-    attachDiagnostic(diagnostics, {
-      action: "probe",
-      error,
-      pid,
-      target: "process-group",
-    });
-    return true;
+    return { alive: true, error };
   }
 }
 
@@ -139,7 +254,7 @@ function waitWithTimeout(promise, timeoutMs, timerOperations) {
   return new Promise((resolve) => {
     let completed = false;
     let timeout = null;
-    const finish = (timedOut) => {
+    const finish = (timedOut, outcome) => {
       if (completed) {
         return;
       }
@@ -147,22 +262,41 @@ function waitWithTimeout(promise, timeoutMs, timerOperations) {
       if (timeout !== null) {
         timerOperations.clearTimeout(timeout);
       }
-      resolve(timedOut);
+      resolve({ outcome, timedOut });
     };
     timeout = timerOperations.setTimeout(
       () => finish(true),
       timeoutMs,
     );
     void promise.then(
-      () => finish(false),
-      () => finish(false),
+      (outcome) => finish(false, outcome),
+      (error) => finish(false, { error, ok: false }),
     );
   });
 }
 
+/**
+ * @param {{
+ *   forceKillTimeoutMs?: number,
+ *   killProcess?: (pid: number, signal?: string | number) => boolean,
+ *   onDiagnostic?: (diagnostic: SignalLifecycleDiagnostic) => void,
+ *   platform?: NodeJS.Platform,
+ *   spawnProcess?: (
+ *     command: string,
+ *     args: string[],
+ *     options: import("node:child_process").SpawnOptions,
+ *   ) => import("node:child_process").ChildProcess,
+ *   treeExitTimeoutMs?: number,
+ *   timerOperations?: {
+ *     clearTimeout: typeof clearTimeout,
+ *     setTimeout: typeof setTimeout,
+ *   },
+ * }} [options]
+ */
 export function createSignalLifecycle({
   forceKillTimeoutMs = DEFAULT_FORCE_KILL_TIMEOUT_MS,
   killProcess = process.kill.bind(process),
+  onDiagnostic,
   platform = process.platform,
   spawnProcess = spawn,
   treeExitTimeoutMs = DEFAULT_TREE_EXIT_TIMEOUT_MS,
@@ -189,9 +323,15 @@ export function createSignalLifecycle({
   let forceRequested = false;
   let forceTimer = null;
   let gracefulForwardedChild = null;
+  let gracefulTermination = null;
   let forceForwardedChild = null;
+  let forceTermination = null;
   let installed = false;
   const diagnostics = [];
+  const reportDiagnostic = createDiagnosticReporter(
+    diagnostics,
+    onDiagnostic,
+  );
 
   const clearForceTimer = () => {
     if (forceTimer !== null) {
@@ -217,14 +357,19 @@ export function createSignalLifecycle({
       gracefulForwardedChild = activeChild;
     }
 
-    void terminateProcessTree(activeChild, {
-      diagnostics,
+    const termination = terminateProcessTree(activeChild, {
       force,
       killProcess,
       platform,
+      reportDiagnostic,
       signal: firstSignal,
       spawnProcess,
     });
+    if (force) {
+      forceTermination = termination;
+    } else {
+      gracefulTermination = termination;
+    }
 
     if (!force && forceKillTimeoutMs >= 0) {
       clearForceTimer();
@@ -254,7 +399,9 @@ export function createSignalLifecycle({
       clearForceTimer();
       activeChild = null;
       gracefulForwardedChild = null;
+      gracefulTermination = null;
       forceForwardedChild = null;
+      forceTermination = null;
     }
   };
 
@@ -270,7 +417,7 @@ export function createSignalLifecycle({
 
       const pid = child?.pid;
       if (!Number.isInteger(pid) || pid <= 0) {
-        attachDiagnostic(diagnostics, {
+        attachDiagnostic(reportDiagnostic, {
           action: "settle",
           error: new Error("managed child has no valid pid"),
           pid: pid ?? null,
@@ -282,21 +429,46 @@ export function createSignalLifecycle({
       clearForceTimer();
 
       if (platform === "win32") {
-        forceForwardedChild = child;
-        const timeoutReached = await waitWithTimeout(
-          terminateProcessTree(child, {
-            diagnostics,
+        if (!forceTermination && gracefulTermination) {
+          const gracefulResult = await waitWithTimeout(
+            gracefulTermination,
+            treeExitTimeoutMs,
+            timerOperations,
+          );
+          if (
+            !gracefulResult.timedOut &&
+            gracefulResult.outcome?.ok
+          ) {
+            return;
+          }
+          if (gracefulResult.timedOut) {
+            attachDiagnostic(reportDiagnostic, {
+              action: "graceful-timeout",
+              error: new Error("timed out waiting for taskkill"),
+              pid,
+              target: "process-tree",
+            });
+          }
+        }
+
+        if (!forceTermination) {
+          forceForwardedChild = child;
+          forceTermination = terminateProcessTree(child, {
             force: true,
             killProcess,
             platform,
+            reportDiagnostic,
             signal: firstSignal,
             spawnProcess,
-          }),
+          });
+        }
+        const forceResult = await waitWithTimeout(
+          forceTermination,
           treeExitTimeoutMs,
           timerOperations,
         );
-        if (timeoutReached) {
-          attachDiagnostic(diagnostics, {
+        if (forceResult.timedOut) {
+          attachDiagnostic(reportDiagnostic, {
             action: "settle-timeout",
             error: new Error("timed out waiting for taskkill"),
             pid,
@@ -306,24 +478,39 @@ export function createSignalLifecycle({
         return;
       }
 
-      if (!isProcessGroupAlive(pid, { diagnostics, killProcess })) {
+      let groupState = getProcessGroupState(pid, { killProcess });
+      let lastProbeError = groupState.error;
+      if (!groupState.alive) {
         return;
       }
 
       forceForwardedChild = child;
       await terminateProcessTree(child, {
-        diagnostics,
         force: true,
         killProcess,
         platform,
+        reportDiagnostic,
         signal: firstSignal,
         spawnProcess,
       });
 
       const deadline = Date.now() + treeExitTimeoutMs;
-      while (isProcessGroupAlive(pid, { diagnostics, killProcess })) {
+      while (true) {
+        groupState = getProcessGroupState(pid, { killProcess });
+        lastProbeError = groupState.error ?? lastProbeError;
+        if (!groupState.alive) {
+          return;
+        }
         if (Date.now() >= deadline) {
-          attachDiagnostic(diagnostics, {
+          if (lastProbeError) {
+            attachDiagnostic(reportDiagnostic, {
+              action: "probe",
+              error: lastProbeError,
+              pid,
+              target: "process-group",
+            });
+          }
+          attachDiagnostic(reportDiagnostic, {
             action: "settle-timeout",
             error: new Error("timed out waiting for process group to exit"),
             pid,
@@ -337,7 +524,7 @@ export function createSignalLifecycle({
         );
       }
     } catch (error) {
-      attachDiagnostic(diagnostics, {
+      attachDiagnostic(reportDiagnostic, {
         action: "settle",
         error,
         pid: child?.pid ?? null,
@@ -364,7 +551,9 @@ export function createSignalLifecycle({
       }
       activeChild = child;
       gracefulForwardedChild = null;
+      gracefulTermination = null;
       forceForwardedChild = null;
+      forceTermination = null;
       if (firstSignal) {
         forwardToActiveTree(forceRequested);
       }
@@ -433,8 +622,20 @@ export function runManagedSpawn(
       if (!settled) {
         settled = true;
         void settleLifecycle().then(
-          () => reject(error),
-          () => reject(error),
+          () =>
+            reject(
+              attachSignalToError(
+                error,
+                signalLifecycle?.signal,
+              ),
+            ),
+          () =>
+            reject(
+              attachSignalToError(
+                error,
+                signalLifecycle?.signal,
+              ),
+            ),
         );
       }
     });
@@ -444,13 +645,18 @@ export function runManagedSpawn(
       }
       settled = true;
       void settleLifecycle().then(() => {
-        const interruptedSignal = signal ?? signalLifecycle?.signal;
+        const interruptedSignal = signalLifecycle?.signal ?? signal;
         resolve({
           exitCode: exitCode ?? (interruptedSignal ? 1 : 0),
           signal: interruptedSignal ?? null,
         });
       }, (error) => {
-        reject(error);
+        reject(
+          attachSignalToError(
+            error,
+            signalLifecycle?.signal,
+          ),
+        );
       });
     });
   });
@@ -460,7 +666,7 @@ export function runManagedSpawn(
  * @param {string} command
  * @param {string[]} args
  * @param {import("node:child_process").ExecFileOptions & {
- *   execFileProcess?: typeof execFile,
+ *   execFileProcess?: typeof spawnExecFileProcess,
  *   signalLifecycle?: ReturnType<typeof createSignalLifecycle>,
  * }} [options]
  */
@@ -468,7 +674,7 @@ export function runManagedExecFile(
   command,
   args,
   {
-    execFileProcess = execFile,
+    execFileProcess = spawnExecFileProcess,
     signalLifecycle,
     ...execFileOptions
   } = {},
@@ -491,12 +697,23 @@ export function runManagedExecFile(
       void settleLifecycle().then(
         () => {
           if (error) {
-            reject(error);
+            reject(
+              attachSignalToError(
+                error,
+                signalLifecycle?.signal,
+              ),
+            );
           } else {
             resolve({ stdout, stderr });
           }
         },
-        (settleError) => reject(error ?? settleError),
+        (settleError) =>
+          reject(
+            attachSignalToError(
+              error ?? settleError,
+              signalLifecycle?.signal,
+            ),
+          ),
       );
     };
 
@@ -512,6 +729,96 @@ export function runManagedExecFile(
     signalLifecycle?.attachChild(child);
     child.once("error", (error) => finish(error));
   });
+}
+
+function spawnExecFileProcess(
+  command,
+  args,
+  {
+    encoding = "utf8",
+    maxBuffer = 1024 * 1024,
+    ...spawnOptions
+  },
+  callback,
+) {
+  const child = spawn(command, args, {
+    ...spawnOptions,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let bufferedBytes = 0;
+  let bufferError = null;
+
+  const collect = (chunks) => (chunk) => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buffer);
+    bufferedBytes += buffer.byteLength;
+    if (!bufferError && bufferedBytes > maxBuffer) {
+      bufferError = new Error(
+        `Console command output exceeded maxBuffer (${maxBuffer})`,
+      );
+      child.kill("SIGKILL");
+    }
+  };
+  child.stdout.on("data", collect(stdoutChunks));
+  child.stderr.on("data", collect(stderrChunks));
+  child.once("close", (exitCode, signal) => {
+    const stdoutBuffer = Buffer.concat(stdoutChunks);
+    const stderrBuffer = Buffer.concat(stderrChunks);
+    const stdout =
+      encoding === "buffer" || encoding === null
+        ? stdoutBuffer
+        : stdoutBuffer.toString(encoding);
+    const stderr =
+      encoding === "buffer" || encoding === null
+        ? stderrBuffer
+        : stderrBuffer.toString(encoding);
+    let error = bufferError;
+
+    if (!error && (exitCode !== 0 || signal)) {
+      const commandLine = [command, ...args].join(" ");
+      error = new Error(
+        signal
+          ? `Command failed by ${signal}: ${commandLine}\n${stderr}`
+          : `Command failed with exit code ${exitCode}: ${commandLine}\n${stderr}`,
+      );
+      Object.defineProperties(error, {
+        code: {
+          configurable: true,
+          enumerable: true,
+          value: exitCode,
+        },
+        cmd: {
+          configurable: true,
+          enumerable: true,
+          value: commandLine,
+        },
+        killed: {
+          configurable: true,
+          enumerable: true,
+          value: Boolean(signal),
+        },
+        signal: {
+          configurable: true,
+          enumerable: true,
+          value: signal,
+        },
+        stderr: {
+          configurable: true,
+          enumerable: true,
+          value: stderr,
+        },
+        stdout: {
+          configurable: true,
+          enumerable: true,
+          value: stdout,
+        },
+      });
+    }
+    callback(error, stdout, stderr);
+  });
+  return child;
 }
 
 export function throwIfSignalRecorded(signalLifecycle, stage) {

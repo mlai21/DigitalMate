@@ -3,7 +3,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareConsole } from "./prepare.mjs";
 import {
+  attachSignalToError,
   createSignalLifecycle,
+  formatSignalLifecycleDiagnostic,
   runManagedSpawn,
 } from "./process-lifecycle.mjs";
 import { validateConsoleBuild } from "./validate-build.mjs";
@@ -39,6 +41,7 @@ function attachCleanupError(primaryError, cleanupError) {
 }
 
 export async function runPreparedConsoleTests({
+  createLifecycle = createSignalLifecycle,
   prepare = prepareConsole,
   runCommand = spawnCommand,
   validateBuild = validateConsoleBuild,
@@ -47,7 +50,7 @@ export async function runPreparedConsoleTests({
   let workdir;
   let outcome = { exitCode: 0, signal: null };
   let primaryError;
-  const signalLifecycle = createSignalLifecycle();
+  const signalLifecycle = createLifecycle();
 
   signalLifecycle.install();
   try {
@@ -103,11 +106,11 @@ export async function runPreparedConsoleTests({
       if (cleanupError !== undefined) {
         attachCleanupError(primaryError, cleanupError);
       }
-      if (signalLifecycle.signal && typeof primaryError === "object") {
-        Object.defineProperty(primaryError, "signal", {
-          configurable: true,
-          value: signalLifecycle.signal,
-        });
+      if (signalLifecycle.signal) {
+        primaryError = attachSignalToError(
+          primaryError,
+          signalLifecycle.signal,
+        );
       }
       throw primaryError;
     }
@@ -132,7 +135,14 @@ const isMain =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
-  runPreparedConsoleTests().then(
+  runPreparedConsoleTests({
+    createLifecycle: () =>
+      createSignalLifecycle({
+        onDiagnostic: (diagnostic) => {
+          console.error(formatSignalLifecycleDiagnostic(diagnostic));
+        },
+      }),
+  }).then(
     ({ exitCode, signal, cleanupError }) => {
       if (cleanupError) {
         console.error(

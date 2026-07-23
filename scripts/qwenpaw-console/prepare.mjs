@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  attachSignalToError,
   createSignalLifecycle,
+  formatSignalLifecycleDiagnostic,
   runManagedExecFile,
   throwIfSignalRecorded,
 } from "./process-lifecycle.mjs";
@@ -109,8 +111,12 @@ async function prepareConsoleWithDependencies(
     }
     return { workdir, applied: [...applied] };
   } catch (error) {
-    await removePreparedDirectory(workdir, error);
-    throw error;
+    const interruptedError = attachSignalToError(
+      error,
+      signalLifecycle?.signal,
+    );
+    await removePreparedDirectory(workdir, interruptedError);
+    throw interruptedError;
   }
 }
 
@@ -119,11 +125,12 @@ export async function prepareConsole(options = {}) {
     return prepareConsoleWithDependencies(options);
   }
 
-  const signalLifecycle = createSignalLifecycle();
+  const { onDiagnostic, ...preparationOptions } = options;
+  const signalLifecycle = createSignalLifecycle({ onDiagnostic });
   signalLifecycle.install();
   try {
     const result = await prepareConsoleWithDependencies({
-      ...options,
+      ...preparationOptions,
       signalLifecycle,
     });
     if (signalLifecycle.signal && result.workdir) {
@@ -131,6 +138,8 @@ export async function prepareConsole(options = {}) {
     }
     throwIfSignalRecorded(signalLifecycle, "preparation-complete");
     return result;
+  } catch (error) {
+    throw attachSignalToError(error, signalLifecycle.signal);
   } finally {
     signalLifecycle.remove();
   }
@@ -145,7 +154,11 @@ const isMain =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
-  prepareConsole()
+  prepareConsole({
+    onDiagnostic: (diagnostic) => {
+      console.error(formatSignalLifecycleDiagnostic(diagnostic));
+    },
+  })
     .then(({ applied }) => {
       console.log(`Console patches verified: ${applied.join(", ")}`);
     })

@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   access,
   chmod,
@@ -30,7 +31,9 @@ import {
   prepareConsole,
 } from "../../scripts/qwenpaw-console/prepare.mjs";
 import {
+  attachSignalToError,
   createSignalLifecycle as createProcessSignalLifecycle,
+  formatSignalLifecycleDiagnostic,
   getWindowsTreeKillCommand,
   runManagedSpawn,
 } from "../../scripts/qwenpaw-console/process-lifecycle.mjs";
@@ -194,7 +197,7 @@ async function withFakeUpstream(
   await createFakeUpstream(fixtureRoot);
   await writeFile(
     fakeGitPath,
-    `#!/usr/bin/env node
+    `#!${process.execPath}
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args.includes("clone")) {
@@ -605,6 +608,121 @@ if (recordedSignal) {
   }
 }
 
+function processTargetExists(pid: number, processGroup = false) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(processGroup ? -pid : pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function processPidIsActive(pid: number) {
+  if (!processTargetExists(pid)) {
+    return false;
+  }
+  try {
+    const { stdout } = await execFileAsync("ps", [
+      "-o",
+      "stat=",
+      "-p",
+      String(pid),
+    ]);
+    const state = stdout.trim();
+    return state !== "" && !state.startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessTargetsToExit(
+  leaderPid: number,
+  descendantPids: number[],
+  timeoutMs = 8_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const descendantStates = await Promise.all(
+      descendantPids.map((pid) => processPidIsActive(pid)),
+    );
+    if (
+      !processTargetExists(leaderPid, true) &&
+      !descendantStates.some(Boolean)
+    ) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function forceCleanupRecordedProcessTree(pidPath: string) {
+  let source: string;
+  try {
+    source = await readFile(pidPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { descendantPids: [], leaderPid: 0 };
+    }
+    throw error;
+  }
+
+  const [leaderPid, ...descendantPids] = source
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  const targets = [leaderPid, ...descendantPids].filter(
+    (pid): pid is number => Number.isInteger(pid) && pid > 0,
+  );
+
+  if (leaderPid) {
+    try {
+      process.kill(-leaderPid, "SIGKILL");
+    } catch {
+      // The process group may already be gone; direct PID fallbacks follow.
+    }
+  }
+  for (const pid of targets) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The process may already have exited.
+    }
+  }
+
+  if (
+    leaderPid &&
+    !(await waitForProcessTargetsToExit(
+      leaderPid,
+      descendantPids,
+    ))
+  ) {
+    throw new Error(
+      `recorded process tree did not exit: ${targets.join(", ")}`,
+    );
+  }
+  return { descendantPids, leaderPid: leaderPid ?? 0 };
+}
+
+async function forceCloseCliProcess(child: ReturnType<typeof spawn>) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  child.kill("SIGKILL");
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 3_000);
+    child.once("close", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
 async function runRealConsoleBuildCliSignalTest({
   ignoreFirstSignal = false,
   grandchildIgnoresFirstSignal = ignoreFirstSignal,
@@ -633,7 +751,7 @@ async function runRealConsoleBuildCliSignalTest({
   await mkdir(fakeBinRoot);
   await writeFile(
     fakeNpmPath,
-    `#!/usr/bin/env node
+    `#!${process.execPath}
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const ignoreFirstSignal = ${JSON.stringify(ignoreFirstSignal)};
@@ -767,10 +885,163 @@ setInterval(() => {}, 1000);
       temporaryRoot,
     };
   } catch (error) {
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill("SIGKILL");
+    let cleanupError: unknown;
+    try {
+      await forceCloseCliProcess(child);
+      await forceCleanupRecordedProcessTree(fakeNpmPidPath);
+    } catch (caughtCleanupError) {
+      cleanupError = caughtCleanupError;
     }
     await rm(temporaryRoot, { recursive: true, force: true });
+    if (cleanupError !== undefined) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Console build CLI fixture and process-tree cleanup failed",
+      );
+    }
+    throw error;
+  }
+}
+
+async function runRealConsolePrepareCliForceKillTest(): Promise<{
+  exitCode: number | null;
+  fakeGitPid: number;
+  grandchildPid: number;
+  pidPath: string;
+  signal: NodeJS.Signals | null;
+  signalLogPath: string;
+  stderr: string;
+  temporaryRoot: string;
+}> {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "dm-qwenpaw-prepare-cli-signal-"),
+  );
+  const fakeBinRoot = path.join(temporaryRoot, "bin");
+  const fakeGitPath = path.join(fakeBinRoot, "git");
+  const pidPath = path.join(temporaryRoot, "fake-git.pid");
+  const readyPath = path.join(temporaryRoot, "fake-git.ready");
+  const signalLogPath = path.join(temporaryRoot, "fake-git-signals.log");
+  await mkdir(fakeBinRoot);
+  await writeFile(
+    fakeGitPath,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const grandchild = spawn(
+  process.execPath,
+  [
+    "-e",
+    ${JSON.stringify(`
+const fs = require("node:fs");
+const record = (signal) =>
+  fs.appendFileSync(${JSON.stringify(signalLogPath)}, "grandchild:" + signal + "\\n");
+process.on("SIGINT", () => record("SIGINT"));
+process.on("SIGTERM", () => record("SIGTERM"));
+fs.writeFileSync(${JSON.stringify(readyPath)}, "ready");
+setInterval(() => {}, 1000);
+`)},
+  ],
+  { stdio: "ignore" },
+);
+fs.writeFileSync(
+  ${JSON.stringify(pidPath)},
+  process.pid + "\\n" + grandchild.pid,
+);
+const record = (signal) =>
+  fs.appendFileSync(
+    ${JSON.stringify(signalLogPath)},
+    "git:" + signal + "\\n",
+  );
+process.on("SIGINT", () => record("SIGINT"));
+process.on("SIGTERM", () => record("SIGTERM"));
+setInterval(() => {}, 1000);
+`,
+    "utf8",
+  );
+  await chmod(fakeGitPath, 0o755);
+
+  const child = spawn(
+    process.execPath,
+    [path.resolve("scripts/qwenpaw-console/prepare.mjs")],
+    {
+      cwd: path.resolve("."),
+      env: {
+        ...process.env,
+        PATH: `${fakeBinRoot}${path.delimiter}${process.env.PATH ?? ""}`,
+        TMPDIR: temporaryRoot,
+        TMP: temporaryRoot,
+        TEMP: temporaryRoot,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  try {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      try {
+        await access(readyPath);
+        break;
+      } catch {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          throw new Error(
+            `Console prepare CLI exited before fake git was ready: ${child.exitCode}/${child.signalCode}\n${stderr}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    await access(readyPath);
+    expect(child.kill("SIGTERM")).toBe(true);
+
+    const closed = await new Promise<{
+      exitCode: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("Console prepare CLI did not exit")),
+        12_000,
+      );
+      child.once("error", reject);
+      child.once("close", (exitCode, signal) => {
+        clearTimeout(timeout);
+        resolve({ exitCode, signal });
+      });
+    });
+    const [fakeGitPid, grandchildPid] = (
+      await readFile(pidPath, "utf8")
+    )
+      .split(/\s+/)
+      .map(Number);
+    return {
+      ...closed,
+      fakeGitPid,
+      grandchildPid,
+      pidPath,
+      signalLogPath,
+      stderr,
+      temporaryRoot,
+    };
+  } catch (error) {
+    let cleanupError: unknown;
+    try {
+      await forceCloseCliProcess(child);
+      await forceCleanupRecordedProcessTree(pidPath);
+    } catch (caughtCleanupError) {
+      cleanupError = caughtCleanupError;
+    }
+    await rm(temporaryRoot, { recursive: true, force: true });
+    if (cleanupError !== undefined) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Console prepare CLI fixture and process-tree cleanup failed",
+      );
+    }
     throw error;
   }
 }
@@ -1759,6 +2030,55 @@ describe("QwenPaw Console patch preparation", () => {
       await rm(temporaryParent, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("真实 prepare CLI 强杀忽略首信号的 git 进程树后仍以首个 SIGTERM 退出", async () => {
+    const result = await runRealConsolePrepareCliForceKillTest();
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGTERM",
+      });
+      await expect(
+        readFile(result.signalLogPath, "utf8"),
+      ).resolves.toEqual(
+        expect.stringContaining("git:SIGTERM"),
+      );
+      const processTreeExited = await waitForProcessTargetsToExit(
+        result.fakeGitPid,
+        [result.grandchildPid],
+      );
+      const remainingProcesses = processTreeExited
+        ? ""
+        : (
+            await execFileAsync("ps", [
+              "-o",
+              "pid=,ppid=,pgid=,stat=,command=",
+              "-p",
+              `${result.fakeGitPid},${result.grandchildPid}`,
+            ])
+          ).stdout;
+      expect(
+        processTreeExited,
+        `fakeGitPid=${result.fakeGitPid}\nstderr=${result.stderr}\n${remainingProcesses}`,
+      ).toBe(true);
+      expect(processTargetExists(result.fakeGitPid, true)).toBe(false);
+      await expect(
+        processPidIsActive(result.fakeGitPid),
+      ).resolves.toBe(false);
+      await expect(
+        processPidIsActive(result.grandchildPid),
+      ).resolves.toBe(false);
+      expect(
+        (await readdir(result.temporaryRoot)).filter((entry) =>
+          entry.startsWith("digitalmate-qwenpaw-console-"),
+        ),
+      ).toEqual([]);
+    } finally {
+      await forceCleanupRecordedProcessTree(result.pidPath);
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 45_000);
 });
 
 describe("QwenPaw Console isolated test runner", () => {
@@ -2753,6 +3073,10 @@ describe("QwenPaw Console atomic static build", () => {
       "scripts/qwenpaw-console/prepare.mjs",
       "utf8",
     );
+    const testSource = await readFile(
+      "scripts/qwenpaw-console/test.mjs",
+      "utf8",
+    );
     expect(buildSource).not.toContain(
       "consoleTestTesting.validateConsoleBuild",
     );
@@ -2761,6 +3085,16 @@ describe("QwenPaw Console atomic static build", () => {
     );
     expect(buildSource).not.toContain('from "./test.mjs"');
     expect(prepareSource).not.toContain('from "./test.mjs"');
+    for (const cliSource of [
+      buildSource,
+      prepareSource,
+      testSource,
+    ]) {
+      expect(cliSource).toContain("onDiagnostic:");
+      expect(cliSource).toContain(
+        "formatSignalLifecycleDiagnostic(diagnostic)",
+      );
+    }
   });
 
   it("CLI 错误详情同时包含回滚 backup 路径与每个 cleanup 阶段路径", () => {
@@ -2795,14 +3129,14 @@ describe("QwenPaw Console atomic static build", () => {
   it("signal lifecycle 保留首信号，并将第二个信号升级为进程组 SIGKILL", () => {
     const forwardedSignals: Array<{
       pid: number;
-      signal: NodeJS.Signals;
+      signal: string | number;
     }> = [];
     const child = { pid: 4242 };
     const beforeSigint = process.listenerCount("SIGINT");
     const beforeSigterm = process.listenerCount("SIGTERM");
     const lifecycle = createProcessSignalLifecycle({
       forceKillTimeoutMs: 60_000,
-      killProcess: (pid: number, signal: NodeJS.Signals) => {
+      killProcess: (pid: number, signal: string | number = 0) => {
         forwardedSignals.push({ pid, signal });
         return true;
       },
@@ -2831,12 +3165,12 @@ describe("QwenPaw Console atomic static build", () => {
   it("signal lifecycle 在有界超时后自动强杀仍活动的进程组", async () => {
     const forwardedSignals: Array<{
       pid: number;
-      signal: NodeJS.Signals;
+      signal: string | number;
     }> = [];
     const child = { pid: 5252 };
     const lifecycle = createProcessSignalLifecycle({
       forceKillTimeoutMs: 20,
-      killProcess: (pid: number, signal: NodeJS.Signals) => {
+      killProcess: (pid: number, signal: string | number = 0) => {
         forwardedSignals.push({ pid, signal });
         return true;
       },
@@ -2859,10 +3193,36 @@ describe("QwenPaw Console atomic static build", () => {
     }
   });
 
+  it("首信号覆盖不可写的子进程信号时包装错误并保留原始详情", () => {
+    const originalError = new Error("git was force killed", {
+      cause: new Error("original cause"),
+    });
+    Object.defineProperty(originalError, "signal", {
+      configurable: false,
+      enumerable: true,
+      value: "SIGKILL",
+    });
+    Object.freeze(originalError);
+
+    const interruptedError = attachSignalToError(
+      originalError,
+      "SIGTERM",
+    );
+
+    expect(interruptedError).not.toBe(originalError);
+    expect(interruptedError).toMatchObject({
+      message: "git was force killed",
+      signal: "SIGTERM",
+    });
+    expect(Reflect.get(interruptedError, "cause")).toBe(originalError);
+    expect(Reflect.get(originalError, "signal")).toBe("SIGKILL");
+  });
+
   it("进程组终止与探测失败只记诊断，仍会清理定时器和监听器", async () => {
     const beforeSigint = process.listenerCount("SIGINT");
     const beforeSigterm = process.listenerCount("SIGTERM");
     let clearedTimers = 0;
+    const reportedDiagnostics: string[] = [];
     const lifecycle = createProcessSignalLifecycle({
       forceKillTimeoutMs: 60_000,
       killProcess: () => {
@@ -2870,6 +3230,11 @@ describe("QwenPaw Console atomic static build", () => {
           code: "EPERM",
         });
         throw error;
+      },
+      onDiagnostic: (diagnostic) => {
+        reportedDiagnostics.push(
+          formatSignalLifecycleDiagnostic(diagnostic),
+        );
       },
       platform: "linux",
       timerOperations: {
@@ -2904,6 +3269,13 @@ describe("QwenPaw Console atomic static build", () => {
           }),
         ]),
       );
+      expect(reportedDiagnostics).toEqual(
+        expect.arrayContaining([
+          "Console process cleanup graceful failed for process-group pid=6262: permission denied",
+          "Console process cleanup force failed for process-group pid=6262: permission denied",
+          "Console process cleanup settle-timeout failed for process-group pid=6262: timed out waiting for process group to exit",
+        ]),
+      );
       expect(clearedTimers).toBeGreaterThan(0);
     } finally {
       lifecycle.remove();
@@ -2924,6 +3296,134 @@ describe("QwenPaw Console atomic static build", () => {
       command: "taskkill",
       args: ["/PID", "1234", "/T", "/F"],
     });
+  });
+
+  it("Windows taskkill graceful 与 force 异步非零退出均记录且不阻断后续强杀", async () => {
+    const commands: string[][] = [];
+    const reportedDiagnostics: string[] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      onDiagnostic: (diagnostic) => {
+        reportedDiagnostics.push(
+          formatSignalLifecycleDiagnostic(diagnostic),
+        );
+      },
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const killer = new EventEmitter();
+        commands.push([command, ...args]);
+        queueMicrotask(() => {
+          killer.emit("close", args.includes("/F") ? 9 : 5, null);
+        });
+        return killer as unknown as ReturnType<typeof spawn>;
+      },
+    });
+    const child = { pid: 7373 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      await new Promise((resolve) => setImmediate(resolve));
+      process.emit("SIGINT", "SIGINT");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(commands).toEqual([
+        ["taskkill", "/PID", "7373", "/T"],
+        ["taskkill", "/PID", "7373", "/T", "/F"],
+      ]);
+      expect(lifecycle.diagnostics).toEqual([
+        expect.objectContaining({
+          action: "graceful",
+          command: "taskkill /PID 7373 /T",
+          exitCode: 5,
+          pid: 7373,
+          signal: null,
+        }),
+        expect.objectContaining({
+          action: "force",
+          command: "taskkill /PID 7373 /T /F",
+          exitCode: 9,
+          pid: 7373,
+          signal: null,
+        }),
+      ]);
+      expect(reportedDiagnostics).toEqual([
+        "Console process cleanup graceful failed for taskkill /PID 7373 /T: exit code 5",
+        "Console process cleanup force failed for taskkill /PID 7373 /T /F: exit code 9",
+      ]);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows graceful taskkill 成功后 settle 不重复强杀也不产生虚假诊断", async () => {
+    const commands: string[][] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const killer = new EventEmitter();
+        commands.push([command, ...args]);
+        queueMicrotask(() => killer.emit("close", 0, null));
+        return killer as unknown as ReturnType<typeof spawn>;
+      },
+    });
+    const child = { pid: 7474 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      await new Promise((resolve) => setImmediate(resolve));
+      await lifecycle.settleChild(child);
+
+      expect(commands).toEqual([
+        ["taskkill", "/PID", "7474", "/T"],
+      ]);
+      expect(lifecycle.diagnostics).toEqual([]);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows taskkill error/close 竞态只结算并报告一次", async () => {
+    const reportedDiagnostics: string[] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      onDiagnostic: (diagnostic) => {
+        reportedDiagnostics.push(
+          formatSignalLifecycleDiagnostic(diagnostic),
+        );
+      },
+      platform: "win32",
+      spawnProcess: () => {
+        const killer = new EventEmitter();
+        queueMicrotask(() => {
+          killer.emit("error", new Error("taskkill spawn failed"));
+          killer.emit("close", 5, null);
+        });
+        return killer as unknown as ReturnType<typeof spawn>;
+      },
+    });
+    const child = { pid: 7575 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(lifecycle.diagnostics).toHaveLength(1);
+      expect(reportedDiagnostics).toEqual([
+        "Console process cleanup graceful failed for taskkill /PID 7575 /T: taskkill spawn failed",
+      ]);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
   });
 
   it("prepare 返回前收到信号时不启动命令、校验或发布并等待清理", async () => {
@@ -3032,6 +3532,80 @@ describe("QwenPaw Console atomic static build", () => {
     },
     20_000,
   );
+
+  it("真实 CLI helper 失败清理会按记录 PID 强杀 detached 进程组", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-helper-cleanup-"),
+    );
+    const pidPath = path.join(temporaryRoot, "fixture.pid");
+    let leaderPid = 0;
+    let grandchildPid = 0;
+
+    try {
+      const leader = spawn(
+        process.execPath,
+        [
+          "-e",
+          `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const grandchild = spawn(
+  process.execPath,
+  ["-e", "setInterval(() => {}, 1000)"],
+  { stdio: "ignore" },
+);
+fs.writeFileSync(
+  ${JSON.stringify(pidPath)},
+  process.pid + "\\n" + grandchild.pid,
+);
+setInterval(() => {}, 1000);
+`,
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+        },
+      );
+      leaderPid = leader.pid ?? 0;
+
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        try {
+          const [, recordedGrandchildPid] = (
+            await readFile(pidPath, "utf8")
+          )
+            .split(/\s+/)
+            .map(Number);
+          grandchildPid = recordedGrandchildPid;
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      expect(grandchildPid).toBeGreaterThan(0);
+
+      await forceCleanupRecordedProcessTree(pidPath);
+
+      expect(processTargetExists(leaderPid, true)).toBe(false);
+      await expect(processPidIsActive(leaderPid)).resolves.toBe(false);
+      await expect(
+        processPidIsActive(grandchildPid),
+      ).resolves.toBe(false);
+    } finally {
+      try {
+        await forceCleanupRecordedProcessTree(pidPath);
+      } catch {
+        for (const pid of [leaderPid, grandchildPid]) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // Best-effort final fallback for a broken cleanup assertion.
+          }
+        }
+      }
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("真实 CLI 向 npm 进程组转发 SIGTERM 且不遗留 npm 或 grandchild", async () => {
     const result = await runRealConsoleBuildCliSignalTest();

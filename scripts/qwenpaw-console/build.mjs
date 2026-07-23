@@ -13,7 +13,9 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { prepareConsole } from "./prepare.mjs";
 import {
+  attachSignalToError,
   createSignalLifecycle,
+  formatSignalLifecycleDiagnostic,
   runManagedSpawn,
 } from "./process-lifecycle.mjs";
 import { validateConsoleBuild } from "./validate-build.mjs";
@@ -443,7 +445,10 @@ export async function buildConsole(dependencies = defaultDependencies) {
 
     if (primaryError !== undefined) {
       if (signalLifecycle.signal) {
-        attachErrorDetail(primaryError, "signal", signalLifecycle.signal);
+        primaryError = attachSignalToError(
+          primaryError,
+          signalLifecycle.signal,
+        );
       }
       throw primaryError;
     }
@@ -511,7 +516,14 @@ function reportErrorDetails(error) {
 }
 
 if (isMain) {
-  buildConsole().then(
+  buildConsole({
+    createLifecycle: () =>
+      createSignalLifecycle({
+        onDiagnostic: (diagnostic) => {
+          console.error(formatSignalLifecycleDiagnostic(diagnostic));
+        },
+      }),
+  }).then(
     ({ publishRoot, signal }) => {
       if (publishRoot) {
         console.log(`DigitalMate Console published at ${publishRoot}`);
