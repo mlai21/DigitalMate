@@ -1576,7 +1576,7 @@ export function runManagedSpawn(
         },
       );
     };
-    child.once("error", onChildError);
+    child.on("error", onChildError);
     child.once("close", onChildClose);
   });
 }
@@ -1729,7 +1729,7 @@ export function runManagedExecFile(
         rejectWithTerminationFailure(terminationError);
       }
     };
-    child.once("error", onChildError);
+    child.on("error", onChildError);
   });
 }
 

@@ -4285,6 +4285,290 @@ setInterval(() => {
     }
   });
 
+  it.each(["spawn", "exec"] as const)(
+    "%s runner 连续收到两个 child error 时保留首错并等待 late close",
+    async (runner) => {
+      const firstError = Object.assign(new Error("first child error"), {
+        code: "EIO",
+      });
+      const secondError = Object.assign(new Error("second child error"), {
+        code: "EPIPE",
+      });
+      const childTarget = Object.assign(new EventEmitter(), {
+        pid: runner === "spawn" ? 6563 : 6564,
+        kill() {
+          return true;
+        },
+      });
+      let closeListener:
+        | ((exitCode: number | null, signal: NodeJS.Signals | null) => void)
+        | undefined;
+      let disposeCount = 0;
+      const child = new Proxy(childTarget, {
+        get(target, property, receiver) {
+          if (
+            typeof property === "symbol" &&
+            property.description === "managedProcessDispose"
+          ) {
+            return () => {
+              disposeCount += 1;
+              if (closeListener) {
+                target.off("close", closeListener);
+              }
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      let detachCount = 0;
+      let forceCount = 0;
+      let settleCount = 0;
+      let stopWatchingCount = 0;
+      const lifecycle = {
+        signal: null,
+        detachedCommands: true,
+        attachChild() {},
+        detachChild() {
+          detachCount += 1;
+        },
+        forceTerminateChild() {
+          forceCount += 1;
+          return Promise.resolve();
+        },
+        async settleChild() {
+          settleCount += 1;
+          detachCount += 1;
+        },
+        watchChildTermination() {
+          return () => {
+            stopWatchingCount += 1;
+          };
+        },
+      };
+      const running =
+        runner === "spawn"
+          ? runManagedSpawn("fake-command", [], {
+              signalLifecycle: lifecycle as never,
+              spawnProcess: (() =>
+                child as unknown as ReturnType<
+                  typeof spawn
+                >) as unknown as typeof spawn,
+            })
+          : runManagedExecFile("fake-command", [], {
+              execFileProcess: ((
+                _command: string,
+                _args: string[],
+                _options: unknown,
+                callback: (
+                  error: Error,
+                  stdout: string,
+                  stderr: string,
+                ) => void,
+              ) => {
+                closeListener = () =>
+                  callback(firstError, "", "");
+                child.once("close", closeListener);
+                return child;
+              }) as never,
+              signalLifecycle: lifecycle as never,
+            });
+      const emittedErrors: unknown[] = [];
+      let terminalCount = 0;
+
+      for (const error of [firstError, secondError]) {
+        try {
+          child.emit("error", error);
+        } catch (emittedError) {
+          emittedErrors.push(emittedError);
+        }
+      }
+      child.emit("close", null, "SIGKILL");
+      const caught = await running.then(
+        () => {
+          terminalCount += 1;
+          return undefined;
+        },
+        (error) => {
+          terminalCount += 1;
+          return error;
+        },
+      );
+
+      expect(emittedErrors).toEqual([]);
+      expect(caught).toBe(firstError);
+      expect(Reflect.has(caught, "terminationError")).toBe(false);
+      expect(terminalCount).toBe(1);
+      expect(forceCount).toBe(2);
+      expect(settleCount).toBe(1);
+      expect(detachCount).toBe(1);
+      expect(stopWatchingCount).toBe(1);
+      expect(disposeCount).toBe(runner === "exec" ? 1 : 0);
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    },
+  );
+
+  it.each(["spawn", "exec"] as const)(
+    "%s runner 的 direct kill 同步触发第二个 child error 时仍安全结算",
+    async (runner) => {
+      const firstError = Object.assign(new Error("first child error"), {
+        code: "EIO",
+      });
+      const secondError = Object.assign(
+        new Error("direct kill child error"),
+        {
+          code: "EPIPE",
+        },
+      );
+      let groupAlive = true;
+      let directKillCount = 0;
+      let secondEmitError: unknown;
+      let closeListener:
+        | ((exitCode: number | null, signal: NodeJS.Signals | null) => void)
+        | undefined;
+      let disposeCount = 0;
+      const childTarget = Object.assign(new EventEmitter(), {
+        pid: runner === "spawn" ? 6565 : 6566,
+        kill() {
+          directKillCount += 1;
+          groupAlive = false;
+          try {
+            childTarget.emit("error", secondError);
+          } catch (error) {
+            secondEmitError = error;
+            throw error;
+          }
+          childTarget.emit("close", null, "SIGKILL");
+          return true;
+        },
+      });
+      const child = new Proxy(childTarget, {
+        get(target, property, receiver) {
+          if (
+            typeof property === "symbol" &&
+            property.description === "managedProcessDispose"
+          ) {
+            return () => {
+              disposeCount += 1;
+              if (closeListener) {
+                target.off("close", closeListener);
+              }
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+      const lifecycle = createProcessSignalLifecycle({
+        forceKillTimeoutMs: 10,
+        killProcess: (_pid: number, signal: string | number = 0) => {
+          if (signal === 0) {
+            if (!groupAlive) {
+              throw Object.assign(new Error("missing"), {
+                code: "ESRCH",
+              });
+            }
+            throw Object.assign(new Error("permission denied"), {
+              code: "EPERM",
+            });
+          }
+          throw Object.assign(new Error("permission denied"), {
+            code: "EPERM",
+          });
+        },
+        platform: "linux",
+        timerOperations: {
+          clearTimeout(timer: ReturnType<typeof setTimeout>) {
+            activeTimers.delete(timer);
+            clearTimeout(timer);
+          },
+          setTimeout(callback: () => void, delay: number) {
+            const timer = setTimeout(() => {
+              activeTimers.delete(timer);
+              callback();
+            }, delay);
+            activeTimers.add(timer);
+            return timer;
+          },
+        } as never,
+        treeExitTimeoutMs: 10,
+      });
+      const originalSettleChild = lifecycle.settleChild;
+      let settleCount = 0;
+      lifecycle.settleChild = async (target) => {
+        settleCount += 1;
+        await originalSettleChild(target);
+      };
+      const running =
+        runner === "spawn"
+          ? runManagedSpawn("fake-command", [], {
+              signalLifecycle: lifecycle,
+              spawnProcess: (() =>
+                child as unknown as ReturnType<
+                  typeof spawn
+                >) as unknown as typeof spawn,
+            })
+          : runManagedExecFile("fake-command", [], {
+              execFileProcess: ((
+                _command: string,
+                _args: string[],
+                _options: unknown,
+                callback: (
+                  error: Error,
+                  stdout: string,
+                  stderr: string,
+                ) => void,
+              ) => {
+                closeListener = () =>
+                  callback(firstError, "", "");
+                child.once("close", closeListener);
+                return child;
+              }) as never,
+              signalLifecycle: lifecycle,
+            });
+      let terminalCount = 0;
+
+      try {
+        child.emit("error", firstError);
+        const caught = await running.then(
+          () => {
+            terminalCount += 1;
+            return undefined;
+          },
+          (error) => {
+            terminalCount += 1;
+            return error;
+          },
+        );
+
+        expect(secondEmitError).toBeUndefined();
+        expect(caught).toBe(firstError);
+        expect(Reflect.has(caught, "terminationError")).toBe(false);
+        expect(terminalCount).toBe(1);
+        expect(directKillCount).toBe(1);
+        expect(settleCount).toBe(1);
+        expect(disposeCount).toBe(runner === "exec" ? 1 : 0);
+        expect(child.listenerCount("error")).toBe(0);
+        expect(child.listenerCount("close")).toBe(0);
+        expect(activeTimers.size).toBe(0);
+        expect(
+          lifecycle.diagnostics.some(
+            (diagnostic) =>
+              diagnostic.action === "runner-timeout" ||
+              diagnostic.action === "settle-timeout",
+          ),
+        ).toBe(false);
+        expect(lifecycle.signal).toBeNull();
+      } finally {
+        lifecycle.detachChild(child);
+        lifecycle.remove();
+        for (const timer of activeTimers) {
+          clearTimeout(timer);
+        }
+      }
+    },
+  );
+
   it("POSIX maxBuffer 后迟到 child error 不会覆盖 overflow 且 late close 只清理一次", async () => {
     const overflowError = Object.assign(
       new Error("stdout maxBuffer length exceeded (1024)"),
@@ -4297,6 +4581,13 @@ setInterval(() => {
     const commandError = Object.assign(new Error("late child error"), {
       code: "EIO",
     });
+    const secondaryError = Object.assign(
+      new Error("second late child error"),
+      {
+        code: "EPIPE",
+      },
+    );
+    let secondaryEmitError: unknown;
     const childTarget = Object.assign(new EventEmitter(), {
       pid: 6567,
       kill() {
@@ -4368,6 +4659,11 @@ setInterval(() => {
           options.onMaxBuffer?.(child, overflowError);
           queueMicrotask(() => {
             child.emit("error", commandError);
+            try {
+              child.emit("error", secondaryError);
+            } catch (error) {
+              secondaryEmitError = error;
+            }
             child.emit("close", null, "SIGKILL");
           });
         });
@@ -4398,6 +4694,7 @@ setInterval(() => {
         killed: true,
         signal: null,
       });
+      expect(secondaryEmitError).toBeUndefined();
       expect(terminalCount).toBe(1);
       expect(settleCount).toBe(1);
       expect(disposeCount).toBe(1);
