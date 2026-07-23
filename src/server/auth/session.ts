@@ -11,18 +11,58 @@ export async function createSessionToken(userId: string, secret: string): Promis
 }
 
 export async function verifySessionToken(token: string, secret: string): Promise<string | null> {
-  const [payload, signature] = token.split(".");
-  if (!payload || !signature) return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+
+  const [payload, signature] = parts;
+  if (
+    !payload ||
+    !signature ||
+    !/^[A-Za-z0-9_-]+$/.test(payload) ||
+    !/^[A-Za-z0-9_-]+$/.test(signature)
+  ) {
+    return null;
+  }
 
   const expected = sign(payload, secret);
   if (!safeEqual(signature, expected)) return null;
 
   try {
     const parsed = JSON.parse(base64UrlDecode(payload)) as { sub?: unknown };
-    return typeof parsed.sub === "string" ? parsed.sub : null;
+    return typeof parsed.sub === "string" && parsed.sub.length > 0 ? parsed.sub : null;
   } catch {
     return null;
   }
+}
+
+export async function verifySessionRequest(request: Request, secret: string): Promise<string | null> {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) return null;
+
+  let sessionToken: string | null = null;
+  let foundSessionCookie = false;
+
+  for (const rawCookie of cookieHeader.split(";")) {
+    const cookie = rawCookie.trim();
+    if (!cookie) continue;
+
+    const separatorIndex = cookie.indexOf("=");
+    if (separatorIndex < 0) {
+      if (cookie === sessionCookieName) return null;
+      continue;
+    }
+
+    const name = cookie.slice(0, separatorIndex).trim();
+    if (name !== sessionCookieName) continue;
+    if (foundSessionCookie) return null;
+    foundSessionCookie = true;
+
+    const value = cookie.slice(separatorIndex + 1).trim();
+    if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) return null;
+    sessionToken = value;
+  }
+
+  return sessionToken ? verifySessionToken(sessionToken, secret) : null;
 }
 
 export async function verifyPassword(input: string, expected: string): Promise<boolean> {
