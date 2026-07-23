@@ -4038,6 +4038,222 @@ setInterval(() => {
     }
   });
 
+  it("Windows runner 在 graceful 与 force taskkill 成功但 child 未关闭时继续 direct kill 并保留首信号", async () => {
+    const taskkillCommands: string[][] = [];
+    const childKillCalls: NodeJS.Signals[] = [];
+    const listenerSnapshots: Array<{
+      close: number;
+      error: number;
+    }> = [];
+    const helpers: EventEmitter[] = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 9191,
+      kill(signal: NodeJS.Signals) {
+        childKillCalls.push(signal);
+        listenerSnapshots.push({
+          close: child.listenerCount("close"),
+          error: child.listenerCount("error"),
+        });
+        queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const helper = new EventEmitter();
+        taskkillCommands.push([command, ...args]);
+        helpers.push(helper);
+        queueMicrotask(() => helper.emit("close", 0, null));
+        return helper as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+    let timedOut = false;
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(raced).toEqual({
+        outcome: { exitCode: 1, signal: "SIGTERM" },
+        timedOut: false,
+      });
+      expect(taskkillCommands).toEqual([
+        ["taskkill", "/PID", "9191", "/T"],
+        ["taskkill", "/PID", "9191", "/T", "/F"],
+      ]);
+      expect(childKillCalls).toEqual(["SIGKILL"]);
+      expect(listenerSnapshots).toEqual([{ close: 1, error: 1 }]);
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      for (const helper of helpers) {
+        expect(helper.listenerCount("error")).toBe(0);
+        expect(helper.listenerCount("close")).toBe(0);
+      }
+    } finally {
+      if (timedOut) {
+        child.emit("close", null, "SIGKILL");
+        await running.catch(() => {});
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows runner 在 graceful taskkill 成功且 child 随后关闭时不误升级 force", async () => {
+    const taskkillCommands: string[][] = [];
+    const childKillCalls: NodeJS.Signals[] = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 9242,
+      kill(signal: NodeJS.Signals) {
+        childKillCalls.push(signal);
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const helper = new EventEmitter();
+        taskkillCommands.push([command, ...args]);
+        queueMicrotask(() => {
+          helper.emit("close", 0, null);
+          queueMicrotask(() =>
+            child.emit("close", null, "SIGTERM"),
+          );
+        });
+        return helper as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(running).resolves.toEqual({
+        exitCode: 1,
+        signal: "SIGTERM",
+      });
+      expect(taskkillCommands).toEqual([
+        ["taskkill", "/PID", "9242", "/T"],
+      ]);
+      expect(childKillCalls).toEqual([]);
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+    } finally {
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
+  it("Windows runner 在 direct kill 被接受但 child 仍未关闭时才显式失败并安全 detach", async () => {
+    const taskkillCommands: string[][] = [];
+    const childKillCalls: NodeJS.Signals[] = [];
+    const listenerSnapshots: Array<{
+      close: number;
+      error: number;
+    }> = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 9292,
+      kill(signal: NodeJS.Signals) {
+        childKillCalls.push(signal);
+        listenerSnapshots.push({
+          close: child.listenerCount("close"),
+          error: child.listenerCount("error"),
+        });
+        return true;
+      },
+    });
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      platform: "win32",
+      spawnProcess: (command: string, args: readonly string[]) => {
+        const helper = new EventEmitter();
+        taskkillCommands.push([command, ...args]);
+        queueMicrotask(() => helper.emit("close", 0, null));
+        return helper as unknown as ReturnType<typeof spawn>;
+      },
+      treeExitTimeoutMs: 10,
+    });
+    const running = runManagedSpawn("fake-command", [], {
+      signalLifecycle: lifecycle,
+      spawnProcess: (() =>
+        child as unknown as ReturnType<
+          typeof spawn
+        >) as unknown as typeof spawn,
+    });
+    let timedOut = false;
+
+    lifecycle.install();
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+      const raced = await Promise.race([
+        running.then(
+          (outcome) => ({ outcome, timedOut: false }),
+          (error) => ({ error, timedOut: false }),
+        ),
+        new Promise<{ timedOut: true }>((resolve) =>
+          setTimeout(() => resolve({ timedOut: true }), 300),
+        ),
+      ]);
+      timedOut = raced.timedOut;
+
+      expect(timedOut).toBe(false);
+      if (!raced.timedOut) {
+        expect(raced).toMatchObject({
+          error: {
+            code: "ERR_CONSOLE_PROCESS_TERMINATION_TIMEOUT",
+            signal: "SIGTERM",
+          },
+        });
+      }
+      expect(taskkillCommands).toEqual([
+        ["taskkill", "/PID", "9292", "/T"],
+        ["taskkill", "/PID", "9292", "/T", "/F"],
+      ]);
+      expect(childKillCalls).toEqual(["SIGKILL"]);
+      expect(listenerSnapshots).toEqual([{ close: 1, error: 1 }]);
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      const diagnosticCount = lifecycle.diagnostics.length;
+      child.emit("close", null, "SIGKILL");
+      expect(lifecycle.diagnostics).toHaveLength(diagnosticCount);
+    } finally {
+      if (timedOut) {
+        child.emit("close", null, "SIGKILL");
+        await running.catch(() => {});
+      }
+      lifecycle.detachChild(child);
+      lifecycle.remove();
+    }
+  });
+
   it("Windows runner 在 child 与 taskkill helpers 都不退出时独立 watchdog 回落 direct kill", async () => {
     const taskkillCommands: string[][] = [];
     const helperKillCalls: Array<{

@@ -760,14 +760,6 @@ export function createSignalLifecycle({
             if (childResult.closed || childResult.detached) {
               return;
             }
-            notifyTerminationFailure(
-              child,
-              createTerminationTimeoutError(
-                child,
-                "graceful taskkill completed but the child did not close",
-              ),
-            );
-            return;
           }
         }
 
@@ -803,9 +795,6 @@ export function createSignalLifecycle({
           return;
         }
 
-        if (activeChild !== child || closedChild === child) {
-          return;
-        }
         if (
           !forceResult.timedOut &&
           forceResult.outcome?.ok
@@ -817,14 +806,6 @@ export function createSignalLifecycle({
           if (childResult.closed || childResult.detached) {
             return;
           }
-          notifyTerminationFailure(
-            child,
-            createTerminationTimeoutError(
-              child,
-              "forced taskkill completed but the child did not close",
-            ),
-          );
-          return;
         }
 
         let directKillAccepted = false;
