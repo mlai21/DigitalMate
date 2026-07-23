@@ -13,6 +13,8 @@
     "test:e2e": "node scripts/run-e2e.mjs",
     "test:e2e:app": "playwright test",
     "test:e2e:scroll": "playwright test --config playwright.scroll.config.ts",
+    "console:sync": "node scripts/qwenpaw-console/sync.mjs",
+    "console:verify-upstream": "node scripts/qwenpaw-console/verify-upstream.mjs",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:seed": "tsx src/server/db/seed.ts",
     "agent": "tsx src/agent-service/index.ts"
