@@ -2,6 +2,7 @@ import type { LlmMessage, LlmPurpose } from "@/server/llm/types";
 
 export type LlmUsageLogInput = {
   userId: string;
+  agentId: string;
   conversationId?: string | null;
   purpose: LlmPurpose;
   model: string;

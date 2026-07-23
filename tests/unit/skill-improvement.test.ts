@@ -119,7 +119,7 @@ describe("processSkillImprovement", () => {
   it("creates a pending revision for a frequently used skill", async () => {
     const repositories = buildRepositories({ usageCount: 5 });
 
-    const outcome = await processSkillImprovement({ repositories, llm, model: "light", userId: "u1" });
+    const outcome = await processSkillImprovement({ repositories, llm, model: "light", scope: { userId: "u1", agentId: "a1" } });
 
     expect(outcome.proposed).toBe(1);
     expect(repositories.skillRevisions.create).toHaveBeenCalledWith(
@@ -130,7 +130,7 @@ describe("processSkillImprovement", () => {
   it("skips skills below the usage threshold", async () => {
     const repositories = buildRepositories({ usageCount: 3 });
 
-    const outcome = await processSkillImprovement({ repositories, llm, model: "light", userId: "u1" });
+    const outcome = await processSkillImprovement({ repositories, llm, model: "light", scope: { userId: "u1", agentId: "a1" } });
 
     expect(outcome.proposed).toBe(0);
     expect(repositories.skillRevisions.create).not.toHaveBeenCalled();
@@ -139,7 +139,7 @@ describe("processSkillImprovement", () => {
   it("does not stack revisions when one is already pending", async () => {
     const repositories = buildRepositories({ usageCount: 10, hasPending: true });
 
-    const outcome = await processSkillImprovement({ repositories, llm, model: "light", userId: "u1" });
+    const outcome = await processSkillImprovement({ repositories, llm, model: "light", scope: { userId: "u1", agentId: "a1" } });
 
     expect(outcome.proposed).toBe(0);
     expect(repositories.skillRevisions.create).not.toHaveBeenCalled();

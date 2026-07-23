@@ -5,9 +5,16 @@ import { GET as listConversationMessages } from "@/app/api/conversations/[conver
 import { POST as createProject } from "@/app/api/projects/route";
 
 const mocks = vi.hoisted(() => {
+  const agentScope = { userId: "user-1", agentId: "agent-1" };
+  const defaultAgent = {
+    id: agentScope.agentId,
+    userId: agentScope.userId,
+    status: "active" as const,
+  };
   const conversation = {
     id: "00000000-0000-4000-8000-000000000001",
     userId: "user-1",
+    agentId: "agent-1",
     channel: "web",
     title: "新的对话",
     projectId: null,
@@ -17,6 +24,7 @@ const mocks = vi.hoisted(() => {
   const project = {
     id: "00000000-0000-4000-8000-000000000002",
     userId: "user-1",
+    agentId: "agent-1",
     name: "AI 学习",
     description: "",
     updatedAt: new Date("2026-07-08T10:00:00+08:00"),
@@ -24,6 +32,7 @@ const mocks = vi.hoisted(() => {
   const message = {
     id: "00000000-0000-4000-8000-000000000003",
     userId: "user-1",
+    agentId: "agent-1",
     conversationId: conversation.id,
     role: "user" as const,
     content: "看看附件",
@@ -41,6 +50,7 @@ const mocks = vi.hoisted(() => {
   const boundAttachment = {
     id: "00000000-0000-4000-8000-000000000004",
     userId: "user-1",
+    agentId: "agent-1",
     messageId: message.id,
     kind: "document" as const,
     fileName: "notes.md",
@@ -57,17 +67,20 @@ const mocks = vi.hoisted(() => {
   };
   const listAttachmentsForMessages = vi.fn(async () => [boundAttachment]);
   const repositories = {
+    agents: {
+      getDefault: vi.fn(async () => defaultAgent),
+    },
     conversations: {
       listWithStats: vi.fn(async () => [{ ...conversation, messageCount: 3, lastMessageAt: conversation.updatedAt }]),
       create: vi.fn(async () => conversation),
-      getForUser: vi.fn(async () => conversation),
+      get: vi.fn(async () => conversation),
       update: vi.fn(async () => ({ ...conversation, title: "改名后", pinned: true })),
       delete: vi.fn(async () => undefined),
     },
     projects: {
       list: vi.fn(async () => [project]),
       create: vi.fn(async () => project),
-      getForUser: vi.fn(async () => project),
+      get: vi.fn(async () => project),
     },
     messages: {
       list: vi.fn(async () => [message, internalMessage]),
@@ -77,6 +90,7 @@ const mocks = vi.hoisted(() => {
     },
   };
   return {
+    agentScope,
     conversation,
     project,
     message,
@@ -148,7 +162,7 @@ describe("conversations API", () => {
       "role",
     ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
-    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [mocks.message.id]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith(mocks.agentScope, [mocks.message.id]);
     expect(serialized).not.toContain("userId");
     expect(serialized).not.toContain("conversationId");
     expect(serialized).not.toContain("internalSecret");
@@ -181,7 +195,7 @@ describe("conversations API", () => {
   });
 
   it("does not query messages or attachments for an unowned conversation", async () => {
-    mocks.repositories.conversations.getForUser.mockResolvedValueOnce(null as never);
+    mocks.repositories.conversations.get.mockResolvedValueOnce(null as never);
 
     const response = await listConversationMessages(
       new Request("http://localhost/api/conversations/unowned/messages"),
@@ -221,8 +235,8 @@ describe("conversations API", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.repositories.projects.getForUser).toHaveBeenCalledWith("user-1", mocks.project.id);
-    expect(mocks.repositories.conversations.create).toHaveBeenCalledWith("user-1", {
+    expect(mocks.repositories.projects.get).toHaveBeenCalledWith(mocks.agentScope, mocks.project.id);
+    expect(mocks.repositories.conversations.create).toHaveBeenCalledWith(mocks.agentScope, {
       title: undefined,
       projectId: mocks.project.id,
     });
@@ -241,7 +255,7 @@ describe("conversations API", () => {
 
     expect(response.status).toBe(200);
     expect(body.conversation.title).toBe("改名后");
-    expect(mocks.repositories.conversations.update).toHaveBeenCalledWith("user-1", mocks.conversation.id, {
+    expect(mocks.repositories.conversations.update).toHaveBeenCalledWith(mocks.agentScope, mocks.conversation.id, {
       title: "改名后",
       pinned: true,
       projectId: null,
@@ -254,11 +268,11 @@ describe("conversations API", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(mocks.repositories.conversations.delete).toHaveBeenCalledWith("user-1", mocks.conversation.id);
+    expect(mocks.repositories.conversations.delete).toHaveBeenCalledWith(mocks.agentScope, mocks.conversation.id);
   });
 
   it("returns 404 when deleting a conversation that is not owned", async () => {
-    mocks.repositories.conversations.getForUser.mockResolvedValueOnce(null as never);
+    mocks.repositories.conversations.get.mockResolvedValueOnce(null as never);
 
     const response = await deleteConversation(new Request("http://localhost/api/conversations/x", { method: "DELETE" }), {
       params: Promise.resolve({ conversationId: mocks.conversation.id }),
@@ -278,7 +292,7 @@ describe("conversations API", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.repositories.projects.create).toHaveBeenCalledWith("user-1", { name: "AI 学习" });
+    expect(mocks.repositories.projects.create).toHaveBeenCalledWith(mocks.agentScope, { name: "AI 学习" });
   });
 
   it("rejects invalid project payloads", async () => {

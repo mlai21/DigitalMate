@@ -3,6 +3,7 @@ import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { redirectUrl } from "@/server/http/redirect";
 import type { MemoryKind } from "@/server/agent/memory";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 const memoryKinds = new Set<MemoryKind>(["episodic", "profile", "agent_self"]);
 
@@ -13,9 +14,11 @@ export async function POST(request: Request) {
   const kind = String(form.get("kind") ?? "profile") as MemoryKind;
   const content = String(form.get("content") ?? "");
   const confidence = Number(form.get("confidence") ?? 0.7);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
 
   if (memoryId && memoryKinds.has(kind) && content.trim()) {
-    await createRepositories().memories.update(user.id, memoryId, {
+    await repositories.memories.update(scope, memoryId, {
       kind,
       content,
       confidence: Number.isFinite(confidence) ? Math.min(Math.max(confidence, 0), 1) : 0.7,

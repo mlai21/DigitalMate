@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -14,7 +15,8 @@ export default async function ConversationDetailPage({
 
   const { conversationId } = await params;
   const repositories = createRepositories();
-  const conversation = await repositories.conversations.getForUser(user.id, conversationId);
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const conversation = await repositories.conversations.get(scope, conversationId);
   if (!conversation) {
     return (
       <section className="admin-card">
@@ -24,8 +26,8 @@ export default async function ConversationDetailPage({
   }
 
   const [messages, toolLogs] = await Promise.all([
-    repositories.messages.listAllForAudit(conversationId),
-    repositories.toolLogs.listByConversation(user.id, conversationId),
+    repositories.messages.listAllForAudit(scope, conversationId),
+    repositories.toolLogs.listByConversation(scope, conversationId),
   ]);
 
   const timeline = [

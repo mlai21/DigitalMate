@@ -13,6 +13,7 @@ const telegramTarget: NormalizedChannelMessage = {
   occurredAt: new Date("2026-07-05T09:00:00+08:00"),
   raw: {},
 };
+const scope = { userId: "user-1", agentId: "agent-1" };
 
 describe("processDueProactiveTasks", () => {
   it("cancels legacy shares without an explicit subscription or scheduled digest authorization", async () => {
@@ -21,6 +22,7 @@ describe("processDueProactiveTasks", () => {
     const markCancelled = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -31,6 +33,7 @@ describe("processDueProactiveTasks", () => {
         dueTask: {
           id: "legacy-share",
           userId: "user-1",
+          agentId: "agent-1",
           conversationId: "conversation-1",
           kind: "share",
           content: "一整页未经整理的搜索结果",
@@ -42,7 +45,7 @@ describe("processDueProactiveTasks", () => {
     });
 
     expect(messagesCreate).not.toHaveBeenCalled();
-    expect(markCancelled).toHaveBeenCalledWith("legacy-share");
+    expect(markCancelled).toHaveBeenCalledWith(scope, "legacy-share");
     expect(markSent).not.toHaveBeenCalled();
   });
 
@@ -51,6 +54,7 @@ describe("processDueProactiveTasks", () => {
     const markCancelled = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -61,6 +65,7 @@ describe("processDueProactiveTasks", () => {
         dueTask: {
           id: "source-less-share",
           userId: "user-1",
+          agentId: "agent-1",
           conversationId: "conversation-1",
           kind: "share",
           content: "伪造的订阅摘要",
@@ -72,7 +77,7 @@ describe("processDueProactiveTasks", () => {
     });
 
     expect(messagesCreate).not.toHaveBeenCalled();
-    expect(markCancelled).toHaveBeenCalledWith("source-less-share");
+    expect(markCancelled).toHaveBeenCalledWith(scope, "source-less-share");
   });
 
   it("delivers a share only when its authorization type and source id are both present", async () => {
@@ -80,6 +85,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -89,6 +95,7 @@ describe("processDueProactiveTasks", () => {
         dueTask: {
           id: "authorized-share",
           userId: "user-1",
+          agentId: "agent-1",
           conversationId: "conversation-1",
           kind: "share",
           content: "这是一条已经整理好的主题摘要",
@@ -102,7 +109,7 @@ describe("processDueProactiveTasks", () => {
     expect(messagesCreate).toHaveBeenCalledWith(
       expect.objectContaining({ content: "这是一条已经整理好的主题摘要" }),
     );
-    expect(markSent).toHaveBeenCalledWith("authorized-share");
+    expect(markSent).toHaveBeenCalledWith(scope, "authorized-share");
   });
 
   it("does not push the same proactive task twice when its message already exists", async () => {
@@ -111,6 +118,7 @@ describe("processDueProactiveTasks", () => {
     const sendChannel = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel,
       repositories: fakeRepositories({
@@ -123,7 +131,7 @@ describe("processDueProactiveTasks", () => {
 
     expect(messagesCreate).toHaveBeenCalledTimes(1);
     expect(sendChannel).not.toHaveBeenCalled();
-    expect(markSent).toHaveBeenCalledWith("task-1");
+    expect(markSent).toHaveBeenCalledWith(scope, "task-1");
   });
 
   it("marks a task failed when its only channel push attempt fails", async () => {
@@ -131,6 +139,7 @@ describe("processDueProactiveTasks", () => {
     const markFailed = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(async () => {
         throw new Error("channel unavailable");
@@ -143,7 +152,7 @@ describe("processDueProactiveTasks", () => {
       }),
     });
 
-    expect(markFailed).toHaveBeenCalledWith("task-1");
+    expect(markFailed).toHaveBeenCalledWith(scope, "task-1");
     expect(markSent).not.toHaveBeenCalled();
   });
 
@@ -153,6 +162,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel,
       repositories: fakeRepositories({ messagesCreate, markSent, latestDirectTarget: telegramTarget }),
@@ -160,12 +170,13 @@ describe("processDueProactiveTasks", () => {
 
     expect(messagesCreate).toHaveBeenCalledWith({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       role: "assistant",
       content: "提醒一下：提交报销",
     });
     expect(sendChannel).toHaveBeenCalledWith(telegramTarget, "提醒一下：提交报销");
-    expect(markSent).toHaveBeenCalledWith("task-1");
+    expect(markSent).toHaveBeenCalledWith(scope, "task-1");
   });
 
   it("keeps quiet-hour proactive tasks pending", async () => {
@@ -173,6 +184,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T23:30:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({ messagesCreate, markSent, latestDirectTarget: telegramTarget }),
@@ -187,6 +199,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T23:30:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -196,6 +209,7 @@ describe("processDueProactiveTasks", () => {
         dueTask: {
           id: "task-urgent",
           userId: "user-1",
+          agentId: "agent-1",
           conversationId: "conversation-1",
           kind: "reminder",
           content: "吃药",
@@ -212,7 +226,7 @@ describe("processDueProactiveTasks", () => {
         content: "提醒一下：吃药",
       }),
     );
-    expect(markSent).toHaveBeenCalledWith("task-urgent");
+    expect(markSent).toHaveBeenCalledWith(scope, "task-urgent");
   });
 
   it("backs off non-reminder tasks after consecutive ignored proactive messages", async () => {
@@ -220,6 +234,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -229,6 +244,7 @@ describe("processDueProactiveTasks", () => {
         dueTask: {
           id: "task-2",
           userId: "user-1",
+          agentId: "agent-1",
           conversationId: "conversation-1",
           kind: "follow_up",
           content: "演讲准备得怎么样了？",
@@ -249,6 +265,7 @@ describe("processDueProactiveTasks", () => {
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
+      scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
       sendChannel: vi.fn(),
       repositories: fakeRepositories({
@@ -265,15 +282,15 @@ describe("processDueProactiveTasks", () => {
         content: "提醒一下：提交报销",
       }),
     );
-    expect(markSent).toHaveBeenCalledWith("task-1");
+    expect(markSent).toHaveBeenCalledWith(scope, "task-1");
   });
 });
 
 function fakeRepositories(input: {
   messagesCreate: (payload: unknown) => unknown;
-  markSent: (taskId: string) => void;
-  markCancelled?: (taskId: string) => void;
-  markFailed?: (taskId: string) => void;
+  markSent: (agentScope: { userId: string; agentId: string }, taskId: string) => void;
+  markCancelled?: (agentScope: { userId: string; agentId: string }, taskId: string) => void;
+  markFailed?: (agentScope: { userId: string; agentId: string }, taskId: string) => void;
   latestDirectTarget: NormalizedChannelMessage | null;
   dueTask?: DbProactiveTask;
   unansweredStreak?: number;
@@ -282,6 +299,7 @@ function fakeRepositories(input: {
   const dueTask: DbProactiveTask = {
     id: "task-1",
     userId: "user-1",
+    agentId: "agent-1",
     conversationId: "conversation-1",
     kind: "reminder",
     content: "提交报销",
@@ -310,9 +328,10 @@ function fakeRepositories(input: {
     },
     messages: {
       create: input.messagesCreate,
-      createFromProactiveTask: vi.fn(async (payload: { taskId: string; userId: string; conversationId: string; content: string }) => {
+      createFromProactiveTask: vi.fn(async (currentScope: typeof scope, payload: { taskId: string; conversationId: string; content: string }) => {
         input.messagesCreate({
-          userId: payload.userId,
+          userId: currentScope.userId,
+          agentId: currentScope.agentId,
           conversationId: payload.conversationId,
           role: "assistant",
           content: payload.content,

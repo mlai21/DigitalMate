@@ -2,6 +2,7 @@ import { ModelRoutingForm } from "@/components/admin/model-routing-form";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { groupCatalogByProvider, MODEL_CATALOG } from "@/server/llm/catalog";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -9,7 +10,9 @@ export default async function ModelsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后管理模型。</section>;
 
-  const settings = await createRepositories().settings.get(user.id);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const settings = await repositories.settings.get(scope);
   const groups = groupCatalogByProvider();
 
   return (

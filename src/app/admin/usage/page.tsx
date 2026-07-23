@@ -1,6 +1,7 @@
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { summarizeUsageLogs } from "@/server/llm/usage";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +9,9 @@ export default async function UsagePage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看用量。</section>;
 
-  const logs = await createRepositories().llmUsage.list(user.id);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const logs = await repositories.llmUsage.list(scope);
   const summary = summarizeUsageLogs(
     logs.map((log) => ({
       model: String(log.model),

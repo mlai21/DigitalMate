@@ -11,9 +11,16 @@ type HistoryRow = { id: string; role: "user" | "assistant"; content: string };
 const DEFAULT_CLIENT_TURN_ID = "60000000-0000-4000-8000-000000000000";
 
 const mocks = vi.hoisted(() => {
+  const agentScope = { userId: "user-1", agentId: "agent-1" };
+  const defaultAgent = {
+    id: agentScope.agentId,
+    userId: agentScope.userId,
+    status: "active" as const,
+  };
   const readyDocument = {
     id: "30000000-0000-4000-8000-000000000001",
     userId: "user-1",
+    agentId: "agent-1",
     messageId: null,
     kind: "document" as const,
     fileName: "notes.md",
@@ -63,8 +70,7 @@ const mocks = vi.hoisted(() => {
       status: "bound" as const,
     })),
   }));
-  const messagesCreateIdempotentUserTurn = vi.fn(async (input: {
-    userId: string;
+  const messagesCreateIdempotentUserTurn = vi.fn(async (_scope: typeof agentScope, input: {
     conversationId: string;
     content: string;
     attachmentIds: string[];
@@ -79,15 +85,14 @@ const mocks = vi.hoisted(() => {
     const message = await messagesCreate({ role: "user", content: input.content });
     return { message, attachments: [], created: true };
   });
-  const messagesCreateIdempotentAssistantTurn = vi.fn(async (input: {
-    userId: string;
+  const messagesCreateIdempotentAssistantTurn = vi.fn(async (_scope: typeof agentScope, input: {
     conversationId: string;
     content: string;
   }) => ({
     message: await messagesCreate({ role: "assistant", content: input.content }),
     created: true,
   }));
-  const findByClientTurn = vi.fn<(userId: string, clientTurnId: string, role: "user" | "assistant") => Promise<{
+  const findByClientTurn = vi.fn<(scope: typeof agentScope, clientTurnId: string, role: "user" | "assistant") => Promise<{
     id: string;
     userId: string;
     conversationId: string;
@@ -99,8 +104,8 @@ const mocks = vi.hoisted(() => {
   const claimClientTurnExecution = vi.fn(async () => true);
   const proactiveTaskCreate = vi.fn(async () => undefined);
   const getAttachmentForUser = vi.fn<
-    (userId: string, attachmentId: string) => Promise<DbMessageAttachment | null>
-  >(async (_userId, attachmentId) =>
+    (scope: typeof agentScope, attachmentId: string) => Promise<DbMessageAttachment | null>
+  >(async (_scope, attachmentId) =>
     attachmentId === readyImage.id ? readyImage : attachmentId === readyDocument.id ? readyDocument : null,
   );
   const listAttachmentsForMessages = vi.fn<() => Promise<DbMessageAttachment[]>>(async () => []);
@@ -110,6 +115,8 @@ const mocks = vi.hoisted(() => {
   const readAttachment = vi.fn(async () => Buffer.from("private-image"));
 
   return {
+    agentScope,
+    defaultAgent,
     readyDocument,
     readyImage,
     extractAndSaveFromMessage,
@@ -128,9 +135,12 @@ const mocks = vi.hoisted(() => {
     listMessagesAfter,
     readAttachment,
     createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
+      agents: {
+        getDefault: vi.fn(async () => defaultAgent),
+      },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
-        getForUser: vi.fn(async (): Promise<{ id: string } | null> => ({ id: "conversation-1" })),
+        get: vi.fn(async (): Promise<{ id: string } | null> => ({ id: "conversation-1" })),
       },
       messages: {
         create: messagesCreate,
@@ -145,7 +155,7 @@ const mocks = vi.hoisted(() => {
         listAfter: listMessagesAfter,
       },
       messageAttachments: {
-        getForUser: getAttachmentForUser,
+        get: getAttachmentForUser,
         listForMessages: listAttachmentsForMessages,
       },
       memories: {
@@ -221,7 +231,7 @@ describe("chat route", () => {
     mocks.runAgent.mockReset().mockImplementation(async function* () {
       yield "收到。";
     });
-    mocks.getAttachmentForUser.mockReset().mockImplementation(async (_userId, attachmentId) =>
+    mocks.getAttachmentForUser.mockReset().mockImplementation(async (_scope, attachmentId) =>
       attachmentId === mocks.readyImage.id
         ? mocks.readyImage
         : attachmentId === mocks.readyDocument.id
@@ -231,7 +241,7 @@ describe("chat route", () => {
     mocks.listAttachmentsForMessages.mockReset().mockResolvedValue([]);
     mocks.listMessages.mockReset().mockResolvedValue([]);
     mocks.listMessagesAfter.mockReset().mockResolvedValue([]);
-    mocks.messagesCreateIdempotentUserTurn.mockReset().mockImplementation(async (input) => {
+    mocks.messagesCreateIdempotentUserTurn.mockReset().mockImplementation(async (_scope, input) => {
       if (input.attachmentIds.length > 0) {
         const result = await mocks.messagesCreateWithAttachments({
           content: input.content,
@@ -242,7 +252,7 @@ describe("chat route", () => {
       const message = await mocks.messagesCreate({ role: "user", content: input.content });
       return { message, attachments: [], created: true };
     });
-    mocks.messagesCreateIdempotentAssistantTurn.mockReset().mockImplementation(async (input) => ({
+    mocks.messagesCreateIdempotentAssistantTurn.mockReset().mockImplementation(async (_scope, input) => ({
       message: await mocks.messagesCreate({ role: "assistant", content: input.content }),
       created: true,
     }));
@@ -339,7 +349,7 @@ describe("chat route", () => {
       "role",
     ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
-    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith(mocks.agentScope, [message.id]);
     expect(serialized).not.toContain("userId");
     expect(serialized).not.toContain("conversationId");
     expect(serialized).not.toContain("internalSecret");
@@ -420,6 +430,7 @@ describe("chat route", () => {
       lastMessageAt: new Date("2026-07-14T00:02:00Z"),
     };
     mocks.createRepositories.mockReturnValueOnce({
+      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
       conversations: {
         listWithStats: vi.fn(async () => [conversation]),
         getOrCreateDefault: vi.fn(async () => conversation),
@@ -466,7 +477,7 @@ describe("chat route", () => {
       "role",
     ]);
     expect(mocks.listAttachmentsForMessages).toHaveBeenCalledTimes(1);
-    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith("user-1", [message.id]);
+    expect(mocks.listAttachmentsForMessages).toHaveBeenCalledWith(mocks.agentScope, [message.id]);
     expect(serialized).not.toContain("userId");
     expect(serialized).not.toContain("conversationId");
     expect(serialized).not.toContain("internalSecret");
@@ -509,6 +520,7 @@ describe("chat route", () => {
       lastMessageAt: new Date("2026-07-14T00:02:00Z"),
     };
     mocks.createRepositories.mockReturnValueOnce({
+      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
       conversations: {
         listWithStats: vi.fn(async () => [conversation]),
         getOrCreateDefault: vi.fn(async () => conversation),
@@ -562,14 +574,16 @@ describe("chat route", () => {
       clientTurnId: DEFAULT_CLIENT_TURN_ID,
       userMessageId: "message-user",
     });
-    expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledWith({
-      userId: "user-1",
-      conversationId: "conversation-1",
-      clientTurnId: DEFAULT_CLIENT_TURN_ID,
-      payloadHash: expect.any(String),
-      content: "",
-      attachmentIds: [mocks.readyImage.id],
-    });
+    expect(mocks.messagesCreateIdempotentUserTurn).toHaveBeenCalledWith(
+      mocks.agentScope,
+      {
+        conversationId: "conversation-1",
+        clientTurnId: DEFAULT_CLIENT_TURN_ID,
+        payloadHash: expect.any(String),
+        content: "",
+        attachmentIds: [mocks.readyImage.id],
+      },
+    );
     expect(mocks.runAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         message: "",
@@ -655,12 +669,12 @@ describe("chat route", () => {
     mocks.findByClientTurn.mockImplementation(async (_userId, _clientTurnId, role) =>
       role === "user" ? storedUser : storedAssistant,
     );
-    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (input) => {
+    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (_scope, input) => {
       if (storedUser) return { message: storedUser, attachments: [], created: false };
       storedUser = persistedMessage("user", input.content);
       return { message: storedUser, attachments: [], created: true };
     });
-    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (input) => {
+    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (_scope, input) => {
       if (storedAssistant) return { message: storedAssistant, created: false };
       storedAssistant = persistedMessage("assistant", input.content);
       return { message: storedAssistant, created: true };
@@ -719,12 +733,12 @@ describe("chat route", () => {
     mocks.findByClientTurn.mockImplementation(async (_userId, _clientTurnId, role) =>
       role === "user" ? storedUser : storedAssistant,
     );
-    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (input) => {
+    mocks.messagesCreateIdempotentUserTurn.mockImplementation(async (_scope, input) => {
       if (storedUser) return { message: storedUser, attachments: [], created: false };
       storedUser = persistedMessage("user", input.content);
       return { message: storedUser, attachments: [], created: true };
     });
-    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (input) => {
+    mocks.messagesCreateIdempotentAssistantTurn.mockImplementation(async (_scope, input) => {
       if (storedAssistant) return { message: storedAssistant, created: false };
       storedAssistant = persistedMessage("assistant", input.content);
       return { message: storedAssistant, created: true };
@@ -807,7 +821,12 @@ describe("chat route", () => {
     await response.text();
 
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
-    expect(mocks.recentHistory).toHaveBeenCalledWith("conversation-1", 12, DEFAULT_CLIENT_TURN_ID);
+    expect(mocks.recentHistory).toHaveBeenCalledWith(
+      mocks.agentScope,
+      "conversation-1",
+      12,
+      DEFAULT_CLIENT_TURN_ID,
+    );
     expect(mocks.messagesCreateIdempotentAssistantTurn).toHaveBeenCalledTimes(1);
   });
 
@@ -1530,9 +1549,10 @@ describe("chat route", () => {
   it("rejects conversation ids that do not belong to the current user", async () => {
     const messagesCreate = vi.fn();
     mocks.createRepositories.mockReturnValueOnce({
+      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
-        getForUser: vi.fn(async () => null),
+        get: vi.fn(async () => null),
       },
       messages: {
         create: messagesCreate,
@@ -1573,20 +1593,21 @@ describe("chat route", () => {
   it("stores urgent reminder metadata for delivery policy", async () => {
     const createTask = vi.fn(async () => undefined);
     mocks.createRepositories.mockReturnValueOnce({
+      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
-        getForUser: vi.fn(async () => ({ id: "conversation-1" })),
+        get: vi.fn(async () => ({ id: "conversation-1" })),
       },
       messages: {
         create: mocks.messagesCreate,
         recentHistory: vi.fn(async () => []),
         findByClientTurn: vi.fn(async () => null),
-        createIdempotentUserTurn: vi.fn(async (input: { content: string }) => ({
+        createIdempotentUserTurn: vi.fn(async (_scope: typeof mocks.agentScope, input: { content: string }) => ({
           message: await mocks.messagesCreate({ role: "user", content: input.content }),
           attachments: [],
           created: true,
         })),
-        createIdempotentAssistantTurn: vi.fn(async (input: { content: string }) => ({
+        createIdempotentAssistantTurn: vi.fn(async (_scope: typeof mocks.agentScope, input: { content: string }) => ({
           message: await mocks.messagesCreate({ role: "assistant", content: input.content }),
           created: true,
         })),
@@ -1624,6 +1645,7 @@ describe("chat route", () => {
 
     expect(response.status).toBe(200);
     expect(createTask).toHaveBeenCalledWith(
+      mocks.agentScope,
       expect.objectContaining({
         kind: "reminder",
         content: "吃药",

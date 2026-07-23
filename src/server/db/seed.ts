@@ -75,6 +75,17 @@ async function main() {
     if (!agentId) throw new Error("default_agent_not_created");
 
     await client.query(
+      `INSERT INTO agent_settings (
+         user_id, agent_id, persona, proactivity, cadence, search
+       )
+       SELECT $1, $2, persona, proactivity, cadence, search
+       FROM settings
+       WHERE user_id = $1
+       ON CONFLICT (user_id, agent_id) DO NOTHING`,
+      [user.id, agentId],
+    );
+
+    await client.query(
       `INSERT INTO conversations (user_id, agent_id, title)
        SELECT $1, $2, $3
        WHERE NOT EXISTS (

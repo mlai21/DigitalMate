@@ -10,22 +10,23 @@ import { recordEventReflection } from "@/server/evolution/event-reflection";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
 import type { SkillInstallOutcome } from "@/server/skills/install";
 import type { LlmClient } from "@/server/llm/types";
+import type { AgentScope } from "@/server/agents/types";
+import type { ToolLogInput } from "@/server/agent/run-agent";
 
 type ChannelRepositories = {
   channels: {
-    ensureConversation(userId: string, message: NormalizedChannelMessage): Promise<{ id: string }>;
-    createChannelMessage(input: unknown): Promise<unknown> | unknown;
-    recentBotMessageAt(channel: string, externalConversationId: string): Promise<Date | null>;
-    sentCounts(userId: string, channel: string, externalConversationId: string, now?: Date): Promise<{ sentInLastHour: number; sentToday: number }>;
-    recentMessageCount(channel: string, externalConversationId: string, since: Date): Promise<number>;
-    createDecision(input: unknown): Promise<unknown> | unknown;
+    ensureConversation(scope: AgentScope, message: NormalizedChannelMessage): Promise<{ id: string }>;
+    createChannelMessage(scope: AgentScope, input: unknown): Promise<unknown> | unknown;
+    recentBotMessageAt(scope: AgentScope, channel: string, externalConversationId: string): Promise<Date | null>;
+    sentCounts(scope: AgentScope, channel: string, externalConversationId: string, now?: Date): Promise<{ sentInLastHour: number; sentToday: number }>;
+    recentMessageCount(scope: AgentScope, channel: string, externalConversationId: string, since: Date): Promise<number>;
+    createDecision(scope: AgentScope, input: unknown): Promise<unknown> | unknown;
   };
   memories: {
-    findRelevant(userId: string, query: string): Promise<Array<{ id: string; content: string; createdAt: Date }>>;
+    findRelevant(scope: AgentScope, query: string): Promise<Array<{ id: string; content: string; createdAt: Date }>>;
   };
   proactiveTasks: {
-    create(input: {
-      userId: string;
+    create(scope: AgentScope, input: {
       conversationId: string;
       kind: "reminder" | "follow_up" | "share";
       content: string;
@@ -34,17 +35,16 @@ type ChannelRepositories = {
     }): Promise<unknown> | unknown;
   };
   toolLogs: {
-    create(input: Parameters<typeof runAgent>[0]["repositories"]["toolLogs"] extends infer T ? never : never): unknown;
-  } | { create(input: unknown): unknown };
+    create(input: ToolLogInput): unknown;
+  };
   reflections?: {
-    create(input: { userId: string; reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
-    latestBySourceEvent?(userId: string, event: string): Promise<Date | null>;
-    findAppliedSuggestions?(userId: string): Promise<string[]>;
+    create(scope: AgentScope, input: { reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
+    latestBySourceEvent?(scope: AgentScope, event: string): Promise<Date | null>;
+    findAppliedSuggestions?(scope: AgentScope): Promise<string[]>;
   };
   messages: {
-    recentHistory(conversationId: string): Promise<Array<{ role: "user" | "assistant"; content: string }>>;
-    create(input: {
-      userId: string;
+    recentHistory(scope: AgentScope, conversationId: string): Promise<Array<{ role: "user" | "assistant"; content: string }>>;
+    create(scope: AgentScope, input: {
       conversationId: string;
       role: "user" | "assistant" | "system";
       content: string;
@@ -56,7 +56,7 @@ type ChannelRepositories = {
     findEnabledByName?(userId: string, name: string): Promise<{ id: string; name: string } | null>;
   };
   settings: {
-    get(userId: string): Promise<{
+    get(scope: AgentScope): Promise<{
       persona: { name: string; style: string; emojiHabit?: string };
       proactivity: { quietStart: string; quietEnd: string; maxPerDay: number; minIntervalMinutes?: number; maxPerHour?: number };
       modelRouting: { main: string; light: string };
@@ -68,7 +68,7 @@ type ChannelRepositories = {
 
 export async function handleChannelMessage(input: {
   message: NormalizedChannelMessage;
-  userId: string;
+  scope: AgentScope;
   repositories: ChannelRepositories;
   llm: LlmClient;
   model: string;
@@ -80,10 +80,9 @@ export async function handleChannelMessage(input: {
   now?: Date;
 }): Promise<void> {
   const now = input.now ?? new Date();
-  const conversation = await input.repositories.channels.ensureConversation(input.userId, input.message);
-  await input.repositories.channels.createChannelMessage({ userId: input.userId, conversationId: conversation.id, message: input.message });
-  await input.repositories.messages.create({
-    userId: input.userId,
+  const conversation = await input.repositories.channels.ensureConversation(input.scope, input.message);
+  await input.repositories.channels.createChannelMessage(input.scope, { conversationId: conversation.id, message: input.message });
+  await input.repositories.messages.create(input.scope, {
     conversationId: conversation.id,
     role: "user",
     content: input.message.text,
@@ -93,7 +92,7 @@ export async function handleChannelMessage(input: {
     await recordEventReflection(
       { reflections: input.repositories.reflections },
       {
-        userId: input.userId,
+        scope: input.scope,
         event: "user_dissatisfaction",
         summary: input.message.text,
         source: {
@@ -109,11 +108,11 @@ export async function handleChannelMessage(input: {
   if (input.message.chatType === "group") {
     const recentWindowStart = new Date(now.getTime() - 2 * 60_000);
     const [settings, memories, recentBotMessageAt, counts, recentMessageCount] = await Promise.all([
-      input.repositories.settings.get(input.userId),
-      input.repositories.memories.findRelevant(input.userId, input.message.text),
-      input.repositories.channels.recentBotMessageAt(input.message.channel, input.message.externalConversationId),
-      input.repositories.channels.sentCounts(input.userId, input.message.channel, input.message.externalConversationId, now),
-      input.repositories.channels.recentMessageCount(input.message.channel, input.message.externalConversationId, recentWindowStart),
+      input.repositories.settings.get(input.scope),
+      input.repositories.memories.findRelevant(input.scope, input.message.text),
+      input.repositories.channels.recentBotMessageAt(input.scope, input.message.channel, input.message.externalConversationId),
+      input.repositories.channels.sentCounts(input.scope, input.message.channel, input.message.externalConversationId, now),
+      input.repositories.channels.recentMessageCount(input.scope, input.message.channel, input.message.externalConversationId, recentWindowStart),
     ]);
     const decision = shouldInterject({
       message: input.message,
@@ -131,8 +130,7 @@ export async function handleChannelMessage(input: {
       sentToday: counts.sentToday,
       recentMessageCount,
     });
-    await input.repositories.channels.createDecision({
-      userId: input.userId,
+    await input.repositories.channels.createDecision(input.scope, {
       conversationId: conversation.id,
       message: input.message,
       shouldInterject: decision.shouldInterject,
@@ -141,8 +139,8 @@ export async function handleChannelMessage(input: {
     if (!decision.shouldInterject) return;
   }
 
-  const settings = await input.repositories.settings.get(input.userId);
-  const history = await input.repositories.messages.recentHistory(conversation.id);
+  const settings = await input.repositories.settings.get(input.scope);
+  const history = await input.repositories.messages.recentHistory(input.scope, conversation.id);
 
   // IM channels cannot render skill cards, so slash prefixes are the explicit
   // invocation path here: "/skill-name ..." and "/create-skill ..." (P1-11/12).
@@ -154,7 +152,7 @@ export async function handleChannelMessage(input: {
     createSkillMode = true;
     if (command.rest) agentMessage = command.rest;
   } else if (command?.kind === "use_skill" && input.repositories.skills?.findEnabledByName) {
-    const skill = await input.repositories.skills.findEnabledByName(input.userId, command.name);
+    const skill = await input.repositories.skills.findEnabledByName(input.scope.userId, command.name);
     if (skill) {
       explicitSkillIds.push(skill.id);
       agentMessage = command.rest || buildExplicitSkillFallbackMessage(skill.name);
@@ -169,7 +167,8 @@ export async function handleChannelMessage(input: {
 
   let answer = "";
   for await (const chunk of runAgent({
-    userId: input.userId,
+    userId: input.scope.userId,
+    agentId: input.scope.agentId,
     conversationId: conversation.id,
     message: agentMessage,
     history,
@@ -191,8 +190,7 @@ export async function handleChannelMessage(input: {
     answer += chunk;
   }
   if (!answer.trim()) return;
-  await input.repositories.messages.create({
-    userId: input.userId,
+  await input.repositories.messages.create(input.scope, {
     conversationId: conversation.id,
     role: "assistant",
     content: answer,
@@ -213,7 +211,7 @@ export async function handleChannelMessage(input: {
 async function scheduleDirectChannelTask(
   input: {
     message: NormalizedChannelMessage;
-    userId: string;
+    scope: AgentScope;
     repositories: ChannelRepositories;
   },
   conversationId: string,
@@ -223,8 +221,7 @@ async function scheduleDirectChannelTask(
 
   const reminder = parseReminder(input.message.text, now);
   if (reminder) {
-    await input.repositories.proactiveTasks.create({
-      userId: input.userId,
+    await input.repositories.proactiveTasks.create(input.scope, {
       conversationId,
       kind: "reminder",
       content: reminder.content,
@@ -236,8 +233,7 @@ async function scheduleDirectChannelTask(
 
   const followUp = parseFollowUp(input.message.text, now);
   if (!followUp) return;
-  await input.repositories.proactiveTasks.create({
-    userId: input.userId,
+  await input.repositories.proactiveTasks.create(input.scope, {
     conversationId,
     kind: "follow_up",
     content: followUp.content,

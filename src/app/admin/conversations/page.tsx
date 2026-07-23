@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -9,9 +10,10 @@ export default async function ConversationsPage() {
   if (!user) return <section className="admin-card">需要登录后查看会话。</section>;
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const [conversations, projects] = await Promise.all([
-    repositories.conversations.listWithStats(user.id),
-    repositories.projects.list(user.id),
+    repositories.conversations.listWithStats(scope),
+    repositories.projects.list(scope),
   ]);
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
 

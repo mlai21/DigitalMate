@@ -14,11 +14,12 @@ const baseContract: GoalContract = {
   stopConditions: { maxNoProgressRounds: 3, escalation: [] },
   deliverable: { format: "report" },
 };
+const scope = { userId: "user-1", agentId: "agent-1" };
 
 function buildGoal(overrides: Partial<DbGoal>): DbGoal {
   return {
     id: "goal-1",
-    userId: "user-1",
+    ...scope,
     title: "测试目标",
     contract: baseContract,
     status: "running",
@@ -89,9 +90,9 @@ describe("processGoalLoops (M-B closed loop)", () => {
     const goal = buildGoal({ status: "confirmed", nextRunAt: null });
     const harness = buildHarness({ goals: [goal] });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services, now });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services, now });
 
-    expect(harness.setStatus).toHaveBeenCalledWith(goal.id, "running", { nextRunAt: now });
+    expect(harness.setStatus).toHaveBeenCalledWith(scope, goal.id, "running", { nextRunAt: now });
     expect(harness.executeStep).toHaveBeenCalledOnce();
     expect(outcome.pickedUp).toBe(1);
     expect(outcome.rounds).toBe(1);
@@ -101,11 +102,11 @@ describe("processGoalLoops (M-B closed loop)", () => {
     const goal = buildGoal({ budgetUsed: { rounds: 20, tokens: 0, costUsd: 0 } });
     const harness = buildHarness({ goals: [goal] });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
     expect(harness.executeStep).not.toHaveBeenCalled();
-    expect(harness.setStatus).toHaveBeenCalledWith(goal.id, "failed_budget", { finished: true, nextRunAt: null });
-    expect(harness.createStep).toHaveBeenCalledWith(expect.objectContaining({ phase: "failed" }));
+    expect(harness.setStatus).toHaveBeenCalledWith(scope, goal.id, "failed_budget", { finished: true, nextRunAt: null });
+    expect(harness.createStep).toHaveBeenCalledWith(scope, expect.objectContaining({ phase: "failed" }));
     expect(outcome.stopped).toBe(1);
   });
 
@@ -114,9 +115,10 @@ describe("processGoalLoops (M-B closed loop)", () => {
     const goal = buildGoal({ noProgressRounds: 2 });
     const harness = buildHarness({ goals: [goal] });
 
-    await processGoalLoops({ repositories: harness.repositories, services: harness.services, now });
+    await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services, now });
 
     expect(harness.createStep).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
         phase: "committed",
         round: 1,
@@ -125,6 +127,7 @@ describe("processGoalLoops (M-B closed loop)", () => {
       }),
     );
     expect(harness.updateProgress).toHaveBeenCalledWith(
+      scope,
       goal.id,
       expect.objectContaining({
         noProgressRounds: 0,
@@ -132,7 +135,7 @@ describe("processGoalLoops (M-B closed loop)", () => {
         progressSummary: progressCandidate.progressSummary,
       }),
     );
-    const [, nextRunAt] = harness.releaseRunningStep.mock.calls[0] as unknown as [string, Date];
+    const [, , nextRunAt] = harness.releaseRunningStep.mock.calls[0] as unknown as [typeof scope, string, Date];
     expect(nextRunAt.getTime()).toBe(now.getTime() + 30 * 60_000);
   });
 
@@ -150,9 +153,9 @@ describe("processGoalLoops (M-B closed loop)", () => {
       },
     });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
-    expect(harness.setStatus).toHaveBeenCalledWith(goal.id, "succeeded", { finished: true, nextRunAt: null });
+    expect(harness.setStatus).toHaveBeenCalledWith(scope, goal.id, "succeeded", { finished: true, nextRunAt: null });
     expect(outcome.succeeded).toBe(1);
   });
 
@@ -163,10 +166,10 @@ describe("processGoalLoops (M-B closed loop)", () => {
       verify: { progressed: true, criteriaStatus: [], allMet: true, evidenceRefs: [], summary: "", tokensUsed: 0 },
     });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
     expect(outcome.succeeded).toBe(0);
-    expect(harness.setStatus).not.toHaveBeenCalledWith(goal.id, "succeeded", expect.anything());
+    expect(harness.setStatus).not.toHaveBeenCalledWith(scope, goal.id, "succeeded", expect.anything());
   });
 
   it("stops with failed_no_progress when consecutive no-progress rounds hit the contract limit", async () => {
@@ -177,10 +180,10 @@ describe("processGoalLoops (M-B closed loop)", () => {
       verify: { ...progressVerify, progressed: false },
     });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
-    expect(harness.updateProgress).toHaveBeenCalledWith(goal.id, expect.objectContaining({ noProgressRounds: 3 }));
-    expect(harness.setStatus).toHaveBeenCalledWith(goal.id, "failed_no_progress", { finished: true, nextRunAt: null });
+    expect(harness.updateProgress).toHaveBeenCalledWith(scope, goal.id, expect.objectContaining({ noProgressRounds: 3 }));
+    expect(harness.setStatus).toHaveBeenCalledWith(scope, goal.id, "failed_no_progress", { finished: true, nextRunAt: null });
     expect(outcome.stopped).toBe(1);
   });
 
@@ -188,12 +191,13 @@ describe("processGoalLoops (M-B closed loop)", () => {
     const goal = buildGoal({ noProgressRounds: 0 });
     const harness = buildHarness({ goals: [goal], executeError: new Error("search unavailable") });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
     expect(harness.createStep).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({ phase: "failed", error: "search unavailable" }),
     );
-    expect(harness.updateProgress).toHaveBeenCalledWith(goal.id, expect.objectContaining({ noProgressRounds: 1 }));
+    expect(harness.updateProgress).toHaveBeenCalledWith(scope, goal.id, expect.objectContaining({ noProgressRounds: 1 }));
     expect(harness.releaseRunningStep).toHaveBeenCalledOnce();
     expect(outcome.rounds).toBe(1);
     expect(outcome.stopped).toBe(0);
@@ -203,7 +207,7 @@ describe("processGoalLoops (M-B closed loop)", () => {
     const goal = buildGoal({});
     const harness = buildHarness({ goals: [goal], claimResult: false });
 
-    const outcome = await processGoalLoops({ repositories: harness.repositories, services: harness.services });
+    const outcome = await processGoalLoops({ scope, repositories: harness.repositories, services: harness.services });
 
     expect(outcome.skipped).toBe(1);
     expect(harness.executeStep).not.toHaveBeenCalled();

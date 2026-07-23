@@ -19,6 +19,8 @@ import { supportsImageInput } from "@/server/llm/catalog";
 import type { LlmMessage } from "@/server/llm/types";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
+import type { AgentScope } from "@/server/agents/types";
 
 export const runtime = "nodejs";
 
@@ -50,9 +52,10 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const conversation = body.data.conversationId
-    ? await repositories.conversations.getForUser(user.id, body.data.conversationId)
-    : await repositories.conversations.getOrCreateDefault(user.id);
+    ? await repositories.conversations.get(scope, body.data.conversationId)
+    : await repositories.conversations.getOrCreateDefault(scope);
   if (!conversation) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
@@ -66,13 +69,12 @@ export async function POST(request: Request) {
     searchEnabled: body.data.searchEnabled === true,
   });
 
-  const existingUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+  const existingUserMessage = await repositories.messages.findByClientTurn(scope, clientTurnId, "user");
   const encoder = new TextEncoder();
   let userTurn: Awaited<ReturnType<typeof repositories.messages.createIdempotentUserTurn>> | undefined;
   if (existingUserMessage) {
     try {
-      userTurn = await repositories.messages.createIdempotentUserTurn({
-        userId: user.id,
+      userTurn = await repositories.messages.createIdempotentUserTurn(scope, {
         conversationId,
         clientTurnId,
         payloadHash,
@@ -83,7 +85,7 @@ export async function POST(request: Request) {
       return createClientTurnErrorResponse(error);
     }
 
-    const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+    const existingAssistant = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
     if (existingAssistant) {
       return createReplayResponse({
         encoder,
@@ -98,23 +100,22 @@ export async function POST(request: Request) {
 
   // Read history before creating the current turn so it cannot be appended
   // twice by buildMessages (once in history and once as the current user turn).
-  const historyRows = await repositories.messages.recentHistory(conversationId, 12, clientTurnId);
-  const settings = await repositories.settings.get(user.id);
+  const historyRows = await repositories.messages.recentHistory(scope, conversationId, 12, clientTurnId);
+  const settings = await repositories.settings.get(scope);
   const env = readEnv();
   const { client, model } = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
   let currentAttachments = await loadTurnAttachments({
     repositories,
-    userId: user.id,
+    scope,
     attachmentIds: body.data.attachmentIds,
     existingUserMessageId: existingUserMessage?.id,
   });
   if (!currentAttachments && !existingUserMessage) {
-    const racedUserMessage = await repositories.messages.findByClientTurn(user.id, clientTurnId, "user");
+    const racedUserMessage = await repositories.messages.findByClientTurn(scope, clientTurnId, "user");
     if (racedUserMessage) {
       try {
-        userTurn = await repositories.messages.createIdempotentUserTurn({
-          userId: user.id,
+        userTurn = await repositories.messages.createIdempotentUserTurn(scope, {
           conversationId,
           clientTurnId,
           payloadHash,
@@ -124,7 +125,7 @@ export async function POST(request: Request) {
       } catch (error) {
         return createClientTurnErrorResponse(error);
       }
-      const racedAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+      const racedAssistant = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
       if (racedAssistant) {
         return createReplayResponse({
           encoder,
@@ -137,7 +138,7 @@ export async function POST(request: Request) {
       }
       currentAttachments = await loadTurnAttachments({
         repositories,
-        userId: user.id,
+        scope,
         attachmentIds: body.data.attachmentIds,
         existingUserMessageId: racedUserMessage.id,
       });
@@ -151,7 +152,7 @@ export async function POST(request: Request) {
     .map((message) => ("id" in message && typeof message.id === "string" ? message.id : null))
     .filter((id): id is string => id !== null);
   const historicalAttachments = historyMessageIds.length > 0
-    ? await repositories.messageAttachments.listForMessages(user.id, historyMessageIds)
+    ? await repositories.messageAttachments.listForMessages(scope, historyMessageIds)
     : [];
   const orderedHistoricalAttachments = orderAttachmentsByMessage(historyMessageIds, historicalAttachments);
   const imageInputSupported = supportsImageInput(model);
@@ -182,8 +183,7 @@ export async function POST(request: Request) {
 
   if (!userTurn) {
     try {
-      userTurn = await repositories.messages.createIdempotentUserTurn({
-        userId: user.id,
+      userTurn = await repositories.messages.createIdempotentUserTurn(scope, {
         conversationId,
         clientTurnId,
         payloadHash,
@@ -197,13 +197,13 @@ export async function POST(request: Request) {
   const userMessage = userTurn.message;
   if (userTurn.created) {
     await recordEventReflection(repositories, {
-      userId: user.id,
+      scope,
       event: "user_dissatisfaction",
       summary: body.data.message,
       source: { conversationId, messageId: userMessage.id },
     }).catch(() => undefined);
   }
-  const existingAssistant = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+  const existingAssistant = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
   if (existingAssistant) {
     return createReplayResponse({
       encoder,
@@ -245,7 +245,7 @@ export async function POST(request: Request) {
       let executionAccepted = false;
       let releaseExecutionLock: (() => Promise<void>) | undefined;
       try {
-        releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(user.id, clientTurnId);
+        releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(scope, clientTurnId);
       } catch {
         console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
         safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
@@ -262,7 +262,7 @@ export async function POST(request: Request) {
             clientTurnId,
           });
         };
-        const assistantAfterLock = await repositories.messages.findByClientTurn(user.id, clientTurnId, "assistant");
+        const assistantAfterLock = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
         if (assistantAfterLock) {
           acceptExecution();
           safeEnqueue(controller, encoder, { type: "chunk", content: assistantAfterLock.content });
@@ -277,11 +277,10 @@ export async function POST(request: Request) {
           return;
         }
 
-        const executionClaimed = await repositories.messages.claimClientTurnExecution(user.id, clientTurnId);
+        const executionClaimed = await repositories.messages.claimClientTurnExecution(scope, clientTurnId);
         if (!executionClaimed) {
           const interruptedText = "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
-          const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn({
-            userId: user.id,
+          const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
             conversationId,
             clientTurnId,
             content: interruptedText,
@@ -303,6 +302,7 @@ export async function POST(request: Request) {
         acceptExecution();
         for await (const chunk of runAgent({
           userId: user.id,
+          agentId: scope.agentId,
           conversationId,
           message: agentMessage,
           attachments: currentLlmAttachments,
@@ -342,8 +342,7 @@ export async function POST(request: Request) {
           safeEnqueue(controller, encoder, { type: "chunk", content: assistantText });
         }
 
-        const assistantTurn = await repositories.messages.createIdempotentAssistantTurn({
-          userId: user.id,
+        const assistantTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
           conversationId,
           clientTurnId,
           content: assistantText,
@@ -357,8 +356,7 @@ export async function POST(request: Request) {
         if (assistantTurn.created) try {
           const reminder = parseReminder(body.data.message);
           if (reminder) {
-            await repositories.proactiveTasks.create({
-              userId: user.id,
+            await repositories.proactiveTasks.create(scope, {
               conversationId,
               kind: "reminder",
               content: reminder.content,
@@ -368,8 +366,7 @@ export async function POST(request: Request) {
           } else {
             const followUp = parseFollowUp(body.data.message);
             if (followUp) {
-              await repositories.proactiveTasks.create({
-                userId: user.id,
+              await repositories.proactiveTasks.create(scope, {
                 conversationId,
                 kind: "follow_up",
                 content: followUp.content,
@@ -396,7 +393,7 @@ export async function POST(request: Request) {
         if (assistantTurn.created) setTimeout(() => {
           void runPostTurnTasks({
             repositories,
-            userId: user.id,
+            scope,
             conversationId,
             conversationTitle: conversation.title,
             userText: body.data.message,
@@ -424,8 +421,7 @@ export async function POST(request: Request) {
         });
         let fallbackTurn;
         try {
-          fallbackTurn = await repositories.messages.createIdempotentAssistantTurn({
-            userId: user.id,
+          fallbackTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
             conversationId,
             clientTurnId,
             content,
@@ -481,13 +477,13 @@ export async function POST(request: Request) {
 
 async function loadTurnAttachments(input: {
   repositories: ReturnType<typeof createRepositories>;
-  userId: string;
+  scope: AgentScope;
   attachmentIds: string[];
   existingUserMessageId?: string;
 }): Promise<DbMessageAttachment[] | null> {
   if (new Set(input.attachmentIds).size !== input.attachmentIds.length) return null;
   const attachments = await Promise.all(
-    input.attachmentIds.map((attachmentId) => input.repositories.messageAttachments.getForUser(input.userId, attachmentId)),
+    input.attachmentIds.map((attachmentId) => input.repositories.messageAttachments.get(input.scope, attachmentId)),
   );
   if (
     attachments.some(
@@ -650,7 +646,7 @@ function hashClientTurnPayload(input: {
 
 async function runPostTurnTasks(input: {
   repositories: ReturnType<typeof createRepositories>;
-  userId: string;
+  scope: AgentScope;
   conversationId: string;
   conversationTitle: string;
   userText: string;
@@ -666,12 +662,12 @@ async function runPostTurnTasks(input: {
       userText: input.userText,
       assistantText: input.assistantText,
     })
-      .then((title) => input.repositories.conversations.setTitleIfDefault(input.conversationId, title))
+      .then((title) => input.repositories.conversations.setTitleIfDefault(input.scope, input.conversationId, title))
       .catch(() => undefined);
   }
 
   await recordTurnReview(input.repositories, {
-    userId: input.userId,
+    scope: input.scope,
     conversationId: input.conversationId,
     llm: input.llm,
     model: input.model,

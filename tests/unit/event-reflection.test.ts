@@ -30,7 +30,7 @@ describe("event reflections", () => {
     await recordEventReflection(
       { reflections: { create } },
       {
-        userId: "user-1",
+        scope: { userId: "user-1", agentId: "agent-1" },
         event: "task_failure",
         summary: "沙箱任务失败：权限不足",
         source: { taskRunId: "task-1", taskKind: "sandbox" },
@@ -38,8 +38,8 @@ describe("event reflections", () => {
     );
 
     expect(create).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({
-        userId: "user-1",
         reflection: expect.objectContaining({
           negatives: expect.arrayContaining([expect.stringContaining("沙箱任务失败")]),
         }),
@@ -58,7 +58,7 @@ describe("event reflections", () => {
     await recordEventReflection(
       { reflections: { create } },
       {
-        userId: "user-1",
+        scope: { userId: "user-1", agentId: "agent-1" },
         event: "user_dissatisfaction",
         summary: "这个方案不错，继续",
       },

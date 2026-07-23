@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { deleteAttachment } from "@/server/attachments/storage";
 import type { DbMessageAttachment } from "@/server/db/repositories";
+import type { AgentScope } from "@/server/agents/types";
 
 export const ATTACHMENT_DRAFT_MAX_AGE_HOURS = 24;
 export const ATTACHMENT_CLEANUP_BATCH_SIZE = 100;
@@ -19,10 +20,10 @@ const FINAL_ATTACHMENT_FILE_PATTERN = new RegExp(`^${UUID_V4_FRAGMENT}$`, "i");
 
 type AttachmentCleanupRepositories = {
   messageAttachments: {
-    claimExpiredDrafts(hours: number, limit?: number): Promise<DbMessageAttachment[]>;
-    deleteDraft(userId: string, attachmentId: string, deletionClaimToken: string): Promise<boolean>;
+    claimExpiredDrafts(scope: AgentScope, hours: number, limit?: number): Promise<DbMessageAttachment[]>;
+    deleteDraft(scope: AgentScope, attachmentId: string, deletionClaimToken: string): Promise<boolean>;
     releaseDeletionClaim(
-      userId: string,
+      scope: AgentScope,
       attachmentId: string,
       deletionClaimToken: string,
       errorCode: string,
@@ -49,6 +50,7 @@ export type AttachmentCleanupResult = {
 };
 
 export async function cleanupStaleAttachments(options: {
+  scope: AgentScope;
   repositories: AttachmentCleanupRepositories;
   storageDirectory: string;
   deleteFile?: typeof deleteAttachment;
@@ -69,6 +71,7 @@ export async function cleanupStaleAttachments(options: {
   let claimed: DbMessageAttachment[] = [];
   try {
     claimed = await options.repositories.messageAttachments.claimExpiredDrafts(
+      options.scope,
       ATTACHMENT_DRAFT_MAX_AGE_HOURS,
       ATTACHMENT_CLEANUP_BATCH_SIZE,
     );
@@ -88,7 +91,7 @@ export async function cleanupStaleAttachments(options: {
     try {
       await deleteFile(options.storageDirectory, attachment.storageKey);
       const deleted = await options.repositories.messageAttachments.deleteDraft(
-        attachment.userId,
+        options.scope,
         attachment.id,
         token,
       );
@@ -102,7 +105,7 @@ export async function cleanupStaleAttachments(options: {
       logger.error(`Attachment cleanup item ${attachment.id}: stage=delete code=attachment_cleanup_failed.`);
       try {
         const released = await options.repositories.messageAttachments.releaseDeletionClaim(
-          attachment.userId,
+          options.scope,
           attachment.id,
           token,
           "attachment_cleanup_failed",

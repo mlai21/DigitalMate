@@ -3,6 +3,7 @@ import type { LlmClient } from "@/server/llm/types";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
 import type { SkillDraft } from "@/server/evolution/skills";
 import { createSkillDraft } from "@/server/evolution/skills";
+import type { AgentScope } from "@/server/agents/types";
 
 export type TurnReviewResult = {
   reflection: ReflectionRecord | null;
@@ -74,7 +75,7 @@ export async function reviewTurnWithLlm(input: {
 
 type TurnReviewRepositories = {
   reflections: {
-    create(input: { userId: string; reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
+    create(scope: AgentScope, input: { reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
   };
   skills: {
     create(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
@@ -84,7 +85,7 @@ type TurnReviewRepositories = {
 export async function recordTurnReview(
   repositories: TurnReviewRepositories,
   input: {
-    userId: string;
+    scope: AgentScope;
     conversationId: string;
     llm: LlmClient;
     model: string;
@@ -96,14 +97,13 @@ export async function recordTurnReview(
   if (!result) return null;
 
   if (result.reflection) {
-    await repositories.reflections.create({
-      userId: input.userId,
+    await repositories.reflections.create(input.scope, {
       reflection: result.reflection,
       sourceWindow: { event: "turn_review", conversationId: input.conversationId },
     });
   }
   if (result.skillDraft) {
-    await repositories.skills.create(input.userId, result.skillDraft);
+    await repositories.skills.create(input.scope.userId, result.skillDraft);
   }
   return result;
 }

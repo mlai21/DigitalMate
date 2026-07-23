@@ -6,6 +6,7 @@ import { redirectUrl } from "@/server/http/redirect";
 import { getLlmClient } from "@/server/llm/router";
 import { discoverSkillsFromGitHub } from "@/server/skills/import";
 import { scanSkillContent } from "@/server/skills/security-scan";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
@@ -19,7 +20,8 @@ export async function POST(request: Request) {
 
   const env = readEnv();
   const repositories = createRepositories();
-  const settings = await repositories.settings.get(user.id);
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const settings = await repositories.settings.get(scope);
   const light = getLlmClient("light", env, settings.modelRouting);
 
   let installed = 0;

@@ -13,6 +13,8 @@ import { validateAttachmentFile } from "@/server/attachments/validation";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
+import type { AgentScope } from "@/server/agents/types";
 
 export const runtime = "nodejs";
 
@@ -86,6 +88,12 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
+  let scope: AgentScope;
+  try {
+    scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  } catch {
+    return errorResponse("attachment_upload_failed", 500);
+  }
   let releaseMutationLock: (() => Promise<void>) | undefined;
   try {
     releaseMutationLock = await repositories.messageAttachments.acquireUserMutationLock(user.id);
@@ -117,8 +125,7 @@ export async function POST(request: Request) {
     const storageKey = createAttachmentStorageKey();
     const storageRoot = readEnv().attachmentStorageDir;
     const attachments = repositories.messageAttachments;
-    const draft = await attachments.createDraft({
-      userId: user.id,
+    const draft = await attachments.createDraft(scope, {
       kind: validated.kind,
       fileName: validated.fileName,
       mimeType: validated.mimeType,
@@ -130,11 +137,11 @@ export async function POST(request: Request) {
 
     try {
       await saveAttachment(storageRoot, storageKey, upload.bytes);
-      const attachment = await attachments.markReady(user.id, draft.id);
+      const attachment = await attachments.markReady(scope, draft.id);
       if (!attachment) throw new Error("attachment_ready_transition_failed");
       return NextResponse.json({ attachment: publicAttachment(attachment) }, { status: 201 });
     } catch (error) {
-      await attachments.markFailed(user.id, draft.id, "attachment_upload_failed").catch(() => undefined);
+      await attachments.markFailed(scope, draft.id, "attachment_upload_failed").catch(() => undefined);
       const isExistingTarget = error instanceof Error && "code" in error && error.code === "EEXIST";
       if (!isExistingTarget) {
         await deleteAttachment(storageRoot, storageKey).catch(() => undefined);

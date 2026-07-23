@@ -9,6 +9,7 @@ import { redirectUrl } from "@/server/http/redirect";
 import { defaultArtifactRoot, writeArtifactFile } from "@/server/tasks/artifacts";
 import { runSandboxTask } from "@/server/tasks/sandbox";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -22,9 +23,9 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const inputSummary = `沙箱执行：${script.slice(0, 80)}`;
-  const taskRunId = await repositories.taskRuns.create({
-    userId: user.id,
+  const taskRunId = await repositories.taskRuns.create(scope, {
     kind: "sandbox",
     inputSummary,
     metadata: { image },
@@ -49,9 +50,9 @@ export async function POST(request: Request) {
       mimeType: "text/plain; charset=utf-8",
       buffer: Buffer.from(output),
     });
-    await repositories.taskArtifacts.create({ userId: user.id, taskRunId, ...stored });
+    await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
     await completeTaskWithSkillDraft(repositories, {
-      userId: user.id,
+      scope,
       taskRunId,
       kind: "sandbox",
       inputSummary,
@@ -59,9 +60,9 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await repositories.taskRuns.fail(taskRunId, message);
+    await repositories.taskRuns.fail(scope, taskRunId, message);
     await recordEventReflection(repositories, {
-      userId: user.id,
+      scope,
       event: "task_failure",
       summary: `${inputSummary} 失败：${message}`,
       source: { taskRunId, taskKind: "sandbox" },

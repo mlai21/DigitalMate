@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { defaultArtifactRoot, readArtifactFile } from "@/server/tasks/artifacts";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -14,7 +15,9 @@ export async function GET(_request: Request, context: { params: Promise<{ artifa
   }
 
   const { artifactId } = await context.params;
-  const artifact = await createRepositories().taskArtifacts.getForUser(user.id, artifactId);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const artifact = await repositories.taskArtifacts.get(scope, artifactId);
   if (!artifact) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }

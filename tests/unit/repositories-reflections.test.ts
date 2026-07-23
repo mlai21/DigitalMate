@@ -12,10 +12,15 @@ describe("reflection repository", () => {
     });
     const repositories = createRepositories({ query } as unknown as Pool);
 
-    await expect(repositories.reflections.latestBySourceEvent("user-1", "proactive_ignored")).resolves.toBe(latest);
+    await expect(
+      repositories.reflections.latestBySourceEvent(
+        { userId: "user-1", agentId: "agent-1" },
+        "proactive_ignored",
+      ),
+    ).resolves.toBe(latest);
 
     const [sql, params] = query.mock.calls[0] ?? [];
-    expect(String(sql)).toContain("source_window->>'event' = $2");
-    expect(params).toEqual(["user-1", "proactive_ignored"]);
+    expect(String(sql)).toContain("source_window->>'event' = $3");
+    expect(params).toEqual(["user-1", "agent-1", "proactive_ignored"]);
   });
 });

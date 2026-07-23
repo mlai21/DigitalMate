@@ -44,6 +44,7 @@ describe("runAgent", () => {
       {
         id: "30000000-0000-4000-8000-000000000001",
         userId: "user-1",
+        agentId: "agent-1",
         messageId: null,
         kind: "image",
         fileName: "cat.png",
@@ -61,6 +62,7 @@ describe("runAgent", () => {
       {
         id: "30000000-0000-4000-8000-000000000002",
         userId: "user-1",
+        agentId: "agent-1",
         messageId: null,
         kind: "document",
         fileName: "notes.md",
@@ -99,6 +101,7 @@ describe("runAgent", () => {
   it("fails with stable context errors instead of silently dropping over-budget attachments", async () => {
     const base = {
       userId: "user-1",
+      agentId: "agent-1",
       messageId: null,
       kind: "document" as const,
       fileName: "notes.md",
@@ -243,6 +246,7 @@ describe("runAgent", () => {
     const currentChunks: string[] = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "请搜索并保存",
       attachments: [attachment],
@@ -282,6 +286,7 @@ describe("runAgent", () => {
     const historyChunks: string[] = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "继续",
       history: [{ role: "user", content: "上一轮", attachments: [attachment] }],
@@ -318,6 +323,7 @@ describe("runAgent", () => {
     searchRun.mockResolvedValueOnce({ summary: "今日新闻", results: [] });
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我搜新闻",
       history: [],
@@ -362,6 +368,7 @@ describe("runAgent", () => {
     const chunks: string[] = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "继续",
       history: [{
@@ -417,6 +424,7 @@ describe("runAgent", () => {
     );
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "看附件",
       attachments: [{
@@ -472,6 +480,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "周末有什么建议？",
       history: [],
@@ -511,6 +520,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我查一下明天北京天气",
       history: [],
@@ -539,6 +549,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "你好",
       history: [],
@@ -571,6 +582,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "继续",
       history: [],
@@ -593,6 +605,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我整理一份周报",
       history: [],
@@ -642,6 +655,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我看看这个想法",
       history: [],
@@ -672,6 +686,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "我们继续",
       history: [],
@@ -710,6 +725,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "用 xlsx_summary 看下销售表",
       history: [],
@@ -750,6 +766,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "整理周报",
       history: [],
@@ -771,7 +788,12 @@ describe("runAgent", () => {
       void chunk;
     }
 
-    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-1", "skill-2"], "conversation-1", "auto");
+    expect(recordUsage).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      ["skill-1", "skill-2"],
+      "conversation-1",
+      "auto",
+    );
   });
 
   it("loads explicitly selected skills unconditionally and skips auto-matching", async () => {
@@ -785,6 +807,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我分析这个人",
       history: [],
@@ -803,7 +826,12 @@ describe("runAgent", () => {
 
     expect(findByIds).toHaveBeenCalledWith("user-1", ["skill-9"]);
     expect(findEnabled).not.toHaveBeenCalled();
-    expect(recordUsage).toHaveBeenCalledWith("user-1", ["skill-9"], "conversation-1", "explicit");
+    expect(recordUsage).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      ["skill-9"],
+      "conversation-1",
+      "explicit",
+    );
     const systemPrompt = seenInputs[0]?.messages[0]?.content ?? "";
     expect(systemPrompt).toContain("用户显式指定了以下 Skill");
     expect(systemPrompt).toContain("女娲");
@@ -820,6 +848,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "你觉得人生的意义是什么",
       history: [],
@@ -859,6 +888,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我查一下北京天气",
       history: [],
@@ -892,6 +922,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "北京天气怎么样",
       history: [],
@@ -939,6 +970,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "确认，就按这个建",
       history: [],
@@ -995,6 +1027,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "把这套周报做法记下来",
       history: [],
@@ -1039,6 +1072,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "记住这个",
       history: [],
@@ -1065,6 +1099,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "你好",
       history: [],
@@ -1116,6 +1151,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "安装这个 https://github.com/alchaincyf/nuwa-skill",
       history: [],
@@ -1147,6 +1183,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "安装这个 https://github.com/owner/repo#安装",
       history: [],
@@ -1169,6 +1206,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "你好",
       history: [],
@@ -1194,6 +1232,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "看下今天新闻",
       history: [],
@@ -1226,6 +1265,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我安装这个 skill https://github.com/example/skills",
       history: [],
@@ -1257,6 +1297,7 @@ describe("runAgent", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "明天北京天气怎么样",
       history: [],
@@ -1289,6 +1330,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我搜一下北京天气",
       history: [],
@@ -1323,6 +1365,7 @@ describe("runAgent", () => {
     const chunks = [];
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "帮我查一下北京天气",
       history: [],

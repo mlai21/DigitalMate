@@ -12,16 +12,23 @@ import { createRepositories } from "@/server/db/repositories";
 const createdAt = new Date("2026-07-14T00:00:00Z");
 const USER_1 = "00000000-0000-4000-8000-000000000001";
 const USER_2 = "00000000-0000-4000-8000-000000000002";
+const AGENT_1 = "01000000-0000-4000-8000-000000000001";
+const TEST_SCOPE = { userId: USER_1, agentId: AGENT_1 };
 const CONVERSATION_1 = "10000000-0000-4000-8000-000000000001";
 const MESSAGE_1 = "20000000-0000-4000-8000-000000000001";
 const OLD_MESSAGE = "20000000-0000-4000-8000-000000000002";
 const ATTACHMENT_1 = "30000000-0000-4000-8000-000000000001";
 const ATTACHMENT_2 = "30000000-0000-4000-8000-000000000002";
 
+function scopeForUser(userId: string) {
+  return { userId, agentId: `6${userId[0]}${userId.slice(2)}` };
+}
+
 function attachmentRow(overrides: Record<string, unknown> = {}) {
   return {
     id: ATTACHMENT_1,
     user_id: USER_1,
+    agent_id: AGENT_1,
     message_id: null,
     kind: "document",
     file_name: "notes.md",
@@ -43,6 +50,7 @@ function messageRow() {
   return {
     id: MESSAGE_1,
     user_id: USER_1,
+    agent_id: AGENT_1,
     conversation_id: CONVERSATION_1,
     role: "user",
     content: "请看附件",
@@ -71,8 +79,7 @@ describe("message attachments repository", () => {
     const repositories = createRepositories(createPool(query));
 
     await expect(
-      repositories.messageAttachments.createDraft({
-        userId: USER_1,
+      repositories.messageAttachments.createDraft(TEST_SCOPE, {
         kind: "document",
         fileName: "notes.md",
         mimeType: "text/markdown",
@@ -83,6 +90,7 @@ describe("message attachments repository", () => {
     ).resolves.toMatchObject({
       id: ATTACHMENT_1,
       userId: USER_1,
+      agentId: AGENT_1,
       messageId: null,
       fileName: "notes.md",
       storageKey: "storage-1",
@@ -94,6 +102,7 @@ describe("message attachments repository", () => {
     expect(sql).toContain("'pending'");
     expect(params).toEqual([
       USER_1,
+      AGENT_1,
       "document",
       "notes.md",
       "text/markdown",
@@ -109,48 +118,50 @@ describe("message attachments repository", () => {
     const repositories = createRepositories(createPool(query));
 
     await expect(
-      repositories.messageAttachments.markReady(USER_1, ATTACHMENT_1),
+      repositories.messageAttachments.markReady(TEST_SCOPE, ATTACHMENT_1),
     ).resolves.toMatchObject({ id: ATTACHMENT_1, status: "ready" });
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("SET status = 'ready'");
     expect(sql).toContain("message_id IS NULL AND status = 'pending'");
     expect(sql).toContain("deletion_claim_token = NULL");
-    expect(params).toEqual([USER_1, ATTACHMENT_1]);
+    expect(params).toEqual([USER_1, AGENT_1, ATTACHMENT_1]);
   });
 
-  it("only reads an attachment through its owning user", async () => {
+  it("only reads an attachment through its owning agent scope", async () => {
     const query = vi.fn(async () => ({ rows: [attachmentRow()] }));
     const repositories = createRepositories(createPool(query));
 
-    await expect(repositories.messageAttachments.getForUser(USER_1, ATTACHMENT_1)).resolves.toMatchObject({
+    await expect(repositories.messageAttachments.get(TEST_SCOPE, ATTACHMENT_1)).resolves.toMatchObject({
       id: ATTACHMENT_1,
       userId: USER_1,
+      agentId: AGENT_1,
     });
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
-    expect(sql).toContain("WHERE user_id = $1 AND id = $2");
-    expect(params).toEqual([USER_1, ATTACHMENT_1]);
+    expect(sql).toContain("WHERE user_id = $1 AND agent_id = $2 AND id = $3");
+    expect(params).toEqual([USER_1, AGENT_1, ATTACHMENT_1]);
   });
 
   it("lists attachments for user-owned message ids in one query", async () => {
     const query = vi.fn(async () => ({ rows: [attachmentRow({ message_id: MESSAGE_1, status: "bound" })] }));
     const repositories = createRepositories(createPool(query));
 
-    await expect(repositories.messageAttachments.listForMessages(USER_1, [MESSAGE_1])).resolves.toHaveLength(1);
+    await expect(repositories.messageAttachments.listForMessages(TEST_SCOPE, [MESSAGE_1])).resolves.toHaveLength(1);
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("user_id = $1");
-    expect(sql).toContain("message_id = ANY($2::uuid[])");
+    expect(sql).toContain("agent_id = $2");
+    expect(sql).toContain("message_id = ANY($3::uuid[])");
     expect(sql).toContain("ORDER BY created_at ASC, id ASC");
-    expect(params).toEqual([USER_1, [MESSAGE_1]]);
+    expect(params).toEqual([USER_1, AGENT_1, [MESSAGE_1]]);
   });
 
   it("does not query when no message ids are requested", async () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));
 
-    await expect(repositories.messageAttachments.listForMessages(USER_1, [])).resolves.toEqual([]);
+    await expect(repositories.messageAttachments.listForMessages(TEST_SCOPE, [])).resolves.toEqual([]);
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -175,7 +186,7 @@ describe("message attachments repository", () => {
     const repositories = createRepositories(createPool(query));
 
     await expect(
-      repositories.messageAttachments.claimDraftForDeletion(USER_1, ATTACHMENT_1),
+      repositories.messageAttachments.claimDraftForDeletion(TEST_SCOPE, ATTACHMENT_1),
     ).resolves.toMatchObject({
       id: ATTACHMENT_1,
       userId: USER_1,
@@ -188,10 +199,10 @@ describe("message attachments repository", () => {
     expect(sql).toContain("UPDATE message_attachments");
     expect(sql).toContain("SET status = 'deleting'");
     expect(sql).toContain("deletion_claim_token = gen_random_uuid()");
-    expect(sql).toContain("user_id = $1 AND id = $2");
+    expect(sql).toContain("user_id = $1 AND agent_id = $2 AND id = $3");
     expect(sql).toContain("message_id IS NULL AND status IN ('ready', 'failed', 'deleting')");
     expect(sql).toContain("RETURNING *");
-    expect(params).toEqual([USER_1, ATTACHMENT_1]);
+    expect(params).toEqual([USER_1, AGENT_1, ATTACHMENT_1]);
   });
 
   it("deletes only the matching fenced claim and marks upload drafts failed", async () => {
@@ -199,28 +210,28 @@ describe("message attachments repository", () => {
     const repositories = createRepositories(createPool(query));
     const claimToken = "50000000-0000-4000-8000-000000000001";
 
-    await repositories.messageAttachments.deleteDraft(USER_1, ATTACHMENT_1, claimToken);
-    await repositories.messageAttachments.markFailed(USER_1, ATTACHMENT_2, "attachment_parse_failed");
+    await repositories.messageAttachments.deleteDraft(TEST_SCOPE, ATTACHMENT_1, claimToken);
+    await repositories.messageAttachments.markFailed(TEST_SCOPE, ATTACHMENT_2, "attachment_parse_failed");
 
     const [deleteSql, deleteParams] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(deleteSql).toContain("DELETE FROM message_attachments");
-    expect(deleteSql).toContain("user_id = $1 AND id = $2");
+    expect(deleteSql).toContain("user_id = $1 AND agent_id = $2 AND id = $3");
     expect(deleteSql).toContain("status = 'deleting'");
-    expect(deleteSql).toContain("deletion_claim_token = $3");
-    expect(deleteParams).toEqual([USER_1, ATTACHMENT_1, claimToken]);
+    expect(deleteSql).toContain("deletion_claim_token = $4");
+    expect(deleteParams).toEqual([USER_1, AGENT_1, ATTACHMENT_1, claimToken]);
 
     const [failedSql, failedParams] = query.mock.calls[1] as unknown as [string, unknown[]];
     expect(failedSql).toContain("status = 'failed'");
     expect(failedSql).toContain("message_id IS NULL");
     expect(failedSql).toContain("status IN ('pending', 'ready', 'failed')");
-    expect(failedParams).toEqual([USER_1, ATTACHMENT_2, "attachment_parse_failed"]);
+    expect(failedParams).toEqual([USER_1, AGENT_1, ATTACHMENT_2, "attachment_parse_failed"]);
   });
 
   it("atomically claims expired drafts with leases, retry backoff and fair ordering", async () => {
     const query = vi.fn(async () => ({ rows: [attachmentRow({ status: "deleting" })] }));
     const repositories = createRepositories(createPool(query));
 
-    await expect(repositories.messageAttachments.claimExpiredDrafts(24)).resolves.toEqual([
+    await expect(repositories.messageAttachments.claimExpiredDrafts(TEST_SCOPE, 24)).resolves.toEqual([
       expect.objectContaining({ id: ATTACHMENT_1, status: "deleting" }),
     ]);
 
@@ -231,7 +242,7 @@ describe("message attachments repository", () => {
     expect(sql).toContain("status = 'pending'");
     expect(sql).toContain("status = 'failed'");
     expect(sql).toContain("status = 'deleting'");
-    expect(sql).toContain("created_at < now() - ($1 * interval '1 hour')");
+    expect(sql).toContain("created_at < now() - ($3 * interval '1 hour')");
     expect(sql).toContain("updated_at < now() - interval '5 minutes'");
     expect(sql).toContain("updated_at < now() - interval '15 minutes'");
     expect(sql).toContain("ORDER BY updated_at ASC, id ASC");
@@ -239,18 +250,18 @@ describe("message attachments repository", () => {
     expect(sql).toContain("SET status = 'deleting'");
     expect(sql).toContain("deletion_claim_token = gen_random_uuid()");
     expect(sql).toContain("RETURNING attachment.*");
-    expect(sql).toContain("LIMIT $2");
-    expect(params).toEqual([24, 100]);
+    expect(sql).toContain("LIMIT $4");
+    expect(params).toEqual([USER_1, AGENT_1, 24, 100]);
   });
 
   it("caps the deletion claim batch size at one hundred", async () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));
 
-    await repositories.messageAttachments.claimExpiredDrafts(24, 1_000);
+    await repositories.messageAttachments.claimExpiredDrafts(TEST_SCOPE, 24, 1_000);
 
     const [, params] = query.mock.calls[0] as unknown as [string, unknown[]];
-    expect(params).toEqual([24, 100]);
+    expect(params).toEqual([USER_1, AGENT_1, 24, 100]);
   });
 
   it("releases only the matching deletion claim back to failed", async () => {
@@ -259,7 +270,7 @@ describe("message attachments repository", () => {
     const claimToken = "50000000-0000-4000-8000-000000000001";
 
     await repositories.messageAttachments.releaseDeletionClaim(
-      USER_1,
+      TEST_SCOPE,
       ATTACHMENT_1,
       claimToken,
       "attachment_cleanup_failed",
@@ -267,11 +278,11 @@ describe("message attachments repository", () => {
 
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toContain("SET status = 'failed'");
-    expect(sql).toContain("user_id = $1 AND id = $2");
+    expect(sql).toContain("user_id = $1 AND agent_id = $2 AND id = $3");
     expect(sql).toContain("message_id IS NULL AND status = 'deleting'");
-    expect(sql).toContain("deletion_claim_token = $3");
+    expect(sql).toContain("deletion_claim_token = $4");
     expect(sql).toContain("deletion_claim_token = NULL");
-    expect(params).toEqual([USER_1, ATTACHMENT_1, claimToken, "attachment_cleanup_failed"]);
+    expect(params).toEqual([USER_1, AGENT_1, ATTACHMENT_1, claimToken, "attachment_cleanup_failed"]);
   });
 
   it.each([
@@ -285,7 +296,7 @@ describe("message attachments repository", () => {
     const query = vi.fn(async () => ({ rows: [] }));
     const repositories = createRepositories(createPool(query));
 
-    await expect(repositories.messageAttachments.claimExpiredDrafts(hours, limit)).rejects.toThrow(
+    await expect(repositories.messageAttachments.claimExpiredDrafts(TEST_SCOPE, hours, limit)).rejects.toThrow(
       "invalid_attachment_claim_limit",
     );
     expect(query).not.toHaveBeenCalled();
@@ -317,8 +328,7 @@ describe("messages.createWithAttachments", () => {
     const repositories = createRepositories(pool);
 
     await expect(
-      repositories.messages.createWithAttachments({
-        userId: USER_1,
+      repositories.messages.createWithAttachments(TEST_SCOPE, {
         conversationId: CONVERSATION_1,
         content: "请看附件",
         attachmentIds: [ATTACHMENT_1, ATTACHMENT_2],
@@ -345,10 +355,11 @@ describe("messages.createWithAttachments", () => {
 
     const lockSql = String(query.mock.calls[2]?.[0]);
     const [, lockParams] = query.mock.calls[2] as unknown as [unknown, unknown[]];
-    expect(lockSql).toContain("user_id = $2");
+    expect(lockSql).toContain("user_id = $1");
+    expect(lockSql).toContain("agent_id = $2");
     expect(lockSql).toContain("ORDER BY id");
     expect(lockSql).toContain("FOR UPDATE");
-    expect(lockParams).toEqual([[ATTACHMENT_1, ATTACHMENT_2], USER_1]);
+    expect(lockParams).toEqual([USER_1, AGENT_1, [ATTACHMENT_1, ATTACHMENT_2]]);
     const bindSql = String(query.mock.calls[4]?.[0]);
     expect(bindSql).toContain("status = 'ready'");
     expect(bindSql).toContain("message_id IS NULL");
@@ -371,8 +382,7 @@ describe("messages.createWithAttachments", () => {
     const repositories = createRepositories(pool);
 
     await expect(
-      repositories.messages.createWithAttachments({
-        userId: USER_1,
+      repositories.messages.createWithAttachments(TEST_SCOPE, {
         conversationId: CONVERSATION_1,
         content: "请看附件",
         attachmentIds: [ATTACHMENT_1],
@@ -398,8 +408,7 @@ describe("messages.createWithAttachments", () => {
     const repositories = createRepositories(pool);
 
     await expect(
-      repositories.messages.createWithAttachments({
-        userId: USER_1,
+      repositories.messages.createWithAttachments(TEST_SCOPE, {
         conversationId: CONVERSATION_1,
         content: "太多附件",
         attachmentIds: Array.from(
@@ -426,8 +435,7 @@ describe("messages.createWithAttachments", () => {
     const repositories = createRepositories(pool);
 
     await expect(
-      repositories.messages.createWithAttachments({
-        userId: USER_1,
+      repositories.messages.createWithAttachments(TEST_SCOPE, {
         conversationId: CONVERSATION_1,
         content: "文件太大",
         attachmentIds: [ATTACHMENT_1],
@@ -452,8 +460,7 @@ describe("messages.createWithAttachments", () => {
     const repositories = createRepositories(pool);
 
     await expect(
-      repositories.messages.createWithAttachments({
-        userId: USER_1,
+      repositories.messages.createWithAttachments(TEST_SCOPE, {
         conversationId: CONVERSATION_1,
         content: "重复附件",
         attachmentIds: [ATTACHMENT_1, ATTACHMENT_1],
@@ -489,9 +496,10 @@ async function readClientTurnMigration(): Promise<string> {
   )?.[0];
   if (!columnMigration) throw new Error("client_turn_migration_missing");
   return `${columnMigration}
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role
-  ON messages(user_id, client_turn_id, role)
-  WHERE client_turn_id IS NOT NULL;`;
+DROP INDEX IF EXISTS idx_messages_client_turn_role;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role
+  ON messages(user_id, agent_id, client_turn_id, role)
+WHERE client_turn_id IS NOT NULL;`;
 }
 
 async function reservePort(): Promise<number> {
@@ -565,14 +573,26 @@ describe("message attachment PostgreSQL concurrency", () => {
       CREATE TABLE users (
         id uuid PRIMARY KEY
       );
+      CREATE TABLE digital_agents (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        slug text NOT NULL,
+        display_name text NOT NULL,
+        status text NOT NULL DEFAULT 'active',
+        is_default boolean NOT NULL DEFAULT true,
+        inherits_user_resources boolean NOT NULL DEFAULT true,
+        UNIQUE (user_id, id)
+      );
       CREATE TABLE conversations (
         id uuid PRIMARY KEY,
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_id uuid NOT NULL,
         updated_at timestamptz NOT NULL DEFAULT now()
       );
       CREATE TABLE messages (
         id uuid PRIMARY KEY DEFAULT (md5(random()::text || clock_timestamp()::text)::uuid),
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_id uuid NOT NULL,
         conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         role text NOT NULL,
         content text NOT NULL,
@@ -581,6 +601,7 @@ describe("message attachment PostgreSQL concurrency", () => {
       CREATE TABLE message_attachments (
         id uuid PRIMARY KEY,
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_id uuid NOT NULL,
         message_id uuid REFERENCES messages(id) ON DELETE CASCADE,
         kind text NOT NULL,
         file_name text NOT NULL,
@@ -621,8 +642,16 @@ describe("message attachment PostgreSQL concurrency", () => {
   });
 
   async function seedConversation(userId: string, conversationId: string): Promise<void> {
+    const scope = scopeForUser(userId);
     await databasePool.query("INSERT INTO users (id) VALUES ($1)", [userId]);
-    await databasePool.query("INSERT INTO conversations (id, user_id) VALUES ($1, $2)", [conversationId, userId]);
+    await databasePool.query(
+      "INSERT INTO digital_agents (id, user_id, slug, display_name) VALUES ($1, $2, 'digitalmate', 'DigitalMate')",
+      [scope.agentId, userId],
+    );
+    await databasePool.query(
+      "INSERT INTO conversations (id, user_id, agent_id) VALUES ($1, $2, $3)",
+      [conversationId, userId, scope.agentId],
+    );
   }
 
   async function seedAttachment(input: {
@@ -634,11 +663,12 @@ describe("message attachment PostgreSQL concurrency", () => {
     status?: "pending" | "ready" | "failed" | "deleting";
   }): Promise<void> {
     const createdAt = input.createdAt ?? new Date();
+    const scope = scopeForUser(input.userId);
     await databasePool.query(
       `INSERT INTO message_attachments
-       (id, user_id, kind, file_name, mime_type, size_bytes, storage_key, status, created_at, updated_at)
-       VALUES ($1, $2, 'document', 'notes.md', 'text/markdown', 12, $3, $4, $5, $6)`,
-      [input.id, input.userId, input.storageKey, input.status ?? "ready", createdAt, input.updatedAt ?? createdAt],
+       (id, user_id, agent_id, kind, file_name, mime_type, size_bytes, storage_key, status, created_at, updated_at)
+       VALUES ($1, $2, $3, 'document', 'notes.md', 'text/markdown', 12, $4, $5, $6, $7)`,
+      [input.id, input.userId, scope.agentId, input.storageKey, input.status ?? "ready", createdAt, input.updatedAt ?? createdAt],
     );
   }
 
@@ -663,7 +693,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     expect(tokenColumn.rows).toHaveLength(1);
   });
 
-  it("keeps only the legacy client turn uniqueness used by the transition repository", async () => {
+  it("uses agent-scoped client turn uniqueness", async () => {
     await databasePool.query(await readClientTurnMigration());
     const columns = await databasePool.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
@@ -685,9 +715,9 @@ describe("message attachment PostgreSQL concurrency", () => {
        ORDER BY indexname`,
     );
     expect(indexes.rows).toHaveLength(1);
-    expect(indexes.rows[0].indexname).toBe("idx_messages_client_turn_role");
+    expect(indexes.rows[0].indexname).toBe("idx_messages_client_turn_agent_role");
     expect(indexes.rows[0].indexdef).toContain("UNIQUE");
-    expect(indexes.rows[0].indexdef).toContain("(user_id, client_turn_id, role)");
+    expect(indexes.rows[0].indexdef).toContain("(user_id, agent_id, client_turn_id, role)");
     expect(indexes.rows[0].indexdef).toContain("WHERE (client_turn_id IS NOT NULL)");
   });
 
@@ -706,8 +736,8 @@ describe("message attachment PostgreSQL concurrency", () => {
       attachmentIds: [],
     };
 
-    const first = await repositories.messages.createIdempotentUserTurn(input);
-    const retry = await repositories.messages.createIdempotentUserTurn(input);
+    const first = await repositories.messages.createIdempotentUserTurn(scopeForUser(userId), input);
+    const retry = await repositories.messages.createIdempotentUserTurn(scopeForUser(userId), input);
 
     expect(first.created).toBe(true);
     expect(retry.created).toBe(false);
@@ -725,8 +755,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     const clientTurnId = "52000000-0000-4000-8000-000000000009";
     await seedConversation(userId, conversationId);
     const firstRepositories = createRepositories(databasePool);
-    await firstRepositories.messages.createIdempotentUserTurn({
-      userId,
+    await firstRepositories.messages.createIdempotentUserTurn(scopeForUser(userId), {
       conversationId,
       clientTurnId,
       payloadHash: "durable-execution-claim",
@@ -735,12 +764,12 @@ describe("message attachment PostgreSQL concurrency", () => {
     });
 
     await expect(
-      firstRepositories.messages.claimClientTurnExecution(userId, clientTurnId),
+      firstRepositories.messages.claimClientTurnExecution(scopeForUser(userId), clientTurnId),
     ).resolves.toBe(true);
 
     const restartedRepositories = createRepositories(databasePool);
     await expect(
-      restartedRepositories.messages.claimClientTurnExecution(userId, clientTurnId),
+      restartedRepositories.messages.claimClientTurnExecution(scopeForUser(userId), clientTurnId),
     ).resolves.toBe(false);
     const persisted = await databasePool.query<{ client_turn_execution_started_at: Date | null }>(
       `SELECT client_turn_execution_started_at FROM messages
@@ -768,10 +797,10 @@ describe("message attachment PostgreSQL concurrency", () => {
     };
 
     const [first, second] = await Promise.all([
-      repositories.messages.createIdempotentUserTurn(input),
-      repositories.messages.createIdempotentUserTurn(input),
+      repositories.messages.createIdempotentUserTurn(scopeForUser(userId), input),
+      repositories.messages.createIdempotentUserTurn(scopeForUser(userId), input),
     ]);
-    const retryAfterBound = await repositories.messages.createIdempotentUserTurn(input);
+    const retryAfterBound = await repositories.messages.createIdempotentUserTurn(scopeForUser(userId), input);
 
     expect(new Set([first.message.id, second.message.id, retryAfterBound.message.id]).size).toBe(1);
     expect([first.created, second.created].filter(Boolean)).toHaveLength(1);
@@ -786,8 +815,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     const clientTurnId = "52000000-0000-4000-8000-000000000003";
     await seedConversation(userId, conversationId);
     const repositories = createRepositories(databasePool);
-    await repositories.messages.createIdempotentUserTurn({
-      userId,
+    await repositories.messages.createIdempotentUserTurn(scopeForUser(userId), {
       conversationId,
       clientTurnId,
       payloadHash: "payload-original",
@@ -795,8 +823,7 @@ describe("message attachment PostgreSQL concurrency", () => {
       attachmentIds: [],
     });
 
-    await expect(repositories.messages.createIdempotentUserTurn({
-      userId,
+    await expect(repositories.messages.createIdempotentUserTurn(scopeForUser(userId), {
       conversationId,
       clientTurnId,
       payloadHash: "payload-changed",
@@ -813,11 +840,11 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
 
     const [normal, fallback] = await Promise.all([
-      repositories.messages.createIdempotentAssistantTurn({
-        userId, conversationId, clientTurnId, content: "正常回复",
+      repositories.messages.createIdempotentAssistantTurn(scopeForUser(userId), {
+        conversationId, clientTurnId, content: "正常回复",
       }),
-      repositories.messages.createIdempotentAssistantTurn({
-        userId, conversationId, clientTurnId, content: "降级回复",
+      repositories.messages.createIdempotentAssistantTurn(scopeForUser(userId), {
+        conversationId, clientTurnId, content: "降级回复",
       }),
     ]);
 
@@ -835,9 +862,9 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
     const userId = "50000000-0000-4000-8000-000000000005";
     const clientTurnId = "52000000-0000-4000-8000-000000000005";
-    const releaseFirst = await repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId);
+    const releaseFirst = await repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId);
     let secondAcquired = false;
-    const secondLock = repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId).then((release) => {
+    const secondLock = repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId).then((release) => {
       secondAcquired = true;
       return release;
     });
@@ -873,9 +900,9 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
     const userId = "50000000-0000-4000-8000-000000000006";
     const clientTurnId = "52000000-0000-4000-8000-000000000006";
-    const releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId);
+    const releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId);
     const waiters = Array.from({ length: 12 }, () =>
-      repositories.messages.acquireClientTurnExecutionLock(userId, clientTurnId).then(async (release) => {
+      repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId).then(async (release) => {
         await release();
       }),
     );
@@ -902,11 +929,11 @@ describe("message attachment PostgreSQL concurrency", () => {
     let releaseSecond: (() => Promise<void>) | undefined;
     try {
       releaseFirst = await repositories.messages.acquireClientTurnExecutionLock(
-        "50000000-0000-4000-8000-000000000007",
+        scopeForUser("50000000-0000-4000-8000-000000000007"),
         "52000000-0000-4000-8000-000000000007",
       );
       releaseSecond = await repositories.messages.acquireClientTurnExecutionLock(
-        "50000000-0000-4000-8000-000000000008",
+        scopeForUser("50000000-0000-4000-8000-000000000008"),
         "52000000-0000-4000-8000-000000000008",
       );
       let businessQueryCompleted = false;
@@ -938,15 +965,15 @@ describe("message attachment PostgreSQL concurrency", () => {
     await seedAttachment({ id: attachmentId, userId, storageKey: "pg-token-fence" });
     const repositories = createRepositories(databasePool);
 
-    const firstClaim = await repositories.messageAttachments.claimDraftForDeletion(userId, attachmentId);
-    const secondClaim = await repositories.messageAttachments.claimDraftForDeletion(userId, attachmentId);
+    const firstClaim = await repositories.messageAttachments.claimDraftForDeletion(scopeForUser(userId), attachmentId);
+    const secondClaim = await repositories.messageAttachments.claimDraftForDeletion(scopeForUser(userId), attachmentId);
     expect(firstClaim?.deletionClaimToken).toBeTruthy();
     expect(secondClaim?.deletionClaimToken).toBeTruthy();
     expect(secondClaim?.deletionClaimToken).not.toBe(firstClaim?.deletionClaimToken);
 
     await expect(
       repositories.messageAttachments.releaseDeletionClaim(
-        userId,
+        scopeForUser(userId),
         attachmentId,
         firstClaim!.deletionClaimToken!,
         "old_worker",
@@ -954,20 +981,20 @@ describe("message attachment PostgreSQL concurrency", () => {
     ).resolves.toBe(false);
     await expect(
       repositories.messageAttachments.deleteDraft(
-        userId,
+        scopeForUser(userId),
         attachmentId,
         firstClaim!.deletionClaimToken!,
       ),
     ).resolves.toBe(false);
 
-    const stored = await repositories.messageAttachments.getForUser(userId, attachmentId);
+    const stored = await repositories.messageAttachments.get(scopeForUser(userId), attachmentId);
     expect(stored).toMatchObject({
       status: "deleting",
       deletionClaimToken: secondClaim!.deletionClaimToken,
     });
     await expect(
       repositories.messageAttachments.deleteDraft(
-        userId,
+        scopeForUser(userId),
         attachmentId,
         secondClaim!.deletionClaimToken!,
       ),
@@ -983,14 +1010,12 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
 
     const results = await Promise.allSettled([
-      repositories.messages.createWithAttachments({
-        userId,
+      repositories.messages.createWithAttachments(scopeForUser(userId), {
         conversationId,
         content: "first",
         attachmentIds: [attachmentId],
       }),
-      repositories.messages.createWithAttachments({
-        userId,
+      repositories.messages.createWithAttachments(scopeForUser(userId), {
         conversationId,
         content: "second",
         attachmentIds: [attachmentId],
@@ -1018,14 +1043,12 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
 
     const results = await Promise.allSettled([
-      repositories.messages.createWithAttachments({
-        userId,
+      repositories.messages.createWithAttachments(scopeForUser(userId), {
         conversationId,
         content: "ascending",
         attachmentIds: [lowerId, higherId],
       }),
-      repositories.messages.createWithAttachments({
-        userId,
+      repositories.messages.createWithAttachments(scopeForUser(userId), {
         conversationId,
         content: "descending",
         attachmentIds: [higherId, lowerId],
@@ -1051,9 +1074,8 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
 
     const [claimResult, bindResult] = await Promise.allSettled([
-      repositories.messageAttachments.claimExpiredDrafts(24, 1),
-      repositories.messages.createWithAttachments({
-        userId,
+      repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 1),
+      repositories.messages.createWithAttachments(scopeForUser(userId), {
         conversationId,
         content: "bind while cleanup starts",
         attachmentIds: [attachmentId],
@@ -1098,17 +1120,16 @@ describe("message attachment PostgreSQL concurrency", () => {
       updatedAt: old,
     });
     const repositories = createRepositories(databasePool);
-    await repositories.messages.createWithAttachments({
-      userId,
+    await repositories.messages.createWithAttachments(scopeForUser(userId), {
       conversationId,
       content: "bind old attachment",
       attachmentIds: [boundId],
     });
 
-    const claimed = await repositories.messageAttachments.claimExpiredDrafts(24, 10);
+    const claimed = await repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 10);
 
     expect(claimed.map((attachment) => attachment.id)).toEqual([pendingId]);
-    const bound = await repositories.messageAttachments.getForUser(userId, boundId);
+    const bound = await repositories.messageAttachments.get(scopeForUser(userId), boundId);
     expect(bound).toMatchObject({ status: "bound", messageId: expect.any(String) });
   });
 
@@ -1129,8 +1150,8 @@ describe("message attachment PostgreSQL concurrency", () => {
     const repositories = createRepositories(databasePool);
 
     const [first, second] = await Promise.all([
-      repositories.messageAttachments.claimExpiredDrafts(24, 2),
-      repositories.messageAttachments.claimExpiredDrafts(24, 2),
+      repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 2),
+      repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 2),
     ]);
 
     expect(first).toHaveLength(2);
@@ -1167,7 +1188,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     });
     const repositories = createRepositories(databasePool);
 
-    const claimed = await repositories.messageAttachments.claimExpiredDrafts(24, 10);
+    const claimed = await repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 10);
 
     expect(claimed.map((attachment) => attachment.id)).toEqual([staleId]);
   });
@@ -1196,14 +1217,14 @@ describe("message attachment PostgreSQL concurrency", () => {
     });
     const repositories = createRepositories(databasePool);
 
-    const firstClaim = await repositories.messageAttachments.claimExpiredDrafts(24, 1);
+    const firstClaim = await repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 1);
     expect(firstClaim.map((attachment) => attachment.id)).toEqual([readyHighId]);
 
     await databasePool.query(
       "UPDATE message_attachments SET updated_at = now() - interval '6 minutes' WHERE id = $1",
       [failedLowId],
     );
-    const retryClaim = await repositories.messageAttachments.claimExpiredDrafts(24, 1);
+    const retryClaim = await repositories.messageAttachments.claimExpiredDrafts(scopeForUser(userId), 24, 1);
     expect(retryClaim.map((attachment) => attachment.id)).toEqual([failedLowId]);
   });
 
@@ -1228,6 +1249,7 @@ describe("message attachment PostgreSQL concurrency", () => {
       ]);
 
       const result = await cleanupStaleAttachments({
+        scope: scopeForUser(userId),
         repositories: createRepositories(databasePool),
         storageDirectory: storageRoot,
         logger: { info: vi.fn(), error: vi.fn() },
@@ -1236,7 +1258,7 @@ describe("message attachment PostgreSQL concurrency", () => {
       expect((await readdir(storageRoot)).sort()).toEqual([referencedKey]);
       expect(result.orphanedFiles).toEqual({ deleted: 1, failed: 0 });
       await expect(
-        createRepositories(databasePool).messageAttachments.getForUser(userId, attachmentId),
+        createRepositories(databasePool).messageAttachments.get(scopeForUser(userId), attachmentId),
       ).resolves.toMatchObject({ storageKey: referencedKey });
     } finally {
       await rm(storageRoot, { recursive: true, force: true });

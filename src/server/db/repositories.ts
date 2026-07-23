@@ -24,6 +24,9 @@ import {
   type AttachmentKind,
   type AttachmentStatus,
 } from "@/server/attachments/types";
+import type { AgentScope } from "@/server/agents/types";
+import { createAgentRepository } from "@/server/agents/repository";
+import { createAgentSettingsRepository } from "@/server/settings/agent-settings";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -36,6 +39,7 @@ export type DbUser = {
 export type DbConversation = {
   id: string;
   userId: string;
+  agentId: string;
   channel: string;
   title: string;
   projectId: string | null;
@@ -46,6 +50,7 @@ export type DbConversation = {
 export type DbProject = {
   id: string;
   userId: string;
+  agentId: string;
   name: string;
   description: string;
   updatedAt: Date;
@@ -88,6 +93,7 @@ export type DbSkillRevision = {
 export type DbMessage = {
   id: string;
   userId: string;
+  agentId: string;
   conversationId: string;
   role: "user" | "assistant" | "system";
   content: string;
@@ -97,6 +103,7 @@ export type DbMessage = {
 export type DbMessageAttachment = {
   id: string;
   userId: string;
+  agentId: string;
   messageId: string | null;
   kind: AttachmentKind;
   fileName: string;
@@ -115,6 +122,7 @@ export type DbMessageAttachment = {
 export type DbAttachmentStatus = AttachmentStatus | "deleting";
 
 export type DbMemoryEntry = RankableMemory & {
+  agentId: string;
   kind: string;
   confidence: number;
 };
@@ -122,6 +130,7 @@ export type DbMemoryEntry = RankableMemory & {
 export type DbGoal = {
   id: string;
   userId: string;
+  agentId: string;
   title: string;
   contract: GoalContract;
   status: GoalStatus;
@@ -142,6 +151,7 @@ export type GoalStepPhase = "collecting" | "drafting" | "verifying" | "committed
 
 export type DbGoalStep = {
   id: string;
+  agentId: string;
   goalId: string;
   round: number;
   phase: GoalStepPhase;
@@ -159,6 +169,7 @@ export type DbGoalStep = {
 export type DbProactiveTask = {
   id: string;
   userId: string;
+  agentId: string;
   conversationId: string;
   kind: "reminder" | "follow_up" | "share";
   content: string;
@@ -171,6 +182,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
   const pool = providedPool ?? getPool();
   const turnLockPool = providedTurnLockPool ?? (providedPool ? pool : getTurnLockPool());
   return {
+    agents: createAgentRepository(pool),
+    agentSettings: createAgentSettingsRepository(pool),
     users: {
       async ensureDefault(): Promise<DbUser> {
         const existing = await pool.query<{ id: string; display_name: string }>(
@@ -187,48 +200,60 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     conversations: {
-      async getOrCreateDefault(userId: string): Promise<DbConversation> {
+      async getOrCreateDefault(scope: AgentScope): Promise<DbConversation> {
         const existing = await pool.query(
-          "SELECT * FROM conversations WHERE user_id = $1 AND channel = 'web' ORDER BY updated_at DESC LIMIT 1",
-          [userId],
+          "SELECT * FROM conversations WHERE user_id = $1 AND agent_id = $2 AND channel = 'web' ORDER BY updated_at DESC LIMIT 1",
+          [scope.userId, scope.agentId],
         );
         if (existing.rows[0]) return mapConversation(existing.rows[0]);
 
-        const created = await pool.query("INSERT INTO conversations (user_id, title) VALUES ($1, $2) RETURNING *", [
-          userId,
-          "和 DigitalMate 的对话",
-        ]);
-        return mapConversation(created.rows[0]);
-      },
-      async create(userId: string, input?: { title?: string; projectId?: string | null }): Promise<DbConversation> {
         const created = await pool.query(
-          "INSERT INTO conversations (user_id, title, project_id) VALUES ($1, $2, $3) RETURNING *",
-          [userId, input?.title?.trim() || "新的对话", input?.projectId ?? null],
+          "INSERT INTO conversations (user_id, agent_id, title) VALUES ($1, $2, $3) RETURNING *",
+          [scope.userId, scope.agentId, "和 DigitalMate 的对话"],
         );
         return mapConversation(created.rows[0]);
       },
-      async getForUser(userId: string, conversationId: string): Promise<DbConversation | null> {
-        const result = await pool.query("SELECT * FROM conversations WHERE user_id = $1 AND id = $2", [
-          userId,
+      async create(scope: AgentScope, input?: { title?: string; projectId?: string | null }): Promise<DbConversation> {
+        const created = await pool.query(
+          `INSERT INTO conversations (user_id, agent_id, title, project_id)
+           SELECT $1, $2, $3, project.id
+           FROM (SELECT $4::uuid AS requested_id) AS requested
+           LEFT JOIN projects AS project
+             ON project.user_id = $1 AND project.agent_id = $2 AND project.id = requested.requested_id
+           WHERE requested.requested_id IS NULL OR project.id IS NOT NULL
+           RETURNING conversations.*`,
+          [scope.userId, scope.agentId, input?.title?.trim() || "新的对话", input?.projectId ?? null],
+        );
+        if (!created.rows[0]) throw new Error("project_not_found");
+        return mapConversation(created.rows[0]);
+      },
+      async get(scope: AgentScope, conversationId: string): Promise<DbConversation | null> {
+        const result = await pool.query("SELECT * FROM conversations WHERE user_id = $1 AND agent_id = $2 AND id = $3", [
+          scope.userId,
+          scope.agentId,
           conversationId,
         ]);
         return result.rows[0] ? mapConversation(result.rows[0]) : null;
       },
-      async list(userId: string): Promise<DbConversation[]> {
-        const result = await pool.query("SELECT * FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC", [userId]);
+      async list(scope: AgentScope): Promise<DbConversation[]> {
+        const result = await pool.query(
+          "SELECT * FROM conversations WHERE user_id = $1 AND agent_id = $2 ORDER BY updated_at DESC",
+          [scope.userId, scope.agentId],
+        );
         return result.rows.map(mapConversation);
       },
-      async listWithStats(userId: string): Promise<DbConversationSummaryRow[]> {
+      async listWithStats(scope: AgentScope): Promise<DbConversationSummaryRow[]> {
         const result = await pool.query(
           `SELECT c.*,
                   count(m.id) FILTER (WHERE m.visible_to_user = true)::int AS message_count,
                   max(m.created_at) AS last_message_at
            FROM conversations c
-           LEFT JOIN messages m ON m.conversation_id = c.id
-           WHERE c.user_id = $1
+           LEFT JOIN messages m
+             ON m.conversation_id = c.id AND m.user_id = c.user_id AND m.agent_id = c.agent_id
+           WHERE c.user_id = $1 AND c.agent_id = $2
            GROUP BY c.id
            ORDER BY c.pinned DESC, c.updated_at DESC`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return result.rows.map((row) => ({
           ...mapConversation(row),
@@ -237,20 +262,29 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         }));
       },
       async update(
-        userId: string,
+        scope: AgentScope,
         conversationId: string,
         input: { title?: string; pinned?: boolean; projectId?: string | null },
       ): Promise<DbConversation | null> {
         const result = await pool.query(
           `UPDATE conversations SET
-             title = COALESCE($3, title),
-             pinned = COALESCE($4, pinned),
-             project_id = CASE WHEN $5 THEN $6::uuid ELSE project_id END,
+             title = COALESCE($4, title),
+             pinned = COALESCE($5, pinned),
+             project_id = CASE WHEN $6 THEN $7::uuid ELSE project_id END,
              updated_at = now()
-           WHERE user_id = $1 AND id = $2
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
+             AND (
+               $6 = false
+               OR $7::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1 FROM projects
+                 WHERE projects.user_id = $1 AND projects.agent_id = $2 AND projects.id = $7
+               )
+             )
            RETURNING *`,
           [
-            userId,
+            scope.userId,
+            scope.agentId,
             conversationId,
             input.title?.trim() || null,
             input.pinned ?? null,
@@ -260,53 +294,66 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         );
         return result.rows[0] ? mapConversation(result.rows[0]) : null;
       },
-      async setTitleIfDefault(conversationId: string, title: string): Promise<void> {
+      async setTitleIfDefault(scope: AgentScope, conversationId: string, title: string): Promise<void> {
         const trimmed = title.trim();
         if (!trimmed) return;
-        await pool.query("UPDATE conversations SET title = $2 WHERE id = $1 AND title IN ('新的对话', '和 DigitalMate 的对话')", [
-          conversationId,
-          trimmed.slice(0, 60),
-        ]);
+        await pool.query(
+          `UPDATE conversations SET title = $4
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
+             AND title IN ('新的对话', '和 DigitalMate 的对话')`,
+          [scope.userId, scope.agentId, conversationId, trimmed.slice(0, 60)],
+        );
       },
-      async delete(userId: string, conversationId: string): Promise<void> {
-        await pool.query("DELETE FROM conversations WHERE user_id = $1 AND id = $2", [userId, conversationId]);
+      async delete(scope: AgentScope, conversationId: string): Promise<void> {
+        await pool.query(
+          "DELETE FROM conversations WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, conversationId],
+        );
       },
     },
     projects: {
-      async create(userId: string, input: { name: string; description?: string }): Promise<DbProject> {
+      async create(scope: AgentScope, input: { name: string; description?: string }): Promise<DbProject> {
         const result = await pool.query(
-          "INSERT INTO projects (user_id, name, description) VALUES ($1, $2, $3) RETURNING *",
-          [userId, input.name.trim(), input.description?.trim() ?? ""],
+          "INSERT INTO projects (user_id, agent_id, name, description) VALUES ($1, $2, $3, $4) RETURNING *",
+          [scope.userId, scope.agentId, input.name.trim(), input.description?.trim() ?? ""],
         );
         return mapProject(result.rows[0]);
       },
-      async list(userId: string): Promise<DbProject[]> {
-        const result = await pool.query("SELECT * FROM projects WHERE user_id = $1 ORDER BY updated_at DESC", [userId]);
+      async list(scope: AgentScope): Promise<DbProject[]> {
+        const result = await pool.query(
+          "SELECT * FROM projects WHERE user_id = $1 AND agent_id = $2 ORDER BY updated_at DESC",
+          [scope.userId, scope.agentId],
+        );
         return result.rows.map(mapProject);
       },
-      async getForUser(userId: string, projectId: string): Promise<DbProject | null> {
-        const result = await pool.query("SELECT * FROM projects WHERE user_id = $1 AND id = $2", [userId, projectId]);
-        return result.rows[0] ? mapProject(result.rows[0]) : null;
-      },
-      async update(userId: string, projectId: string, input: { name?: string; description?: string }): Promise<DbProject | null> {
+      async get(scope: AgentScope, projectId: string): Promise<DbProject | null> {
         const result = await pool.query(
-          `UPDATE projects SET
-             name = COALESCE($3, name),
-             description = COALESCE($4, description),
-             updated_at = now()
-           WHERE user_id = $1 AND id = $2
-           RETURNING *`,
-          [userId, projectId, input.name?.trim() || null, input.description?.trim() ?? null],
+          "SELECT * FROM projects WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, projectId],
         );
         return result.rows[0] ? mapProject(result.rows[0]) : null;
       },
-      async delete(userId: string, projectId: string): Promise<void> {
-        await pool.query("DELETE FROM projects WHERE user_id = $1 AND id = $2", [userId, projectId]);
+      async update(scope: AgentScope, projectId: string, input: { name?: string; description?: string }): Promise<DbProject | null> {
+        const result = await pool.query(
+          `UPDATE projects SET
+             name = COALESCE($4, name),
+             description = COALESCE($5, description),
+             updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
+           RETURNING *`,
+          [scope.userId, scope.agentId, projectId, input.name?.trim() || null, input.description?.trim() ?? null],
+        );
+        return result.rows[0] ? mapProject(result.rows[0]) : null;
+      },
+      async delete(scope: AgentScope, projectId: string): Promise<void> {
+        await pool.query(
+          "DELETE FROM projects WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, projectId],
+        );
       },
     },
     messages: {
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         conversationId: string;
         role: DbMessage["role"];
         content: string;
@@ -314,11 +361,16 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         memoryProcessed?: boolean;
       }): Promise<DbMessage> {
         const result = await pool.query(
-          `INSERT INTO messages (user_id, conversation_id, role, content, visible_to_user, memory_processed)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO messages (user_id, agent_id, conversation_id, role, content, visible_to_user, memory_processed)
+           SELECT $1, $2, conversation.id, $4, $5, $6, $7
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1
+             AND conversation.agent_id = $2
+             AND conversation.id = $3
            RETURNING *`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.conversationId,
             input.role,
             input.content,
@@ -326,11 +378,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
             input.memoryProcessed ?? false,
           ],
         );
-        await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
+        if (!result.rows[0]) throw new Error("conversation_not_found");
+        await pool.query(
+          "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, input.conversationId],
+        );
         return mapMessage(result.rows[0]);
       },
-      async createWithAttachments(input: {
-        userId: string;
+      async createWithAttachments(scope: AgentScope, input: {
         conversationId: string;
         content: string;
         attachmentIds: string[];
@@ -347,8 +402,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           }
 
           const conversation = await client.query(
-            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
-            [input.conversationId, input.userId],
+            "SELECT id FROM conversations WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
           );
           if (!conversation.rows[0]) {
             throw new Error("conversation_not_found");
@@ -358,10 +413,10 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           if (input.attachmentIds.length > 0) {
             const locked = await client.query(
               `SELECT * FROM message_attachments
-               WHERE id = ANY($1::uuid[]) AND user_id = $2
+               WHERE user_id = $1 AND agent_id = $2 AND id = ANY($3::uuid[])
                ORDER BY id
                FOR UPDATE`,
-              [input.attachmentIds, input.userId],
+              [scope.userId, scope.agentId, input.attachmentIds],
             );
             lockedAttachments = locked.rows.map(mapMessageAttachment);
 
@@ -369,7 +424,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
               lockedAttachments.length === input.attachmentIds.length
               && lockedAttachments.every(
                 (attachment) =>
-                  attachment.userId === input.userId
+                  attachment.userId === scope.userId
+                  && attachment.agentId === scope.agentId
                   && attachment.status === "ready"
                   && attachment.messageId === null,
               );
@@ -384,10 +440,10 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           }
 
           const createdMessage = await client.query(
-            `INSERT INTO messages (user_id, conversation_id, role, content)
-             VALUES ($1, $2, 'user', $3)
+            `INSERT INTO messages (user_id, agent_id, conversation_id, role, content)
+             VALUES ($1, $2, $3, 'user', $4)
              RETURNING *`,
-            [input.userId, input.conversationId, input.content],
+            [scope.userId, scope.agentId, input.conversationId, input.content],
           );
           const message = mapMessage(createdMessage.rows[0]);
 
@@ -395,13 +451,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           if (input.attachmentIds.length > 0) {
             const bound = await client.query(
               `UPDATE message_attachments
-               SET message_id = $2, status = 'bound', updated_at = now()
-               WHERE id = ANY($1::uuid[])
-                 AND user_id = $3
+               SET message_id = $4, status = 'bound', updated_at = now()
+               WHERE user_id = $1
+                 AND agent_id = $2
+                 AND id = ANY($3::uuid[])
                  AND status = 'ready'
                  AND message_id IS NULL
                RETURNING *`,
-              [input.attachmentIds, message.id, input.userId],
+              [scope.userId, scope.agentId, input.attachmentIds, message.id],
             );
             if (bound.rows.length !== input.attachmentIds.length) {
               throw new Error("attachment_not_bindable");
@@ -416,8 +473,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           }
 
           await client.query(
-            "UPDATE conversations SET updated_at = now() WHERE id = $1 AND user_id = $2",
-            [input.conversationId, input.userId],
+            "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
           );
           await client.query("COMMIT");
           return { message, attachments };
@@ -428,8 +485,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           client.release();
         }
       },
-      async createIdempotentUserTurn(input: {
-        userId: string;
+      async createIdempotentUserTurn(scope: AgentScope, input: {
         conversationId: string;
         clientTurnId: string;
         payloadHash: string;
@@ -447,28 +503,28 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           }
 
           const conversation = await client.query(
-            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
-            [input.conversationId, input.userId],
+            "SELECT id FROM conversations WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
           );
           if (!conversation.rows[0]) throw new Error("conversation_not_found");
 
           const inserted = await client.query(
             `INSERT INTO messages
-             (user_id, conversation_id, role, content, client_turn_id, client_turn_payload_hash)
-             VALUES ($1, $2, 'user', $3, $4, $5)
-             ON CONFLICT (user_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
+             (user_id, agent_id, conversation_id, role, content, client_turn_id, client_turn_payload_hash)
+             VALUES ($1, $2, $3, 'user', $4, $5, $6)
+             ON CONFLICT (user_id, agent_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
              DO NOTHING
              RETURNING *`,
-            [input.userId, input.conversationId, input.content, input.clientTurnId, input.payloadHash],
+            [scope.userId, scope.agentId, input.conversationId, input.content, input.clientTurnId, input.payloadHash],
           );
           const created = inserted.rows.length > 0;
           const storedRow = created
             ? inserted.rows[0]
             : (await client.query(
                 `SELECT * FROM messages
-                 WHERE user_id = $1 AND client_turn_id = $2 AND role = 'user'
+                 WHERE user_id = $1 AND agent_id = $2 AND client_turn_id = $3 AND role = 'user'
                  FOR UPDATE`,
-                [input.userId, input.clientTurnId],
+                [scope.userId, scope.agentId, input.clientTurnId],
               )).rows[0];
           if (
             !storedRow
@@ -485,8 +541,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
               ? []
               : (await client.query(
                   `SELECT * FROM message_attachments
-                   WHERE user_id = $1 AND message_id = $2`,
-                  [input.userId, message.id],
+                   WHERE user_id = $1 AND agent_id = $2 AND message_id = $3`,
+                  [scope.userId, scope.agentId, message.id],
                 )).rows.map(mapMessageAttachment);
             const byId = new Map(existingAttachments.map((attachment) => [attachment.id, attachment]));
             if (
@@ -507,10 +563,10 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           if (input.attachmentIds.length > 0) {
             const locked = await client.query(
               `SELECT * FROM message_attachments
-               WHERE id = ANY($1::uuid[]) AND user_id = $2
+               WHERE user_id = $1 AND agent_id = $2 AND id = ANY($3::uuid[])
                ORDER BY id
                FOR UPDATE`,
-              [input.attachmentIds, input.userId],
+              [scope.userId, scope.agentId, input.attachmentIds],
             );
             const lockedAttachments = locked.rows.map(mapMessageAttachment);
             const allBindable =
@@ -526,13 +582,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
 
             const bound = await client.query(
               `UPDATE message_attachments
-               SET message_id = $2, status = 'bound', updated_at = now()
-               WHERE id = ANY($1::uuid[])
-                 AND user_id = $3
+               SET message_id = $4, status = 'bound', updated_at = now()
+               WHERE user_id = $1
+                 AND agent_id = $2
+                 AND id = ANY($3::uuid[])
                  AND status = 'ready'
                  AND message_id IS NULL
                RETURNING *`,
-              [input.attachmentIds, message.id, input.userId],
+              [scope.userId, scope.agentId, input.attachmentIds, message.id],
             );
             if (bound.rows.length !== input.attachmentIds.length) {
               throw new Error("attachment_not_bindable");
@@ -547,8 +604,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           }
 
           await client.query(
-            "UPDATE conversations SET updated_at = now() WHERE id = $1 AND user_id = $2",
-            [input.conversationId, input.userId],
+            "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
           );
           await client.query("COMMIT");
           return { message, attachments, created: true };
@@ -559,39 +616,43 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           client.release();
         }
       },
-      async createIdempotentAssistantTurn(input: {
-        userId: string;
+      async createIdempotentAssistantTurn(scope: AgentScope, input: {
         conversationId: string;
         clientTurnId: string;
         content: string;
       }): Promise<{ message: DbMessage; created: boolean }> {
         const inserted = await pool.query(
-          `INSERT INTO messages (user_id, conversation_id, role, content, client_turn_id)
-           VALUES ($1, $2, 'assistant', $3, $4)
-           ON CONFLICT (user_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
+          `INSERT INTO messages (user_id, agent_id, conversation_id, role, content, client_turn_id)
+           SELECT $1, $2, conversation.id, 'assistant', $4, $5
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $3
+           ON CONFLICT (user_id, agent_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
            DO NOTHING
            RETURNING *`,
-          [input.userId, input.conversationId, input.content, input.clientTurnId],
+          [scope.userId, scope.agentId, input.conversationId, input.content, input.clientTurnId],
         );
         const created = inserted.rows.length > 0;
         const row = created
           ? inserted.rows[0]
           : (await pool.query(
               `SELECT * FROM messages
-               WHERE user_id = $1 AND client_turn_id = $2 AND role = 'assistant'`,
-              [input.userId, input.clientTurnId],
+               WHERE user_id = $1 AND agent_id = $2 AND client_turn_id = $3 AND role = 'assistant'`,
+              [scope.userId, scope.agentId, input.clientTurnId],
             )).rows[0];
         if (!row) throw new Error("client_turn_assistant_missing");
         if (created) {
-          await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
+          await pool.query(
+            "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
+          );
         }
         return { message: mapMessage(row), created };
       },
       async acquireClientTurnExecutionLock(
-        userId: string,
+        scope: AgentScope,
         clientTurnId: string,
       ): Promise<() => Promise<void>> {
-        const lockKey = `${userId}:${clientTurnId}`;
+        const lockKey = `${scope.userId}:${scope.agentId}:${clientTurnId}`;
         while (true) {
           const client = await turnLockPool.connect();
           let locked = false;
@@ -631,68 +692,82 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           };
         }
       },
-      async claimClientTurnExecution(userId: string, clientTurnId: string): Promise<boolean> {
+      async claimClientTurnExecution(scope: AgentScope, clientTurnId: string): Promise<boolean> {
         const result = await pool.query(
           `UPDATE messages
            SET client_turn_execution_started_at = now()
            WHERE user_id = $1
-             AND client_turn_id = $2
+             AND agent_id = $2
+             AND client_turn_id = $3
              AND role = 'user'
              AND client_turn_execution_started_at IS NULL
            RETURNING id`,
-          [userId, clientTurnId],
+          [scope.userId, scope.agentId, clientTurnId],
         );
         return result.rows.length === 1;
       },
       async findByClientTurn(
-        userId: string,
+        scope: AgentScope,
         clientTurnId: string,
         role: "user" | "assistant",
       ): Promise<DbMessage | null> {
         const result = await pool.query(
           `SELECT * FROM messages
-           WHERE user_id = $1 AND client_turn_id = $2 AND role = $3`,
-          [userId, clientTurnId, role],
+           WHERE user_id = $1 AND agent_id = $2 AND client_turn_id = $3 AND role = $4`,
+          [scope.userId, scope.agentId, clientTurnId, role],
         );
         return result.rows[0] ? mapMessage(result.rows[0]) : null;
       },
-      async createFromProactiveTask(input: {
+      async createFromProactiveTask(scope: AgentScope, input: {
         taskId: string;
-        userId: string;
         conversationId: string;
         content: string;
       }): Promise<boolean> {
         const result = await pool.query(
-          `INSERT INTO messages (user_id, conversation_id, role, content, source_task_id)
-           VALUES ($1, $2, 'assistant', $3, $4)
-           ON CONFLICT (source_task_id) WHERE source_task_id IS NOT NULL DO NOTHING
+          `INSERT INTO messages (user_id, agent_id, conversation_id, role, content, source_task_id)
+           SELECT $1, $2, conversation.id, 'assistant', $4, proactive_task.id
+           FROM conversations AS conversation
+           JOIN proactive_tasks AS proactive_task
+             ON proactive_task.user_id = $1 AND proactive_task.agent_id = $2 AND proactive_task.id = $3
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $5
+           ON CONFLICT (agent_id, source_task_id) WHERE source_task_id IS NOT NULL DO NOTHING
            RETURNING id`,
-          [input.userId, input.conversationId, input.content, input.taskId],
+          [scope.userId, scope.agentId, input.taskId, input.content, input.conversationId],
         );
         if (result.rows.length === 0) return false;
-        await pool.query("UPDATE conversations SET updated_at = now() WHERE id = $1", [input.conversationId]);
+        await pool.query(
+          "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, input.conversationId],
+        );
         return true;
       },
-      async list(conversationId: string): Promise<DbMessage[]> {
+      async list(scope: AgentScope, conversationId: string): Promise<DbMessage[]> {
         const result = await pool.query(
-          "SELECT * FROM messages WHERE conversation_id = $1 AND visible_to_user = true ORDER BY created_at ASC",
-          [conversationId],
+          `SELECT * FROM messages
+           WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3
+             AND visible_to_user = true
+           ORDER BY created_at ASC`,
+          [scope.userId, scope.agentId, conversationId],
         );
         return result.rows.map(mapMessage);
       },
-      async listAllForAudit(conversationId: string): Promise<Array<DbMessage & { visibleToUser: boolean }>> {
-        const result = await pool.query("SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC", [
-          conversationId,
-        ]);
+      async listAllForAudit(scope: AgentScope, conversationId: string): Promise<Array<DbMessage & { visibleToUser: boolean }>> {
+        const result = await pool.query(
+          "SELECT * FROM messages WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3 ORDER BY created_at ASC",
+          [scope.userId, scope.agentId, conversationId],
+        );
         return result.rows.map((row) => ({ ...mapMessage(row), visibleToUser: Boolean(row.visible_to_user) }));
       },
-      async recentHistory(conversationId: string, limit = 12, excludeClientTurnId?: string) {
+      async recentHistory(scope: AgentScope, conversationId: string, limit = 12, excludeClientTurnId?: string) {
         const result = await pool.query(
           `SELECT id, role, content FROM messages
-           WHERE conversation_id = $1 AND visible_to_user = true AND role IN ('user', 'assistant')
-             ${excludeClientTurnId ? "AND client_turn_id IS DISTINCT FROM $3::uuid" : ""}
-           ORDER BY created_at DESC LIMIT $2`,
-          excludeClientTurnId ? [conversationId, limit, excludeClientTurnId] : [conversationId, limit],
+           WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3
+             AND visible_to_user = true AND role IN ('user', 'assistant')
+             ${excludeClientTurnId ? "AND client_turn_id IS DISTINCT FROM $5::uuid" : ""}
+           ORDER BY created_at DESC LIMIT $4`,
+          excludeClientTurnId
+            ? [scope.userId, scope.agentId, conversationId, limit, excludeClientTurnId]
+            : [scope.userId, scope.agentId, conversationId, limit],
         );
         return result.rows
           .reverse()
@@ -702,25 +777,32 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
             content: row.content,
           }));
       },
-      async listAfter(conversationId: string, after: Date): Promise<DbMessage[]> {
-        const result = await pool.query(
-          "SELECT * FROM messages WHERE conversation_id = $1 AND visible_to_user = true AND created_at > $2 ORDER BY created_at ASC",
-          [conversationId, after],
-        );
-        return result.rows.map(mapMessage);
-      },
-      async unprocessedForMemory(limit = 20): Promise<DbMessage[]> {
+      async listAfter(scope: AgentScope, conversationId: string, after: Date): Promise<DbMessage[]> {
         const result = await pool.query(
           `SELECT * FROM messages
-           WHERE memory_processed = false AND visible_to_user = true AND role = 'user'
-           ORDER BY created_at ASC LIMIT $1`,
-          [limit],
+           WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3
+             AND visible_to_user = true AND created_at > $4
+           ORDER BY created_at ASC`,
+          [scope.userId, scope.agentId, conversationId, after],
         );
         return result.rows.map(mapMessage);
       },
-      async markMemoryProcessed(ids: string[]): Promise<void> {
+      async unprocessedForMemory(scope: AgentScope, limit = 20): Promise<DbMessage[]> {
+        const result = await pool.query(
+          `SELECT * FROM messages
+           WHERE user_id = $1 AND agent_id = $2
+             AND memory_processed = false AND visible_to_user = true AND role = 'user'
+           ORDER BY created_at ASC LIMIT $3`,
+          [scope.userId, scope.agentId, limit],
+        );
+        return result.rows.map(mapMessage);
+      },
+      async markMemoryProcessed(scope: AgentScope, ids: string[]): Promise<void> {
         if (ids.length === 0) return;
-        await pool.query("UPDATE messages SET memory_processed = true WHERE id = ANY($1::uuid[])", [ids]);
+        await pool.query(
+          "UPDATE messages SET memory_processed = true WHERE user_id = $1 AND agent_id = $2 AND id = ANY($3::uuid[])",
+          [scope.userId, scope.agentId, ids],
+        );
       },
     },
     messageAttachments: {
@@ -765,8 +847,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           };
         }
       },
-      async createDraft(input: {
-        userId: string;
+      async createDraft(scope: AgentScope, input: {
         kind: AttachmentKind;
         fileName: string;
         mimeType: string;
@@ -777,11 +858,12 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       }): Promise<DbMessageAttachment> {
         const result = await pool.query(
           `INSERT INTO message_attachments
-           (user_id, kind, file_name, mime_type, size_bytes, storage_key, extracted_text, text_truncated, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+           (user_id, agent_id, kind, file_name, mime_type, size_bytes, storage_key, extracted_text, text_truncated, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
            RETURNING *`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.kind,
             input.fileName,
             input.mimeType,
@@ -793,31 +875,31 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         );
         return mapMessageAttachment(result.rows[0]);
       },
-      async markReady(userId: string, attachmentId: string): Promise<DbMessageAttachment | null> {
+      async markReady(scope: AgentScope, attachmentId: string): Promise<DbMessageAttachment | null> {
         const result = await pool.query(
           `UPDATE message_attachments
            SET status = 'ready', error_code = NULL, deletion_claim_token = NULL, updated_at = now()
-           WHERE user_id = $1 AND id = $2
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND message_id IS NULL AND status = 'pending'
            RETURNING *`,
-          [userId, attachmentId],
+          [scope.userId, scope.agentId, attachmentId],
         );
         return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
       },
-      async getForUser(userId: string, attachmentId: string): Promise<DbMessageAttachment | null> {
+      async get(scope: AgentScope, attachmentId: string): Promise<DbMessageAttachment | null> {
         const result = await pool.query(
-          "SELECT * FROM message_attachments WHERE user_id = $1 AND id = $2",
-          [userId, attachmentId],
+          "SELECT * FROM message_attachments WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, attachmentId],
         );
         return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
       },
-      async listForMessages(userId: string, messageIds: string[]): Promise<DbMessageAttachment[]> {
+      async listForMessages(scope: AgentScope, messageIds: string[]): Promise<DbMessageAttachment[]> {
         if (messageIds.length === 0) return [];
         const result = await pool.query(
           `SELECT * FROM message_attachments
-           WHERE user_id = $1 AND message_id = ANY($2::uuid[])
+           WHERE user_id = $1 AND agent_id = $2 AND message_id = ANY($3::uuid[])
            ORDER BY created_at ASC, id ASC`,
-          [userId, messageIds],
+          [scope.userId, scope.agentId, messageIds],
         );
         return result.rows.map(mapMessageAttachment);
       },
@@ -830,111 +912,113 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         return result.rows.map((row) => row.storage_key);
       },
       async claimDraftForDeletion(
-        userId: string,
+        scope: AgentScope,
         attachmentId: string,
       ): Promise<DbMessageAttachment | null> {
         const result = await pool.query(
           `UPDATE message_attachments
            SET status = 'deleting', deletion_claim_token = gen_random_uuid(), updated_at = now()
-           WHERE user_id = $1 AND id = $2
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND message_id IS NULL AND status IN ('ready', 'failed', 'deleting')
            RETURNING *`,
-          [userId, attachmentId],
+          [scope.userId, scope.agentId, attachmentId],
         );
         return result.rows[0] ? mapMessageAttachment(result.rows[0]) : null;
       },
       async deleteDraft(
-        userId: string,
+        scope: AgentScope,
         attachmentId: string,
         deletionClaimToken: string,
       ): Promise<boolean> {
         const result = await pool.query(
           `DELETE FROM message_attachments
-           WHERE user_id = $1 AND id = $2
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND message_id IS NULL AND status = 'deleting'
-             AND deletion_claim_token = $3
+             AND deletion_claim_token = $4
            RETURNING id`,
-          [userId, attachmentId, deletionClaimToken],
+          [scope.userId, scope.agentId, attachmentId, deletionClaimToken],
         );
         return result.rows.length > 0;
       },
-      async claimExpiredDrafts(hours: number, limit = 100): Promise<DbMessageAttachment[]> {
+      async claimExpiredDrafts(scope: AgentScope, hours: number, limit = 100): Promise<DbMessageAttachment[]> {
         const { safeHours, safeLimit } = validateAttachmentClaimLimit(hours, limit);
         const result = await pool.query(
           `WITH candidates AS (
              SELECT id
              FROM message_attachments
-             WHERE message_id IS NULL
+             WHERE user_id = $1 AND agent_id = $2 AND message_id IS NULL
                AND (
                  (status = 'ready'
-                   AND created_at < now() - ($1 * interval '1 hour'))
+                   AND created_at < now() - ($3 * interval '1 hour'))
                  OR (status = 'pending'
-                   AND created_at < now() - ($1 * interval '1 hour'))
+                   AND created_at < now() - ($3 * interval '1 hour'))
                  OR (status = 'failed'
-                   AND created_at < now() - ($1 * interval '1 hour')
+                   AND created_at < now() - ($3 * interval '1 hour')
                    AND updated_at < now() - interval '5 minutes')
                  OR (status = 'deleting'
                    AND updated_at < now() - interval '15 minutes')
                )
              ORDER BY updated_at ASC, id ASC
-             LIMIT $2
+             LIMIT $4
              FOR UPDATE SKIP LOCKED
            )
            UPDATE message_attachments AS attachment
            SET status = 'deleting', deletion_claim_token = gen_random_uuid(), updated_at = now()
            FROM candidates
-           WHERE attachment.id = candidates.id
+           WHERE attachment.user_id = $1 AND attachment.agent_id = $2
+             AND attachment.id = candidates.id
            RETURNING attachment.*`,
-          [safeHours, safeLimit],
+          [scope.userId, scope.agentId, safeHours, safeLimit],
         );
         return result.rows.map(mapMessageAttachment);
       },
-      async markFailed(userId: string, attachmentId: string, errorCode: string): Promise<void> {
+      async markFailed(scope: AgentScope, attachmentId: string, errorCode: string): Promise<void> {
         await pool.query(
           `UPDATE message_attachments
-           SET status = 'failed', error_code = $3, deletion_claim_token = NULL, updated_at = now()
+           SET status = 'failed', error_code = $4, deletion_claim_token = NULL, updated_at = now()
            WHERE user_id = $1
-             AND id = $2
+             AND agent_id = $2
+             AND id = $3
              AND message_id IS NULL
              AND status IN ('pending', 'ready', 'failed')`,
-          [userId, attachmentId, errorCode],
+          [scope.userId, scope.agentId, attachmentId, errorCode],
         );
       },
       async releaseDeletionClaim(
-        userId: string,
+        scope: AgentScope,
         attachmentId: string,
         deletionClaimToken: string,
         errorCode: string,
       ): Promise<boolean> {
         const result = await pool.query(
           `UPDATE message_attachments
-           SET status = 'failed', error_code = $4, deletion_claim_token = NULL, updated_at = now()
-           WHERE user_id = $1 AND id = $2
+           SET status = 'failed', error_code = $5, deletion_claim_token = NULL, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND message_id IS NULL AND status = 'deleting'
-             AND deletion_claim_token = $3
+             AND deletion_claim_token = $4
            RETURNING id`,
-          [userId, attachmentId, deletionClaimToken, errorCode],
+          [scope.userId, scope.agentId, attachmentId, deletionClaimToken, errorCode],
         );
         return result.rows.length > 0;
       },
     },
     memories: {
-      async findRelevant(userId: string, query: string): Promise<RankableMemory[]> {
+      async findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]> {
         const queryEmbedding = formatPgVector(await embedText(query));
         const semanticResult = await pool.query(
-          `SELECT id, content, created_at, 1 - (embedding <=> $2::vector) AS similarity
+          `SELECT id, content, created_at, 1 - (embedding <=> $3::vector) AS similarity
            FROM memory_entries
-           WHERE user_id = $1 AND ${ACTIVE_MEMORY_CONDITION} AND embedding IS NOT NULL
-           ORDER BY embedding <=> $2::vector
+           WHERE user_id = $1 AND agent_id = $2 AND ${ACTIVE_MEMORY_CONDITION} AND embedding IS NOT NULL
+           ORDER BY embedding <=> $3::vector
            LIMIT 12`,
-          [userId, queryEmbedding],
+          [scope.userId, scope.agentId, queryEmbedding],
         );
         const lexicalResult = await pool.query(
           `SELECT id, content, created_at
            FROM memory_entries
-           WHERE user_id = $1 AND ${ACTIVE_MEMORY_CONDITION}
+           WHERE user_id = $1 AND agent_id = $2 AND ${ACTIVE_MEMORY_CONDITION}
            ORDER BY created_at DESC LIMIT 80`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return mergeMemoryCandidates(
           query,
@@ -947,7 +1031,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           })),
         );
       },
-      async createMany(userId: string, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void> {
+      async createMany(scope: AgentScope, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void> {
         for (const entry of memories) {
           const safeContent = redactSensitiveMemory(entry.content);
           if (!safeContent) continue;
@@ -955,49 +1039,60 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           const embedding = formatPgVector(await embedText(memory.content));
           const expiresAt = memoryExpiresAt(memory);
           await pool.query(
-            `INSERT INTO memory_entries (user_id, kind, content, confidence, source_message_id, embedding, expires_at)
-             SELECT $1, $2, $3, $4, $5, $6::vector, $7
-             WHERE NOT EXISTS (
+            `INSERT INTO memory_entries (
+               user_id, agent_id, kind, content, confidence, source_message_id, embedding, expires_at
+             )
+             SELECT $1, $2, $3, $4, $5, $6, $7::vector, $8
+             WHERE (
+               $6::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1 FROM messages
+                 WHERE messages.user_id = $1 AND messages.agent_id = $2 AND messages.id = $6
+               )
+             )
+             AND NOT EXISTS (
                SELECT 1 FROM memory_entries
-               WHERE user_id = $1 AND content = $3 AND ${ACTIVE_MEMORY_CONDITION}
+               WHERE user_id = $1 AND agent_id = $2 AND content = $4 AND ${ACTIVE_MEMORY_CONDITION}
              )`,
-            [userId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
+            [scope.userId, scope.agentId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
           );
         }
       },
-      async listActiveByKind(userId: string, kind: MemoryKind): Promise<DbMemoryEntry[]> {
+      async listActiveByKind(scope: AgentScope, kind: MemoryKind): Promise<DbMemoryEntry[]> {
         const result = await pool.query(
           `SELECT id, kind, content, confidence, created_at
            FROM memory_entries
-           WHERE user_id = $1 AND kind = $2 AND ${ACTIVE_MEMORY_CONDITION}
+           WHERE user_id = $1 AND agent_id = $2 AND kind = $3 AND ${ACTIVE_MEMORY_CONDITION}
            ORDER BY created_at ASC`,
-          [userId, kind],
+          [scope.userId, scope.agentId, kind],
         );
         return result.rows.map((row) => ({
           id: row.id,
+          agentId: scope.agentId,
           kind: row.kind,
           content: row.content,
           confidence: Number(row.confidence),
           createdAt: row.created_at,
         }));
       },
-      async softDeleteMany(userId: string, memoryIds: string[]): Promise<void> {
+      async softDeleteMany(scope: AgentScope, memoryIds: string[]): Promise<void> {
         if (memoryIds.length === 0) return;
-        await pool.query("UPDATE memory_entries SET deleted_at = now() WHERE user_id = $1 AND id = ANY($2::uuid[])", [
-          userId,
-          memoryIds,
-        ]);
+        await pool.query(
+          "UPDATE memory_entries SET deleted_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = ANY($3::uuid[])",
+          [scope.userId, scope.agentId, memoryIds],
+        );
       },
-      async list(userId: string): Promise<DbMemoryEntry[]> {
+      async list(scope: AgentScope): Promise<DbMemoryEntry[]> {
         const result = await pool.query(
           `SELECT id, kind, content, confidence, created_at
            FROM memory_entries
-           WHERE user_id = $1 AND ${ACTIVE_MEMORY_CONDITION}
+           WHERE user_id = $1 AND agent_id = $2 AND ${ACTIVE_MEMORY_CONDITION}
            ORDER BY created_at DESC`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return result.rows.map((row) => ({
           id: row.id,
+          agentId: scope.agentId,
           kind: row.kind,
           content: row.content,
           confidence: Number(row.confidence),
@@ -1005,7 +1100,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         }));
       },
       async update(
-        userId: string,
+        scope: AgentScope,
         memoryId: string,
         input: { kind: MemoryKind; content: string; confidence: number },
       ): Promise<void> {
@@ -1014,33 +1109,39 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         const embedding = formatPgVector(await embedText(content));
         await pool.query(
           `UPDATE memory_entries
-           SET kind = $3, content = $4, confidence = $5, embedding = $6::vector
-           WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
-          [userId, memoryId, input.kind, content, input.confidence, embedding],
+           SET kind = $4, content = $5, confidence = $6, embedding = $7::vector
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND deleted_at IS NULL`,
+          [scope.userId, scope.agentId, memoryId, input.kind, content, input.confidence, embedding],
         );
       },
-      async delete(userId: string, memoryId: string): Promise<void> {
-        await pool.query("UPDATE memory_entries SET deleted_at = now() WHERE user_id = $1 AND id = $2", [userId, memoryId]);
+      async delete(scope: AgentScope, memoryId: string): Promise<void> {
+        await pool.query(
+          "UPDATE memory_entries SET deleted_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, memoryId],
+        );
       },
     },
     conversationSummaries: {
-      async latest(conversationId: string): Promise<string | null> {
+      async latest(scope: AgentScope, conversationId: string): Promise<string | null> {
         const result = await pool.query(
-          "SELECT summary FROM conversation_summaries WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1",
-          [conversationId],
+          `SELECT summary FROM conversation_summaries
+           WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3
+           ORDER BY created_at DESC LIMIT 1`,
+          [scope.userId, scope.agentId, conversationId],
         );
         return result.rows[0]?.summary ?? null;
       },
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         conversationId: string;
         summary: string;
         messageCount: number;
       }): Promise<void> {
         await pool.query(
-          `INSERT INTO conversation_summaries (user_id, conversation_id, summary, message_count)
-           VALUES ($1, $2, $3, $4)`,
-          [input.userId, input.conversationId, input.summary, input.messageCount],
+          `INSERT INTO conversation_summaries (user_id, agent_id, conversation_id, summary, message_count)
+           SELECT $1, $2, conversation.id, $4, $5
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $3`,
+          [scope.userId, scope.agentId, input.conversationId, input.summary, input.messageCount],
         );
       },
     },
@@ -1048,10 +1149,23 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       async create(input: ToolLogInput): Promise<void> {
         await pool.query(
           `INSERT INTO tool_call_logs
-           (user_id, conversation_id, goal_id, tool_name, input_summary, output_summary, status, duration_ms, error)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+           (user_id, agent_id, conversation_id, goal_id, tool_name, input_summary, output_summary, status, duration_ms, error)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+           WHERE (
+             $3::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM conversations
+               WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $3
+             )
+           )
+           AND (
+             $4::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM goals
+               WHERE goals.user_id = $1 AND goals.agent_id = $2 AND goals.id = $4
+             )
+           )`,
           [
             input.userId,
+            input.agentId,
             input.conversationId,
             input.goalId ?? null,
             input.toolName,
@@ -1063,16 +1177,19 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           ],
         );
       },
-      async list(userId: string) {
-        const result = await pool.query("SELECT * FROM tool_call_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100", [
-          userId,
-        ]);
+      async list(scope: AgentScope) {
+        const result = await pool.query(
+          "SELECT * FROM tool_call_logs WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 100",
+          [scope.userId, scope.agentId],
+        );
         return result.rows;
       },
-      async listByConversation(userId: string, conversationId: string) {
+      async listByConversation(scope: AgentScope, conversationId: string) {
         const result = await pool.query(
-          "SELECT * FROM tool_call_logs WHERE user_id = $1 AND conversation_id = $2 ORDER BY created_at ASC LIMIT 200",
-          [userId, conversationId],
+          `SELECT * FROM tool_call_logs
+           WHERE user_id = $1 AND agent_id = $2 AND conversation_id = $3
+           ORDER BY created_at ASC LIMIT 200`,
+          [scope.userId, scope.agentId, conversationId],
         );
         return result.rows;
       },
@@ -1081,10 +1198,17 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       async create(input: LlmUsageLogInput): Promise<void> {
         await pool.query(
           `INSERT INTO llm_usage_logs
-           (user_id, conversation_id, purpose, model, input_tokens, output_tokens, total_tokens)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+           (user_id, agent_id, conversation_id, purpose, model, input_tokens, output_tokens, total_tokens)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8
+           WHERE (
+             $3::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM conversations
+               WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $3
+             )
+           )`,
           [
             input.userId,
+            input.agentId,
             input.conversationId ?? null,
             input.purpose,
             input.model,
@@ -1094,21 +1218,20 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           ],
         );
       },
-      async list(userId: string) {
+      async list(scope: AgentScope) {
         const result = await pool.query(
           `SELECT id, purpose, model, input_tokens, output_tokens, total_tokens, created_at
            FROM llm_usage_logs
-           WHERE user_id = $1
+           WHERE user_id = $1 AND agent_id = $2
            ORDER BY created_at DESC
            LIMIT 500`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return result.rows;
       },
     },
     proactiveTasks: {
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         conversationId: string;
         kind: "reminder" | "follow_up" | "share";
         content: string;
@@ -1116,54 +1239,68 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         metadata?: Record<string, unknown>;
       }): Promise<void> {
         await pool.query(
-          `INSERT INTO proactive_tasks (user_id, conversation_id, kind, content, scheduled_at, metadata)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [input.userId, input.conversationId, input.kind, input.content, input.scheduledAt, JSON.stringify(input.metadata ?? {})],
+          `INSERT INTO proactive_tasks (user_id, agent_id, conversation_id, kind, content, scheduled_at, metadata)
+           SELECT $1, $2, conversation.id, $4, $5, $6, $7
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $3`,
+          [scope.userId, scope.agentId, input.conversationId, input.kind, input.content, input.scheduledAt, JSON.stringify(input.metadata ?? {})],
         );
       },
-      async due(now = new Date()): Promise<DbProactiveTask[]> {
+      async due(scope: AgentScope, now = new Date()): Promise<DbProactiveTask[]> {
         const result = await pool.query(
-          "SELECT * FROM proactive_tasks WHERE status = 'pending' AND scheduled_at <= $1 ORDER BY scheduled_at ASC LIMIT 20",
-          [now],
+          `SELECT * FROM proactive_tasks
+           WHERE user_id = $1 AND agent_id = $2 AND status = 'pending' AND scheduled_at <= $3
+           ORDER BY scheduled_at ASC LIMIT 20`,
+          [scope.userId, scope.agentId, now],
         );
         return result.rows.map(mapProactiveTask);
       },
-      async markSent(taskId: string): Promise<void> {
-        await pool.query("UPDATE proactive_tasks SET status = 'sent', sent_at = now(), updated_at = now() WHERE id = $1", [taskId]);
+      async markSent(scope: AgentScope, taskId: string): Promise<void> {
+        await pool.query(
+          "UPDATE proactive_tasks SET status = 'sent', sent_at = now(), updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, taskId],
+        );
       },
-      async markCancelled(taskId: string): Promise<void> {
-        await pool.query("UPDATE proactive_tasks SET status = 'cancelled', updated_at = now() WHERE id = $1", [taskId]);
+      async markCancelled(scope: AgentScope, taskId: string): Promise<void> {
+        await pool.query(
+          "UPDATE proactive_tasks SET status = 'cancelled', updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, taskId],
+        );
       },
-      async markFailed(taskId: string): Promise<void> {
-        await pool.query("UPDATE proactive_tasks SET status = 'failed', updated_at = now() WHERE id = $1", [taskId]);
+      async markFailed(scope: AgentScope, taskId: string): Promise<void> {
+        await pool.query(
+          "UPDATE proactive_tasks SET status = 'failed', updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, taskId],
+        );
       },
-      async countSentToday(userId: string, now = new Date()): Promise<number> {
+      async countSentToday(scope: AgentScope, now = new Date()): Promise<number> {
         const result = await pool.query(
           `SELECT count(*)::int AS count FROM proactive_tasks
-           WHERE user_id = $1 AND status = 'sent' AND sent_at::date = $2::date`,
-          [userId, now],
+           WHERE user_id = $1 AND agent_id = $2 AND status = 'sent' AND sent_at::date = $3::date`,
+          [scope.userId, scope.agentId, now],
         );
         return Number(result.rows[0]?.count ?? 0);
       },
-      async list(userId: string): Promise<DbProactiveTask[]> {
-        const result = await pool.query("SELECT * FROM proactive_tasks WHERE user_id = $1 ORDER BY scheduled_at DESC LIMIT 100", [
-          userId,
-        ]);
+      async list(scope: AgentScope): Promise<DbProactiveTask[]> {
+        const result = await pool.query(
+          "SELECT * FROM proactive_tasks WHERE user_id = $1 AND agent_id = $2 ORDER BY scheduled_at DESC LIMIT 100",
+          [scope.userId, scope.agentId],
+        );
         return result.rows.map(mapProactiveTask);
       },
-      async latestByKind(userId: string, kind: DbProactiveTask["kind"]): Promise<Date | null> {
+      async latestByKind(scope: AgentScope, kind: DbProactiveTask["kind"]): Promise<Date | null> {
         const result = await pool.query(
-          "SELECT created_at FROM proactive_tasks WHERE user_id = $1 AND kind = $2 ORDER BY created_at DESC LIMIT 1",
-          [userId, kind],
+          "SELECT created_at FROM proactive_tasks WHERE user_id = $1 AND agent_id = $2 AND kind = $3 ORDER BY created_at DESC LIMIT 1",
+          [scope.userId, scope.agentId, kind],
         );
         return result.rows[0]?.created_at ?? null;
       },
-      async unansweredStreak(userId: string): Promise<number> {
+      async unansweredStreak(scope: AgentScope): Promise<number> {
         const result = await pool.query(
           `WITH recent AS (
              SELECT id, conversation_id, sent_at
              FROM proactive_tasks
-             WHERE user_id = $1 AND status = 'sent' AND sent_at IS NOT NULL
+             WHERE user_id = $1 AND agent_id = $2 AND status = 'sent' AND sent_at IS NOT NULL
              ORDER BY sent_at DESC
              LIMIT 3
            )
@@ -1171,63 +1308,82 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
            FROM recent
            WHERE NOT EXISTS (
              SELECT 1 FROM messages
-             WHERE messages.conversation_id = recent.conversation_id
+             WHERE messages.user_id = $1 AND messages.agent_id = $2
+               AND messages.conversation_id = recent.conversation_id
                AND messages.role = 'user'
                AND messages.created_at > recent.sent_at
            )`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return Number(result.rows[0]?.count ?? 0);
       },
     },
     goals: {
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         title: string;
         contract: GoalContract;
         conversationId?: string | null;
       }): Promise<DbGoal> {
         const result = await pool.query(
-          `INSERT INTO goals (user_id, title, contract, conversation_id)
-           VALUES ($1, $2, $3, $4)
+          `INSERT INTO goals (user_id, agent_id, title, contract, conversation_id)
+           SELECT $1, $2, $3, $4, $5
+           WHERE (
+             $5::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM conversations
+               WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $5
+             )
+           )
            RETURNING *`,
-          [input.userId, input.title.trim(), JSON.stringify(input.contract), input.conversationId ?? null],
+          [scope.userId, scope.agentId, input.title.trim(), JSON.stringify(input.contract), input.conversationId ?? null],
         );
+        if (!result.rows[0]) throw new Error("conversation_not_found");
         return mapGoal(result.rows[0]);
       },
-      async getForUser(userId: string, goalId: string): Promise<DbGoal | null> {
-        const result = await pool.query("SELECT * FROM goals WHERE user_id = $1 AND id = $2", [userId, goalId]);
+      async get(scope: AgentScope, goalId: string): Promise<DbGoal | null> {
+        const result = await pool.query(
+          "SELECT * FROM goals WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, goalId],
+        );
         return result.rows[0] ? mapGoal(result.rows[0]) : null;
       },
-      async list(userId: string): Promise<DbGoal[]> {
-        const result = await pool.query("SELECT * FROM goals WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100", [userId]);
+      async list(scope: AgentScope): Promise<DbGoal[]> {
+        const result = await pool.query(
+          "SELECT * FROM goals WHERE user_id = $1 AND agent_id = $2 ORDER BY updated_at DESC LIMIT 100",
+          [scope.userId, scope.agentId],
+        );
         return result.rows.map(mapGoal);
       },
-      async listDue(now = new Date()): Promise<DbGoal[]> {
+      async listDue(scope: AgentScope, now = new Date()): Promise<DbGoal[]> {
         const result = await pool.query(
           `SELECT * FROM goals
-           WHERE status = 'confirmed'
-              OR (status = 'running' AND next_run_at IS NOT NULL AND next_run_at <= $1)
+           WHERE user_id = $1 AND agent_id = $2
+             AND (
+               status = 'confirmed'
+               OR (status = 'running' AND next_run_at IS NOT NULL AND next_run_at <= $3)
+             )
            ORDER BY next_run_at ASC NULLS FIRST
            LIMIT 10`,
-          [now],
+          [scope.userId, scope.agentId, now],
         );
         return result.rows.map(mapGoal);
       },
       async setStatus(
+        scope: AgentScope,
         goalId: string,
         status: GoalStatus,
         options?: { needsHumanPrompt?: string | null; nextRunAt?: Date | null; finished?: boolean },
       ): Promise<void> {
         await pool.query(
           `UPDATE goals SET
-             status = $2,
-             needs_human_prompt = CASE WHEN $3 THEN $4 ELSE needs_human_prompt END,
-             next_run_at = CASE WHEN $5 THEN $6 ELSE next_run_at END,
-             finished_at = CASE WHEN $7 THEN now() ELSE finished_at END,
+             status = $4,
+             needs_human_prompt = CASE WHEN $5 THEN $6 ELSE needs_human_prompt END,
+             next_run_at = CASE WHEN $7 THEN $8 ELSE next_run_at END,
+             finished_at = CASE WHEN $9 THEN now() ELSE finished_at END,
              updated_at = now()
-           WHERE id = $1`,
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
           [
+            scope.userId,
+            scope.agentId,
             goalId,
             status,
             options?.needsHumanPrompt !== undefined,
@@ -1241,35 +1397,39 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       // Marks a goal as executing one round. Returns false when another worker
       // already holds a fresh claim; claims older than 30 minutes are treated
       // as interrupted rounds and may be taken over (restart recovery).
-      async claimRunningStep(goalId: string, stepId: string): Promise<boolean> {
+      async claimRunningStep(scope: AgentScope, goalId: string, stepId: string): Promise<boolean> {
         const result = await pool.query(
-          `UPDATE goals SET running_step = $2, updated_at = now()
-           WHERE id = $1
+          `UPDATE goals SET running_step = $4, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND (running_step IS NULL OR updated_at < now() - interval '30 minutes')
            RETURNING id`,
-          [goalId, stepId],
+          [scope.userId, scope.agentId, goalId, stepId],
         );
         return result.rows.length > 0;
       },
-      async releaseRunningStep(goalId: string, nextRunAt: Date | null): Promise<void> {
+      async releaseRunningStep(scope: AgentScope, goalId: string, nextRunAt: Date | null): Promise<void> {
         await pool.query(
-          "UPDATE goals SET running_step = NULL, next_run_at = $2, updated_at = now() WHERE id = $1",
-          [goalId, nextRunAt],
+          `UPDATE goals SET running_step = NULL, next_run_at = $4, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
+          [scope.userId, scope.agentId, goalId, nextRunAt],
         );
       },
       async updateProgress(
+        scope: AgentScope,
         goalId: string,
         input: { progressSummary?: string; reportDraft?: string; budgetUsed?: GoalBudgetUsed; noProgressRounds?: number },
       ): Promise<void> {
         await pool.query(
           `UPDATE goals SET
-             progress_summary = COALESCE($2, progress_summary),
-             report_draft = COALESCE($3, report_draft),
-             budget_used = COALESCE($4, budget_used),
-             no_progress_rounds = COALESCE($5, no_progress_rounds),
+             progress_summary = COALESCE($4, progress_summary),
+             report_draft = COALESCE($5, report_draft),
+             budget_used = COALESCE($6, budget_used),
+             no_progress_rounds = COALESCE($7, no_progress_rounds),
              updated_at = now()
-           WHERE id = $1`,
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
           [
+            scope.userId,
+            scope.agentId,
             goalId,
             input.progressSummary ?? null,
             input.reportDraft ?? null,
@@ -1280,7 +1440,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     goalSteps: {
-      async create(input: {
+      async create(scope: AgentScope, input: {
         goalId: string;
         round: number;
         phase: GoalStepPhase;
@@ -1295,10 +1455,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       }): Promise<string> {
         const result = await pool.query(
           `INSERT INTO goal_steps
-           (goal_id, round, phase, intent, evidence, candidate, verify_result, failed_paths, tokens_used, duration_ms, error)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           (agent_id, goal_id, round, phase, intent, evidence, candidate, verify_result, failed_paths, tokens_used, duration_ms, error)
+           SELECT $2, goal.id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+           FROM goals AS goal
+           WHERE goal.user_id = $1 AND goal.agent_id = $2 AND goal.id = $3
            RETURNING id`,
           [
+            scope.userId,
+            scope.agentId,
             input.goalId,
             input.round,
             input.phase,
@@ -1312,45 +1476,59 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
             input.error ?? null,
           ],
         );
+        if (!result.rows[0]) throw new Error("goal_not_found");
         return result.rows[0].id;
       },
-      async listByGoal(goalId: string): Promise<DbGoalStep[]> {
-        const result = await pool.query("SELECT * FROM goal_steps WHERE goal_id = $1 ORDER BY round ASC, created_at ASC", [
-          goalId,
-        ]);
+      async listByGoal(scope: AgentScope, goalId: string): Promise<DbGoalStep[]> {
+        const result = await pool.query(
+          `SELECT step.* FROM goal_steps AS step
+           JOIN goals AS goal ON goal.id = step.goal_id AND goal.agent_id = step.agent_id
+           WHERE goal.user_id = $1 AND step.agent_id = $2 AND step.goal_id = $3
+           ORDER BY step.round ASC, step.created_at ASC`,
+          [scope.userId, scope.agentId, goalId],
+        );
         return result.rows.map(mapGoalStep);
       },
-      async latestRound(goalId: string): Promise<number> {
-        const result = await pool.query("SELECT max(round)::int AS round FROM goal_steps WHERE goal_id = $1", [goalId]);
+      async latestRound(scope: AgentScope, goalId: string): Promise<number> {
+        const result = await pool.query(
+          `SELECT max(step.round)::int AS round FROM goal_steps AS step
+           JOIN goals AS goal ON goal.id = step.goal_id AND goal.agent_id = step.agent_id
+           WHERE goal.user_id = $1 AND step.agent_id = $2 AND step.goal_id = $3`,
+          [scope.userId, scope.agentId, goalId],
+        );
         return Number(result.rows[0]?.round ?? 0);
       },
     },
     channels: {
-      async ensureConversation(userId: string, message: NormalizedChannelMessage): Promise<DbConversation> {
+      async ensureConversation(scope: AgentScope, message: NormalizedChannelMessage): Promise<DbConversation> {
         const existing = await pool.query(
-          "SELECT * FROM conversations WHERE user_id = $1 AND channel = $2 AND title = $3 ORDER BY updated_at DESC LIMIT 1",
-          [userId, message.channel, channelConversationTitle(message)],
+          `SELECT * FROM conversations
+           WHERE user_id = $1 AND agent_id = $2 AND channel = $3 AND title = $4
+           ORDER BY updated_at DESC LIMIT 1`,
+          [scope.userId, scope.agentId, message.channel, channelConversationTitle(message)],
         );
         if (existing.rows[0]) return mapConversation(existing.rows[0]);
 
         const created = await pool.query(
-          "INSERT INTO conversations (user_id, channel, title) VALUES ($1, $2, $3) RETURNING *",
-          [userId, message.channel, channelConversationTitle(message)],
+          "INSERT INTO conversations (user_id, agent_id, channel, title) VALUES ($1, $2, $3, $4) RETURNING *",
+          [scope.userId, scope.agentId, message.channel, channelConversationTitle(message)],
         );
         return mapConversation(created.rows[0]);
       },
-      async createChannelMessage(input: {
-        userId: string;
+      async createChannelMessage(scope: AgentScope, input: {
         conversationId: string;
         message: NormalizedChannelMessage;
       }): Promise<void> {
         await pool.query(
           `INSERT INTO channel_messages
-           (user_id, conversation_id, channel, external_conversation_id, external_message_id, sender_id, chat_type, text, raw_payload, occurred_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           ON CONFLICT (channel, external_message_id) DO NOTHING`,
+           (user_id, agent_id, conversation_id, channel, external_conversation_id, external_message_id, sender_id, chat_type, text, raw_payload, occurred_at)
+           SELECT $1, $2, conversation.id, $4, $5, $6, $7, $8, $9, $10, $11
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $3
+           ON CONFLICT (agent_id, channel, external_message_id) DO NOTHING`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.conversationId,
             input.message.channel,
             input.message.externalConversationId,
@@ -1363,42 +1541,44 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           ],
         );
       },
-      async recentBotMessageAt(channel: string, externalConversationId: string): Promise<Date | null> {
+      async recentBotMessageAt(scope: AgentScope, channel: string, externalConversationId: string): Promise<Date | null> {
         const result = await pool.query(
           `SELECT created_at FROM interjection_decisions
-           WHERE channel = $1 AND external_conversation_id = $2 AND should_interject = true
+           WHERE user_id = $1 AND agent_id = $2
+             AND channel = $3 AND external_conversation_id = $4 AND should_interject = true
            ORDER BY created_at DESC LIMIT 1`,
-          [channel, externalConversationId],
+          [scope.userId, scope.agentId, channel, externalConversationId],
         );
         return result.rows[0]?.created_at ?? null;
       },
-      async sentCounts(userId: string, channel: string, externalConversationId: string, now = new Date()) {
+      async sentCounts(scope: AgentScope, channel: string, externalConversationId: string, now = new Date()) {
         const result = await pool.query(
           `SELECT
-             count(*) FILTER (WHERE created_at >= $4::timestamptz - interval '1 hour')::int AS last_hour,
-             count(*) FILTER (WHERE created_at::date = $4::date)::int AS today
+             count(*) FILTER (WHERE created_at >= $5::timestamptz - interval '1 hour')::int AS last_hour,
+             count(*) FILTER (WHERE created_at::date = $5::date)::int AS today
            FROM interjection_decisions
-           WHERE user_id = $1 AND channel = $2 AND external_conversation_id = $3 AND should_interject = true`,
-          [userId, channel, externalConversationId, now],
+           WHERE user_id = $1 AND agent_id = $2
+             AND channel = $3 AND external_conversation_id = $4 AND should_interject = true`,
+          [scope.userId, scope.agentId, channel, externalConversationId, now],
         );
         return {
           sentInLastHour: Number(result.rows[0]?.last_hour ?? 0),
           sentToday: Number(result.rows[0]?.today ?? 0),
         };
       },
-      async recentMessageCount(channel: string, externalConversationId: string, since: Date): Promise<number> {
+      async recentMessageCount(scope: AgentScope, channel: string, externalConversationId: string, since: Date): Promise<number> {
         const result = await pool.query(
           `SELECT count(*)::int AS count
            FROM channel_messages
-           WHERE channel = $1
-             AND external_conversation_id = $2
-             AND occurred_at >= $3`,
-          [channel, externalConversationId, since],
+           WHERE user_id = $1 AND agent_id = $2
+             AND channel = $3
+             AND external_conversation_id = $4
+             AND occurred_at >= $5`,
+          [scope.userId, scope.agentId, channel, externalConversationId, since],
         );
         return Number(result.rows[0]?.count ?? 0);
       },
-      async createDecision(input: {
-        userId: string;
+      async createDecision(scope: AgentScope, input: {
         conversationId: string;
         message: NormalizedChannelMessage;
         shouldInterject: boolean;
@@ -1406,10 +1586,13 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       }): Promise<void> {
         await pool.query(
           `INSERT INTO interjection_decisions
-           (user_id, conversation_id, channel, external_conversation_id, should_interject, reason)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+           (user_id, agent_id, conversation_id, channel, external_conversation_id, should_interject, reason)
+           SELECT $1, $2, conversation.id, $4, $5, $6, $7
+           FROM conversations AS conversation
+           WHERE conversation.user_id = $1 AND conversation.agent_id = $2 AND conversation.id = $3`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.conversationId,
             input.message.channel,
             input.message.externalConversationId,
@@ -1418,25 +1601,25 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           ],
         );
       },
-      async listDecisions(userId: string) {
+      async listDecisions(scope: AgentScope) {
         const result = await pool.query(
           `SELECT id, channel, external_conversation_id, should_interject, reason, created_at
            FROM interjection_decisions
-           WHERE user_id = $1
+           WHERE user_id = $1 AND agent_id = $2
            ORDER BY created_at DESC
            LIMIT 200`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         return result.rows;
       },
-      async latestDirectTarget(userId: string): Promise<NormalizedChannelMessage | null> {
+      async latestDirectTarget(scope: AgentScope): Promise<NormalizedChannelMessage | null> {
         const result = await pool.query(
           `SELECT channel, external_conversation_id, external_message_id, sender_id, chat_type, text, raw_payload, occurred_at
            FROM channel_messages
-           WHERE user_id = $1 AND chat_type = 'direct'
+           WHERE user_id = $1 AND agent_id = $2 AND chat_type = 'direct'
            ORDER BY occurred_at DESC
            LIMIT 1`,
-          [userId],
+          [scope.userId, scope.agentId],
         );
         const row = result.rows[0];
         if (!row) return null;
@@ -1453,12 +1636,13 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     reflections: {
-      async create(input: { userId: string; reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<void> {
+      async create(scope: AgentScope, input: { reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<void> {
         await pool.query(
-          `INSERT INTO reflections (user_id, positives, negatives, suggestions, source_window)
-           VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO reflections (user_id, agent_id, positives, negatives, suggestions, source_window)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.reflection.positives,
             input.reflection.negatives,
             input.reflection.suggestions,
@@ -1466,38 +1650,43 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           ],
         );
       },
-      async list(userId: string) {
-        const result = await pool.query("SELECT * FROM reflections WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100", [
-          userId,
-        ]);
+      async list(scope: AgentScope) {
+        const result = await pool.query(
+          "SELECT * FROM reflections WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 100",
+          [scope.userId, scope.agentId],
+        );
         return result.rows;
       },
-      async findAppliedSuggestions(userId: string): Promise<string[]> {
+      async findAppliedSuggestions(scope: AgentScope): Promise<string[]> {
         const result = await pool.query<{ suggestions: string[] }>(
-          "SELECT suggestions FROM reflections WHERE user_id = $1 AND status = 'applied' ORDER BY created_at DESC LIMIT 5",
-          [userId],
+          "SELECT suggestions FROM reflections WHERE user_id = $1 AND agent_id = $2 AND status = 'applied' ORDER BY created_at DESC LIMIT 5",
+          [scope.userId, scope.agentId],
         );
         return result.rows.flatMap((row) => row.suggestions).filter(Boolean).slice(0, 12);
       },
-      async latestCreatedAt(userId: string): Promise<Date | null> {
-        const result = await pool.query("SELECT created_at FROM reflections WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [
-          userId,
-        ]);
-        return result.rows[0]?.created_at ?? null;
-      },
-      async latestBySourceEvent(userId: string, event: string): Promise<Date | null> {
+      async latestCreatedAt(scope: AgentScope): Promise<Date | null> {
         const result = await pool.query(
-          `SELECT created_at
-           FROM reflections
-           WHERE user_id = $1 AND source_window->>'event' = $2
-           ORDER BY created_at DESC
-           LIMIT 1`,
-          [userId, event],
+          "SELECT created_at FROM reflections WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 1",
+          [scope.userId, scope.agentId],
         );
         return result.rows[0]?.created_at ?? null;
       },
-      async setStatus(userId: string, reflectionId: string, status: "applied" | "dismissed"): Promise<void> {
-        await pool.query("UPDATE reflections SET status = $3 WHERE user_id = $1 AND id = $2", [userId, reflectionId, status]);
+      async latestBySourceEvent(scope: AgentScope, event: string): Promise<Date | null> {
+        const result = await pool.query(
+          `SELECT created_at
+           FROM reflections
+           WHERE user_id = $1 AND agent_id = $2 AND source_window->>'event' = $3
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [scope.userId, scope.agentId, event],
+        );
+        return result.rows[0]?.created_at ?? null;
+      },
+      async setStatus(scope: AgentScope, reflectionId: string, status: "applied" | "dismissed"): Promise<void> {
+        await pool.query(
+          "UPDATE reflections SET status = $4 WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, reflectionId, status],
+        );
       },
     },
     skills: {
@@ -1567,7 +1756,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         ]);
       },
       async recordUsage(
-        userId: string,
+        scope: AgentScope,
         skillIds: string[],
         conversationId: string | null,
         triggeredBy: "auto" | "explicit" = "auto",
@@ -1575,12 +1764,21 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         if (skillIds.length === 0) return;
         await pool.query(
           "UPDATE skills SET usage_count = usage_count + 1, last_used_at = now() WHERE user_id = $1 AND id = ANY($2::uuid[])",
-          [userId, skillIds],
+          [scope.userId, skillIds],
         );
         for (const skillId of skillIds) {
           await pool.query(
-            "INSERT INTO skill_usage_logs (user_id, skill_id, conversation_id, triggered_by) VALUES ($1, $2, $3, $4)",
-            [userId, skillId, conversationId, triggeredBy],
+            `INSERT INTO skill_usage_logs (user_id, agent_id, skill_id, conversation_id, triggered_by)
+             SELECT $1, $2, skill.id, $4, $5
+             FROM skills AS skill
+             WHERE skill.user_id = $1 AND skill.id = $3
+               AND (
+                 $4::uuid IS NULL OR EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $4
+                 )
+               )`,
+            [scope.userId, scope.agentId, skillId, conversationId, triggeredBy],
           );
         }
       },
@@ -1640,60 +1838,76 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     skillUsageLogs: {
-      async countSince(skillId: string, since: Date | null): Promise<number> {
+      async countSince(scope: AgentScope, skillId: string, since: Date | null): Promise<number> {
         const result = since
           ? await pool.query<{ count: string }>(
-              "SELECT count(*) AS count FROM skill_usage_logs WHERE skill_id = $1 AND created_at > $2",
-              [skillId, since],
+              `SELECT count(*) AS count FROM skill_usage_logs
+               WHERE user_id = $1 AND agent_id = $2 AND skill_id = $3 AND created_at > $4`,
+              [scope.userId, scope.agentId, skillId, since],
             )
-          : await pool.query<{ count: string }>("SELECT count(*) AS count FROM skill_usage_logs WHERE skill_id = $1", [skillId]);
+          : await pool.query<{ count: string }>(
+              "SELECT count(*) AS count FROM skill_usage_logs WHERE user_id = $1 AND agent_id = $2 AND skill_id = $3",
+              [scope.userId, scope.agentId, skillId],
+            );
         return Number(result.rows[0]?.count ?? 0);
       },
-      async recentConversationIds(skillId: string, limit: number): Promise<string[]> {
+      async recentConversationIds(scope: AgentScope, skillId: string, limit: number): Promise<string[]> {
         const result = await pool.query<{ conversation_id: string }>(
           `SELECT DISTINCT ON (conversation_id) conversation_id
            FROM skill_usage_logs
-           WHERE skill_id = $1 AND conversation_id IS NOT NULL
+           WHERE user_id = $1 AND agent_id = $2 AND skill_id = $3 AND conversation_id IS NOT NULL
            ORDER BY conversation_id, created_at DESC
-           LIMIT $2`,
-          [skillId, limit],
+           LIMIT $4`,
+          [scope.userId, scope.agentId, skillId, limit],
         );
         return result.rows.map((row) => row.conversation_id);
       },
     },
     taskRuns: {
-      async list(userId: string) {
-        const result = await pool.query("SELECT * FROM task_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100", [userId]);
+      async list(scope: AgentScope) {
+        const result = await pool.query(
+          "SELECT * FROM task_runs WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 100",
+          [scope.userId, scope.agentId],
+        );
         return result.rows;
       },
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         conversationId?: string | null;
         kind: "sandbox" | "spreadsheet" | "presentation";
         inputSummary: string;
         metadata?: unknown;
       }): Promise<string> {
         const result = await pool.query(
-          `INSERT INTO task_runs (user_id, conversation_id, kind, input_summary, metadata)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO task_runs (user_id, agent_id, conversation_id, kind, input_summary, metadata)
+           SELECT $1, $2, $3, $4, $5, $6
+           WHERE (
+             $3::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM conversations
+               WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $3
+             )
+           )
            RETURNING id`,
-          [input.userId, input.conversationId ?? null, input.kind, input.inputSummary, JSON.stringify(input.metadata ?? {})],
+          [scope.userId, scope.agentId, input.conversationId ?? null, input.kind, input.inputSummary, JSON.stringify(input.metadata ?? {})],
         );
+        if (!result.rows[0]) throw new Error("conversation_not_found");
         return result.rows[0].id;
       },
-      async complete(taskRunId: string, outputSummary: string): Promise<void> {
-        await pool.query("UPDATE task_runs SET status = 'succeeded', output_summary = $2, updated_at = now() WHERE id = $1", [
-          taskRunId,
-          outputSummary,
-        ]);
+      async complete(scope: AgentScope, taskRunId: string, outputSummary: string): Promise<void> {
+        await pool.query(
+          `UPDATE task_runs SET status = 'succeeded', output_summary = $4, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
+          [scope.userId, scope.agentId, taskRunId, outputSummary],
+        );
       },
-      async fail(taskRunId: string, error: string): Promise<void> {
-        await pool.query("UPDATE task_runs SET status = 'failed', error = $2, updated_at = now() WHERE id = $1", [taskRunId, error]);
+      async fail(scope: AgentScope, taskRunId: string, error: string): Promise<void> {
+        await pool.query(
+          "UPDATE task_runs SET status = 'failed', error = $4, updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, taskRunId, error],
+        );
       },
     },
     taskArtifacts: {
-      async create(input: {
-        userId: string;
+      async create(scope: AgentScope, input: {
         taskRunId: string;
         fileName: string;
         mimeType: string;
@@ -1701,11 +1915,14 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         metadata?: unknown;
       }): Promise<string> {
         const result = await pool.query(
-          `INSERT INTO task_artifacts (user_id, task_run_id, file_name, mime_type, storage_path, metadata)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO task_artifacts (user_id, agent_id, task_run_id, file_name, mime_type, storage_path, metadata)
+           SELECT $1, $2, task_run.id, $4, $5, $6, $7
+           FROM task_runs AS task_run
+           WHERE task_run.user_id = $1 AND task_run.agent_id = $2 AND task_run.id = $3
            RETURNING id`,
           [
-            input.userId,
+            scope.userId,
+            scope.agentId,
             input.taskRunId,
             input.fileName,
             input.mimeType,
@@ -1713,17 +1930,21 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
             JSON.stringify(input.metadata ?? {}),
           ],
         );
+        if (!result.rows[0]) throw new Error("task_run_not_found");
         return result.rows[0].id;
       },
-      async list(userId: string) {
+      async list(scope: AgentScope) {
         const result = await pool.query(
-          "SELECT * FROM task_artifacts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200",
-          [userId],
+          "SELECT * FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 200",
+          [scope.userId, scope.agentId],
         );
         return result.rows;
       },
-      async getForUser(userId: string, artifactId: string) {
-        const result = await pool.query("SELECT * FROM task_artifacts WHERE user_id = $1 AND id = $2", [userId, artifactId]);
+      async get(scope: AgentScope, artifactId: string) {
+        const result = await pool.query(
+          "SELECT * FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          [scope.userId, scope.agentId, artifactId],
+        );
         return result.rows[0] ?? null;
       },
     },
@@ -1772,36 +1993,40 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     settings: {
-      async get(userId: string) {
-        await ensureSettings(pool, userId);
-        const result = await pool.query("SELECT * FROM settings WHERE user_id = $1", [userId]);
-        const row = result.rows[0];
-        return {
-          persona: row.persona ?? defaultSettings.persona,
-          proactivity: row.proactivity ?? defaultSettings.proactivity,
-          modelRouting: row.model_routing ?? defaultSettings.modelRouting,
-          cadence: row.cadence ?? defaultSettings.cadence,
-          search: row.search?.aggressiveness ? row.search : defaultSettings.search,
-        };
+      async get(scope: AgentScope) {
+        return createAgentSettingsRepository(pool).get(scope);
       },
-      async update(userId: string, settings: typeof defaultSettings): Promise<void> {
+      async getUserModelRouting(userId: string): Promise<typeof defaultSettings.modelRouting> {
+        await ensureSettings(pool, userId);
+        const result = await pool.query("SELECT model_routing FROM settings WHERE user_id = $1", [userId]);
+        return result.rows[0]?.model_routing ?? defaultSettings.modelRouting;
+      },
+      async update(scope: AgentScope, settings: typeof defaultSettings): Promise<void> {
+        await ensureSettings(pool, scope.userId);
+        await createAgentSettingsRepository(pool).ensure(scope);
         await pool.query(
-          `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (user_id) DO UPDATE SET
-             persona = EXCLUDED.persona,
-             proactivity = EXCLUDED.proactivity,
-             model_routing = EXCLUDED.model_routing,
-             cadence = EXCLUDED.cadence,
-             search = EXCLUDED.search,
-             updated_at = now()`,
-          [userId, settings.persona, settings.proactivity, settings.modelRouting, settings.cadence, settings.search],
+          "UPDATE settings SET model_routing = $2, updated_at = now() WHERE user_id = $1",
+          [scope.userId, settings.modelRouting],
+        );
+        await pool.query(
+          `UPDATE agent_settings
+           SET persona = $3,
+               proactivity = $4,
+               cadence = $5,
+               search = $6,
+               revision = revision + 1,
+               updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2`,
+          [scope.userId, scope.agentId, settings.persona, settings.proactivity, settings.cadence, settings.search],
         );
       },
     },
     personalData: {
       async export(userId: string) {
         const tables = [
+          "digital_agents",
+          "agent_settings",
+          "agent_resource_grants",
           "projects",
           "conversations",
           "messages",
@@ -1814,10 +2039,13 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           "interjection_decisions",
           "reflections",
           "skills",
+          "skill_revisions",
+          "skill_usage_logs",
           "task_runs",
           "task_artifacts",
           "tool_registrations",
           "llm_usage_logs",
+          "memory_jobs",
           "goals",
           "settings",
         ];
@@ -1826,8 +2054,17 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           const result = await pool.query(`SELECT * FROM ${table} WHERE user_id = $1`, [userId]);
           exported[table] = result.rows;
         }
+        const goalSteps = await pool.query(
+          `SELECT goal_steps.*
+           FROM goal_steps
+           JOIN goals ON goals.id = goal_steps.goal_id
+           WHERE goals.user_id = $1
+           ORDER BY goal_steps.created_at ASC, goal_steps.id ASC`,
+          [userId],
+        );
+        exported.goal_steps = goalSteps.rows;
         const attachments = await pool.query(
-          `SELECT id, user_id, message_id, kind, file_name, mime_type, size_bytes,
+          `SELECT id, user_id, agent_id, message_id, kind, file_name, mime_type, size_bytes,
                   extracted_text, text_truncated, status, error_code, created_at, updated_at
            FROM message_attachments
            WHERE user_id = $1
@@ -1852,6 +2089,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       async clear(userId: string): Promise<void> {
         const tables = [
           "goals",
+          "skill_usage_logs",
+          "skill_revisions",
           "task_artifacts",
           "task_runs",
           "tool_registrations",
@@ -1870,6 +2109,7 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           "messages",
           "conversations",
           "projects",
+          "agent_resource_grants",
         ];
         for (const table of tables) {
           await pool.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
@@ -1887,6 +2127,31 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
             defaultSettings.cadence,
             defaultSettings.search,
           ],
+        );
+        await pool.query(
+          `UPDATE agent_settings
+           SET persona = $2,
+               proactivity = $3,
+               cadence = $4,
+               search = $5,
+               model_routing_override = '{}'::jsonb,
+               revision = revision + 1,
+               updated_at = now()
+           WHERE user_id = $1`,
+          [
+            userId,
+            defaultSettings.persona,
+            defaultSettings.proactivity,
+            defaultSettings.cadence,
+            defaultSettings.search,
+          ],
+        );
+        await pool.query(
+          `UPDATE digital_agents
+           SET persona = '{}'::jsonb,
+               updated_at = now()
+           WHERE user_id = $1`,
+          [userId],
         );
       },
     },
@@ -2015,6 +2280,7 @@ function mapConversation(row: Record<string, unknown>): DbConversation {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     channel: String(row.channel),
     title: String(row.title),
     projectId: row.project_id ? String(row.project_id) : null,
@@ -2027,6 +2293,7 @@ function mapProject(row: Record<string, unknown>): DbProject {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     name: String(row.name),
     description: String(row.description ?? ""),
     updatedAt: row.updated_at as Date,
@@ -2037,6 +2304,7 @@ function mapMessage(row: Record<string, unknown>): DbMessage {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     conversationId: String(row.conversation_id),
     role: row.role as DbMessage["role"],
     content: String(row.content),
@@ -2048,6 +2316,7 @@ function mapMessageAttachment(row: Record<string, unknown>): DbMessageAttachment
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     messageId: row.message_id ? String(row.message_id) : null,
     kind: row.kind as AttachmentKind,
     fileName: String(row.file_name),
@@ -2078,6 +2347,7 @@ function mapGoal(row: Record<string, unknown>): DbGoal {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     title: String(row.title),
     contract: (isRecord(row.contract) ? row.contract : {}) as GoalContract,
     status: row.status as GoalStatus,
@@ -2098,6 +2368,7 @@ function mapGoal(row: Record<string, unknown>): DbGoal {
 function mapGoalStep(row: Record<string, unknown>): DbGoalStep {
   return {
     id: String(row.id),
+    agentId: String(row.agent_id),
     goalId: String(row.goal_id),
     round: Number(row.round),
     phase: row.phase as GoalStepPhase,
@@ -2117,6 +2388,7 @@ function mapProactiveTask(row: Record<string, unknown>): DbProactiveTask {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    agentId: String(row.agent_id),
     conversationId: String(row.conversation_id),
     kind: row.kind as DbProactiveTask["kind"],
     content: String(row.content),

@@ -1,5 +1,6 @@
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -7,7 +8,9 @@ export default async function RemindersPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看提醒。</section>;
 
-  const reminders = await createRepositories().proactiveTasks.list(user.id);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const reminders = await repositories.proactiveTasks.list(scope);
 
   return (
     <section className="admin-list">

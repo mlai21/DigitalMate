@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => {
   const draft: DbMessageAttachment = {
     id: "30000000-0000-4000-8000-000000000001",
     userId: "00000000-0000-4000-8000-000000000001",
+    agentId: "10000000-0000-4000-8000-000000000001",
     messageId: null,
     kind: "document" as const,
     fileName: "notes.md",
@@ -23,9 +24,11 @@ const mocks = vi.hoisted(() => {
     createdAt: new Date("2026-07-14T00:00:00Z"),
     updatedAt: new Date("2026-07-14T00:00:00Z"),
   };
+  const scope = { userId: draft.userId, agentId: draft.agentId };
 
   return {
     draft,
+    scope,
     requireCurrentUser: vi.fn(async () => ({ id: draft.userId })),
     createDraft: vi.fn<() => Promise<DbMessageAttachment>>(async () => draft),
     markReady: vi.fn<() => Promise<DbMessageAttachment | null>>(
@@ -62,13 +65,20 @@ vi.mock("@/server/config/env", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    agents: {
+      getDefault: vi.fn(async () => ({
+        id: mocks.draft.agentId,
+        userId: mocks.draft.userId,
+        status: "active",
+      })),
+    },
     messageAttachments: {
       createDraft: mocks.createDraft,
       markReady: mocks.markReady,
       markFailed: mocks.markFailed,
       claimDraftForDeletion: mocks.claimDraftForDeletion,
       deleteDraft: mocks.deleteDraft,
-      getForUser: mocks.getForUser,
+      get: mocks.getForUser,
       releaseDeletionClaim: mocks.releaseDeletionClaim,
       acquireUserMutationLock: mocks.acquireUserMutationLock,
     },
@@ -317,6 +327,7 @@ describe("chat attachment upload route", () => {
 
     expect(response.status).toBe(201);
     expect(mocks.createDraft).toHaveBeenCalledWith(
+      mocks.scope,
       expect.objectContaining({ kind: "image", sizeBytes: ATTACHMENT_LIMITS.maxFileBytes }),
     );
   });
@@ -406,8 +417,7 @@ describe("chat attachment upload route", () => {
       mocks.draft.storageKey,
       Buffer.from("hello world\n"),
     );
-    expect(mocks.createDraft).toHaveBeenCalledWith({
-      userId: mocks.draft.userId,
+    expect(mocks.createDraft).toHaveBeenCalledWith(mocks.scope, {
       kind: "document",
       fileName: "notes.md",
       mimeType: "text/markdown",
@@ -416,7 +426,7 @@ describe("chat attachment upload route", () => {
       extractedText: "hello world\n",
       textTruncated: false,
     });
-    expect(mocks.markReady).toHaveBeenCalledWith(mocks.draft.userId, mocks.draft.id);
+    expect(mocks.markReady).toHaveBeenCalledWith(mocks.scope, mocks.draft.id);
   });
 
   it("does not publish storage when pending draft persistence fails", async () => {
@@ -448,7 +458,7 @@ describe("chat attachment upload route", () => {
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "attachment_upload_failed" });
     expect(mocks.markFailed).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       "attachment_upload_failed",
     );
@@ -472,7 +482,7 @@ describe("chat attachment upload route", () => {
 
     expect(response.status).toBe(500);
     expect(mocks.markFailed).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       "attachment_upload_failed",
     );
@@ -493,7 +503,7 @@ describe("chat attachment upload route", () => {
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "attachment_upload_failed" });
     expect(mocks.markFailed).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       "attachment_upload_failed",
     );
@@ -579,7 +589,7 @@ describe("chat attachment delete route", () => {
     expect(mocks.deleteStoredAttachment).toHaveBeenCalledOnce();
     expect(mocks.deleteDraft).toHaveBeenCalledOnce();
     expect(mocks.deleteDraft).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       firstClaimToken,
     );
@@ -619,7 +629,7 @@ describe("chat attachment delete route", () => {
     await expect(response.json()).resolves.toEqual({ error: "attachment_delete_failed" });
     expect(mocks.deleteDraft).not.toHaveBeenCalled();
     expect(mocks.releaseDeletionClaim).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       firstClaimToken,
       "attachment_delete_failed",
@@ -654,14 +664,14 @@ describe("chat attachment delete route", () => {
     expect(firstResponse.status).toBe(500);
     expect(retryResponse.status).toBe(204);
     expect(mocks.releaseDeletionClaim).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       firstClaimToken,
       "attachment_delete_failed",
     );
     expect(mocks.deleteDraft).toHaveBeenNthCalledWith(
       2,
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       retryClaimToken,
     );
@@ -693,14 +703,14 @@ describe("chat attachment delete route", () => {
     expect(retryResponse.status).toBe(204);
     await expect(response.json()).resolves.toEqual({ error: "attachment_delete_failed" });
     expect(mocks.releaseDeletionClaim).toHaveBeenCalledWith(
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       firstClaimToken,
       "attachment_delete_failed",
     );
     expect(mocks.deleteDraft).toHaveBeenNthCalledWith(
       2,
-      mocks.draft.userId,
+      mocks.scope,
       mocks.draft.id,
       retryClaimToken,
     );

@@ -8,6 +8,7 @@ import {
 } from "@/server/goals/contract";
 import type { LlmClient, LlmMessage, LlmTool, LlmToolCall } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount } from "@/server/llm/usage";
+import type { AgentScope } from "@/server/agents/types";
 
 export type GoalStepCandidate = {
   intent: string;
@@ -26,7 +27,7 @@ export type ExecuteGoalStepInput = {
   llm: LlmClient;
   model: string;
   search: { run(query: string): Promise<{ summary: string }> };
-  memories: { findRelevant(userId: string, query: string): Promise<RankableMemory[]> };
+  memories: { findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]> };
   toolLogs: { create(input: ToolLogInput): Promise<unknown> | unknown };
   now?: Date;
 };
@@ -152,6 +153,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
 
   const logBase = {
     userId: input.goal.userId,
+    agentId: input.goal.agentId,
     conversationId: input.goal.conversationId,
     goalId: input.goal.id,
     toolName: toolCall.name,
@@ -194,7 +196,10 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
 
   if (toolCall.name === "memory_search") {
     try {
-      const memories = await input.memories.findRelevant(input.goal.userId, query);
+      const memories = await input.memories.findRelevant(
+        { userId: input.goal.userId, agentId: input.goal.agentId },
+        query,
+      );
       const summary =
         memories.length > 0 ? memories.map((memory) => `- ${memory.content}`).join("\n") : "没有找到相关记忆。";
       await input.toolLogs.create({

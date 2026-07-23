@@ -197,6 +197,13 @@ function fakeRepositories() {
     users: {
       ensureDefault: vi.fn(async () => ({ id: "user-1" })),
     },
+    agents: {
+      getDefault: vi.fn(async () => ({
+        id: "agent-1",
+        userId: "user-1",
+        status: "active",
+      })),
+    },
     settings: {
       get: vi.fn(async () => ({
         modelRouting: { main: "mock-main", light: "mock-light" },

@@ -9,6 +9,7 @@ import {
 import type { GoalStepCandidate } from "@/server/goals/executor";
 import type { GoalVerifyResult } from "@/server/goals/verifier";
 import { reduceGoalStatus, type GoalStatus } from "@/server/goals/state-machine";
+import type { AgentScope } from "@/server/agents/types";
 
 export type GoalRoundServices = {
   executeStep(goal: DbGoal, recentSteps: DbGoalStep[]): Promise<GoalStepCandidate>;
@@ -16,6 +17,7 @@ export type GoalRoundServices = {
 };
 
 type GoalLoopDeps = {
+  scope: AgentScope;
   repositories: ReturnType<typeof createRepositories>;
   services: GoalRoundServices;
   now?: Date;
@@ -38,9 +40,9 @@ const DEFAULT_MAX_NO_PROGRESS_ROUNDS = 3;
  * State transitions only ever go through reduceGoalStatus; LLM verdicts are
  * inputs, never the transition itself.
  */
-export async function processGoalLoops({ repositories, services, now = new Date() }: GoalLoopDeps): Promise<GoalLoopOutcome> {
+export async function processGoalLoops({ scope, repositories, services, now = new Date() }: GoalLoopDeps): Promise<GoalLoopOutcome> {
   const outcome: GoalLoopOutcome = { pickedUp: 0, rounds: 0, succeeded: 0, stopped: 0, skipped: 0 };
-  const dueGoals = await repositories.goals.listDue(now);
+  const dueGoals = await repositories.goals.listDue(scope, now);
 
   for (const goal of dueGoals) {
     let status: GoalStatus = goal.status;
@@ -48,35 +50,36 @@ export async function processGoalLoops({ repositories, services, now = new Date(
     if (status === "confirmed") {
       const transition = reduceGoalStatus(status, { type: "picked_up" });
       if (!transition.ok) continue;
-      await repositories.goals.setStatus(goal.id, transition.status, { nextRunAt: now });
+      await repositories.goals.setStatus(scope, goal.id, transition.status, { nextRunAt: now });
       status = transition.status;
       outcome.pickedUp += 1;
     }
 
     if (status !== "running") continue;
 
-    const claimed = await repositories.goals.claimRunningStep(goal.id, randomUUID());
+    const claimed = await repositories.goals.claimRunningStep(scope, goal.id, randomUUID());
     if (!claimed) {
       outcome.skipped += 1;
       continue;
     }
 
-    await runGoalRound({ repositories, services, goal, now, outcome });
+    await runGoalRound({ scope, repositories, services, goal, now, outcome });
   }
 
   return outcome;
 }
 
 async function runGoalRound(context: {
+  scope: AgentScope;
   repositories: ReturnType<typeof createRepositories>;
   services: GoalRoundServices;
   goal: DbGoal;
   now: Date;
   outcome: GoalLoopOutcome;
 }): Promise<void> {
-  const { repositories, services, goal, now, outcome } = context;
+  const { scope, repositories, services, goal, now, outcome } = context;
   const startedAt = Date.now();
-  const priorSteps = await repositories.goalSteps.listByGoal(goal.id);
+  const priorSteps = await repositories.goalSteps.listByGoal(scope, goal.id);
   const round = (priorSteps[priorSteps.length - 1]?.round ?? 0) + 1;
 
   // 1. Budget is a hard control-plane boundary: checked before the model runs.
@@ -84,17 +87,17 @@ async function runGoalRound(context: {
   if (budgetVerdict.exhausted) {
     const transition = reduceGoalStatus("running", { type: "budget_exhausted" });
     if (transition.ok) {
-      await repositories.goalSteps.create({
+      await repositories.goalSteps.create(scope, {
         goalId: goal.id,
         round,
         phase: "failed",
         intent: "预算前置检查",
         error: `预算耗尽：${budgetVerdict.reason}`,
       });
-      await repositories.goals.setStatus(goal.id, transition.status, { finished: true, nextRunAt: null });
+      await repositories.goals.setStatus(scope, goal.id, transition.status, { finished: true, nextRunAt: null });
       outcome.stopped += 1;
     }
-    await repositories.goals.releaseRunningStep(goal.id, null);
+    await repositories.goals.releaseRunningStep(scope, goal.id, null);
     return;
   }
 
@@ -114,7 +117,7 @@ async function runGoalRound(context: {
       evidenceRefs: verify.evidenceRefs,
       summary: verify.summary,
     };
-    await repositories.goalSteps.create({
+    await repositories.goalSteps.create(scope, {
       goalId: goal.id,
       round,
       phase: "committed",
@@ -128,7 +131,7 @@ async function runGoalRound(context: {
     });
 
     const noProgressRounds = verify.progressed ? 0 : goal.noProgressRounds + 1;
-    await repositories.goals.updateProgress(goal.id, {
+    await repositories.goals.updateProgress(scope, goal.id, {
       progressSummary: candidate.progressSummary || undefined,
       reportDraft: appendReportDraft(goal.reportDraft, round, candidate.candidate),
       budgetUsed: {
@@ -143,8 +146,8 @@ async function runGoalRound(context: {
     if (verify.allMet) {
       const transition = reduceGoalStatus("running", { type: "verified_success", evidenceRefs: verify.evidenceRefs });
       if (transition.ok) {
-        await repositories.goals.setStatus(goal.id, transition.status, { finished: true, nextRunAt: null });
-        await repositories.goals.releaseRunningStep(goal.id, null);
+        await repositories.goals.setStatus(scope, goal.id, transition.status, { finished: true, nextRunAt: null });
+        await repositories.goals.releaseRunningStep(scope, goal.id, null);
         outcome.succeeded += 1;
         return;
       }
@@ -154,20 +157,20 @@ async function runGoalRound(context: {
     if (noProgressRounds >= maxNoProgress) {
       const transition = reduceGoalStatus("running", { type: "no_progress_limit_reached" });
       if (transition.ok) {
-        await repositories.goals.setStatus(goal.id, transition.status, { finished: true, nextRunAt: null });
-        await repositories.goals.releaseRunningStep(goal.id, null);
+        await repositories.goals.setStatus(scope, goal.id, transition.status, { finished: true, nextRunAt: null });
+        await repositories.goals.releaseRunningStep(scope, goal.id, null);
         outcome.stopped += 1;
         return;
       }
     }
 
-    await repositories.goals.releaseRunningStep(goal.id, nextRunAtByCadence(goal, now));
+    await repositories.goals.releaseRunningStep(scope, goal.id, nextRunAtByCadence(goal, now));
   } catch (error) {
     // Execution/verification failure: leave a ledger row, count it as a
     // no-progress round, and let the next round retry. Backoff lands in M-D.
     const message = error instanceof Error ? error.message : String(error);
     await repositories.goalSteps
-      .create({
+      .create(scope, {
         goalId: goal.id,
         round,
         phase: "failed",
@@ -178,7 +181,7 @@ async function runGoalRound(context: {
 
     const noProgressRounds = goal.noProgressRounds + 1;
     await repositories.goals
-      .updateProgress(goal.id, {
+      .updateProgress(scope, goal.id, {
         budgetUsed: { ...goal.budgetUsed, rounds: goal.budgetUsed.rounds + 1 },
         noProgressRounds,
       })
@@ -189,13 +192,13 @@ async function runGoalRound(context: {
     if (noProgressRounds >= maxNoProgress) {
       const transition = reduceGoalStatus("running", { type: "no_progress_limit_reached" });
       if (transition.ok) {
-        await repositories.goals.setStatus(goal.id, transition.status, { finished: true, nextRunAt: null });
-        await repositories.goals.releaseRunningStep(goal.id, null);
+        await repositories.goals.setStatus(scope, goal.id, transition.status, { finished: true, nextRunAt: null });
+        await repositories.goals.releaseRunningStep(scope, goal.id, null);
         outcome.stopped += 1;
         return;
       }
     }
-    await repositories.goals.releaseRunningStep(goal.id, nextRunAtByCadence(goal, now));
+    await repositories.goals.releaseRunningStep(scope, goal.id, nextRunAtByCadence(goal, now));
   }
 }
 

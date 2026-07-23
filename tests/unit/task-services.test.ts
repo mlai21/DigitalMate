@@ -17,6 +17,9 @@ vi.mock("@/server/auth/current-user", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    agents: {
+      getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
+    },
     taskRuns: {
       create: routeMocks.taskRunsCreate,
       complete: routeMocks.taskRunsComplete,
@@ -69,12 +72,14 @@ describe("csv task route", () => {
     expect(response.status).toBe(303);
     expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledTimes(2);
     expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({
         fileName: "csv-summary.md",
         mimeType: "text/markdown; charset=utf-8",
       }),
     );
     expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({
         fileName: "csv-summary-chart.svg",
         mimeType: "image/svg+xml; charset=utf-8",

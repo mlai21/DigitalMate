@@ -1,6 +1,7 @@
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { ToolLogCard } from "@/components/admin/tool-log-card";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +9,9 @@ export default async function ToolsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看工具日志。</section>;
 
-  const logs = await createRepositories().toolLogs.list(user.id);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const logs = await repositories.toolLogs.list(scope);
 
   return (
     <section className="admin-list">

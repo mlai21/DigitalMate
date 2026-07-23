@@ -1,8 +1,9 @@
 import { createTaskSkillDraft, type TaskSkillDraftInput } from "@/server/evolution/skills";
+import type { AgentScope } from "@/server/agents/types";
 
 type TaskSkillDraftRepositories = {
   taskRuns: {
-    complete(taskRunId: string, outputSummary: string): Promise<unknown> | unknown;
+    complete(scope: AgentScope, taskRunId: string, outputSummary: string): Promise<unknown> | unknown;
   };
   skills: {
     create(userId: string, draft: ReturnType<typeof createTaskSkillDraft>): Promise<unknown> | unknown;
@@ -12,14 +13,14 @@ type TaskSkillDraftRepositories = {
 export async function completeTaskWithSkillDraft(
   repositories: TaskSkillDraftRepositories,
   input: TaskSkillDraftInput & {
-    userId: string;
+    scope: AgentScope;
     taskRunId: string;
   },
 ): Promise<void> {
-  await repositories.taskRuns.complete(input.taskRunId, input.outputSummary);
+  await repositories.taskRuns.complete(input.scope, input.taskRunId, input.outputSummary);
 
   try {
-    await repositories.skills.create(input.userId, createTaskSkillDraft(input));
+    await repositories.skills.create(input.scope.userId, createTaskSkillDraft(input));
   } catch {
     return;
   }

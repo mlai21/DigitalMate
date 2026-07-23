@@ -1,5 +1,6 @@
 import type { ChatAttachment } from "@/server/attachments/types";
 import type { DbMessageAttachment } from "@/server/db/repositories";
+import type { AgentScope } from "@/server/agents/types";
 
 type ChatMessageSource = {
   id: string;
@@ -17,16 +18,17 @@ export type PublicChatMessage = {
 };
 
 type ListForMessages = (
-  userId: string,
+  scope: AgentScope,
   messageIds: string[],
 ) => Promise<DbMessageAttachment[]>;
 
 export function toChatAttachment(
-  userId: string,
+  scope: AgentScope,
   attachment: DbMessageAttachment,
 ): ChatAttachment | null {
   if (
-    attachment.userId !== userId
+    attachment.userId !== scope.userId
+    || attachment.agentId !== scope.agentId
     || attachment.status !== "bound"
     || !attachment.messageId
   ) return null;
@@ -43,7 +45,7 @@ export function toChatAttachment(
 }
 
 export async function serializeChatMessages(
-  userId: string,
+  scope: AgentScope,
   messages: ChatMessageSource[],
   listForMessages: ListForMessages,
 ): Promise<PublicChatMessage[]> {
@@ -61,12 +63,12 @@ export async function serializeChatMessages(
 
   const messageIds = publicMessages.map((message) => message.id);
   const allowedMessageIds = new Set(messageIds);
-  const attachments = await listForMessages(userId, messageIds);
+  const attachments = await listForMessages(scope, messageIds);
   const byMessageId = new Map<string, ChatAttachment[]>();
 
   for (const attachment of attachments) {
     if (!attachment.messageId || !allowedMessageIds.has(attachment.messageId)) continue;
-    const chatAttachment = toChatAttachment(userId, attachment);
+    const chatAttachment = toChatAttachment(scope, attachment);
     if (!chatAttachment) continue;
     const list = byMessageId.get(attachment.messageId) ?? [];
     list.push(chatAttachment);

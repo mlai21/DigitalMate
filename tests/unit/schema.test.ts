@@ -138,6 +138,18 @@ describe("database schema", () => {
     );
   });
 
+  it("migrates per-agent settings while keeping model routing defaults user-scoped", async () => {
+    const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS agent_settings");
+    expect(schema).toContain("model_routing_override jsonb NOT NULL DEFAULT '{}'::jsonb");
+    expect(schema).toContain("revision integer NOT NULL DEFAULT 1");
+    expect(schema).toMatch(
+      /INSERT INTO agent_settings[\s\S]+SELECT settings\.user_id,\s*digital_agents\.id[\s\S]+settings\.persona[\s\S]+settings\.search[\s\S]+ON CONFLICT \(user_id, agent_id\) DO NOTHING/,
+    );
+    expect(schema).not.toMatch(/DELETE FROM settings/);
+  });
+
   it("seeds the default agent before the default conversation without a future repository API", async () => {
     const seed = await readFile(path.join(process.cwd(), "src/server/db/seed.ts"), "utf8");
 

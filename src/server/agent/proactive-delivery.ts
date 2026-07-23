@@ -2,18 +2,19 @@ import { canSendProactiveMessage } from "@/server/agent/reminders";
 import { splitAssistantText } from "@/server/agent/streaming";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { DbProactiveTask } from "@/server/db/repositories";
+import type { AgentScope } from "@/server/agents/types";
 
 type ProactiveDeliveryRepositories = {
   proactiveTasks: {
-    due(now?: Date): Promise<DbProactiveTask[]>;
-    countSentToday(userId: string, now?: Date): Promise<number>;
-    unansweredStreak(userId: string): Promise<number>;
-    markSent(taskId: string): Promise<void> | void;
-    markCancelled(taskId: string): Promise<void> | void;
-    markFailed(taskId: string): Promise<void> | void;
+    due(scope: AgentScope, now?: Date): Promise<DbProactiveTask[]>;
+    countSentToday(scope: AgentScope, now?: Date): Promise<number>;
+    unansweredStreak(scope: AgentScope): Promise<number>;
+    markSent(scope: AgentScope, taskId: string): Promise<void> | void;
+    markCancelled(scope: AgentScope, taskId: string): Promise<void> | void;
+    markFailed(scope: AgentScope, taskId: string): Promise<void> | void;
   };
   settings: {
-    get(userId: string): Promise<{
+    get(scope: AgentScope): Promise<{
       proactivity: {
         quietStart: string;
         quietEnd: string;
@@ -22,34 +23,34 @@ type ProactiveDeliveryRepositories = {
     }>;
   };
   messages: {
-    createFromProactiveTask(input: {
+    createFromProactiveTask(scope: AgentScope, input: {
       taskId: string;
-      userId: string;
       conversationId: string;
       content: string;
     }): Promise<boolean> | boolean;
   };
   channels: {
-    latestDirectTarget(userId: string): Promise<NormalizedChannelMessage | null>;
+    latestDirectTarget(scope: AgentScope): Promise<NormalizedChannelMessage | null>;
   };
 };
 
 export async function processDueProactiveTasks(input: {
+  scope: AgentScope;
   repositories: ProactiveDeliveryRepositories;
   sendChannel?: (target: NormalizedChannelMessage, text: string) => Promise<unknown> | unknown;
   now?: Date;
 }): Promise<void> {
   const now = input.now ?? new Date();
-  const tasks = await input.repositories.proactiveTasks.due(now);
+  const tasks = await input.repositories.proactiveTasks.due(input.scope, now);
 
   for (const task of tasks) {
     if (task.kind === "share" && !isAuthorizedShare(task)) {
-      await input.repositories.proactiveTasks.markCancelled(task.id);
+      await input.repositories.proactiveTasks.markCancelled(input.scope, task.id);
       continue;
     }
-    const settings = await input.repositories.settings.get(task.userId);
-    const sentToday = await input.repositories.proactiveTasks.countSentToday(task.userId, now);
-    const unansweredCount = await input.repositories.proactiveTasks.unansweredStreak(task.userId);
+    const settings = await input.repositories.settings.get(input.scope);
+    const sentToday = await input.repositories.proactiveTasks.countSentToday(input.scope, now);
+    const unansweredCount = await input.repositories.proactiveTasks.unansweredStreak(input.scope);
     if (task.kind !== "reminder" && unansweredCount >= 2) continue;
 
     const canSend = canSendProactiveMessage(now, {
@@ -62,28 +63,27 @@ export async function processDueProactiveTasks(input: {
     if (!canSend) continue;
 
     const content = proactiveTaskContent(task);
-    const inserted = await input.repositories.messages.createFromProactiveTask({
+    const inserted = await input.repositories.messages.createFromProactiveTask(input.scope, {
       taskId: task.id,
-      userId: task.userId,
       conversationId: task.conversationId,
       content,
     });
 
     if (inserted) {
-      const target = await input.repositories.channels.latestDirectTarget(task.userId);
+      const target = await input.repositories.channels.latestDirectTarget(input.scope);
       if (target && input.sendChannel) {
         try {
           for (const segment of splitAssistantText(content)) {
             await input.sendChannel(target, segment);
           }
         } catch {
-          await input.repositories.proactiveTasks.markFailed(task.id);
+          await input.repositories.proactiveTasks.markFailed(input.scope, task.id);
           continue;
         }
       }
     }
 
-    await input.repositories.proactiveTasks.markSent(task.id);
+    await input.repositories.proactiveTasks.markSent(input.scope, task.id);
   }
 }
 

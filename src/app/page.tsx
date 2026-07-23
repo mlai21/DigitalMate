@@ -3,6 +3,7 @@ import type { ConversationItem, ProjectItem } from "@/components/chat/chat-sideb
 import { serializeChatMessages } from "@/server/attachments/presentation";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -42,9 +43,10 @@ async function loadChatPageData(): Promise<{
     }
 
     const repositories = createRepositories();
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
     const [conversations, projects] = await Promise.all([
-      repositories.conversations.listWithStats(user.id),
-      repositories.projects.list(user.id),
+      repositories.conversations.listWithStats(scope),
+      repositories.projects.list(scope),
     ]);
 
     const initialConversations: ConversationItem[] = conversations.map((conversation) => ({
@@ -64,7 +66,7 @@ async function loadChatPageData(): Promise<{
 
     const active =
       conversations.find((conversation) => conversation.channel === "web") ??
-      (conversations.length === 0 ? await repositories.conversations.getOrCreateDefault(user.id) : undefined);
+      (conversations.length === 0 ? await repositories.conversations.getOrCreateDefault(scope) : undefined);
 
     if (!active) {
       return { initialMessages: [], initialConversations, initialProjects };
@@ -72,9 +74,9 @@ async function loadChatPageData(): Promise<{
 
     let initialMessages: ChatMessage[];
     try {
-      const messages = await repositories.messages.list(active.id);
+      const messages = await repositories.messages.list(scope, active.id);
       initialMessages = await serializeChatMessages(
-        user.id,
+        scope,
         messages,
         repositories.messageAttachments.listForMessages,
       );

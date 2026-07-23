@@ -3,6 +3,7 @@ import { readAttachment } from "@/server/attachments/storage";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -41,7 +42,9 @@ export async function GET(
 
   let attachment;
   try {
-    attachment = await createRepositories().messageAttachments.getForUser(user.id, attachmentId);
+    const repositories = createRepositories();
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    attachment = await repositories.messageAttachments.get(scope, attachmentId);
   } catch {
     return errorResponse("attachment_download_failed", 500);
   }

@@ -59,6 +59,7 @@ describe("personal data helpers", () => {
     const attachment = {
       id: "attachment-1",
       user_id: "user-1",
+      agent_id: "agent-1",
       message_id: "message-1",
       kind: "document",
       file_name: "notes.md",
@@ -83,6 +84,7 @@ describe("personal data helpers", () => {
     const attachmentCall = query.mock.calls.find(([sql]) => String(sql).includes("FROM message_attachments"));
     expect(attachmentCall?.[1]).toEqual(["user-1"]);
     expect(String(attachmentCall?.[0])).toContain("WHERE user_id = $1");
+    expect(String(attachmentCall?.[0])).toContain("agent_id");
     expect(String(attachmentCall?.[0])).toContain("extracted_text");
     expect(String(attachmentCall?.[0])).not.toContain("storage_key");
     expect(String(attachmentCall?.[0])).not.toContain("deletion_claim_token");
@@ -118,5 +120,47 @@ describe("personal data helpers", () => {
       String(sql).includes("DELETE FROM message_attachments"),
     );
     expect(attachmentDelete?.[1]).toEqual(["user-1"]);
+  });
+
+  it("exports agent identities, settings, grants, and agent-scoped goal steps", async () => {
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      void sql;
+      void params;
+      return { rows: [] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.personalData.export("user-1");
+
+    const sql = query.mock.calls.map(([statement]) => String(statement));
+    expect(sql).toContain("SELECT * FROM digital_agents WHERE user_id = $1");
+    expect(sql).toContain("SELECT * FROM agent_settings WHERE user_id = $1");
+    expect(sql).toContain("SELECT * FROM agent_resource_grants WHERE user_id = $1");
+    expect(sql.some((statement) =>
+      statement.includes("FROM goal_steps") && statement.includes("goals.user_id = $1"),
+    )).toBe(true);
+  });
+
+  it("preserves agent identities while clearing grants and resetting every agent setting", async () => {
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      void sql;
+      void params;
+      return { rows: [] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.personalData.clear("user-1");
+
+    const sql = query.mock.calls.map(([statement]) => String(statement));
+    expect(sql).not.toContain("DELETE FROM digital_agents WHERE user_id = $1");
+    expect(sql).toContain("DELETE FROM agent_resource_grants WHERE user_id = $1");
+    expect(sql.some((statement) =>
+      statement.includes("UPDATE agent_settings")
+      && statement.includes("model_routing_override = '{}'::jsonb"),
+    )).toBe(true);
+    expect(sql.some((statement) =>
+      statement.includes("UPDATE digital_agents")
+      && statement.includes("persona = '{}'::jsonb"),
+    )).toBe(true);
   });
 });

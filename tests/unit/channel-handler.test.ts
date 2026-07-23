@@ -24,6 +24,7 @@ const directMessage: NormalizedChannelMessage = {
   occurredAt: new Date("2026-07-05T10:00:00+08:00"),
   raw: {},
 };
+const scope = { userId: "user-1", agentId: "agent-1" };
 
 describe("handleChannelMessage", () => {
   it("answers direct channel messages with the shared agent", async () => {
@@ -35,7 +36,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: directMessage,
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createChannelMessage }),
       llm,
       model: "mock-main",
@@ -53,7 +54,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: directMessage,
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({}),
       llm,
       model: "mock-main",
@@ -73,7 +74,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: directMessage,
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ cadence: { segmentDelayMs: 25, maxSegments: 2 } }),
       llm,
       model: "mock-main",
@@ -95,7 +96,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: directMessage,
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ cadence: { responseDelayMs: 80, segmentDelayMs: 25, maxSegments: 2 } }),
       llm,
       model: "mock-main",
@@ -115,7 +116,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, text: "10 分钟后提醒我喝水" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createTask }),
       llm,
       model: "mock-main",
@@ -124,8 +125,8 @@ describe("handleChannelMessage", () => {
     });
 
     expect(createTask).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
-        userId: "user-1",
         conversationId: "conversation-1",
         kind: "reminder",
         content: "喝水",
@@ -140,7 +141,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, text: "10 分钟后紧急提醒我吃药" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createTask }),
       llm,
       model: "mock-main",
@@ -149,8 +150,8 @@ describe("handleChannelMessage", () => {
     });
 
     expect(createTask).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
-        userId: "user-1",
         conversationId: "conversation-1",
         kind: "reminder",
         content: "吃药",
@@ -167,7 +168,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, text: "我在准备一个演讲" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createTask }),
       llm,
       model: "mock-main",
@@ -176,8 +177,8 @@ describe("handleChannelMessage", () => {
     });
 
     expect(createTask).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
-        userId: "user-1",
         conversationId: "conversation-1",
         kind: "follow_up",
         content: "演讲准备得怎么样了？",
@@ -192,7 +193,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, text: "你刚才理解错了，不是这个意思" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createReflection }),
       llm,
       model: "mock-main",
@@ -201,8 +202,8 @@ describe("handleChannelMessage", () => {
     });
 
     expect(createReflection).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
-        userId: "user-1",
         sourceWindow: expect.objectContaining({
           event: "user_dissatisfaction",
           conversationId: "conversation-1",
@@ -220,7 +221,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "周末去哪爬山？" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createDecision }),
       llm,
       model: "mock-main",
@@ -228,7 +229,7 @@ describe("handleChannelMessage", () => {
       now: new Date("2026-07-05T10:00:00+08:00"),
     });
 
-    expect(createDecision).toHaveBeenCalledWith(expect.objectContaining({ shouldInterject: true }));
+    expect(createDecision).toHaveBeenCalledWith(scope, expect.objectContaining({ shouldInterject: true }));
     expect(send).toHaveBeenCalled();
   });
 
@@ -238,7 +239,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "我朋友小李的身份证是 110101199003071234" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createMessage }),
       llm,
       model: "mock-main",
@@ -247,6 +248,7 @@ describe("handleChannelMessage", () => {
     });
 
     expect(createMessage).toHaveBeenCalledWith(
+      scope,
       expect.objectContaining({
         role: "user",
         content: "我朋友小李的身份证是 110101199003071234",
@@ -264,7 +266,7 @@ describe("handleChannelMessage", () => {
 
     await handleChannelMessage({
       message: { ...directMessage, chatType: "group", text: "周末去哪爬山？" },
-      userId: "user-1",
+      scope,
       repositories: fakeRepositories({ createDecision, recentMessageCount: 8 }),
       llm,
       model: "mock-main",
@@ -272,7 +274,7 @@ describe("handleChannelMessage", () => {
       now: new Date("2026-07-05T10:00:00+08:00"),
     });
 
-    expect(createDecision).toHaveBeenCalledWith(expect.objectContaining({ shouldInterject: false, reason: "conversation_busy" }));
+    expect(createDecision).toHaveBeenCalledWith(scope, expect.objectContaining({ shouldInterject: false, reason: "conversation_busy" }));
     expect(send).not.toHaveBeenCalled();
   });
 });

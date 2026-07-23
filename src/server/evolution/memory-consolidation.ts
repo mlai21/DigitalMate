@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { LlmClient } from "@/server/llm/types";
 import type { ExtractedMemory, MemoryKind } from "@/server/agent/memory";
+import type { AgentScope } from "@/server/agents/types";
 
 // Resident-context layers (profile / agent_self) have strict capacity caps so
 // their per-turn token cost stays bounded (Hermes keeps ~1300 tokens of
@@ -47,9 +48,9 @@ function buildMergePrompt(cap: number): string {
 
 type ConsolidationRepositories = {
   memories: {
-    listActiveByKind(userId: string, kind: MemoryKind): Promise<MemoryEntryForConsolidation[]>;
-    softDeleteMany(userId: string, memoryIds: string[]): Promise<void>;
-    createMany(userId: string, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void>;
+    listActiveByKind(scope: AgentScope, kind: MemoryKind): Promise<MemoryEntryForConsolidation[]>;
+    softDeleteMany(scope: AgentScope, memoryIds: string[]): Promise<void>;
+    createMany(scope: AgentScope, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void>;
   };
 };
 
@@ -63,24 +64,24 @@ export async function consolidateMemoryKind(input: {
   repositories: ConsolidationRepositories;
   llm: LlmClient;
   model: string;
-  userId: string;
+  scope: AgentScope;
   kind: MemoryKind;
   cap?: number;
 }): Promise<ConsolidationOutcome | null> {
   const cap = input.cap ?? MEMORY_CAPACITY_LIMITS[input.kind];
   if (!cap) return null;
 
-  const entries = await input.repositories.memories.listActiveByKind(input.userId, input.kind);
+  const entries = await input.repositories.memories.listActiveByKind(input.scope, input.kind);
   if (entries.length <= cap) return null;
 
   const merged = await mergeWithLlm(input.llm, input.model, entries, cap);
   if (merged) {
     await input.repositories.memories.softDeleteMany(
-      input.userId,
+      input.scope,
       entries.map((entry) => entry.id),
     );
     await input.repositories.memories.createMany(
-      input.userId,
+      input.scope,
       null,
       merged.map((memory) => ({ ...memory, kind: input.kind })),
     );
@@ -94,7 +95,7 @@ export async function consolidateMemoryKind(input: {
 
   const surplus = pickPruneCandidates(entries, entries.length - cap);
   await input.repositories.memories.softDeleteMany(
-    input.userId,
+    input.scope,
     surplus.map((entry) => entry.id),
   );
   return {

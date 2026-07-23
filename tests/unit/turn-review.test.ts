@@ -70,12 +70,12 @@ describe("recordTurnReview", () => {
 
     await recordTurnReview(
       { reflections, skills },
-      { userId: "u1", conversationId: "c1", llm, model: "light", userText: "清洗数据", assistantText: "完成了" },
+      { scope: { userId: "u1", agentId: "a1" }, conversationId: "c1", llm, model: "light", userText: "清洗数据", assistantText: "完成了" },
     );
 
     expect(reflections.create).toHaveBeenCalledWith(
+      { userId: "u1", agentId: "a1" },
       expect.objectContaining({
-        userId: "u1",
         sourceWindow: { event: "turn_review", conversationId: "c1" },
       }),
     );
@@ -89,7 +89,7 @@ describe("recordTurnReview", () => {
 
     const result = await recordTurnReview(
       { reflections, skills },
-      { userId: "u1", conversationId: "c1", llm, model: "light", userText: "哈哈", assistantText: "哈哈" },
+      { scope: { userId: "u1", agentId: "a1" }, conversationId: "c1", llm, model: "light", userText: "哈哈", assistantText: "哈哈" },
     );
 
     expect(result).toBeNull();

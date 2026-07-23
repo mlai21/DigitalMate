@@ -11,6 +11,10 @@ import {
 import type { DbMessageAttachment } from "@/server/db/repositories";
 
 const roots: string[] = [];
+const scope = {
+  userId: "00000000-0000-4000-8000-000000000001",
+  agentId: "10000000-0000-4000-8000-000000000001",
+};
 
 function claimedAttachment(
   id: string,
@@ -19,7 +23,7 @@ function claimedAttachment(
   const timestamp = new Date("2026-07-13T00:00:00.000Z");
   return {
     id,
-    userId: "00000000-0000-4000-8000-000000000001",
+    ...scope,
     messageId: null,
     kind: "document",
     fileName: "private.md",
@@ -69,23 +73,24 @@ describe("stale attachment cleanup", () => {
     const deleteFile = vi.fn(async () => undefined);
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: "/private/attachments",
       deleteFile,
     });
 
-    expect(repositories.messageAttachments.claimExpiredDrafts).toHaveBeenCalledWith(24, 100);
+    expect(repositories.messageAttachments.claimExpiredDrafts).toHaveBeenCalledWith(scope, 24, 100);
     expect(deleteFile).toHaveBeenNthCalledWith(1, "/private/attachments", first.storageKey);
     expect(deleteFile).toHaveBeenNthCalledWith(2, "/private/attachments", second.storageKey);
     expect(repositories.messageAttachments.deleteDraft).toHaveBeenNthCalledWith(
       1,
-      first.userId,
+      scope,
       first.id,
       first.deletionClaimToken,
     );
     expect(repositories.messageAttachments.deleteDraft).toHaveBeenNthCalledWith(
       2,
-      second.userId,
+      scope,
       second.id,
       second.deletionClaimToken,
     );
@@ -113,6 +118,7 @@ describe("stale attachment cleanup", () => {
     const logger = { info: vi.fn(), error: vi.fn() };
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: "/private/attachments",
       deleteFile,
@@ -120,13 +126,13 @@ describe("stale attachment cleanup", () => {
     });
 
     expect(repositories.messageAttachments.releaseDeletionClaim).toHaveBeenCalledExactlyOnceWith(
-      first.userId,
+      scope,
       first.id,
       first.deletionClaimToken,
       "attachment_cleanup_failed",
     );
     expect(repositories.messageAttachments.deleteDraft).toHaveBeenCalledExactlyOnceWith(
-      second.userId,
+      scope,
       second.id,
       second.deletionClaimToken,
     );
@@ -145,13 +151,14 @@ describe("stale attachment cleanup", () => {
     repositories.messageAttachments.deleteDraft.mockResolvedValue(false);
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: "/private/attachments",
       deleteFile: vi.fn(async () => undefined),
     });
 
     expect(repositories.messageAttachments.deleteDraft).toHaveBeenCalledWith(
-      attachment.userId,
+      scope,
       attachment.id,
       attachment.deletionClaimToken,
     );
@@ -168,12 +175,13 @@ describe("stale attachment cleanup", () => {
     const repositories = createRepositories([attachment]);
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: root,
     });
 
     expect(repositories.messageAttachments.deleteDraft).toHaveBeenCalledWith(
-      attachment.userId,
+      scope,
       attachment.id,
       attachment.deletionClaimToken,
     );
@@ -198,6 +206,7 @@ describe("stale attachment cleanup", () => {
     const repositories = createRepositories([]);
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: root,
       now: () => new Date("2026-07-14T00:30:00.000Z"),
@@ -226,6 +235,7 @@ describe("stale attachment cleanup", () => {
     repositories.messageAttachments.listExistingStorageKeys.mockResolvedValue([referenced]);
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: root,
       now: () => new Date("2026-07-14T00:30:00.000Z"),
@@ -258,6 +268,7 @@ describe("stale attachment cleanup", () => {
     );
 
     const result = await cleanupStaleAttachments({
+      scope,
       repositories,
       storageDirectory: root,
       now: () => new Date("2026-07-14T00:30:00.000Z"),

@@ -151,6 +151,7 @@ describe("default digital agent PostgreSQL migration", () => {
           users: string;
           settings: string;
           agents: string;
+          agent_settings: string;
           defaults: string;
           conversations: string;
         }>(
@@ -158,6 +159,7 @@ describe("default digital agent PostgreSQL migration", () => {
              (SELECT count(*) FROM users) AS users,
              (SELECT count(*) FROM settings) AS settings,
              (SELECT count(*) FROM digital_agents) AS agents,
+             (SELECT count(*) FROM agent_settings) AS agent_settings,
              (SELECT count(*) FROM digital_agents WHERE is_default = true) AS defaults,
              (SELECT count(*) FROM conversations WHERE channel = 'web') AS conversations`,
         );
@@ -165,6 +167,7 @@ describe("default digital agent PostgreSQL migration", () => {
           users: "1",
           settings: "1",
           agents: "1",
+          agent_settings: "1",
           defaults: "1",
           conversations: "1",
         });
@@ -208,6 +211,22 @@ describe("default digital agent PostgreSQL migration", () => {
     expect(secondAgents).toEqual(firstAgents);
     const agentCount = await databasePool.query<{ count: string }>("SELECT count(*) AS count FROM digital_agents");
     expect(agentCount.rows[0].count).toBe("2");
+    const migratedSettings = await databasePool.query<{
+      user_id: string;
+      agent_id: string;
+      persona_name: string | null;
+      revision: number;
+    }>(
+      `SELECT user_id, agent_id, persona->>'name' AS persona_name, revision
+       FROM agent_settings
+       ORDER BY user_id`,
+    );
+    expect(migratedSettings.rows).toEqual(firstAgents.map((agent) => ({
+      user_id: agent.user_id,
+      agent_id: agent.id,
+      persona_name: agent.persona_name,
+      revision: 1,
+    })));
     const replacedIndexes = await databasePool.query<{
       old_client_turn: string | null;
       old_source_task: string | null;
@@ -301,6 +320,17 @@ describe("default digital agent PostgreSQL migration", () => {
       { user_id: USER_D, slug: "custom" },
       { user_id: USER_E, slug: "digitalmate" },
     ]);
+    const settingsOwners = await databasePool.query<{ user_id: string; slug: string }>(
+      `SELECT agent_settings.user_id, digital_agents.slug
+       FROM agent_settings
+       JOIN digital_agents
+         ON digital_agents.user_id = agent_settings.user_id
+        AND digital_agents.id = agent_settings.agent_id
+       WHERE agent_settings.user_id = ANY($1::uuid[])
+       ORDER BY agent_settings.user_id`,
+      [[USER_C, USER_D, USER_E]],
+    );
+    expect(settingsOwners.rows).toEqual(defaults.rows);
   });
 
   it("rejects cross-user ownership and parent rows from another agent", async () => {

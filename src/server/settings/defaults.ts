@@ -27,3 +27,22 @@ export const defaultSettings = {
     aggressiveness: "conservative",
   } as { aggressiveness: SearchAggressiveness },
 };
+
+export type PersonaSettings = typeof defaultSettings.persona;
+export type ProactivitySettings = typeof defaultSettings.proactivity;
+export type ModelRoutingSettings = typeof defaultSettings.modelRouting;
+export type CadenceSettings = typeof defaultSettings.cadence;
+export type SearchSettings = typeof defaultSettings.search;
+
+export type UserSettings = {
+  modelRouting: ModelRoutingSettings;
+};
+
+export type AgentBehaviorSettings = {
+  persona: PersonaSettings;
+  proactivity: ProactivitySettings;
+  cadence: CadenceSettings;
+  search: SearchSettings;
+};
+
+export type AppSettings = UserSettings & AgentBehaviorSettings;

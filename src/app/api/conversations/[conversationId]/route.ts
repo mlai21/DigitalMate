@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -28,12 +29,13 @@ export async function PATCH(request: Request, context: RouteContext) {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   if (body.data.projectId) {
-    const project = await repositories.projects.getForUser(user.id, body.data.projectId);
+    const project = await repositories.projects.get(scope, body.data.projectId);
     if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
   }
 
-  const conversation = await repositories.conversations.update(user.id, conversationId, body.data);
+  const conversation = await repositories.conversations.update(scope, conversationId, body.data);
   if (!conversation) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
@@ -58,11 +60,12 @@ export async function DELETE(_request: Request, context: RouteContext) {
 
   const { conversationId } = await context.params;
   const repositories = createRepositories();
-  const conversation = await repositories.conversations.getForUser(user.id, conversationId);
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const conversation = await repositories.conversations.get(scope, conversationId);
   if (!conversation) {
     return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
   }
 
-  await repositories.conversations.delete(user.id, conversationId);
+  await repositories.conversations.delete(scope, conversationId);
   return NextResponse.json({ ok: true });
 }

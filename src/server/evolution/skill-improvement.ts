@@ -1,5 +1,6 @@
 import type { LlmClient } from "@/server/llm/types";
 import { parseSkillMd } from "@/server/skills/skill-md";
+import type { AgentScope } from "@/server/agents/types";
 
 export const SKILL_IMPROVEMENT_USAGE_THRESHOLD = 5;
 
@@ -28,11 +29,11 @@ type ImprovementRepositories = {
     latestForSkill(skillId: string): Promise<{ createdAt: Date } | null>;
   };
   skillUsageLogs: {
-    countSince(skillId: string, since: Date | null): Promise<number>;
-    recentConversationIds(skillId: string, limit: number): Promise<string[]>;
+    countSince(scope: AgentScope, skillId: string, since: Date | null): Promise<number>;
+    recentConversationIds(scope: AgentScope, skillId: string, limit: number): Promise<string[]>;
   };
   messages: {
-    list(conversationId: string): Promise<Array<{ role: string; content: string }>>;
+    list(scope: AgentScope, conversationId: string): Promise<Array<{ role: string; content: string }>>;
   };
 };
 
@@ -110,10 +111,10 @@ export async function processSkillImprovement(input: {
   repositories: ImprovementRepositories;
   llm: LlmClient;
   model: string;
-  userId: string;
+  scope: AgentScope;
   threshold?: number;
 }): Promise<{ proposed: number }> {
-  const skills = await input.repositories.skills.listEnabled(input.userId);
+  const skills = await input.repositories.skills.listEnabled(input.scope.userId);
   let proposed = 0;
 
   for (const skill of skills) {
@@ -121,19 +122,19 @@ export async function processSkillImprovement(input: {
     if (hasPending) continue;
 
     const latestRevision = await input.repositories.skillRevisions.latestForSkill(skill.id);
-    const usage = await input.repositories.skillUsageLogs.countSince(skill.id, latestRevision?.createdAt ?? null);
+    const usage = await input.repositories.skillUsageLogs.countSince(input.scope, skill.id, latestRevision?.createdAt ?? null);
     if (!shouldProposeRevision({ usageSinceLastRevision: usage, hasPendingRevision: hasPending, threshold: input.threshold })) {
       continue;
     }
 
-    const usageContext = await buildUsageContext(input.repositories, skill.id);
+    const usageContext = await buildUsageContext(input.repositories, input.scope, skill.id);
     if (!usageContext) continue;
 
     const proposal = await proposeSkillRevisionWithLlm({ llm: input.llm, model: input.model, skill, usageContext });
     if (!proposal) continue;
 
     await input.repositories.skillRevisions.create({
-      userId: input.userId,
+      userId: input.scope.userId,
       skillId: skill.id,
       proposedContent: proposal.proposedContent,
       reason: proposal.reason,
@@ -144,11 +145,11 @@ export async function processSkillImprovement(input: {
   return { proposed };
 }
 
-async function buildUsageContext(repositories: ImprovementRepositories, skillId: string): Promise<string> {
-  const conversationIds = await repositories.skillUsageLogs.recentConversationIds(skillId, MAX_CONVERSATIONS);
+async function buildUsageContext(repositories: ImprovementRepositories, scope: AgentScope, skillId: string): Promise<string> {
+  const conversationIds = await repositories.skillUsageLogs.recentConversationIds(scope, skillId, MAX_CONVERSATIONS);
   const snippets: string[] = [];
   for (const conversationId of conversationIds) {
-    const messages = await repositories.messages.list(conversationId);
+    const messages = await repositories.messages.list(scope, conversationId);
     const recent = messages.slice(-MAX_MESSAGES_PER_CONVERSATION);
     if (recent.length === 0) continue;
     snippets.push(

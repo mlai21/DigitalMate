@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -19,9 +20,10 @@ export async function GET() {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const [conversations, projects] = await Promise.all([
-    repositories.conversations.listWithStats(user.id),
-    repositories.projects.list(user.id),
+    repositories.conversations.listWithStats(scope),
+    repositories.projects.list(scope),
   ]);
 
   return NextResponse.json({
@@ -49,12 +51,13 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   if (body.data.projectId) {
-    const project = await repositories.projects.getForUser(user.id, body.data.projectId);
+    const project = await repositories.projects.get(scope, body.data.projectId);
     if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
   }
 
-  const conversation = await repositories.conversations.create(user.id, {
+  const conversation = await repositories.conversations.create(scope, {
     title: body.data.title,
     projectId: body.data.projectId ?? null,
   });

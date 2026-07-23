@@ -15,21 +15,29 @@ import { executeGoalStep } from "@/server/goals/executor";
 import { processGoalLoops } from "@/server/goals/orchestrator";
 import { verifyGoalStep } from "@/server/goals/verifier";
 import { getLlmClient } from "@/server/llm/router";
+import type { AgentScope } from "@/server/agents/types";
 
 const intervalMs = 15_000;
 const skillImprovementIntervalMs = 24 * 60 * 60 * 1000;
-let lastSkillImprovementAt = 0;
+const lastSkillImprovementAt = new Map<string, number>();
 
 async function main() {
   const repositories = createRepositories();
-  await repositories.users.ensureDefault();
+  const user = await repositories.users.ensureDefault();
+  const defaultAgent = await repositories.agents.ensureDefault(user.id);
+  await repositories.agentSettings.ensure({ userId: user.id, agentId: defaultAgent.id });
 
   const env = readEnv();
   const cleanupScheduler = startAttachmentCleanupScheduler({
-    run: () => cleanupStaleAttachments({
-      repositories,
-      storageDirectory: env.attachmentStorageDir,
-    }),
+    run: async () => {
+      for (const agent of await repositories.agents.listActive()) {
+        await cleanupStaleAttachments({
+          scope: { userId: agent.userId, agentId: agent.id },
+          repositories,
+          storageDirectory: env.attachmentStorageDir,
+        });
+      }
+    },
   });
   const shutdown = new AbortController();
   const requestShutdown = () => shutdown.abort();
@@ -61,26 +69,30 @@ async function main() {
 
 async function tick(repositories: ReturnType<typeof createRepositories>) {
   const env = readEnv();
-  await processDueProactiveTasks({
-    repositories,
-    sendChannel: (target, text) => sendChannelMessage(env, target, text),
-  });
-  await processMemoryMessages(repositories);
-  await processMemoryConsolidation(repositories);
-  await processConversationCompaction(repositories);
-  await processDailyReflection(repositories);
-  await processSkillImprovementJob(repositories);
-  await processGoalLoopsJob(repositories);
+  for (const agent of await repositories.agents.listActive()) {
+    const scope = { userId: agent.userId, agentId: agent.id } satisfies AgentScope;
+    await processDueProactiveTasks({
+      scope,
+      repositories,
+      sendChannel: (target, text) => sendChannelMessage(env, target, text),
+    });
+    await processMemoryMessages(repositories, scope);
+    await processMemoryConsolidation(repositories, scope);
+    await processConversationCompaction(repositories, scope);
+    await processDailyReflection(repositories, scope);
+    await processSkillImprovementJob(repositories, scope);
+    await processGoalLoopsJob(repositories, scope);
+  }
 }
 
-async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>) {
+async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
   const env = readEnv();
-  const user = await repositories.users.ensureDefault();
-  const settings = await repositories.settings.get(user.id);
+  const settings = await repositories.settings.get(scope);
   const main = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
 
   const outcome = await processGoalLoops({
+    scope,
     repositories,
     services: {
       executeStep: async (goal, recentSteps) => {
@@ -101,6 +113,7 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
         await repositories.llmUsage
           .create({
             userId: goal.userId,
+            agentId: goal.agentId,
             conversationId: goal.conversationId,
             purpose: "main",
             model: main.model,
@@ -116,6 +129,7 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
         await repositories.llmUsage
           .create({
             userId: goal.userId,
+            agentId: goal.agentId,
             conversationId: goal.conversationId,
             purpose: "light",
             model: light.model,
@@ -136,48 +150,45 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
   }
 }
 
-async function processSkillImprovementJob(repositories: ReturnType<typeof createRepositories>) {
+async function processSkillImprovementJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
   // At most once a day: revision proposals ride the same slow cadence as the
   // daily reflection instead of the 15s tick.
-  if (Date.now() - lastSkillImprovementAt < skillImprovementIntervalMs) return;
-  lastSkillImprovementAt = Date.now();
+  if (Date.now() - (lastSkillImprovementAt.get(scope.agentId) ?? 0) < skillImprovementIntervalMs) return;
+  lastSkillImprovementAt.set(scope.agentId, Date.now());
 
   const env = readEnv();
-  const user = await repositories.users.ensureDefault();
-  const settings = await repositories.settings.get(user.id);
+  const settings = await repositories.settings.get(scope);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   const outcome = await processSkillImprovement({
     repositories,
     llm: client,
     model,
-    userId: user.id,
+    scope,
   }).catch(() => null);
   if (outcome && outcome.proposed > 0) {
     console.log(`Skill improvement: proposed ${outcome.proposed} pending revision(s).`);
   }
 }
 
-async function processMemoryMessages(repositories: ReturnType<typeof createRepositories>) {
-  const messages = await repositories.messages.unprocessedForMemory();
+async function processMemoryMessages(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+  const messages = await repositories.messages.unprocessedForMemory(scope);
   if (messages.length === 0) return;
 
   const env = readEnv();
-  const user = await repositories.users.ensureDefault();
-  const settings = await repositories.settings.get(user.id);
+  const settings = await repositories.settings.get(scope);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   for (const message of messages) {
     const memories = await extractMemoriesWithLlm({ llm: client, model, text: message.content });
-    await repositories.memories.createMany(message.userId, message.id, memories);
+    await repositories.memories.createMany(scope, message.id, memories);
   }
-  await repositories.messages.markMemoryProcessed(messages.map((message) => message.id));
+  await repositories.messages.markMemoryProcessed(scope, messages.map((message) => message.id));
 }
 
-async function processMemoryConsolidation(repositories: ReturnType<typeof createRepositories>) {
+async function processMemoryConsolidation(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
   const env = readEnv();
-  const user = await repositories.users.ensureDefault();
-  const settings = await repositories.settings.get(user.id);
+  const settings = await repositories.settings.get(scope);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   for (const kind of Object.keys(MEMORY_CAPACITY_LIMITS) as Array<keyof typeof MEMORY_CAPACITY_LIMITS>) {
@@ -185,7 +196,7 @@ async function processMemoryConsolidation(repositories: ReturnType<typeof create
       repositories,
       llm: client,
       model,
-      userId: user.id,
+      scope,
       kind,
     }).catch(() => null);
     if (outcome) {
@@ -196,19 +207,17 @@ async function processMemoryConsolidation(repositories: ReturnType<typeof create
   }
 }
 
-async function processConversationCompaction(repositories: ReturnType<typeof createRepositories>) {
-  const user = await repositories.users.ensureDefault();
-  const conversations = await repositories.conversations.list(user.id);
+async function processConversationCompaction(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+  const conversations = await repositories.conversations.list(scope);
   for (const conversation of conversations) {
-    const existing = await repositories.conversationSummaries.latest(conversation.id);
+    const existing = await repositories.conversationSummaries.latest(scope, conversation.id);
     if (existing) continue;
 
-    const messages = await repositories.messages.list(conversation.id);
+    const messages = await repositories.messages.list(scope, conversation.id);
     if (!shouldCompactConversation(messages, { threshold: 40 })) continue;
 
     const summary = buildConversationSummary(messages, { keepRecent: 12 });
-    await repositories.conversationSummaries.create({
-      userId: user.id,
+    await repositories.conversationSummaries.create(scope, {
       conversationId: conversation.id,
       summary: summary.text,
       messageCount: summary.messageCount,
@@ -216,14 +225,13 @@ async function processConversationCompaction(repositories: ReturnType<typeof cre
   }
 }
 
-async function processDailyReflection(repositories: ReturnType<typeof createRepositories>) {
-  const user = await repositories.users.ensureDefault();
-  const latest = await repositories.reflections.latestBySourceEvent(user.id, "daily");
+async function processDailyReflection(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+  const latest = await repositories.reflections.latestBySourceEvent(scope, "daily");
   if (!shouldRunDailyReflection(new Date(), latest)) return;
-  const conversations = await repositories.conversations.list(user.id);
+  const conversations = await repositories.conversations.list(scope);
   const conversation = conversations[0];
   if (!conversation) return;
-  const messages = await repositories.messages.list(conversation.id);
+  const messages = await repositories.messages.list(scope, conversation.id);
   if (messages.length === 0) return;
 
   const digest = messages
@@ -231,14 +239,13 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
     .map((message) => (message.role === "user" ? "用户" : "助手") + `：${message.content.slice(0, 200)}`)
     .join("\n");
   const env = readEnv();
-  const settings = await repositories.settings.get(user.id);
+  const settings = await repositories.settings.get(scope);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
   const generated = await generateReflectionWithLlm({ llm: client, model, digest });
   const reflection =
     generated ??
     normalizeReflection("做得好：保持了稳定陪伴。需要改进：反思模型暂不可用，本次为降级记录。建议：检查 light 模型配置。");
-  await repositories.reflections.create({
-    userId: user.id,
+  await repositories.reflections.create(scope, {
     reflection: { positives: reflection.positives, negatives: reflection.negatives, suggestions: reflection.suggestions },
     sourceWindow: { event: "daily", conversationId: conversation.id, messageCount: messages.length },
   });
@@ -248,7 +255,7 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
   if (generated?.skill) {
     await repositories.skills
       .create(
-        user.id,
+        scope.userId,
         createSkillDraft({
           name: generated.skill.name,
           trigger: generated.skill.trigger,

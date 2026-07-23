@@ -6,6 +6,7 @@ import { redirectUrl } from "@/server/http/redirect";
 import { defaultArtifactRoot, writeArtifactFile } from "@/server/tasks/artifacts";
 import { buildSpreadsheetSummaryFiles } from "@/server/tasks/csv";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -18,9 +19,9 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const inputSummary = `表格汇总：${file.name}`;
-  const taskRunId = await repositories.taskRuns.create({
-    userId: user.id,
+  const taskRunId = await repositories.taskRuns.create(scope, {
     kind: "spreadsheet",
     inputSummary,
     metadata: { fileName: file.name, size: file.size },
@@ -41,10 +42,10 @@ export async function POST(request: Request) {
         mimeType: taskFile.mimeType,
         buffer: taskFile.buffer,
       });
-      await repositories.taskArtifacts.create({ userId: user.id, taskRunId, ...stored });
+      await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
     }
     await completeTaskWithSkillDraft(repositories, {
-      userId: user.id,
+      scope,
       taskRunId,
       kind: "spreadsheet",
       inputSummary,
@@ -52,9 +53,9 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await repositories.taskRuns.fail(taskRunId, message);
+    await repositories.taskRuns.fail(scope, taskRunId, message);
     await recordEventReflection(repositories, {
-      userId: user.id,
+      scope,
       event: "task_failure",
       summary: `${inputSummary} 失败：${message}`,
       source: { taskRunId, taskKind: "spreadsheet" },

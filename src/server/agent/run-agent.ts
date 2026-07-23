@@ -10,6 +10,7 @@ import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/ser
 
 export type ToolLogInput = {
   userId: string;
+  agentId: string;
   conversationId: string | null;
   goalId?: string | null;
   toolName: string;
@@ -35,6 +36,7 @@ export type EnabledToolContext = {
 
 export type RunAgentInput = {
   userId: string;
+  agentId: string;
   conversationId: string;
   message: string;
   attachments?: LlmAttachment[];
@@ -44,24 +46,24 @@ export type RunAgentInput = {
   model: string;
   repositories: {
     memories: {
-      findRelevant(userId: string, query: string): Promise<RankableMemory[]>;
+      findRelevant(scope: { userId: string; agentId: string }, query: string): Promise<RankableMemory[]>;
     };
     conversationSummaries?: {
-      latest(conversationId: string): Promise<string | null>;
+      latest(scope: { userId: string; agentId: string }, conversationId: string): Promise<string | null>;
     };
     skills?: {
       findEnabled(userId: string, query: string): Promise<SkillContext[]>;
       findByIds?(userId: string, skillIds: string[]): Promise<SkillContext[]>;
       create?(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
       recordUsage?(
-        userId: string,
+        scope: { userId: string; agentId: string },
         skillIds: string[],
         conversationId: string | null,
         triggeredBy?: "auto" | "explicit",
       ): Promise<unknown> | unknown;
     };
     reflections?: {
-      findAppliedSuggestions(userId: string): Promise<string[]>;
+      findAppliedSuggestions(scope: { userId: string; agentId: string }): Promise<string[]>;
     };
     toolRegistrations?: {
       listEnabled(userId: string): Promise<EnabledToolContext[]>;
@@ -168,29 +170,42 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   // slash panel or /skill-name, load them unconditionally and skip fuzzy
   // auto-matching entirely (PRD P1-11).
   const [memories, explicitSkills, autoSkills, reflectionSuggestions, enabledTools] = await Promise.all([
-    input.repositories.memories.findRelevant(input.userId, input.message),
+    input.repositories.memories.findRelevant({ userId: input.userId, agentId: input.agentId }, input.message),
     !hasAttachmentContext && explicitSkillIds.length > 0 && input.repositories.skills?.findByIds
       ? input.repositories.skills.findByIds(input.userId, explicitSkillIds)
       : Promise.resolve([] as SkillContext[]),
     hasAttachmentContext || explicitSkillIds.length > 0
       ? Promise.resolve([] as SkillContext[])
       : input.repositories.skills?.findEnabled(input.userId, input.message) ?? Promise.resolve([]),
-    input.repositories.reflections?.findAppliedSuggestions(input.userId) ?? Promise.resolve([]),
+    input.repositories.reflections?.findAppliedSuggestions({ userId: input.userId, agentId: input.agentId }) ?? Promise.resolve([]),
     input.repositories.toolRegistrations?.listEnabled(input.userId) ?? Promise.resolve([]),
   ]);
-  const conversationSummary = await input.repositories.conversationSummaries?.latest(input.conversationId);
+  const conversationSummary = await input.repositories.conversationSummaries?.latest(
+    { userId: input.userId, agentId: input.agentId },
+    input.conversationId,
+  );
 
   if (!hasAttachmentContext && input.repositories.skills?.recordUsage) {
     const explicitIds = explicitSkills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
     const autoIds = autoSkills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
     if (explicitIds.length > 0) {
       await Promise.resolve(
-        input.repositories.skills.recordUsage(input.userId, explicitIds, input.conversationId, "explicit"),
+        input.repositories.skills.recordUsage(
+          { userId: input.userId, agentId: input.agentId },
+          explicitIds,
+          input.conversationId,
+          "explicit",
+        ),
       ).catch(() => undefined);
     }
     if (autoIds.length > 0) {
       await Promise.resolve(
-        input.repositories.skills.recordUsage(input.userId, autoIds, input.conversationId, "auto"),
+        input.repositories.skills.recordUsage(
+          { userId: input.userId, agentId: input.agentId },
+          autoIds,
+          input.conversationId,
+          "auto",
+        ),
       ).catch(() => undefined);
     }
   }
@@ -264,6 +279,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
 
   await input.repositories.llmUsage?.create({
     userId: input.userId,
+    agentId: input.agentId,
     conversationId: input.conversationId,
     purpose: input.purpose ?? "main",
     model: input.model,
@@ -330,6 +346,7 @@ async function executeToolCall(context: {
     if (!query) {
       await input.repositories.toolLogs.create({
         userId: input.userId,
+        agentId: input.agentId,
         conversationId: input.conversationId,
         toolName: "web_search",
         inputSummary: "(缺少搜索词)",
@@ -343,6 +360,7 @@ async function executeToolCall(context: {
     if (!input.searchGate) {
       await input.repositories.toolLogs.create({
         userId: input.userId,
+        agentId: input.agentId,
         conversationId: input.conversationId,
         toolName: "web_search_gate",
         inputSummary: query,
@@ -357,6 +375,7 @@ async function executeToolCall(context: {
     // Both allow and deny decisions are logged for admin auditing (PRD 5.4).
     await input.repositories.toolLogs.create({
       userId: input.userId,
+      agentId: input.agentId,
       conversationId: input.conversationId,
       toolName: "web_search_gate",
       inputSummary: query,
@@ -372,6 +391,7 @@ async function executeToolCall(context: {
       collectSearchEvidence(context.searchEvidence, result);
       await input.repositories.toolLogs.create({
         userId: input.userId,
+        agentId: input.agentId,
         conversationId: input.conversationId,
         toolName: "web_search",
         inputSummary: query,
@@ -384,6 +404,7 @@ async function executeToolCall(context: {
       const message = error instanceof Error ? error.message : String(error);
       await input.repositories.toolLogs.create({
         userId: input.userId,
+        agentId: input.agentId,
         conversationId: input.conversationId,
         toolName: "web_search",
         inputSummary: query,
@@ -413,6 +434,7 @@ async function executeToolCall(context: {
   if (!tool) {
     await input.repositories.toolLogs.create({
       userId: input.userId,
+      agentId: input.agentId,
       conversationId: input.conversationId,
       toolName: `registered_tool:${toolCall.name}`,
       inputSummary: toolInput,
@@ -428,6 +450,7 @@ async function executeToolCall(context: {
     const result = await (input.toolExecutor?.run(tool, toolInput) ?? executeRegisteredTool(tool, toolInput));
     await input.repositories.toolLogs.create({
       userId: input.userId,
+      agentId: input.agentId,
       conversationId: input.conversationId,
       toolName: `registered_tool:${tool.name}`,
       inputSummary: toolInput,
@@ -440,6 +463,7 @@ async function executeToolCall(context: {
     const message = error instanceof Error ? error.message : String(error);
     await input.repositories.toolLogs.create({
       userId: input.userId,
+      agentId: input.agentId,
       conversationId: input.conversationId,
       toolName: `registered_tool:${tool.name}`,
       inputSummary: toolInput,
@@ -503,6 +527,7 @@ async function saveSkillFromToolCall(context: {
 
   const logBase = {
     userId: input.userId,
+    agentId: input.agentId,
     conversationId: input.conversationId,
     toolName: "save_skill",
     inputSummary: `${name}：${description}`.slice(0, 500),
@@ -559,6 +584,7 @@ async function createSkillFromToolCall(context: {
 
   const logBase = {
     userId: input.userId,
+    agentId: input.agentId,
     conversationId: input.conversationId,
     toolName: "create_skill",
     inputSummary: `${name}：${description}`.slice(0, 500),
@@ -611,6 +637,7 @@ async function installSkillFromToolCall(context: {
 
   const logBase = {
     userId: input.userId,
+    agentId: input.agentId,
     conversationId: input.conversationId,
     toolName: "install_skill",
     inputSummary: url.slice(0, 500),

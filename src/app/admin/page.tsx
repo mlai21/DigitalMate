@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
 
@@ -9,6 +10,7 @@ export default async function AdminPage() {
   if (!user) return <AdminEmpty message="需要登录后查看后台。" />;
 
   const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const [
     conversations,
     memories,
@@ -21,15 +23,15 @@ export default async function AdminPage() {
     taskRuns,
     toolRegistrations,
   ] = await Promise.all([
-    repositories.conversations.list(user.id),
-    repositories.memories.list(user.id),
-    repositories.toolLogs.list(user.id),
-    repositories.llmUsage.list(user.id),
-    repositories.proactiveTasks.list(user.id),
-    repositories.channels.listDecisions(user.id),
-    repositories.reflections.list(user.id),
+    repositories.conversations.list(scope),
+    repositories.memories.list(scope),
+    repositories.toolLogs.list(scope),
+    repositories.llmUsage.list(scope),
+    repositories.proactiveTasks.list(scope),
+    repositories.channels.listDecisions(scope),
+    repositories.reflections.list(scope),
     repositories.skills.list(user.id),
-    repositories.taskRuns.list(user.id),
+    repositories.taskRuns.list(scope),
     repositories.toolRegistrations.list(user.id),
   ]);
 

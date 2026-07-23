@@ -436,6 +436,23 @@ CREATE TABLE IF NOT EXISTS agent_resource_grants (
     ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS agent_settings (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  persona jsonb NOT NULL DEFAULT '{}'::jsonb,
+  proactivity jsonb NOT NULL DEFAULT '{}'::jsonb,
+  cadence jsonb NOT NULL DEFAULT '{}'::jsonb,
+  search jsonb NOT NULL DEFAULT '{}'::jsonb,
+  model_routing_override jsonb NOT NULL DEFAULT '{}'::jsonb,
+  revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, agent_id),
+  CONSTRAINT agent_settings_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE
+);
+
 INSERT INTO digital_agents (user_id, slug, display_name, persona, is_default)
 SELECT users.id, 'digitalmate', 'DigitalMate', COALESCE(settings.persona, '{}'::jsonb), true
 FROM users
@@ -449,6 +466,21 @@ WHERE NOT EXISTS (
 ON CONFLICT (user_id, slug) DO UPDATE
 SET is_default = true,
     updated_at = now();
+
+INSERT INTO agent_settings (
+  user_id, agent_id, persona, proactivity, cadence, search
+)
+SELECT settings.user_id,
+       digital_agents.id,
+       settings.persona,
+       settings.proactivity,
+       settings.cadence,
+       settings.search
+FROM settings
+JOIN digital_agents
+  ON digital_agents.user_id = settings.user_id
+ AND digital_agents.is_default = true
+ON CONFLICT (user_id, agent_id) DO NOTHING;
 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_id uuid;

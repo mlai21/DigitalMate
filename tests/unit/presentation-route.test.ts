@@ -17,6 +17,9 @@ vi.mock("@/server/auth/current-user", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    agents: {
+      getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
+    },
     taskRuns: {
       create: routeMocks.taskRunsCreate,
       complete: routeMocks.taskRunsComplete,

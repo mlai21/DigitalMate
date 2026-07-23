@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -18,7 +19,9 @@ export async function GET() {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const projects = await createRepositories().projects.list(user.id);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const projects = await repositories.projects.list(scope);
   return NextResponse.json({
     projects: projects.map((project) => ({
       id: project.id,
@@ -42,7 +45,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
   }
 
-  const project = await createRepositories().projects.create(user.id, body.data);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const project = await repositories.projects.create(scope, body.data);
   return NextResponse.json({
     project: {
       id: project.id,

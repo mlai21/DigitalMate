@@ -3,6 +3,7 @@ import { deleteAttachment } from "@/server/attachments/storage";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -32,10 +33,12 @@ export async function DELETE(
     return deletedResponse();
   }
 
-  const attachments = createRepositories().messageAttachments;
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const attachments = repositories.messageAttachments;
   let attachment;
   try {
-    attachment = await attachments.claimDraftForDeletion(user.id, attachmentId);
+    attachment = await attachments.claimDraftForDeletion(scope, attachmentId);
   } catch {
     return errorResponse("attachment_delete_failed", 500);
   }
@@ -50,7 +53,7 @@ export async function DELETE(
   const releaseClaim = async () => {
     try {
       return await attachments.releaseDeletionClaim(
-        user.id,
+        scope,
         attachment.id,
         deletionClaimToken,
         "attachment_delete_failed",
@@ -69,7 +72,7 @@ export async function DELETE(
 
   try {
     const deleted = await attachments.deleteDraft(
-      user.id,
+      scope,
       attachment.id,
       deletionClaimToken,
     );

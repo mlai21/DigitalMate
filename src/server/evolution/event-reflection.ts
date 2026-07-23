@@ -1,16 +1,17 @@
 import type { ReflectionRecord } from "@/server/evolution/reflection";
+import type { AgentScope } from "@/server/agents/types";
 
 export type EventReflectionKind = "daily" | "task_failure" | "user_dissatisfaction" | "proactive_ignored";
 
 type ReflectionWriter = {
   reflections: {
-    create(input: { userId: string; reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
-    latestBySourceEvent?(userId: string, event: EventReflectionKind): Promise<Date | null>;
+    create(scope: AgentScope, input: { reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
+    latestBySourceEvent?(scope: AgentScope, event: EventReflectionKind): Promise<Date | null>;
   };
 };
 
 type EventReflectionInput = {
-  userId: string;
+  scope: AgentScope;
   event: EventReflectionKind;
   summary: string;
   source?: Record<string, unknown>;
@@ -63,12 +64,11 @@ export async function recordEventReflection(repositories: ReflectionWriter, inpu
 
   const shouldDedupe = input.dedupeByEvent ?? input.event === "proactive_ignored";
   if (shouldDedupe && repositories.reflections.latestBySourceEvent) {
-    const latest = await repositories.reflections.latestBySourceEvent(input.userId, input.event);
+    const latest = await repositories.reflections.latestBySourceEvent(input.scope, input.event);
     if (!shouldRecordEventReflection(input.now ?? new Date(), latest)) return false;
   }
 
-  await repositories.reflections.create({
-    userId: input.userId,
+  await repositories.reflections.create(input.scope, {
     reflection: buildEventReflection({ event: input.event, summary: input.summary }),
     sourceWindow: {
       event: input.event,

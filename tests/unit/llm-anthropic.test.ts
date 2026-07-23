@@ -211,6 +211,7 @@ describe("AnthropicClient", () => {
 
     for await (const chunk of runAgent({
       userId: "user-1",
+      agentId: "agent-1",
       conversationId: "conversation-1",
       message: "看附件",
       attachments: [{

@@ -21,6 +21,7 @@ const contract: GoalContract = {
 const goal: DbGoal = {
   id: "goal-1",
   userId: "user-1",
+  agentId: "agent-1",
   title: "主题 X 调研",
   contract,
   status: "running",

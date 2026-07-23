@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
+import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
 
@@ -26,7 +27,9 @@ export async function PATCH(request: Request, context: RouteContext) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
   }
 
-  const project = await createRepositories().projects.update(user.id, projectId, body.data);
+  const repositories = createRepositories();
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const project = await repositories.projects.update(scope, projectId, body.data);
   if (!project) {
     return NextResponse.json({ error: "project_not_found" }, { status: 404 });
   }
@@ -51,11 +54,12 @@ export async function DELETE(_request: Request, context: RouteContext) {
 
   const { projectId } = await context.params;
   const repositories = createRepositories();
-  const project = await repositories.projects.getForUser(user.id, projectId);
+  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const project = await repositories.projects.get(scope, projectId);
   if (!project) {
     return NextResponse.json({ error: "project_not_found" }, { status: 404 });
   }
 
-  await repositories.projects.delete(user.id, projectId);
+  await repositories.projects.delete(scope, projectId);
   return NextResponse.json({ ok: true });
 }

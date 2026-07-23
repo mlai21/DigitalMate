@@ -1,7 +1,7 @@
 import { normalizeSearchAggressiveness } from "@/server/agent/search-gate";
-import { defaultSettings } from "@/server/settings/defaults";
+import type { AppSettings } from "@/server/settings/defaults";
 
-export type AppSettings = typeof defaultSettings;
+export type { AppSettings } from "@/server/settings/defaults";
 
 type ProactivityPreset = "low";
 

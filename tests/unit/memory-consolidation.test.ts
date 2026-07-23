@@ -44,7 +44,7 @@ describe("consolidateMemoryKind", () => {
       repositories,
       llm: completeLlm("[]"),
       model: "light",
-      userId: "u1",
+      scope: { userId: "u1", agentId: "a1" },
       kind: "profile",
       cap: 5,
     });
@@ -58,14 +58,14 @@ describe("consolidateMemoryKind", () => {
     const repositories = buildRepositories(entries);
     const llm = completeLlm('[{"content":"用户偏好合并后 A","confidence":0.9},{"content":"用户偏好合并后 B","confidence":0.8}]');
 
-    const outcome = await consolidateMemoryKind({ repositories, llm, model: "light", userId: "u1", kind: "profile", cap: 4 });
+    const outcome = await consolidateMemoryKind({ repositories, llm, model: "light", scope: { userId: "u1", agentId: "a1" }, kind: "profile", cap: 4 });
 
     expect(outcome).toEqual({ kind: "profile", removedCount: 6, mergedCount: 2, strategy: "llm_merge" });
     expect(repositories.memories.softDeleteMany).toHaveBeenCalledWith(
-      "u1",
+      { userId: "u1", agentId: "a1" },
       entries.map((entry) => entry.id),
     );
-    expect(repositories.memories.createMany).toHaveBeenCalledWith("u1", null, [
+    expect(repositories.memories.createMany).toHaveBeenCalledWith({ userId: "u1", agentId: "a1" }, null, [
       { content: "用户偏好合并后 A", confidence: 0.9, kind: "profile" },
       { content: "用户偏好合并后 B", confidence: 0.8, kind: "profile" },
     ]);
@@ -79,7 +79,7 @@ describe("consolidateMemoryKind", () => {
       repositories,
       llm: completeLlm("抱歉，我不明白。"),
       model: "light",
-      userId: "u1",
+      scope: { userId: "u1", agentId: "a1" },
       kind: "profile",
       cap: 4,
     });

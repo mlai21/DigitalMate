@@ -9,14 +9,18 @@ describe("completeTaskWithSkillDraft", () => {
     };
 
     await completeTaskWithSkillDraft(repositories, {
-      userId: "user-1",
+      scope: { userId: "user-1", agentId: "agent-1" },
       taskRunId: "task-1",
       kind: "spreadsheet",
       inputSummary: "表格汇总：sales.xlsx",
       outputSummary: "表格汇总报告已生成。",
     });
 
-    expect(repositories.taskRuns.complete).toHaveBeenCalledWith("task-1", "表格汇总报告已生成。");
+    expect(repositories.taskRuns.complete).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      "task-1",
+      "表格汇总报告已生成。",
+    );
     expect(repositories.skills.create).toHaveBeenCalledWith(
       "user-1",
       expect.objectContaining({
@@ -35,7 +39,7 @@ describe("completeTaskWithSkillDraft", () => {
 
     await expect(
       completeTaskWithSkillDraft(repositories, {
-        userId: "user-1",
+        scope: { userId: "user-1", agentId: "agent-1" },
         taskRunId: "task-1",
         kind: "sandbox",
         inputSummary: "沙箱执行：node task.js",
@@ -43,6 +47,10 @@ describe("completeTaskWithSkillDraft", () => {
       }),
     ).resolves.toBeUndefined();
 
-    expect(repositories.taskRuns.complete).toHaveBeenCalledWith("task-1", "沙箱任务已执行，输出文件已生成。");
+    expect(repositories.taskRuns.complete).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      "task-1",
+      "沙箱任务已执行，输出文件已生成。",
+    );
   });
 });
