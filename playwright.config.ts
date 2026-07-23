@@ -13,15 +13,23 @@ export default defineConfig({
     trace: "on-first-retry",
   },
   webServer: {
-    command: "node scripts/run-e2e-app.mjs",
+    command: "npm run console:build && node scripts/run-e2e-app.mjs",
     url: appUrl,
     reuseExistingServer: false,
-    timeout: 120_000,
+    timeout: 240_000,
   },
   projects: [
     {
-      name: "chromium",
+      name: "Desktop Chrome",
       use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "iPad Mini",
+      use: { ...devices["iPad Mini"], browserName: "chromium" },
+    },
+    {
+      name: "Mobile Chrome",
+      use: { ...devices["Pixel 5"] },
     },
   ],
 });

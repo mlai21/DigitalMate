@@ -1857,6 +1857,7 @@ describe("QwenPaw Console patch preparation", () => {
         headerSource,
         updateContentSource,
         layoutStyles,
+        globalLayoutStyles,
         chatSource,
         defaultConfigSource,
         codingToggleSource,
@@ -1889,6 +1890,7 @@ describe("QwenPaw Console patch preparation", () => {
         readPrepared("src/layouts/Header.tsx"),
         readPrepared("src/layouts/constants.ts"),
         readPrepared("src/layouts/index.module.less"),
+        readPrepared("src/styles/layout.css"),
         readPrepared("src/pages/Chat/index.tsx"),
         readPrepared("src/pages/Chat/OptionsPanel/defaultConfig.ts"),
         readPrepared("src/components/CodingModeToggle/index.tsx"),
@@ -1932,6 +1934,13 @@ describe("QwenPaw Console patch preparation", () => {
         "linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%)",
       );
       expect(layoutStyles).not.toContain("qwenpawBack.png");
+      expect(layoutStyles).toContain(
+        "background: var(--dm-color-bg-layout, #FAF7F2)",
+      );
+      expect(globalLayoutStyles).toContain(
+        "background: var(--dm-color-bg-layout, #FAF7F2)",
+      );
+      expect(globalLayoutStyles).not.toContain("background: #f9f8f4");
       expect(chatSource).toContain("avatar: extAvatar ?? DIGITALMATE_LOGO_URL");
       expect(chatSource).toContain('nick: extNick ?? "DigitalMate"');
       expect(defaultConfigSource).toContain(
@@ -1949,6 +1958,8 @@ describe("QwenPaw Console patch preparation", () => {
       }
       expect(appSource).toContain('colorPrimary: "#E8684A"');
       expect(appSource).toContain('colorBgLayout: "#FAF7F2"');
+      expect(appSource).toContain("--dm-color-primary: #E8684A");
+      expect(appSource).toContain("--dm-color-bg-layout: #FAF7F2");
       expect(appSource).toContain('pathname.startsWith("/admin-preview/")');
       expect(appSource).toContain('return "/admin-preview"');
       expect(appSource).toContain('pathname.startsWith("/admin/")');

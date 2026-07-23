@@ -2,6 +2,22 @@ diff --git a/src/App.tsx b/src/App.tsx
 index db4877f854ae7593dcbef3a07912cb7431f9fa12..53fb39ad9a1980830ea4ecd938326ad9a9c5d02a 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
+@@ -62,6 +62,15 @@ const GlobalStyle = createGlobalStyle`
+   margin: 0;
+   box-sizing: border-box;
+ }
++
++:root {
++  --dm-color-primary: #E8684A;
++  --dm-color-bg-layout: #FAF7F2;
++}
++
++:root.dark-mode {
++  --dm-color-bg-layout: #1F1B19;
++}
+ `;
+
+ function AuthGuard({ children }: { children: React.ReactNode }) {
 @@ -131,6 +131,9 @@ function AppInner() {
    const { isDark } = useTheme();
    const { loading: pluginsLoading } = usePlugins();
@@ -23,6 +39,88 @@ index db4877f854ae7593dcbef3a07912cb7431f9fa12..53fb39ad9a1980830ea4ecd938326ad9
          }}
        >
          <AntdApp>
+diff --git a/src/layouts/index.module.less b/src/layouts/index.module.less
+index 231f773d9731dfaeff5251304243041c17387efe..ac44ed084ba29be7898678fb558017a4d9f595f9 100644
+--- a/src/layouts/index.module.less
++++ b/src/layouts/index.module.less
+@@ -10,7 +10,7 @@
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+-  background: #f9f8f4;
++  background: var(--dm-color-bg-layout, #FAF7F2);
+
+   :global {
+     .qwenpaw-space-item {
+@@ -54,7 +54,7 @@
+
+ // ─── Sidebar ─────────────────────────────────────────────────────────────────
+ .sider {
+-  background: #f9f8f4 !important;
++  background: var(--dm-color-bg-layout, #FAF7F2) !important;
+   overflow: auto;
+   height: calc(100vh - 64px) !important;
+   padding: 0 16px;
+@@ -101,7 +101,7 @@
+     z-index: 10;
+     margin-bottom: 4px;
+     // Opaque background so scrolled content is hidden behind
+-    background: #f9f7f3;
++    background: var(--dm-color-bg-layout, #FAF7F2);
+     border-radius: 12px 12px 0 0;
+   }
+
+@@ -446,7 +446,7 @@
+   align-items: center;
+   justify-content: flex-end;
+   gap: 4px;
+-  background: #f9f8f4; // match sider background so scrolled content is hidden
++  background: var(--dm-color-bg-layout, #FAF7F2); // match sider background so scrolled content is hidden
+ }
+
+ .collapseToggle {
+diff --git a/src/styles/layout.css b/src/styles/layout.css
+index 59552a9df1a29f5e20bd68390666104197dc50e8..14af4719795090fa7819e9c65bb4fbf94a596717 100644
+--- a/src/styles/layout.css
++++ b/src/styles/layout.css
+@@ -4,11 +4,11 @@ body {
+   overflow: hidden;
+   margin: 0;
+   padding: 0;
+-  background: #f9f8f4;
++  background: var(--dm-color-bg-layout, #FAF7F2);
+ }
+
+ .qwenpaw-layout {
+-  background: #f9f8f4;
++  background: var(--dm-color-bg-layout, #FAF7F2);
+ }
+
+ /* ─── Dark mode global token overrides ─────────────────────────────────────── */
+@@ -897,12 +897,12 @@ html.dark-mode .qwenpaw-sender-content {
+   min-height: 100vh;
+   max-height: 100vh;
+   overflow: hidden;
+-  background: #f9f8f4;
++  background: var(--dm-color-bg-layout, #FAF7F2);
+ }
+
+ .ant-layout-content {
+   overflow: hidden;
+-  background: #f9f8f4;
++  background: var(--dm-color-bg-layout, #FAF7F2);
+ }
+
+ .qwenpaw-bubble-list-wrapper {
+@@ -944,7 +944,7 @@ html.dark-mode .qwenpaw-sender-content {
+ /* Menu background in light mode */
+ .qwenpaw-menu,
+ .ant-menu {
+-  background: #f9f8f4 !important;
++  background: var(--dm-color-bg-layout, #FAF7F2) !important;
+ }
+
+ /* Menu selected item in light mode */
 diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
 index 51b66019bb730990aa7a8a8664a49b9856cbf141..43b338a2a34bdb58117d8a3e9949741ec0273032 100644
 --- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
