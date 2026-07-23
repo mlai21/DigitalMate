@@ -46,15 +46,25 @@ describe("session token", () => {
       },
     });
 
-    expect(await verifySessionRequest(request, "secret")).toBe("user-1");
+    expect(await verifySessionRequest(request, "user-1", "secret")).toBe("user-1");
     expect(
       await verifySessionRequest(
         new Request(`https://digitalmate.example/admin-preview?dm_session=${token}`, {
           headers: { authorization: `Bearer ${token}`, "x-dm-session": token },
         }),
+        "user-1",
         "secret",
       ),
     ).toBeNull();
+  });
+
+  it("rejects a valid signed session belonging to a different user", async () => {
+    const token = await createSessionToken("not-the-default-user", "secret");
+    const request = new Request("https://digitalmate.example/admin-preview", {
+      headers: { cookie: `dm_session=${token}` },
+    });
+
+    expect(await verifySessionRequest(request, "user-1", "secret")).toBeNull();
   });
 
   it("rejects missing, empty, duplicate, tampered and malformed session cookies", async () => {
@@ -76,6 +86,7 @@ describe("session token", () => {
       expect(
         await verifySessionRequest(
           new Request("https://digitalmate.example/admin-preview", { headers }),
+          "user-1",
           "secret",
         ),
       ).toBeNull();

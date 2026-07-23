@@ -35,7 +35,11 @@ export async function verifySessionToken(token: string, secret: string): Promise
   }
 }
 
-export async function verifySessionRequest(request: Request, secret: string): Promise<string | null> {
+export async function verifySessionRequest(
+  request: Request,
+  defaultUserId: string,
+  secret: string,
+): Promise<string | null> {
   const cookieHeader = request.headers.get("cookie");
   if (!cookieHeader) return null;
 
@@ -62,7 +66,10 @@ export async function verifySessionRequest(request: Request, secret: string): Pr
     sessionToken = value;
   }
 
-  return sessionToken ? verifySessionToken(sessionToken, secret) : null;
+  if (!sessionToken) return null;
+
+  const sessionUserId = await verifySessionToken(sessionToken, secret);
+  return sessionUserId && safeEqual(sessionUserId, defaultUserId) ? sessionUserId : null;
 }
 
 export async function verifyPassword(input: string, expected: string): Promise<boolean> {

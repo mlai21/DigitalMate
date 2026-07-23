@@ -20,6 +20,7 @@ type StaticRequest = {
 
 type PreviewHandlerOptions = {
   appSecret: string;
+  defaultUserId: string;
   rootDirectory: string;
 };
 
@@ -73,7 +74,11 @@ export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions)
     request: Request,
     context: RouteContext,
   ): Promise<Response> {
-    const userId = await verifySessionRequest(request, options.appSecret);
+    const userId = await verifySessionRequest(
+      request,
+      options.defaultUserId,
+      options.appSecret,
+    );
     if (!userId) return loginRedirect(request);
 
     const url = new URL(request.url);

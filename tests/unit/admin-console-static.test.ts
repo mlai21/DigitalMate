@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GET as productionPreviewGet,
   runtime as previewRuntime,
@@ -21,11 +21,22 @@ import {
   serveAdminConsoleStatic,
 } from "@/server/admin/console-static";
 
+const routeMocks = vi.hoisted(() => ({
+  ensureDefault: vi.fn(async () => ({ id: "user-1" })),
+}));
+
+vi.mock("@/server/db/repositories", () => ({
+  createRepositories: vi.fn(() => ({
+    users: { ensureDefault: routeMocks.ensureDefault },
+  })),
+}));
+
 const execFileAsync = promisify(execFile);
 const secret = "preview-test-secret";
 let fixtureRoot = "";
 
 beforeEach(async () => {
+  routeMocks.ensureDefault.mockClear();
   fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "digitalmate-console-static-"));
   await mkdir(path.join(fixtureRoot, "assets"), { recursive: true });
   await writeFile(path.join(fixtureRoot, "index.html"), "<!doctype html><title>DigitalMate</title>");
@@ -54,6 +65,7 @@ async function authenticatedRequest(
   const token = await createSessionToken("user-1", secret);
   const handler = createAdminConsolePreviewHandler({
     appSecret: secret,
+    defaultUserId: "user-1",
     rootDirectory: fixtureRoot,
   });
   return handler(
@@ -247,11 +259,13 @@ describe("admin Console preview route", () => {
       { params: Promise.resolve({}) },
     );
     expect(response.status).toBe(307);
+    expect(routeMocks.ensureDefault).toHaveBeenCalledOnce();
   });
 
   it("redirects unauthenticated requests to the same origin with the original path and query", async () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
+      defaultUserId: "user-1",
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -274,6 +288,7 @@ describe("admin Console preview route", () => {
   it("authenticates before path validation so every unauthenticated request redirects", async () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
+      defaultUserId: "user-1",
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -287,6 +302,7 @@ describe("admin Console preview route", () => {
   it("rejects a tampered cookie and does not expose the static root", async () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
+      defaultUserId: "user-1",
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -298,6 +314,23 @@ describe("admin Console preview route", () => {
 
     expect(response.status).toBe(307);
     expect(await response.text()).not.toContain(fixtureRoot);
+  });
+
+  it("rejects a valid signed session belonging to a different user", async () => {
+    const token = await createSessionToken("not-the-default-user", secret);
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      defaultUserId: "user-1",
+      rootDirectory: fixtureRoot,
+    });
+    const response = await handler(
+      new Request("https://digitalmate.example/admin-preview", {
+        headers: { cookie: `dm_session=${token}` },
+      }),
+      { params: Promise.resolve({}) },
+    );
+
+    expect(response.status).toBe(307);
   });
 
   it("serves authenticated requests and accepts Promise route params", async () => {
