@@ -1,7 +1,7 @@
 # QwenPaw Console M0–M1 基线
 
 - 记录日期：2026-07-24
-- 适用范围：Foundation 任务 6（`/admin-preview` 导航与视觉基线）
+- 适用范围：Foundation 任务 6–7（`/admin-preview` 导航与视觉基线、M0–M1 总验证）
 - Node.js：`v22.22.3`
 - npm：`10.9.8`
 - 上游 tag：`v2.0.0.post3`
@@ -36,6 +36,59 @@
 
 Playwright 的 `webServer` 在每轮 E2E 启动前执行 `npm run console:build`；上述两轮 90 项验证均成功完成 Console 构建后才启动应用。构建存在上游既有 peer dependency、循环 chunk 和大 chunk 警告，没有构建失败。
 
+## M0–M1 总验证新鲜证据
+
+以下结果均于 2026-07-24 在 `codex/qwenpaw-console` 分支重新执行。退出码来自完整命令，
+没有用历史结果替代。
+
+| 验证项 | 精确命令 | 退出码 | 数量 / 结果摘要 |
+|---|---|---:|---|
+| 固定上游校验 | `npm run console:verify-upstream` | 0 | commit `fef7e64d984f4332d0b84a343cd209bd3ea5d316`；864 个文件通过快照校验 |
+| Console 全量测试 | `npm run console:test` | 0 | 131 个测试文件、1165 项测试全部通过；测试后的 Console 生产构建成功 |
+| Console 独立构建 | `npm run console:build` | 0 | TypeScript 与 Vite 生产构建成功，转换 15110 个模块；静态产物原子发布到 `public/_admin-console` |
+| 根 TypeScript | `npm run typecheck` | 0 | `tsc --noEmit` 无错误 |
+| 根全量测试 | `npm test` | 0 | 83 个测试文件、828 项测试全部通过 |
+| Console 三视口 E2E | `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts` | 0 | Desktop Chrome、iPad Mini、Mobile Chrome 共 90/90 通过，耗时 1.5 分钟 |
+| 根生产构建 | `npm run build` | 0 | 再次完成 Console 构建；Next.js 生产编译、TypeScript、34 个静态页面生成和路由收集全部成功 |
+| 空白检查 | `git diff --check` | 0 | 执行总验证后与文档更新后复验均无空白错误 |
+
+Console 构建继续报告上游既有 peer dependency、循环 chunk、大 chunk 与多 lockfile
+提示；这些均为 warning，所有独立构建命令和根构建的最终退出码均为 0。
+临时上游依赖安装的 `npm audit` 摘要为 29 项（1 low、11 moderate、17 high）；
+固定上游依赖未在本验收任务中升级，该结果作为后续上游依赖安全评审输入保留。
+
+根 `vitest.config.ts` 明确排除 `.worktrees/**` 与 `vendor/**`，
+`tests/unit/vitest-config.test.ts` 对该边界有回归断言。本轮根测试只运行仓库自身的
+83 个测试文件，没有扫描固定上游或其他工作树。
+
+## 许可、哈希与品牌核对
+
+| 核对项 | 精确命令 | 退出码 | 结果 |
+|---|---|---:|---|
+| 许可与元数据存在 | `test -f vendor/qwenpaw-console/LICENSE && test -f vendor/qwenpaw-console/UPSTREAM.md && test -f vendor/qwenpaw-console/SHA256SUMS` | 0 | Apache License 2.0、来源说明与哈希清单齐全 |
+| 清单摘要与逐文件校验 | `shasum -a 256 vendor/qwenpaw-console/SHA256SUMS && (cd vendor/qwenpaw-console && shasum -a 256 -c SHA256SUMS --quiet)` | 0 | 864 项逐一通过；清单 SHA-256 为 `04459760c48b596c2521dbfcd182660c5784adbecc654ed98d3eb4dc7e85a53a`，与 `UPSTREAM.md` 一致 |
+| 构建产物原始品牌扫描 | `rg -n "QwenPaw\|Qwen" public/_admin-console --glob '*.js' --glob '*.html'` | 0 | 仅 1 个主 bundle 命中：`QwenPaw` 97 次、`Qwen` 14 次；分类如下 |
+
+原始 bundle 的品牌命中分类：
+
+- 69 次 `QwenPaw` 位于固定上游的多语言资源源字符串。全局
+  `digitalmateBrand` i18n 后处理器在渲染前替换为 `DigitalMate`。
+- 21 次 `window.QwenPaw` 是上游插件 Host ABI，必须为插件兼容保留。
+- 5 次是浏览器开发者控制台诊断标签：`QwenPaw audit` 2 次、
+  `QwenPaw registry` 1 次、`[QwenPaw]` 2 次。
+- 1 次是上游 GitHub 来源 URL，1 次是运行时品牌替换器自身的匹配表达式。
+- 14 次 `Qwen` 均来自 7 个 `Qwen/Qwen3-0.6B-GGUF` 模型仓库示例 ID；
+  每个 ID 含 2 次 `Qwen`，属于模型专名而非 Console 产品品牌。
+
+额外使用一次性 Playwright 核验脚本登录预览入口，按中文浅色主题逐页读取 25 个
+非 Chat 内置路由的 `body.innerText`：25/25 页面均无可见 `QwenPaw` 文案。
+构建产物中的必要兼容标识已列入
+`vendor/qwenpaw-console/UPSTREAM.md`，不作为用户可见品牌使用。
+
+`git ls-files public/_admin-console | wc -l` 返回 0，
+`git status --ignored --short public/_admin-console` 将目录标记为 `!!`；构建产物未进入
+Git。总验证开始前工作树干净，构建与 E2E 没有产生待提交文件。
+
 ## 导航与交互基线
 
 - `tests/e2e/admin-console.routes.ts` 固定 26 个上游内置路由，并为 25 个非 Chat 页面逐项声明期望 URL、稳定路由 ID 与页面文本。
@@ -61,14 +114,18 @@ Playwright 的 `webServer` 在每轮 E2E 启动前执行 `npm run console:build`
 
 截图固定为收件箱布局，禁用动画、过渡和光标；时间、随机标识、连接状态及 M2 API 尚未接入时产生的瞬时消息只在截图层隐藏。此次刷新确认三张截图像素未变化。测试仍会等待真实 Console shell、`core.inbox` 页面身份与收件箱内容，不以空 `#root` 或空页面容器作为通过条件。
 
-## M0–M1 总验证边界
+## M0–M1 总验证结论与回滚边界
 
-本文件在任务 6 只记录导航、视觉和相关静态检查，不把任务 7 的总验证提前标记为完成。
-
-| 总验证项 | 当前状态 |
+| 总验证项 | 新鲜结果 |
 |---|---|
-| 固定 Console 上游测试数量 | 既有 Foundation 基线为 1165 项；任务 7 将重新执行并写入新鲜结果 |
-| 根 `npm test` | 待任务 7 新鲜执行 |
-| 根 `npm run build` | 待任务 7 新鲜执行；本任务只确认 E2E 前置的 Console build |
-| `npm run console:verify-upstream` | 待任务 7 新鲜执行 |
-| 许可与构建产物品牌扫描 | 待任务 7 新鲜执行 |
+| 固定 Console 上游 | commit、864 项哈希与目录摘要一致 |
+| Console 测试与构建 | 1165/1165 通过；独立生产构建退出码 0 |
+| 根工程 | TypeScript 退出码 0；828/828 测试通过；生产构建退出码 0 |
+| 三视口预览 | 90/90 通过；26 个内置路由、Chat 跳转、主题、截图和旧后台边界均受保护 |
+| 许可与品牌 | Apache License 2.0 与来源元数据齐全；25 个渲染页面无可见 `QwenPaw` |
+| 构建产物 | `public/_admin-console` 被 Git 忽略，0 个文件受跟踪 |
+
+本里程碑没有切换正式 `/admin`，旧后台仍由现有 Next 页面提供。当前新增运行入口仅为
+`/admin-preview`；若需回滚，可删除该预览路由和忽略的静态产物，现有 `/admin` 与数据库
+均不受影响。M2 兼容 API 与真实数据映射仍未实现，本次验收没有把局部 E2E auth mock
+扩展为产品 API，也没有解冻 P2 功能。
