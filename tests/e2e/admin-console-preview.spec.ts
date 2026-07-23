@@ -1,16 +1,27 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { QWENPAW_BUILTIN_ROUTES } from "./admin-console.routes";
-
-const CONSOLE_ROUTES = QWENPAW_BUILTIN_ROUTES.filter(
-  (route) => route !== "/chat",
-);
+import { QWENPAW_CONSOLE_ROUTE_BASELINES } from "./admin-console.routes";
 
 async function expectConsoleReady(page: Page) {
   await expect(page.locator("#root")).toBeVisible();
   await expect(page.locator("#root .qwenpaw-layout").first()).toBeVisible({
     timeout: 30_000,
   });
+}
+
+async function expectConsolePage(
+  page: Page,
+  baseline: (typeof QWENPAW_CONSOLE_ROUTE_BASELINES)[number],
+) {
+  await expectConsoleReady(page);
+  await expect(page).toHaveURL(`/admin-preview${baseline.expectedPath}`);
+  const pageContent = page.locator(".page-content");
+  await expect(pageContent).toHaveAttribute(
+    "data-console-route",
+    baseline.routeId,
+  );
+  await expect(pageContent).not.toBeEmpty();
+  await expect(pageContent).toContainText(baseline.marker);
 }
 
 test.beforeEach(async ({ page }) => {
@@ -34,26 +45,34 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-for (const route of CONSOLE_ROUTES) {
-  test(`Console 深层刷新 ${route}`, async ({ page }) => {
-    await page.goto(`/admin-preview${route}`);
+for (const baseline of QWENPAW_CONSOLE_ROUTE_BASELINES) {
+  test(`Console 深层刷新 ${baseline.route}`, async ({ page }) => {
+    await page.goto(`/admin-preview${baseline.route}`);
 
-    await expectConsoleReady(page);
+    await expectConsolePage(page, baseline);
     await expect(page).not.toHaveURL(/\/login(?:[/?#]|$)/);
   });
 }
 
-test("Chat 入口只跳转 DigitalMate 首页", async ({ page }, testInfo) => {
+test("Chat 入口只跳转 DigitalMate 首页", async ({ page }) => {
   await page.goto("/admin-preview/chat");
   await expect(page).toHaveURL("/");
   await expect(page.getByRole("textbox", { name: "输入消息" })).toBeVisible();
 
-  if (testInfo.project.name === "Desktop Chrome") {
-    await page.goto("/admin-preview/inbox");
-    await expectConsoleReady(page);
-    await page.getByRole("button", { name: /Chat|聊天/ }).click();
-    await expect(page).toHaveURL("/");
-  }
+  await page.goto("/admin-preview/inbox");
+  await expectConsoleReady(page);
+  await page.getByRole("button", { name: /Chat|聊天/ }).click();
+  await expect(page).toHaveURL("/");
+});
+
+test("未知路由不会满足任何注册页面基线", async ({ page }) => {
+  await page.goto("/admin-preview/__unknown-route__");
+
+  await expectConsoleReady(page);
+  await expect(page).toHaveURL("/admin-preview/__unknown-route__");
+  const pageContent = page.locator(".page-content");
+  await expect(pageContent).toHaveAttribute("data-console-route", "core.chat");
+  await expect(pageContent).toBeEmpty();
 });
 
 test("Console 使用 DigitalMate 珊瑚色与暖白背景", async ({ page }) => {

@@ -1849,6 +1849,8 @@ describe("QwenPaw Console patch preparation", () => {
         appSource,
         indexHtml,
         routesSource,
+        sidebarSource,
+        mainLayoutSource,
         configSource,
         requestSource,
         agentsPageSource,
@@ -1882,6 +1884,8 @@ describe("QwenPaw Console patch preparation", () => {
         readPrepared("src/App.tsx"),
         readPrepared("index.html"),
         readPrepared("src/layouts/registry/builtinRoutes.tsx"),
+        readPrepared("src/layouts/Sidebar.tsx"),
+        readPrepared("src/layouts/MainLayout/index.tsx"),
         readPrepared("src/api/config.ts"),
         readPrepared("src/api/request.ts"),
         readPrepared("src/pages/Settings/Agents/index.tsx"),
@@ -1966,6 +1970,13 @@ describe("QwenPaw Console patch preparation", () => {
       expect(appSource).toContain('return "/admin"');
       expect(appSource).toContain('fetch("/api/admin/compat/auth/status"');
       expect(routesSource).toContain('window.location.assign("/")');
+      expect(sidebarSource).toContain(
+        "aria-label={String(item.label)}",
+      );
+      expect(mainLayoutSource).toContain(
+        'data-console-route={selectedKey}',
+      );
+      expect(mainLayoutSource).toMatch(/<Route\s+caseSensitive/);
       expect
         .soft(routesSource)
         .toContain('return <Navigate to="/inbox" replace />');

@@ -1851,3 +1851,43 @@ index b745352e6210933b4bd4194b1a7f8b954e333743..6417cc9cf0bffe9350bee5b2acee4ea0
      if (!res.ok) {
        console.warn(`[PluginLoader] /api/plugins returned ${res.status}`);
        return { loaded: 0, failed: [] };
+diff --git a/src/layouts/MainLayout/index.tsx b/src/layouts/MainLayout/index.tsx
+--- a/src/layouts/MainLayout/index.tsx
++++ b/src/layouts/MainLayout/index.tsx
+@@ -55,7 +55,10 @@ export default function MainLayout() {
+           <ConsolePollService />
+           <AgentStatusPollingController />
+           <Slot name="content.statusBar" kind="fill" />
+-          <div className="page-content">
++          <div
++            className="page-content"
++            data-console-route={selectedKey}
++          >
+             <ChunkErrorBoundary resetKey={currentPath}>
+               <Suspense
+                 fallback={
+@@ -68,7 +71,12 @@ export default function MainLayout() {
+               >
+                 <Routes>
+                   {routes.map((r) => (
+-                    <Route key={r.id} path={r.path} element={<r.Component />} />
++                    <Route
++                      caseSensitive
++                      key={r.id}
++                      path={r.path}
++                      element={<r.Component />}
++                    />
+                   ))}
+                 </Routes>
+               </Suspense>
+diff --git a/src/layouts/Sidebar.tsx b/src/layouts/Sidebar.tsx
+--- a/src/layouts/Sidebar.tsx
++++ b/src/layouts/Sidebar.tsx
+@@ -457,6 +457,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+                 }}
+               >
+                 <button
++                  aria-label={String(item.label)}
+                   className={`${styles.collapsedNavItem} ${
+                     isActive ? styles.collapsedNavItemActive : ""
+                   }`}
