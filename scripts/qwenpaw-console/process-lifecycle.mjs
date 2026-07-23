@@ -584,6 +584,7 @@ export function createSignalLifecycle({
   let installed = false;
   const childResolutionWaiters = new Set();
   const terminationFailureListeners = new Set();
+  const terminationFailuresByChild = new WeakMap();
   const diagnostics = [];
   const reportDiagnostic = createDiagnosticReporter(
     diagnostics,
@@ -680,6 +681,7 @@ export function createSignalLifecycle({
       return;
     }
     terminationFailure = error;
+    terminationFailuresByChild.set(child, error);
     attachDiagnostic(reportDiagnostic, {
       action: "runner-timeout",
       error,
@@ -954,6 +956,16 @@ export function createSignalLifecycle({
           return;
         }
 
+        if (!Number.isInteger(pid) || pid <= 0) {
+          const childResult = await waitForChildResolution(
+            child,
+            treeExitTimeoutMs,
+          );
+          if (childResult.closed || childResult.detached) {
+            return;
+          }
+        }
+
         let treeExit = await waitForPosixTreeExit(
           child,
           pid,
@@ -1131,24 +1143,42 @@ export function createSignalLifecycle({
     }
   };
 
-  const settleChild = async (child) => {
+  const settleChild = async (child, { closed = true } = {}) => {
     if (activeChild !== child) {
       return;
     }
-    markChildClosed(child);
-    await Promise.resolve();
+    if (closed) {
+      markChildClosed(child);
+    }
 
-    const watchdogPromise =
+    let watchdogPromise =
       terminationWatchdogChild === child
         ? terminationWatchdogPromise
         : null;
+    if (!watchdogPromise) {
+      await Promise.resolve();
+      watchdogPromise =
+        terminationWatchdogChild === child
+          ? terminationWatchdogPromise
+          : null;
+    }
     if (watchdogPromise) {
       await watchdogPromise;
-      const failure = terminationFailure;
+      const failure = terminationFailuresByChild.get(child);
       detachChild(child);
+      terminationFailuresByChild.delete(child);
       if (failure) {
         throw failure;
       }
+      return;
+    }
+    const recordedFailure = terminationFailuresByChild.get(child);
+    if (recordedFailure) {
+      detachChild(child);
+      terminationFailuresByChild.delete(child);
+      throw recordedFailure;
+    }
+    if (activeChild !== child) {
       return;
     }
 
@@ -1292,6 +1322,7 @@ export function createSignalLifecycle({
       });
     } finally {
       detachChild(child);
+      terminationFailuresByChild.delete(child);
     }
   };
 
@@ -1320,6 +1351,7 @@ export function createSignalLifecycle({
       terminationWatchdogChild = null;
       terminationWatchdogPromise = null;
       terminationFailure = null;
+      terminationFailuresByChild.delete(child);
       terminationFailureListeners.clear();
       if (firstSignal) {
         forwardToActiveTree(forceRequested);
@@ -1374,7 +1406,8 @@ export function createSignalLifecycle({
       watchedChild = child;
       terminationFailureListeners.add(listener);
       if (terminationFailure) {
-        queueMicrotask(() => listener(terminationFailure));
+        const failure = terminationFailure;
+        queueMicrotask(() => listener(failure));
       } else {
         startTerminationWatchdog(child);
       }
@@ -1390,6 +1423,31 @@ function shouldDetachCommand(signalLifecycle) {
   return signalLifecycle
     ? signalLifecycle.detachedCommands
     : process.platform !== "win32";
+}
+
+function composeManagedProcessError(
+  primaryError,
+  {
+    commandError,
+    terminationError,
+  } = {},
+) {
+  const error =
+    primaryError ?? commandError ?? terminationError ?? null;
+  if (!error) {
+    return null;
+  }
+
+  const details = {};
+  if (commandError && commandError !== error) {
+    details.commandError = commandError;
+  }
+  if (terminationError && terminationError !== error) {
+    details.terminationError = terminationError;
+  }
+  return Reflect.ownKeys(details).length > 0
+    ? attachErrorDetails(error, details)
+    : error;
 }
 
 /**
@@ -1409,14 +1467,17 @@ export function runManagedSpawn(
     ...spawnOptions
   } = {},
 ) {
+  const managedLifecycle =
+    signalLifecycle ?? createSignalLifecycle();
   return new Promise((resolve, reject) => {
     let settled = false;
+    let pendingPrimaryError = null;
     let stopWatchingTermination = () => {};
     let onChildClose;
     let onChildError;
     const child = spawnProcess(command, args, {
       ...spawnOptions,
-      detached: shouldDetachCommand(signalLifecycle),
+      detached: shouldDetachCommand(managedLifecycle),
     });
     const removeChildListeners = () => {
       if (onChildError) {
@@ -1426,54 +1487,54 @@ export function runManagedSpawn(
         child.off?.("close", onChildClose);
       }
     };
-    signalLifecycle?.attachChild(child);
+    managedLifecycle.attachChild(child);
+    const rejectWithTerminationFailure = (terminationError) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      stopWatchingTermination();
+      removeChildListeners();
+      managedLifecycle.detachChild(child);
+      const primaryError = composeManagedProcessError(
+        pendingPrimaryError,
+        { terminationError },
+      );
+      reject(
+        attachSignalToError(
+          primaryError,
+          managedLifecycle.signal,
+        ),
+      );
+    };
     stopWatchingTermination =
-      signalLifecycle?.watchChildTermination?.(
+      managedLifecycle.watchChildTermination?.(
         child,
-        (terminationError) => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          stopWatchingTermination();
-          removeChildListeners();
-          reject(
-            attachSignalToError(
-              terminationError,
-              signalLifecycle?.signal,
-            ),
-          );
-        },
+        rejectWithTerminationFailure,
       ) ?? stopWatchingTermination;
 
     const settleLifecycle = async () => {
-      if (typeof signalLifecycle?.settleChild === "function") {
-        await signalLifecycle.settleChild(child);
+      if (typeof managedLifecycle.settleChild === "function") {
+        await managedLifecycle.settleChild(child, {
+          closed: true,
+        });
       } else {
-        signalLifecycle?.detachChild(child);
+        managedLifecycle.detachChild(child);
       }
     };
     onChildError = (error) => {
-      if (!settled) {
-        settled = true;
-        stopWatchingTermination();
-        removeChildListeners();
-        void settleLifecycle().then(
-          () =>
-            reject(
-              attachSignalToError(
-                error,
-                signalLifecycle?.signal,
-              ),
-            ),
-          () =>
-            reject(
-              attachSignalToError(
-                error,
-                signalLifecycle?.signal,
-              ),
-          ),
+      if (settled) {
+        return;
+      }
+      pendingPrimaryError ??= error;
+      try {
+        const completion =
+          managedLifecycle.forceTerminateChild(child);
+        void completion?.catch?.(
+          rejectWithTerminationFailure,
         );
+      } catch (terminationError) {
+        rejectWithTerminationFailure(terminationError);
       }
     };
     onChildClose = (exitCode, signal) => {
@@ -1483,20 +1544,37 @@ export function runManagedSpawn(
       settled = true;
       stopWatchingTermination();
       removeChildListeners();
-      void settleLifecycle().then(() => {
-        const interruptedSignal = signalLifecycle?.signal ?? signal;
-        resolve({
-          exitCode: exitCode ?? (interruptedSignal ? 1 : 0),
-          signal: interruptedSignal ?? null,
-        });
-      }, (error) => {
-        reject(
-          attachSignalToError(
-            error,
-            signalLifecycle?.signal,
-          ),
-        );
-      });
+      void settleLifecycle().then(
+        () => {
+          if (pendingPrimaryError) {
+            reject(
+              attachSignalToError(
+                pendingPrimaryError,
+                managedLifecycle.signal,
+              ),
+            );
+            return;
+          }
+          const interruptedSignal =
+            managedLifecycle.signal ?? signal;
+          resolve({
+            exitCode: exitCode ?? (interruptedSignal ? 1 : 0),
+            signal: interruptedSignal ?? null,
+          });
+        },
+        (terminationError) => {
+          const primaryError = composeManagedProcessError(
+            pendingPrimaryError,
+            { terminationError },
+          );
+          reject(
+            attachSignalToError(
+              primaryError,
+              managedLifecycle.signal,
+            ),
+          );
+        },
+      );
     };
     child.once("error", onChildError);
     child.once("close", onChildClose);
@@ -1525,7 +1603,8 @@ export function runManagedExecFile(
   return new Promise((resolve, reject) => {
     let child;
     let settled = false;
-    let pendingPrimaryError = null;
+    let pendingCommandError = null;
+    let pendingMaxBufferError = null;
     let stopWatchingTermination = () => {};
     let onChildError;
     const removeChildListeners = () => {
@@ -1536,24 +1615,64 @@ export function runManagedExecFile(
     };
     const settleLifecycle = async () => {
       if (typeof managedLifecycle?.settleChild === "function") {
-        await managedLifecycle.settleChild(child);
+        await managedLifecycle.settleChild(child, {
+          closed: true,
+        });
       } else {
         managedLifecycle?.detachChild(child);
       }
     };
-    const finish = (error, stdout, stderr) => {
+    const recordCommandError = (error) => {
+      if (
+        error &&
+        error !== pendingMaxBufferError &&
+        !pendingCommandError
+      ) {
+        pendingCommandError = error;
+      }
+    };
+    const selectPrimaryError = (terminationError) =>
+      composeManagedProcessError(
+        pendingMaxBufferError ??
+          pendingCommandError ??
+          terminationError,
+        {
+          commandError: pendingMaxBufferError
+            ? pendingCommandError
+            : undefined,
+          terminationError,
+        },
+      );
+    const rejectWithTerminationFailure = (terminationError) => {
       if (settled) {
         return;
       }
       settled = true;
       stopWatchingTermination();
       removeChildListeners();
+      managedLifecycle.detachChild(child);
+      reject(
+        attachSignalToError(
+          selectPrimaryError(terminationError),
+          managedLifecycle.signal,
+        ),
+      );
+    };
+    const finish = (error, stdout, stderr) => {
+      if (settled) {
+        return;
+      }
+      recordCommandError(error);
+      settled = true;
+      stopWatchingTermination();
+      removeChildListeners();
       void settleLifecycle().then(
         () => {
-          if (error) {
+          const primaryError = selectPrimaryError();
+          if (primaryError) {
             reject(
               attachSignalToError(
-                error,
+                primaryError,
                 managedLifecycle?.signal,
               ),
             );
@@ -1562,11 +1681,8 @@ export function runManagedExecFile(
           }
         },
         (settleError) => {
-          const primaryError = pendingPrimaryError
-            ? attachErrorDetails(pendingPrimaryError, {
-                terminationError: settleError,
-              })
-            : error ?? settleError;
+          const primaryError =
+            selectPrimaryError(settleError);
           reject(
             attachSignalToError(
               primaryError,
@@ -1584,7 +1700,7 @@ export function runManagedExecFile(
         ...execFileOptions,
         detached: shouldDetachCommand(managedLifecycle),
         onMaxBuffer: (overflowedChild, overflowError) => {
-          pendingPrimaryError = overflowError;
+          pendingMaxBufferError ??= overflowError;
           return managedLifecycle.forceTerminateChild(
             overflowedChild,
           );
@@ -1596,28 +1712,23 @@ export function runManagedExecFile(
     stopWatchingTermination =
       managedLifecycle.watchChildTermination?.(
         child,
-        (terminationError) => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          stopWatchingTermination();
-          removeChildListeners();
-          managedLifecycle.detachChild(child);
-          const primaryError = pendingPrimaryError
-            ? attachErrorDetails(pendingPrimaryError, {
-                terminationError,
-              })
-            : terminationError;
-          reject(
-            attachSignalToError(
-              primaryError,
-              managedLifecycle.signal,
-            ),
-          );
-        },
+        rejectWithTerminationFailure,
       ) ?? stopWatchingTermination;
-    onChildError = (error) => finish(error);
+    onChildError = (error) => {
+      if (settled) {
+        return;
+      }
+      recordCommandError(error);
+      try {
+        const completion =
+          managedLifecycle.forceTerminateChild(child);
+        void completion?.catch?.(
+          rejectWithTerminationFailure,
+        );
+      } catch (terminationError) {
+        rejectWithTerminationFailure(terminationError);
+      }
+    };
     child.once("error", onChildError);
   });
 }
