@@ -1,19 +1,35 @@
 diff --git a/src/App.tsx b/src/App.tsx
-index 53fb39a..3439cb8 100644
+index 53fb39ad9a1980830ea4ecd938326ad9a9c5d02a..3439cb878d8c2634226a8174edc52f957a58d4b0 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -8 +8 @@ import { App as AntdApp } from "antd";
+@@ -5,7 +5,7 @@ import {
+   bailianTheme,
+ } from "@agentscope-ai/design";
+ import { App as AntdApp } from "antd";
 -import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 +import { BrowserRouter, Routes, Route } from "react-router-dom";
-@@ -31,5 +30,0 @@ import { UpdateTakeoverGate } from "./components/UpdateTakeoverPage";
+ import { useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import zhCN from "antd/locale/zh_CN";
+@@ -28,14 +28,8 @@ import { PluginProvider, usePlugins } from "./plugins/PluginContext";
+ import { ApprovalProvider } from "./contexts/ApprovalContext";
+ import { DesktopUpdateProvider } from "./contexts/DesktopUpdateContext";
+ import { UpdateTakeoverGate } from "./components/UpdateTakeoverPage";
 -import { Suspense } from "react";
 -import { lazyImportWithRetry } from "./utils/lazyWithRetry";
 -
 -const LoginPage = lazyImportWithRetry("./pages/Login/index");
 -import { authApi } from "./api/modules/auth";
-@@ -38 +32,0 @@ import { useUploadLimitStore } from "./stores/uploadLimitStore";
+ import { languageApi } from "./api/modules/language";
+ import { useUploadLimitStore } from "./stores/uploadLimitStore";
 -import { getApiUrl, getApiToken, clearAuthToken } from "./api/config";
-@@ -76,27 +70,6 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+ import CloseWindowPrompt from "./tauri/CloseWindowPrompt";
+ import { isTauri } from "@tauri-apps/api/core";
+ import "./styles/layout.css";
+@@ -73,36 +67,20 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+     let cancelled = false;
+     (async () => {
+       try {
 -        const res = await authApi.getStatus();
 -        if (cancelled) return;
 -        if (!res.enabled) {
@@ -47,16 +63,23 @@ index 53fb39a..3439cb8 100644
 +        });
 +        if (!response.ok) {
 +          throw new Error("Failed to check DigitalMate auth status");
-@@ -103,0 +77,5 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+         }
 +        const result = (await response.json()) as {
 +          authenticated?: boolean;
 +        };
 +        if (cancelled) return;
 +        setStatus(result.authenticated === true ? "ok" : "auth-required");
-@@ -105 +83 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+       } catch {
 -        if (!cancelled) setStatus("ok");
 +        if (!cancelled) setStatus("auth-required");
-@@ -114,7 +92 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+       }
+     })();
+     return () => {
+@@ -111,18 +89,29 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+   }, []);
+-
++
+   if (status === "loading") return null;
 -  if (status === "auth-required")
 -    return (
 -      <Navigate
@@ -65,7 +88,10 @@ index 53fb39a..3439cb8 100644
 -      />
 -    );
 +  if (status === "auth-required") return <DigitalMateLoginRedirect />;
-@@ -123,0 +96,8 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+   return <>{children}</>;
+ }
+-
++
 +function DigitalMateLoginRedirect() {
 +  useEffect(() => {
 +    const returnTo = `${window.location.pathname}${window.location.search}`;
@@ -74,7 +100,7 @@ index 53fb39a..3439cb8 100644
 +  return null;
 +}
 +
-@@ -125 +105,10 @@ function getRouterBasename(pathname: string): string | undefined {
+ function getRouterBasename(pathname: string): string | undefined {
 -  return /^\/console(?:\/|$)/.test(pathname) ? "/console" : undefined;
 +  if (
 +    pathname === "/admin-preview" ||
@@ -86,33 +112,59 @@ index 53fb39a..3439cb8 100644
 +    return "/admin";
 +  }
 +  return undefined;
-@@ -214,5 +203 @@ function AppInner() {
+ }
+-
++
+ function AppInner() {
+@@ -211,11 +200,7 @@ function AppInner() {
+                 <Routes>
+                   <Route
+                     path="/login"
 -                    element={
 -                      <Suspense fallback={null}>
 -                        <LoginPage />
 -                      </Suspense>
 -                    }
 +                    element={<DigitalMateLoginRedirect />}
+                   />
+                   <Route
+                     path="/*"
 diff --git a/src/layouts/registry/builtinRoutes.tsx b/src/layouts/registry/builtinRoutes.tsx
-index 48d64ec..e8f9fd1 100644
+index 48d64ec2a55c19d8e929b9e11743017acfbf6148..e8f9fd1935c29b147e3639488bf9307ff985e3c6 100644
 --- a/src/layouts/registry/builtinRoutes.tsx
 +++ b/src/layouts/registry/builtinRoutes.tsx
-@@ -15 +15 @@
+@@ -12,17 +12,13 @@
+  *
+  * Naming convention mirrors builtinMenu: `core.<key>`.
+  */
 -import { Suspense } from "react";
 +import { Suspense, useEffect } from "react";
-@@ -17,2 +16,0 @@ import { Navigate } from "react-router-dom";
+ import { Navigate } from "react-router-dom";
 -import { Spin } from "antd";
 -import { useTranslation } from "react-i18next";
-@@ -20 +17,0 @@ import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
+ import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
 -import { useCodingMode } from "../../stores/codingModeStore";
-@@ -25 +21,0 @@ import type { Route } from "../../plugins/registry/types";
+ import { routeRegistry } from "../../plugins/registry/store";
+ import type { Route } from "../../plugins/registry/types";
+-
++
+ // Eager pages
 -import Chat from "../../pages/Chat";
-@@ -59,2 +55,2 @@ const PluginManagerPage = lazyImportWithRetry(
+ import CodingPage from "../../pages/Coding";
+-
++
+ // Lazy pages
+@@ -56,21 +52,18 @@ const PluginManagerPage = lazyImportWithRetry(
+ );
+-
++
+ /**
 - * "/" lands here. Waits for useSyncCodingMode to populate the store before
 - * deciding between /coding and /chat — see MainLayout.tsx history for why.
 + * "/" lands on the first Console management page. Chat remains on the
 + * DigitalMate home page instead of being duplicated inside the Console.
-@@ -63,11 +59,8 @@ function DefaultRedirect() {
+  */
+ function DefaultRedirect() {
 -  const { t } = useTranslation();
 -  const { codingMode, initialized } = useCodingMode();
 -  if (!initialized) {
@@ -132,6 +184,15 @@ index 48d64ec..e8f9fd1 100644
 +    window.location.assign("/");
 +  }, []);
 +  return null;
-@@ -83 +76 @@ export const BUILTIN_ROUTES: Route[] = [
+ }
+-
++
+ /** Synonym for /acp. Kept for plugins / external links that reference uppercase. */
+@@ -81,6 +74,6 @@ function ACPRedirect() {
+ export const BUILTIN_ROUTES: Route[] = [
+   { id: "core.root", path: "/", component: DefaultRedirect },
 -  { id: "core.chat", path: "/chat/*", component: Chat },
 +  { id: "core.chat", path: "/chat/*", component: DigitalMateHomeRedirect },
+   { id: "core.coding", path: "/coding/*", component: CodingPage },
+   { id: "core.channels", path: "/channels", component: ChannelsPage },
+   { id: "core.sessions", path: "/sessions", component: SessionsPage },

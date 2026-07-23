@@ -1,13 +1,19 @@
 diff --git a/index.html b/index.html
-index 57b0834..542f70b 100644
+index 57b0834ef0a04fc93b2f2222646aa743603d3f22..542f70b95b9d872b9f5cc5a221c0e73248ea069f 100644
 --- a/index.html
 +++ b/index.html
-@@ -10 +10 @@
+@@ -7,7 +7,7 @@
+       name="viewport"
+       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+     />
 -    <title>QwenPaw Console</title>
 +    <title>DigitalMate Console</title>
+   </head>
+   <body>
+     <div id="root"></div>
 diff --git a/public/digitalmate-logo.svg b/public/digitalmate-logo.svg
 new file mode 100644
-index 0000000..a5f0e59
+index 0000000000000000000000000000000000000000..a5f0e5913b861f08ebe2c538132a1a4d6e47fd27
 --- /dev/null
 +++ b/public/digitalmate-logo.svg
 @@ -0,0 +1,12 @@
@@ -25,27 +31,42 @@ index 0000000..a5f0e59
 +</svg>
 diff --git a/src/constants/branding.ts b/src/constants/branding.ts
 new file mode 100644
-index 0000000..98b4ada
+index 0000000000000000000000000000000000000000..98b4adaa91fb0fb933f6abdead2261eae99d5e24
 --- /dev/null
 +++ b/src/constants/branding.ts
 @@ -0,0 +1 @@
 +export const DIGITALMATE_LOGO_URL = `${import.meta.env.BASE_URL}digitalmate-logo.svg`;
 diff --git a/src/contexts/DesktopUpdateContext.tsx b/src/contexts/DesktopUpdateContext.tsx
-index 41e9df6..2234cae 100644
+index 41e9df66783d6261d21a2c871b39bc4b6072e88a..2234cae893079f9a29c4ca5c0c1fb74a9b41b9eb 100644
 --- a/src/contexts/DesktopUpdateContext.tsx
 +++ b/src/contexts/DesktopUpdateContext.tsx
-@@ -12,2 +11,0 @@ import {
+@@ -9,8 +9,6 @@ import {
+   type ReactNode,
+ } from "react";
+ import {
 -  checkDesktopUpdate,
 -  checkCachedUpdate,
-@@ -62,2 +60,2 @@ export function DesktopUpdateProvider({ children }: { children: ReactNode }) {
+   downloadDesktopUpdate,
+   installDesktopUpdate,
+   installDownloadedUpdate,
+@@ -59,10 +57,10 @@ function toErrorMessage(err: unknown): string {
+ export function DesktopUpdateProvider({ children }: { children: ReactNode }) {
+   const [phase, setPhase] = useState<UpdatePhase>("idle");
+   const [isBackground, setIsBackground] = useState(false);
 -  const [hasUpdate, setHasUpdate] = useState(false);
 -  const [supportsLaterInstall, setSupportsLaterInstall] = useState(false);
 +  const hasUpdate = false;
 +  const supportsLaterInstall = false;
-@@ -65 +63 @@ export function DesktopUpdateProvider({ children }: { children: ReactNode }) {
+   const [version, setVersion] = useState("");
 -  const [body, setBody] = useState("");
 +  const body = "";
-@@ -73,35 +70,0 @@ export function DesktopUpdateProvider({ children }: { children: ReactNode }) {
+   const [downloaded, setDownloaded] = useState(0);
+   const [total, setTotal] = useState<number | null>(null);
+   const [throughputBps, setThroughputBps] = useState(0);
+@@ -71,40 +69,5 @@ export function DesktopUpdateProvider({ children }: { children: ReactNode }) {
+   const samplesRef = useRef<{ t: number; downloaded: number }[]>([]);
+-
++
 -  // Probe on mount: check remote update + check cached update on disk.
 -  useEffect(() => {
 -    if (!isDesktopApp()) return;
@@ -81,11 +102,18 @@ index 41e9df6..2234cae 100644
 -    };
 -  }, []);
 -
+   const handleProgress = useCallback((p: UpdateProgress) => {
+     const now = Date.now();
+     samplesRef.current.push({ t: now, downloaded: p.downloaded });
 diff --git a/src/i18n.ts b/src/i18n.ts
-index 08a8da2..f8717e5 100644
+index 08a8da2cb085adfbaa4bf80dfbe63025978e1d9e..f8717e547a86171d1e38272d075fa5fb4faa9132 100644
 --- a/src/i18n.ts
 +++ b/src/i18n.ts
-@@ -35 +35,9 @@ const resources = {
+@@ -32,7 +32,15 @@ const resources = {
+   },
+ };
+-
++
 -i18n.use(initReactI18next).init({
 +const digitalMateBrand = {
 +  type: "postProcessor" as const,
@@ -96,35 +124,80 @@ index 08a8da2..f8717e5 100644
 +};
 +
 +i18n.use(digitalMateBrand).use(initReactI18next).init({
-@@ -43,0 +52 @@ i18n.use(initReactI18next).init({
+   resources,
+   lng: localStorage.getItem("language") || navigator.language || "en",
+   fallbackLng: "en",
+@@ -41,6 +49,7 @@ i18n.use(initReactI18next).init({
+   interpolation: {
+     escapeValue: false,
+   },
 +  postProcess: ["digitalmateBrand"],
+ });
+-
++
+ export default i18n;
 diff --git a/src/layouts/Header.tsx b/src/layouts/Header.tsx
-index ce85f49..33db1a1 100644
+index ce85f49c714e47241084ffe2110a2025354e6bde..33db1a10ff38b593955ce5ad27429f4eef367496 100644
 --- a/src/layouts/Header.tsx
 +++ b/src/layouts/Header.tsx
-@@ -8 +7,0 @@ import {
+@@ -5,7 +5,6 @@ import {
+   Spin,
+   Tooltip,
+   Dropdown,
 -  Popover,
-@@ -28,2 +26,0 @@ import {
+   message,
+ } from "antd";
+ import type { MenuProps } from "antd";
+@@ -25,11 +24,7 @@ import {
+   getFeatureDemosUrl,
+   getFaqUrl,
+   getReleaseNotesUrl,
 -  PYPI_URL,
 -  ONE_HOUR_MS,
-@@ -31,2 +27,0 @@ import {
+   UPDATE_MD,
 -  isStableVersion,
 -  compareVersions,
-@@ -40 +34,0 @@ import remarkGfm from "remark-gfm";
+ } from "./constants";
+ import { useTheme } from "../contexts/ThemeContext";
+ import { useState, useEffect, useRef } from "react";
+@@ -37,8 +32,8 @@ import { invoke } from "@tauri-apps/api/core";
+ import { Slot } from "../plugins/registry/Slot";
+ import ReactMarkdown from "react-markdown";
+ import remarkGfm from "remark-gfm";
 -import { useDesktopUpdate } from "../contexts/DesktopUpdateContext";
-@@ -41,0 +36 @@ import { isDesktopApp } from "../tauri/backendRuntime";
+ import { isDesktopApp } from "../tauri/backendRuntime";
 +import { DIGITALMATE_LOGO_URL } from "../constants/branding";
-@@ -52,3 +46,0 @@ import {
+ import {
+   CopyOutlined,
+   CheckOutlined,
+@@ -49,9 +44,6 @@ import {
+   PlayCircleOutlined,
+   InfoCircleOutlined,
+   DownOutlined,
 -  SyncOutlined,
 -  CheckCircleOutlined,
 -  ExclamationCircleOutlined,
-@@ -86,2 +78 @@ export default function Header() {
+ } from "@ant-design/icons";
+-
++
+ const { Header: AntHeader } = Layout;
+@@ -84,10 +76,8 @@ function UpdateCodeBlock({ code }: { code: string }) {
+ export default function Header() {
+   const { t, i18n } = useTranslation();
 -  const { isDark, setThemeMode } = useTheme();
 -  const desktop = useDesktopUpdate();
 +  const { setThemeMode } = useTheme();
-@@ -90 +80,0 @@ export default function Header() {
+   const onDesktop = isDesktopApp();
+   const [version, setVersion] = useState<string>("");
 -  const [latestVersion, setLatestVersion] = useState<string>("");
-@@ -130,55 +119,0 @@ export default function Header() {
+   const [updateModalOpen, setUpdateModalOpen] = useState(false);
+   const [updateMarkdown, setUpdateMarkdown] = useState<string>("");
+   const logoClicksRef = useRef<number[]>([]);
+@@ -127,61 +117,6 @@ export default function Header() {
+     }
+   };
+-
++
 -  // Web-only PyPI fallback: desktop path is owned by DesktopUpdateContext.
 -  useEffect(() => {
 -    if (onDesktop) return;
@@ -180,10 +253,21 @@ index ce85f49..33db1a1 100644
 -
 -  const modalVersion = onDesktop ? desktop.version : latestVersion;
 -
-@@ -257,2 +191,0 @@ export default function Header() {
+   const resourcesMenuItems: MenuProps["items"] = [
+     {
+       key: "tutorial",
+@@ -254,85 +189,19 @@ export default function Header() {
+   ];
+-
++
+   const handleOpenUpdateModal = () => {
 -    setUpdateMarkdown("");
 -    setUpdateModalOpen(true);
-@@ -264,42 +197,2 @@ export default function Header() {
+     const lang = i18n.language?.startsWith("zh")
+       ? "zh"
+       : i18n.language?.startsWith("ru")
+       ? "ru"
+       : "en";
 -
 -    if (onDesktop) {
 -      setUpdateMarkdown(
@@ -228,7 +312,14 @@ index ce85f49..33db1a1 100644
 -    void desktop.installDownloaded();
 +    setUpdateMarkdown(UPDATE_MD[lang] ?? UPDATE_MD.en);
 +    setUpdateModalOpen(true);
-@@ -312,24 +204,0 @@ export default function Header() {
+   };
+-
++
+   const handleNavClick = (url: string) => {
+     openExternalLink(url);
+   };
+-
++
 -  // Background download/ready state for inline header indicator.
 -  const isBackgroundActive =
 -    onDesktop &&
@@ -253,15 +344,29 @@ index ce85f49..33db1a1 100644
 -    ? `${t(`sidebar.updateModal.backgroundFailed`)}: ${desktop.error.message}`
 -    : t(`sidebar.updateModal.backgroundFailed`);
 -
-@@ -348,2 +217,2 @@ export default function Header() {
+   return (
+     <>
+       <AntHeader className={styles.header}>
+@@ -345,87 +214,26 @@ export default function Header() {
+           */}
+           <Slot name="header.logo" kind="replace">
+             <img
 -              src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
 -              alt="QwenPaw"
 +              src={DIGITALMATE_LOGO_URL}
 +              alt="DigitalMate"
-@@ -356 +225 @@ export default function Header() {
+               className={styles.logoImg}
+             />
+           </Slot>
+           <div className={styles.logoDivider} />
+           {version && (
+             <Badge
 -              dot={!!hasUpdate && !isReady && !isBackgroundActive}
 +              dot={false}
-@@ -361,9 +230,2 @@ export default function Header() {
+               color="rgba(255, 157, 77, 1)"
+               offset={[4, 28]}
+             >
+               <span
 -                className={`${styles.versionBadge} ${
 -                  hasUpdate || isReady
 -                    ? styles.versionBadgeClickable
@@ -273,7 +378,11 @@ index ce85f49..33db1a1 100644
 -                }}
 +                className={`${styles.versionBadge} ${styles.versionBadgeClickable}`}
 +                onClick={handleOpenUpdateModal}
-@@ -375,54 +236,0 @@ export default function Header() {
+               >
+                 v{version}
+               </span>
+             </Badge>
+           )}
 -          {isBackgroundActive && (
 -            <Tooltip title={backgroundDownloadTitle}>
 -              <SyncOutlined
@@ -328,7 +437,13 @@ index ce85f49..33db1a1 100644
 -              />
 -            </Tooltip>
 -          )}
-@@ -480,24 +287,0 @@ export default function Header() {
+         </div>
+         <Slot name="header.left" kind="fill" />
+         <Space size="middle">
+@@ -477,30 +285,6 @@ export default function Header() {
+           <Button key="close" onClick={() => setUpdateModalOpen(false)}>
+             {t("common.close")}
+           </Button>,
 -          onDesktop && desktop.supportsLaterInstall ? (
 -            <Button key="later" onClick={handleUpdateLater}>
 -              {t("sidebar.updateModal.updateLater")}
@@ -353,39 +468,60 @@ index ce85f49..33db1a1 100644
 -              {t("sidebar.updateModal.viewReleases")}
 -            </Button>
 -          ),
-@@ -513 +297 @@ export default function Header() {
+         ].filter(Boolean)}
+         width={960}
+         className={styles.updateModal}
+@@ -510,11 +294,11 @@ export default function Header() {
+           <div className={styles.updateModalBannerLeft}>
+             <span className={styles.updateModalVersionTag}>
+               <TagOutlined />
 -              Version {modalVersion || version}
 +              Version {version}
-@@ -517 +301 @@ export default function Header() {
+             </span>
+             <div className={styles.updateModalBannerTitle}>
+               {t("sidebar.updateModal.title", {
 -                version: modalVersion || version,
 +                version,
+               })}
+             </div>
+           </div>
 diff --git a/src/layouts/constants.ts b/src/layouts/constants.ts
-index 192d3b0..afd74e2 100644
+index 192d3b0fed8030bbc8c988fe67103d287524a0ee..afd74e24c5bb9f70c34c86f48a7ec449099d485e 100644
 --- a/src/layouts/constants.ts
 +++ b/src/layouts/constants.ts
-@@ -80 +79,0 @@ export const compareVersions = (a: string, b: string): number => {
+@@ -77,101 +77,22 @@ export const compareVersions = (a: string, b: string): number => {
+ };
+-
++
+ // ── Update markdown ───────────────────────────────────────────────────────
 -// TODO
-@@ -82 +81 @@ export const UPDATE_MD: Record<string, string> = {
+ export const UPDATE_MD: Record<string, string> = {
 -  zh: `### QwenPaw如何更新
 +  zh: `### DigitalMate如何更新
-@@ -84 +83 @@ export const UPDATE_MD: Record<string, string> = {
+-
++
 -要更新 QwenPaw 到最新版本，可根据你的安装方式选择对应方法：
 +DigitalMate Console 作为主应用 \`/admin\` 的一部分统一发布，不支持在 Console 内单独更新。
-@@ -86 +85 @@ export const UPDATE_MD: Record<string, string> = {
+-
++
 -1. 如果你使用的是一键安装脚本，直接重新运行安装命令即可自动升级。
 +请通过当前 DigitalMate 部署环境的既有发布流程更新整个应用。具体版本、构建与发布步骤以本仓库及部署环境的说明为准。`,
-@@ -88 +87 @@ export const UPDATE_MD: Record<string, string> = {
+-
++
 -2. 如果你是通过 pip 安装，在终端中执行以下命令升级：
 +  ru: `### Как обновить DigitalMate
-@@ -90,3 +89 @@ export const UPDATE_MD: Record<string, string> = {
+-
++
 -\`\`\`
 -qwenpaw update
 -\`\`\`
 +DigitalMate Console публикуется вместе с основным приложением по адресу \`/admin\` и не обновляется отдельно из Console.
-@@ -94 +91 @@ qwenpaw update
+-
++
 -3. 如果你是从源码安装，进入项目目录并拉取最新代码后重新安装：
 +Обновляйте всё приложение через существующий процесс развертывания DigitalMate. Сведения о версии, сборке и публикации берите из текущего репозитория и среды развертывания.`,
-@@ -96,8 +93 @@ qwenpaw update
+-
++
 -\`\`\`
 -cd QwenPaw
 -git pull origin main
@@ -395,10 +531,12 @@ index 192d3b0..afd74e2 100644
 -pip install -e .
 -\`\`\`
 +  en: `### How to update DigitalMate
-@@ -105 +95 @@ pip install -e .
+-
++
 -4. 如果你使用的是 Docker，拉取最新镜像并重启容器：
 +DigitalMate Console is released with the host application at \`/admin\` and cannot be updated independently from inside Console.
-@@ -107,70 +97 @@ pip install -e .
+-
++
 -\`\`\`
 -docker pull agentscope/qwenpaw:latest
 -docker run -p 127.0.0.1:8088:8088 -v qwenpaw-data:/app/working -v qwenpaw-secrets:/app/working.secret -v qwenpaw-backups:/app/working.backups agentscope/qwenpaw:latest
@@ -470,93 +608,190 @@ index 192d3b0..afd74e2 100644
 -
 -After upgrading, restart the service with \`qwenpaw app\`.`,
 +Update the complete application through the existing DigitalMate deployment workflow. Use this repository and the target deployment environment as the source of truth for version, build, and release steps.`,
+ };
 diff --git a/src/layouts/index.module.less b/src/layouts/index.module.less
-index 32443a0..c719394 100644
+index 32443a037535fd7a8b48d0d74a22ea8cc9dec410..c719394e66fc5c15f3f083b727090a3e72d4b7df 100644
 --- a/src/layouts/index.module.less
 +++ b/src/layouts/index.module.less
-@@ -747,2 +747,2 @@
+@@ -744,8 +744,8 @@
+ }
+-
++
+ .updateModalBanner {
 -  background: url("/public/qwenpawBack.png") no-repeat center top;
 -  background-size: contain;
 +  background: linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%);
 +  border-top: 3px solid #e8684a;
+   padding: 48px 28px 0px;
+   display: flex;
+   align-items: flex-start;
 diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
-index 4c903f0..05e7203 100644
+index 4c903f0891d626b8654648b1bac8ee6c56935cde..05e7203330a07060306ace8213a4150eaff4083c 100644
 --- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
 +++ b/src/pages/Chat/OptionsPanel/defaultConfig.ts
-@@ -10 +10 @@ const defaultConfig = {
+@@ -7,7 +7,7 @@ const defaultConfig = {
+     prefix: "qwenpaw",
+     leftHeader: {
+       logo: "",
 -      title: "Work with QwenPaw",
 +      title: "Work with DigitalMate",
+     },
+     bubbleList: {
+       userMessageAnchors: {
 diff --git a/src/pages/Chat/index.tsx b/src/pages/Chat/index.tsx
-index 3ff65b9..a89d424 100644
+index 3ff65b997ac52ba155827331abb5ee2f768693d3..a89d42482ec44dfa79026291e40c65e1413d74c6 100644
 --- a/src/pages/Chat/index.tsx
 +++ b/src/pages/Chat/index.tsx
-@@ -22,0 +23 @@ import { buildAuthHeaders } from "../../api/authHeaders";
+@@ -20,6 +20,7 @@ import { agentApi } from "../../api/modules/agent";
+ import { skillApi } from "../../api/modules/skill";
+ import { getApiUrl } from "../../api/config";
+ import { buildAuthHeaders } from "../../api/authHeaders";
 +import { DIGITALMATE_LOGO_URL } from "../../constants/branding";
-@@ -2752,2 +2753,2 @@ export default function ChatPage() {
+ import { providerApi } from "../../api/modules/provider";
+ import type { ProviderInfo, ModelInfo, SkillSpec } from "../../api/types";
+ import ModelSelector from "./ModelSelector";
+@@ -2749,8 +2750,8 @@ export default function ChatPage() {
+       },
+       welcome: {
+         ...i18nConfig.welcome,
 -        nick: extNick ?? "QwenPaw",
 -        avatar: extAvatar ?? "/qwenpaw.png",
 +        nick: extNick ?? "DigitalMate",
 +        avatar: extAvatar ?? DIGITALMATE_LOGO_URL,
+         ...(extGreeting !== undefined ? { greeting: extGreeting } : {}),
+         ...(extDescription !== undefined
+           ? { description: extDescription }
 diff --git a/src/pages/Login/index.tsx b/src/pages/Login/index.tsx
-index 9604940..f9df52a 100644
+index 9604940d8874fb00fadedc741b93c9360c559059..f9df52a812c76017cf5ae65fd2f23e0c2ff0bef3 100644
 --- a/src/pages/Login/index.tsx
 +++ b/src/pages/Login/index.tsx
-@@ -9,0 +10 @@ import { useTheme } from "../../contexts/ThemeContext";
+@@ -7,6 +7,7 @@ import { LockOutlined, UserOutlined } from "@ant-design/icons";
+ import { authApi } from "../../api/modules/auth";
+ import { setAuthToken } from "../../api/config";
+ import { useTheme } from "../../contexts/ThemeContext";
 +import { DIGITALMATE_LOGO_URL } from "../../constants/branding";
-@@ -103,2 +104,2 @@ export default function LoginPage() {
+-
++
+ export default function LoginPage() {
+   const { t } = useTranslation();
+@@ -100,8 +101,8 @@ export default function LoginPage() {
+       >
+         <div style={{ textAlign: "center", marginBottom: 32 }}>
+           <img
 -            src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
 -            alt="QwenPaw"
 +            src={DIGITALMATE_LOGO_URL}
 +            alt="DigitalMate"
+             style={{ height: 48, marginBottom: 12 }}
+           />
+           <h2 style={{ margin: 0, fontWeight: 600, fontSize: 20 }}>
 diff --git a/src/pages/Settings/Market/components/SkillIcon.tsx b/src/pages/Settings/Market/components/SkillIcon.tsx
-index 8c19007..fe2360c 100644
+index 8c19007aad73e6eb93fbcba12c31306db67f83fb..fe2360c33dff1323285b0a88e006c54b2c249837 100644
 --- a/src/pages/Settings/Market/components/SkillIcon.tsx
 +++ b/src/pages/Settings/Market/components/SkillIcon.tsx
-@@ -5 +5 @@ export const SOURCE_LABELS: Record<string, string> = {
+@@ -2,7 +2,7 @@ import { useState } from "react";
+ import styles from "./SkillIcon.module.less";
+-
++
+ export const SOURCE_LABELS: Record<string, string> = {
 -  qwenpaw: "QwenPaw",
 +  qwenpaw: "DigitalMate",
+   clawhub: "ClawHub",
+   modelscope: "ModelScope",
+   aliyun: "Aliyun",
 diff --git a/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx b/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
-index b1c8842..616c3a6 100644
+index b1c88428d18c3100ac887953b40585dece14fa15..616c3a69bced9b2c67abcd4f5b53ef68e686c95d 100644
 --- a/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
 +++ b/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
-@@ -105 +105 @@ describe("MarketPluginList", () => {
+@@ -102,7 +102,7 @@ describe("MarketPluginList", () => {
+     expect(invoke).not.toHaveBeenCalled();
+   });
+-
++
 -  it("shows the QwenPaw compatibility versions returned by the market", () => {
 +  it("shows the DigitalMate compatibility versions returned by the market", () => {
-@@ -115 +115 @@ describe("MarketPluginList", () => {
+     hoisted.plugins.push(
+       makePlugin("https://platform.agentscope.io/plugins/agentscope/demo", [
+         "1.x",
+@@ -113,5 +113,5 @@ describe("MarketPluginList", () => {
+     render(<MarketPluginList onInstalled={vi.fn()} />);
+-
++
 -    expect(screen.getByText("QwenPaw 1.x, 2.x")).toBeInTheDocument();
 +    expect(screen.getByText("DigitalMate 1.x, 2.x")).toBeInTheDocument();
+   });
+ });
 diff --git a/src/pages/Settings/PluginManager/components/MarketPluginList.tsx b/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
-index e410e4b..c02afc9 100644
+index e410e4be700fd3472008cfdbafce2e2377889074..c02afc9dbf8f4765467a8b7713dbd89f4b054821 100644
 --- a/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
 +++ b/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
-@@ -200 +200 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+@@ -197,7 +197,7 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                         color={isCompatible(entry) ? "green" : "orange"}
+                         style={{ margin: 0, fontSize: 11 }}
+                       >
 -                        {`QwenPaw ${entry.qwenpaw_compat_labels.join(", ")}`}
 +                        {`DigitalMate ${entry.qwenpaw_compat_labels.join(", ")}`}
-@@ -237 +237 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                       </Tag>
+                     )}
+                 </div>
+@@ -234,9 +234,9 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                 <Tooltip
+                   title={
+                     !isCompatible(entry)
 -                      ? `This plugin is labeled for QwenPaw ${
 +                      ? `This plugin is labeled for DigitalMate ${
-@@ -239 +239 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                           entry.qwenpaw_compat_labels?.join(", ") ?? "unknown"
 -                        }; compatibility with QwenPaw ${
 +                        }; compatibility with DigitalMate ${
-@@ -262 +262 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                           qwenpawVersion ?? "unknown"
+                         } is unverified.`
+                       : undefined
+@@ -259,7 +259,7 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                           ),
+                           content: t("pluginManager.compatWarningContent", {
+                             defaultValue:
 -                              "This plugin is labeled for QwenPaw {{labels}}. Your QwenPaw version is {{version}}. Installing it may cause errors. Are you sure you want to continue?",
 +                              "This plugin is labeled for DigitalMate {{labels}}. Your DigitalMate version is {{version}}. Installing it may cause errors. Are you sure you want to continue?",
+                             labels:
+                               entry.qwenpaw_compat_labels?.join(", ") ??
+                               "unknown",
 diff --git a/src/tauri/BackendLoadingPage.tsx b/src/tauri/BackendLoadingPage.tsx
-index 19fa2ae..168b06c 100644
+index 19fa2ae6ea10748321f9014f3dc8efbca73a2032..168b06c8a5d5f13999b1a27326da1d9e336486d6 100644
 --- a/src/tauri/BackendLoadingPage.tsx
 +++ b/src/tauri/BackendLoadingPage.tsx
-@@ -6,0 +7 @@ import { type BackendReadyStatus } from "./useBackendReadyPolling";
+@@ -4,6 +4,7 @@ import { useTheme } from "../contexts/ThemeContext";
+ import { useTranslation } from "react-i18next";
+ import styles from "./BackendLoadingPage.module.less";
+ import { type BackendReadyStatus } from "./useBackendReadyPolling";
 +import { DIGITALMATE_LOGO_URL } from "../constants/branding";
-@@ -55 +56,5 @@ export default function BackendLoadingPage({
+-
++
+ const BRAND_COLOR = "#ff7f16";
+ const ERROR_COLOR = "#ff4d4f";
+@@ -52,7 +53,11 @@ export default function BackendLoadingPage({
+       style={style}
+     >
+       <div className={styles.card}>
 -        <img src="/qwenpaw.png" alt="QwenPaw" className={styles.logo} />
 +        <img
 +          src={DIGITALMATE_LOGO_URL}
 +          alt="DigitalMate"
 +          className={styles.logo}
 +        />
+-
++
+         <Progress
+           type="dashboard"
 diff --git a/vite.config.ts b/vite.config.ts
-index 1893f14..abbd384 100644
+index 1893f146c1c679a7d4408d7f67ba7e08dbd7d87c..abbd3848c6898e05e35f4952ff5f8628df7e0c0c 100644
 --- a/vite.config.ts
 +++ b/vite.config.ts
-@@ -23,0 +24 @@ export default defineConfig(({ mode }) => {
+@@ -21,6 +21,7 @@ export default defineConfig(({ mode }) => {
+   const apiBaseUrl = env.VITE_API_BASE_URL ?? "";
+-
++
+   return {
 +    base: "/_admin-console/",
+     define: {
+       VITE_API_BASE_URL: JSON.stringify(apiBaseUrl),
+       TOKEN: JSON.stringify(env.TOKEN || ""),

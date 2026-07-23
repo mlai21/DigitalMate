@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   access,
   chmod,
@@ -14,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   PATCHES,
@@ -29,6 +31,7 @@ import * as consoleTestScript from "../../scripts/qwenpaw-console/test.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
 
 const { UPSTREAM } = qwenpawSync;
+const execFileAsync = promisify(execFile);
 const SNAPSHOT_ROOT = path.resolve("vendor/qwenpaw-console");
 const SOURCE_MAPPING_CASES = [
   {
@@ -820,17 +823,59 @@ describe("QwenPaw Console patch preparation", () => {
     expect(PATCHES[0]).toBe("0001-brand.patch");
   });
 
-  it("四个补丁使用零上下文格式且没有行尾空白", async () => {
+  it("四个补丁使用普通 unified diff 上下文且没有行尾空白", async () => {
     for (const patchName of PATCHES) {
       const patchSource = await readFile(
         path.resolve("patches/qwenpaw-console", patchName),
         "utf8",
       );
       expect.soft(patchSource).toMatch(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m);
-      expect.soft(patchSource).not.toMatch(/^ .+$/m);
+      const modifiedFileSections = patchSource
+        .split(/^diff --git /m)
+        .slice(1)
+        .filter((section) => !/^(?:new|deleted) file mode /m.test(section));
+      expect.soft(modifiedFileSections.length).toBeGreaterThan(0);
+      for (const section of modifiedFileSections) {
+        const hunks = section.split(/^@@ .*@@.*$/m).slice(1);
+        expect.soft(hunks.length).toBeGreaterThan(0);
+        for (const hunk of hunks) {
+          expect.soft(hunk).toMatch(/^ .*\S.*$/m);
+        }
+      }
       expect.soft(patchSource).not.toMatch(/[ \t]+$/m);
     }
   });
+
+  it("生产准备路径与全新 vendor 副本均使用普通 git apply", async () => {
+    const prepareSource = await readFile(
+      path.resolve("scripts/qwenpaw-console/prepare.mjs"),
+      "utf8",
+    );
+    expect(prepareSource).not.toContain("--unidiff-zero");
+
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-ordinary-apply-"),
+    );
+    const workdir = path.join(temporaryRoot, "console");
+
+    try {
+      await cp(path.join(SNAPSHOT_ROOT, "console"), workdir, {
+        recursive: true,
+      });
+      for (const patchName of PATCHES) {
+        const patchPath = path.resolve(
+          "patches/qwenpaw-console",
+          patchName,
+        );
+        await execFileAsync("git", ["apply", "--check", patchPath], {
+          cwd: workdir,
+        });
+        await execFileAsync("git", ["apply", patchPath], { cwd: workdir });
+      }
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it("keep=false 清理目录后不返回失效路径", async () => {
     const result = await prepareConsole();
