@@ -2,6 +2,28 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+const AGENT_SCOPED_TABLES = [
+  "projects",
+  "conversations",
+  "messages",
+  "message_attachments",
+  "conversation_summaries",
+  "memory_entries",
+  "tool_call_logs",
+  "proactive_tasks",
+  "channel_identities",
+  "channel_messages",
+  "interjection_decisions",
+  "reflections",
+  "skill_usage_logs",
+  "task_runs",
+  "task_artifacts",
+  "llm_usage_logs",
+  "memory_jobs",
+  "goals",
+  "goal_steps",
+] as const;
+
 describe("database schema", () => {
   it("defines P0 business tables with user ownership", async () => {
     const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
@@ -83,5 +105,41 @@ describe("database schema", () => {
     expect(schema).toContain("ALTER TABLE IF EXISTS tool_call_logs ADD COLUMN IF NOT EXISTS goal_id uuid REFERENCES goals(id)");
     expect(schema).toContain("CREATE INDEX IF NOT EXISTS idx_goals_due ON goals(next_run_at) WHERE status = 'running'");
     expect(schema).toContain("idx_goal_steps_goal");
+  });
+
+  it("defines the default digital agent boundary for every agent-scoped table", async () => {
+    const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS digital_agents");
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS agent_resource_grants");
+    expect(schema).toContain("idx_digital_agents_one_default");
+    expect(schema).toContain("UNIQUE (user_id, id)");
+    expect(schema).toContain("-- BEGIN DEFAULT DIGITAL AGENT MIGRATION");
+
+    for (const table of AGENT_SCOPED_TABLES) {
+      expect(schema).toContain(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS agent_id uuid`);
+    }
+
+    expect(schema).toContain("idx_messages_client_turn_agent_role");
+    expect(schema).toContain("ON messages(user_id, agent_id, client_turn_id, role)");
+    expect(schema).toContain("idx_channel_identities_agent_external_user");
+    expect(schema).toContain("idx_channel_messages_agent_external_message");
+    expect(schema.indexOf("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role")).toBeLessThan(
+      schema.indexOf("DROP INDEX IF EXISTS idx_messages_client_turn_role"),
+    );
+    expect(schema.indexOf("CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_identities_agent_external_user")).toBeLessThan(
+      schema.indexOf("DROP CONSTRAINT IF EXISTS channel_identities_channel_external_user_id_key"),
+    );
+  });
+
+  it("seeds the default agent before the default conversation without a future repository API", async () => {
+    const seed = await readFile(path.join(process.cwd(), "src/server/db/seed.ts"), "utf8");
+
+    expect(seed).toContain("INSERT INTO digital_agents");
+    expect(seed).toContain("ON CONFLICT (user_id, slug)");
+    expect(seed).toContain("INSERT INTO conversations (user_id, agent_id, title)");
+    expect(seed.indexOf("INSERT INTO digital_agents")).toBeLessThan(seed.indexOf("INSERT INTO conversations"));
+    expect(seed).not.toContain("repositories.agents");
+    expect(seed).not.toContain("getOrCreateDefault(user.id)");
   });
 });

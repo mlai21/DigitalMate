@@ -368,14 +368,484 @@ CREATE TABLE IF NOT EXISTS goal_steps (
 
 ALTER TABLE IF EXISTS tool_call_logs ADD COLUMN IF NOT EXISTS goal_id uuid REFERENCES goals(id) ON DELETE SET NULL;
 
+-- BEGIN DEFAULT DIGITAL AGENT MIGRATION
+
+CREATE TABLE IF NOT EXISTS digital_agents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  slug text NOT NULL,
+  display_name text NOT NULL,
+  persona jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'archived')),
+  is_default boolean NOT NULL DEFAULT false,
+  inherits_user_resources boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, slug),
+  UNIQUE (user_id, id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_digital_agents_one_default
+  ON digital_agents(user_id)
+  WHERE is_default = true;
+
+CREATE TABLE IF NOT EXISTS agent_resource_grants (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  resource_type text NOT NULL CHECK (resource_type IN ('model', 'skill', 'tool')),
+  resource_id text NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, resource_type, resource_id),
+  CONSTRAINT agent_resource_grants_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE
+);
+
+INSERT INTO digital_agents (user_id, slug, display_name, persona, is_default)
+SELECT users.id, 'digitalmate', 'DigitalMate', COALESCE(settings.persona, '{}'::jsonb), true
+FROM users
+LEFT JOIN settings ON settings.user_id = users.id
+ON CONFLICT (user_id, slug) DO UPDATE
+SET is_default = true,
+    updated_at = now();
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE conversation_summaries ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE tool_call_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE proactive_tasks ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE channel_identities ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE channel_messages ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE interjection_decisions ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE reflections ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE skill_usage_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE llm_usage_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE goals ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE goal_steps ADD COLUMN IF NOT EXISTS agent_id uuid;
+
+UPDATE projects AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE channel_identities AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE reflections AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE conversations AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM projects AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.project_id;
+
+UPDATE conversations AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE messages AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE proactive_tasks AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE message_attachments AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM messages AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.message_id;
+
+UPDATE message_attachments AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE conversation_summaries AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE memory_entries AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM messages AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.source_message_id;
+
+UPDATE memory_entries AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE goals AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE goals AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE tool_call_logs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM messages AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.message_id;
+
+UPDATE tool_call_logs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE tool_call_logs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM goals AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.goal_id;
+
+UPDATE tool_call_logs AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE channel_messages AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE channel_messages AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE interjection_decisions AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM channel_messages AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.channel_message_id;
+
+UPDATE interjection_decisions AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE interjection_decisions AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE skill_usage_logs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE skill_usage_logs AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE task_runs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE task_runs AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE task_artifacts AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM task_runs AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.task_run_id;
+
+UPDATE llm_usage_logs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE llm_usage_logs AS scoped_row
+SET agent_id = default_agent.id
+FROM digital_agents AS default_agent
+WHERE scoped_row.agent_id IS NULL
+  AND default_agent.user_id = scoped_row.user_id
+  AND default_agent.is_default = true;
+
+UPDATE memory_jobs AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM conversations AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.conversation_id;
+
+UPDATE goal_steps AS scoped_row
+SET agent_id = parent_row.agent_id
+FROM goals AS parent_row
+WHERE scoped_row.agent_id IS NULL
+  AND parent_row.id = scoped_row.goal_id;
+
+DO $agent_scope_not_null$
+DECLARE
+  table_name text;
+  has_null boolean;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'projects', 'conversations', 'messages', 'message_attachments',
+    'conversation_summaries', 'memory_entries', 'tool_call_logs',
+    'proactive_tasks', 'channel_identities', 'channel_messages',
+    'interjection_decisions', 'reflections', 'skill_usage_logs',
+    'task_runs', 'task_artifacts', 'llm_usage_logs', 'memory_jobs',
+    'goals', 'goal_steps'
+  ]
+  LOOP
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I WHERE agent_id IS NULL)', table_name)
+      INTO has_null;
+    IF has_null THEN
+      RAISE EXCEPTION 'agent_scope_backfill_failed:%', table_name
+        USING ERRCODE = '23502';
+    END IF;
+    EXECUTE format('ALTER TABLE %I ALTER COLUMN agent_id SET NOT NULL', table_name);
+  END LOOP;
+END
+$agent_scope_not_null$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_scope_identity
+  ON projects(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_scope_identity
+  ON conversations(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_scope_identity
+  ON messages(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_tasks_scope_identity
+  ON proactive_tasks(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_scope_identity
+  ON channel_messages(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_scope_identity
+  ON task_runs(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goals_scope_identity
+  ON goals(id, user_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goals_agent_identity
+  ON goals(id, agent_id);
+
+DO $agent_scope_owner_constraints$
+DECLARE
+  table_name text;
+  constraint_name text;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'projects', 'conversations', 'messages', 'message_attachments',
+    'conversation_summaries', 'memory_entries', 'tool_call_logs',
+    'proactive_tasks', 'channel_identities', 'channel_messages',
+    'interjection_decisions', 'reflections', 'skill_usage_logs',
+    'task_runs', 'task_artifacts', 'llm_usage_logs', 'memory_jobs', 'goals'
+  ]
+  LOOP
+    constraint_name := table_name || '_user_agent_fkey';
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint
+      WHERE conrelid = to_regclass(table_name)
+        AND conname = constraint_name
+    ) THEN
+      EXECUTE format(
+        'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (user_id, agent_id) REFERENCES digital_agents(user_id, id) ON DELETE CASCADE',
+        table_name,
+        constraint_name
+      );
+    END IF;
+  END LOOP;
+END
+$agent_scope_owner_constraints$;
+
+DO $agent_scope_required_parent_constraints$
+DECLARE
+  relation_definition text;
+  child_table text;
+  child_column text;
+  parent_table text;
+  constraint_name text;
+BEGIN
+  FOREACH relation_definition IN ARRAY ARRAY[
+    'messages|conversation_id|conversations|messages_conversation_scope_fkey',
+    'message_attachments|message_id|messages|message_attachments_message_scope_fkey',
+    'conversation_summaries|conversation_id|conversations|conversation_summaries_conversation_scope_fkey',
+    'proactive_tasks|conversation_id|conversations|proactive_tasks_conversation_scope_fkey',
+    'task_artifacts|task_run_id|task_runs|task_artifacts_task_run_scope_fkey',
+    'memory_jobs|conversation_id|conversations|memory_jobs_conversation_scope_fkey'
+  ]
+  LOOP
+    child_table := split_part(relation_definition, '|', 1);
+    child_column := split_part(relation_definition, '|', 2);
+    parent_table := split_part(relation_definition, '|', 3);
+    constraint_name := split_part(relation_definition, '|', 4);
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint
+      WHERE conrelid = to_regclass(child_table)
+        AND conname = constraint_name
+    ) THEN
+      EXECUTE format(
+        'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I, user_id, agent_id) REFERENCES %I(id, user_id, agent_id) ON DELETE CASCADE',
+        child_table,
+        constraint_name,
+        child_column,
+        parent_table
+      );
+    END IF;
+  END LOOP;
+END
+$agent_scope_required_parent_constraints$;
+
+DO $agent_scope_optional_parent_constraints$
+DECLARE
+  relation_definition text;
+  child_table text;
+  child_column text;
+  parent_table text;
+  constraint_name text;
+BEGIN
+  FOREACH relation_definition IN ARRAY ARRAY[
+    'conversations|project_id|projects|conversations_project_scope_fkey',
+    'messages|source_task_id|proactive_tasks|messages_source_task_scope_fkey',
+    'memory_entries|source_message_id|messages|memory_entries_source_message_scope_fkey',
+    'tool_call_logs|conversation_id|conversations|tool_call_logs_conversation_scope_fkey',
+    'tool_call_logs|message_id|messages|tool_call_logs_message_scope_fkey',
+    'tool_call_logs|goal_id|goals|tool_call_logs_goal_scope_fkey',
+    'channel_messages|conversation_id|conversations|channel_messages_conversation_scope_fkey',
+    'interjection_decisions|conversation_id|conversations|interjection_decisions_conversation_scope_fkey',
+    'interjection_decisions|channel_message_id|channel_messages|interjection_decisions_channel_message_scope_fkey',
+    'skill_usage_logs|conversation_id|conversations|skill_usage_logs_conversation_scope_fkey',
+    'task_runs|conversation_id|conversations|task_runs_conversation_scope_fkey',
+    'llm_usage_logs|conversation_id|conversations|llm_usage_logs_conversation_scope_fkey',
+    'goals|conversation_id|conversations|goals_conversation_scope_fkey'
+  ]
+  LOOP
+    child_table := split_part(relation_definition, '|', 1);
+    child_column := split_part(relation_definition, '|', 2);
+    parent_table := split_part(relation_definition, '|', 3);
+    constraint_name := split_part(relation_definition, '|', 4);
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint
+      WHERE conrelid = to_regclass(child_table)
+        AND conname = constraint_name
+    ) THEN
+      EXECUTE format(
+        'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I, user_id, agent_id) REFERENCES %I(id, user_id, agent_id) ON DELETE SET NULL (%I)',
+        child_table,
+        constraint_name,
+        child_column,
+        parent_table,
+        child_column
+      );
+    END IF;
+  END LOOP;
+END
+$agent_scope_optional_parent_constraints$;
+
+DO $goal_steps_agent_constraints$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'goal_steps'::regclass
+      AND conname = 'goal_steps_agent_id_fkey'
+  ) THEN
+    ALTER TABLE goal_steps
+      ADD CONSTRAINT goal_steps_agent_id_fkey
+      FOREIGN KEY (agent_id)
+      REFERENCES digital_agents(id)
+      ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'goal_steps'::regclass
+      AND conname = 'goal_steps_goal_agent_fkey'
+  ) THEN
+    ALTER TABLE goal_steps
+      ADD CONSTRAINT goal_steps_goal_agent_fkey
+      FOREIGN KEY (goal_id, agent_id)
+      REFERENCES goals(id, agent_id)
+      ON DELETE CASCADE;
+  END IF;
+END
+$goal_steps_agent_constraints$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role
+  ON messages(user_id, agent_id, client_turn_id, role)
+  WHERE client_turn_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task_agent
+  ON messages(agent_id, source_task_id)
+  WHERE source_task_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_identities_agent_external_user
+  ON channel_identities(agent_id, channel, external_user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_agent_external_message
+  ON channel_messages(agent_id, channel, external_message_id);
+
+DROP INDEX IF EXISTS idx_messages_client_turn_role;
+DROP INDEX IF EXISTS idx_messages_source_task;
+ALTER TABLE channel_identities
+  DROP CONSTRAINT IF EXISTS channel_identities_channel_external_user_id_key;
+ALTER TABLE channel_messages
+  DROP CONSTRAINT IF EXISTS channel_messages_channel_external_message_id_key;
+
 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role
-  ON messages(user_id, client_turn_id, role)
-  WHERE client_turn_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task ON messages(source_task_id) WHERE source_task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(status, created_at) WHERE message_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
