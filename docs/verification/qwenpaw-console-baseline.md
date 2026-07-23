@@ -69,7 +69,7 @@ Console 构建继续报告上游既有 peer dependency、循环 chunk、大 chun
 |---|---|---:|---|
 | 许可与元数据存在 | `test -f vendor/qwenpaw-console/LICENSE && test -f vendor/qwenpaw-console/UPSTREAM.md && test -f vendor/qwenpaw-console/SHA256SUMS` | 0 | Apache License 2.0、来源说明与哈希清单齐全 |
 | 清单摘要与逐文件校验 | `shasum -a 256 vendor/qwenpaw-console/SHA256SUMS && (cd vendor/qwenpaw-console && shasum -a 256 -c SHA256SUMS --quiet)` | 0 | 864 项逐一通过；清单 SHA-256 为 `04459760c48b596c2521dbfcd182660c5784adbecc654ed98d3eb4dc7e85a53a`，与 `UPSTREAM.md` 一致 |
-| 构建产物原始品牌扫描 | `rg -n 'QwenPaw|Qwen' public/_admin-console --glob '*.js' --glob '*.html'` | 0 | 仅 1 个主 bundle 命中；分类如下 |
+| 构建产物原始品牌扫描 | `rg -n -e 'QwenPaw' -e 'Qwen' public/_admin-console --glob '*.js' --glob '*.html'` | 0 | 仅 1 个主 bundle 命中；分类如下 |
 | `QwenPaw` 原始命中计数 | `rg -o 'QwenPaw' public/_admin-console --glob '*.js' --glob '*.html' \| wc -l` | 0 | 97 次 |
 | 独立 `Qwen` 原始命中计数 | `rg -o --pcre2 'Qwen(?!Paw)' public/_admin-console --glob '*.js' --glob '*.html' \| wc -l` | 0 | 14 次 |
 
