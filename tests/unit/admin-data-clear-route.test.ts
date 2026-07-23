@@ -118,6 +118,56 @@ describe("admin personal data clear route", () => {
     consoleError.mockRestore();
   });
 
+  it("keeps all data and releases the mutation lock when disconnect fails before a successful retry", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+    await saveAttachment(root, OWNED_KEY, Buffer.from("owned"));
+    let mutationLockHeld = false;
+    let successfulAcquisitions = 0;
+    mocks.acquireUserMutationLock.mockImplementation(async () => {
+      if (mutationLockHeld) throw new Error("mutation_lock_still_held");
+      mutationLockHeld = true;
+      successfulAcquisitions += 1;
+      return vi.fn(async () => {
+        mutationLockHeld = false;
+        await mocks.releaseUserMutationLock();
+      });
+    });
+    mocks.disconnectUser
+      .mockImplementationOnce(async () => {
+        mocks.callOrder.push("disconnect");
+        throw new Error("disconnect_failed");
+      })
+      .mockImplementationOnce(async () => {
+        mocks.callOrder.push("disconnect");
+      });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const failedResponse = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(failedResponse.status).toBe(500);
+    await expect(failedResponse.json()).resolves.toEqual({ error: "personal_data_clear_failed" });
+    expect(mocks.listAttachmentStorageKeys).not.toHaveBeenCalled();
+    expect(mocks.deleteArtifactTree).not.toHaveBeenCalled();
+    expect(mocks.clear).not.toHaveBeenCalled();
+    await expect(readAttachment(root, OWNED_KEY)).resolves.toEqual(Buffer.from("owned"));
+    expect(mutationLockHeld).toBe(false);
+    expect(successfulAcquisitions).toBe(1);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+
+    const retryResponse = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(retryResponse.status).toBe(303);
+    expect(successfulAcquisitions).toBe(2);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(2);
+    expect(mocks.listAttachmentStorageKeys).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteArtifactTree).toHaveBeenCalledTimes(1);
+    expect(mocks.clear).toHaveBeenCalledTimes(1);
+    await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
+    consoleError.mockRestore();
+  });
+
   it("does not clear database rows when artifact deletion fails", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
     roots.push(root);

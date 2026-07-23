@@ -1,4 +1,9 @@
 export type UserConnectionDisconnector = {
+  /**
+   * Settles before any physical or database deletion starts. Rejecting aborts
+   * the clear operation, leaves persisted locators intact, and must be safe
+   * for the caller to retry after releasing its user mutation lock.
+   */
   disconnectUser(userId: string): Promise<void>;
 };
 
