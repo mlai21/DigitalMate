@@ -88,6 +88,7 @@ export const QWENPAW_CONSOLE_ROUTE_BASELINES = [
     expectedPath: "/models",
     routeId: "core.models",
     marker: "重 试",
+    caseInsensitivePath: "/MODELS",
   },
   {
     route: "/environments",

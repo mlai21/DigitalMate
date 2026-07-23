@@ -25,10 +25,12 @@ export default defineConfig({
     },
     {
       name: "iPad Mini",
+      testMatch: "**/admin-console-preview.spec.ts",
       use: { ...devices["iPad Mini"], browserName: "chromium" },
     },
     {
       name: "Mobile Chrome",
+      testMatch: "**/admin-console-preview.spec.ts",
       use: { ...devices["Pixel 5"] },
     },
   ],

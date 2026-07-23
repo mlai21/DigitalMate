@@ -1866,13 +1866,15 @@ diff --git a/src/layouts/MainLayout/index.tsx b/src/layouts/MainLayout/index.tsx
              <ChunkErrorBoundary resetKey={currentPath}>
                <Suspense
                  fallback={
-@@ -68,7 +71,12 @@ export default function MainLayout() {
+@@ -68,7 +71,14 @@ export default function MainLayout() {
                >
                  <Routes>
                    {routes.map((r) => (
 -                    <Route key={r.id} path={r.path} element={<r.Component />} />
 +                    <Route
-+                      caseSensitive
++                      caseSensitive={
++                        r.id === "core.acp" || r.id === "core.acp-alias"
++                      }
 +                      key={r.id}
 +                      path={r.path}
 +                      element={<r.Component />}
@@ -1883,11 +1885,19 @@ diff --git a/src/layouts/MainLayout/index.tsx b/src/layouts/MainLayout/index.tsx
 diff --git a/src/layouts/Sidebar.tsx b/src/layouts/Sidebar.tsx
 --- a/src/layouts/Sidebar.tsx
 +++ b/src/layouts/Sidebar.tsx
-@@ -457,6 +457,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+@@ -103,3 +103,7 @@
++function getCollapsedNavAriaLabel(item: FlatMenuEntry): string {
++  return typeof item.label === "string" ? item.label : item.key;
++}
++
+ interface SidebarProps {
+   /** Route id of the currently active page (e.g. "core.workspace"). */
+   selectedKey: string;
+@@ -457,6 +461,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
                  }}
                >
                  <button
-+                  aria-label={String(item.label)}
++                  aria-label={getCollapsedNavAriaLabel(item)}
                    className={`${styles.collapsedNavItem} ${
                      isActive ? styles.collapsedNavItemActive : ""
                    }`}

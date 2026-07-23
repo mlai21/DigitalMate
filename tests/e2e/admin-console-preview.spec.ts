@@ -12,9 +12,10 @@ async function expectConsoleReady(page: Page) {
 async function expectConsolePage(
   page: Page,
   baseline: (typeof QWENPAW_CONSOLE_ROUTE_BASELINES)[number],
+  expectedPath: string = baseline.expectedPath,
 ) {
   await expectConsoleReady(page);
-  await expect(page).toHaveURL(`/admin-preview${baseline.expectedPath}`);
+  await expect(page).toHaveURL(`/admin-preview${expectedPath}`);
   const pageContent = page.locator(".page-content");
   await expect(pageContent).toHaveAttribute(
     "data-console-route",
@@ -51,6 +52,11 @@ for (const baseline of QWENPAW_CONSOLE_ROUTE_BASELINES) {
 
     await expectConsolePage(page, baseline);
     await expect(page).not.toHaveURL(/\/login(?:[/?#]|$)/);
+
+    if ("caseInsensitivePath" in baseline) {
+      await page.goto(`/admin-preview${baseline.caseInsensitivePath}`);
+      await expectConsolePage(page, baseline, baseline.caseInsensitivePath);
+    }
   });
 }
 

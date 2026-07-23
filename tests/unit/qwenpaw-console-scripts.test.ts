@@ -1971,12 +1971,22 @@ describe("QwenPaw Console patch preparation", () => {
       expect(appSource).toContain('fetch("/api/admin/compat/auth/status"');
       expect(routesSource).toContain('window.location.assign("/")');
       expect(sidebarSource).toContain(
-        "aria-label={String(item.label)}",
+        "function getCollapsedNavAriaLabel(item: FlatMenuEntry): string",
       );
+      expect(sidebarSource).toContain(
+        'typeof item.label === "string" ? item.label : item.key',
+      );
+      expect(sidebarSource).toContain(
+        "aria-label={getCollapsedNavAriaLabel(item)}",
+      );
+      expect(sidebarSource).not.toContain("String(item.label)");
       expect(mainLayoutSource).toContain(
         'data-console-route={selectedKey}',
       );
-      expect(mainLayoutSource).toMatch(/<Route\s+caseSensitive/);
+      expect(mainLayoutSource).toMatch(
+        /caseSensitive=\{\s*r\.id === "core\.acp" \|\|\s*r\.id === "core\.acp-alias"\s*\}/,
+      );
+      expect(mainLayoutSource).not.toMatch(/<Route\s+caseSensitive\s+key=/);
       expect
         .soft(routesSource)
         .toContain('return <Navigate to="/inbox" replace />');
