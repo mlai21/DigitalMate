@@ -2,6 +2,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -49,11 +50,21 @@ afterEach(async () => {
   if (fixtureRoot) await rm(fixtureRoot, { recursive: true, force: true });
 });
 
-function staticRequest(segments: string[] | undefined, rawPathname: string) {
+type StaticTestHooks = {
+  beforeOpen?: (filePath: string) => Promise<void>;
+  afterOpen?: (filePath: string) => Promise<void>;
+};
+
+function staticRequest(
+  segments: string[] | undefined,
+  rawPathname: string,
+  testHooks?: StaticTestHooks,
+) {
   return serveAdminConsoleStatic({
     rootDirectory: fixtureRoot,
     pathSegments: segments,
     rawPathname,
+    testHooks,
   });
 }
 
@@ -240,6 +251,117 @@ describe("admin Console static reader", () => {
     }
   });
 
+  it.runIf(process.platform !== "win32")("rejects an intermediate directory swapped through an external symlink after preflight", async () => {
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "digitalmate-console-race-outside-"));
+    const requestedDirectory = path.join(fixtureRoot, "race");
+    const safeDirectory = path.join(fixtureRoot, "race-safe");
+    let swapped = false;
+    let beforeOpenCalled = false;
+    let afterOpenCalled = false;
+
+    await mkdir(requestedDirectory);
+    await writeFile(path.join(requestedDirectory, "entry.txt"), "safe");
+    await writeFile(path.join(outsideRoot, "entry.txt"), "external secret");
+
+    try {
+      const response = await staticRequest(
+        ["race", "entry.txt"],
+        "/admin-preview/race/entry.txt",
+        {
+          beforeOpen: async () => {
+            beforeOpenCalled = true;
+            await rename(requestedDirectory, safeDirectory);
+            await symlink(outsideRoot, requestedDirectory);
+            swapped = true;
+          },
+          afterOpen: async () => {
+            afterOpenCalled = true;
+            await rm(requestedDirectory);
+            await rename(safeDirectory, requestedDirectory);
+            swapped = false;
+          },
+        },
+      );
+
+      expect(beforeOpenCalled).toBe(true);
+      expect(afterOpenCalled).toBe(true);
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain("external secret");
+    } finally {
+      if (swapped) {
+        await rm(requestedDirectory, { force: true });
+        await rename(safeDirectory, requestedDirectory);
+      }
+      await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a configured root swapped through an external symlink after preflight", async () => {
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "digitalmate-console-root-race-"));
+    const safeRoot = `${fixtureRoot}-safe`;
+    let swapped = false;
+
+    await writeFile(path.join(fixtureRoot, "entry.txt"), "safe");
+    await writeFile(path.join(outsideRoot, "entry.txt"), "external root secret");
+
+    try {
+      const response = await staticRequest(["entry.txt"], "/admin-preview/entry.txt", {
+        beforeOpen: async () => {
+          await rename(fixtureRoot, safeRoot);
+          await symlink(outsideRoot, fixtureRoot);
+          swapped = true;
+        },
+        afterOpen: async () => {
+          await rm(fixtureRoot);
+          await rename(safeRoot, fixtureRoot);
+          swapped = false;
+        },
+      });
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain("external root secret");
+    } finally {
+      if (swapped) {
+        await rm(fixtureRoot, { force: true });
+        await rename(safeRoot, fixtureRoot);
+      }
+      await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a final regular file replaced between preflight and open", async () => {
+    const requestedFile = path.join(fixtureRoot, "race.txt");
+    const safeFile = path.join(fixtureRoot, "race-safe.txt");
+    const attackerFile = path.join(fixtureRoot, "race-attacker.txt");
+    let swapped = false;
+
+    await writeFile(requestedFile, "safe");
+    await writeFile(attackerFile, "external file content");
+
+    try {
+      const response = await staticRequest(["race.txt"], "/admin-preview/race.txt", {
+        beforeOpen: async () => {
+          await rename(requestedFile, safeFile);
+          await rename(attackerFile, requestedFile);
+          swapped = true;
+        },
+        afterOpen: async () => {
+          await rename(requestedFile, attackerFile);
+          await rename(safeFile, requestedFile);
+          swapped = false;
+        },
+      });
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain("external file content");
+    } finally {
+      if (swapped) {
+        await rename(requestedFile, attackerFile);
+        await rename(safeFile, requestedFile);
+      }
+    }
+  });
+
   it.runIf(process.platform !== "win32")("rejects non-regular filesystem entries", async () => {
     const fifoPath = path.join(fixtureRoot, "events.txt");
     await execFileAsync("mkfifo", [fifoPath]);
@@ -281,7 +403,79 @@ describe("admin Console preview route", () => {
 
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe(
-      "https://digitalmate.example/login?redirect=%2Fadmin-preview%2Fsettings%3Ftab%3Dmodels%26enabled%3D1",
+      "/login?redirect=%2Fadmin-preview%2Fsettings%3Ftab%3Dmodels%26enabled%3D1",
+    );
+  });
+
+  it("keeps the login redirect relative behind a reverse proxy with an internal request origin", async () => {
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      defaultUserId: "user-1",
+      rootDirectory: fixtureRoot,
+    });
+    const response = await handler(
+      new Request("http://n/admin-preview/settings?tab=models", {
+        headers: {
+          host: "digitalmate.example",
+          "x-forwarded-host": "digitalmate.example",
+          "x-forwarded-proto": "https",
+        },
+      }),
+      { params: Promise.resolve({ path: ["settings"] }) },
+    );
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(
+      "/login?redirect=%2Fadmin-preview%2Fsettings%3Ftab%3Dmodels",
+    );
+  });
+
+  it("does not let Host or forwarded headers alter the relative login redirect", async () => {
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      defaultUserId: "user-1",
+      rootDirectory: fixtureRoot,
+    });
+    const response = await handler(
+      new Request("http://n/admin-preview", {
+        headers: {
+          host: "attacker.example",
+          "x-forwarded-host": "attacker.example",
+          "x-forwarded-proto": "javascript",
+        },
+      }),
+      { params: Promise.resolve({}) },
+    );
+
+    expect(response.headers.get("location")).toBe("/login?redirect=%2Fadmin-preview");
+  });
+
+  it("encodes hostile query content without CRLF or an open redirect", async () => {
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      defaultUserId: "user-1",
+      rootDirectory: fixtureRoot,
+    });
+    const request = new Request(
+      "http://n/admin-preview/settings?next=https%3A%2F%2Fevil.example%2F%0D%0ALocation%3A%20https%3A%2F%2Fevil.example",
+    );
+    const response = await handler(request, {
+      params: Promise.resolve({ path: ["settings"] }),
+    });
+    const location = response.headers.get("location");
+
+    expect(location).toBe(
+      `/login?redirect=${encodeURIComponent(
+        "/admin-preview/settings?next=https%3A%2F%2Fevil.example%2F%0D%0ALocation%3A%20https%3A%2F%2Fevil.example",
+      )}`,
+    );
+    expect(location).not.toMatch(/[\r\n]/);
+    expect(location).not.toMatch(/^\/\//);
+    expect(new URL(location!, "https://digitalmate.example").origin).toBe(
+      "https://digitalmate.example",
+    );
+    expect(new URL(location!, "https://digitalmate.example").searchParams.get("redirect")).toBe(
+      `${new URL(request.url).pathname}${new URL(request.url).search}`,
     );
   });
 

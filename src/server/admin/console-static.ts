@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { verifySessionRequest } from "@/server/auth/session";
@@ -16,6 +16,12 @@ type StaticRequest = {
   rootDirectory: string;
   pathSegments?: string[];
   rawPathname: string;
+  testHooks?: StaticTestHooks;
+};
+
+type StaticTestHooks = {
+  beforeOpen?: (filePath: string) => Promise<void>;
+  afterOpen?: (filePath: string) => Promise<void>;
 };
 
 type PreviewHandlerOptions = {
@@ -54,19 +60,25 @@ export async function serveAdminConsoleStatic(input: StaticRequest): Promise<Res
 
   const requestedSegments = validatedPath;
   if (requestedSegments.length === 0) {
-    return serveFile(input.rootDirectory, ["index.html"], true);
+    return serveFile(input.rootDirectory, ["index.html"], true, input.testHooks);
   }
 
   const inspected = await inspectRegularFile(input.rootDirectory, requestedSegments);
   if (inspected.kind === "file") {
-    return respondWithFile(inspected.filePath, requestedSegments);
+    return respondWithFile(
+      input.rootDirectory,
+      inspected.filePath,
+      requestedSegments,
+      false,
+      input.testHooks,
+    );
   }
 
   if (inspected.kind === "blocked" || isExplicitResourceRequest(requestedSegments)) {
     return errorResponse(404);
   }
 
-  return serveFile(input.rootDirectory, ["index.html"], true);
+  return serveFile(input.rootDirectory, ["index.html"], true, input.testHooks);
 }
 
 export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions) {
@@ -175,10 +187,17 @@ async function serveFile(
   rootDirectory: string,
   pathSegments: string[],
   forceHtmlNoStore = false,
+  testHooks?: StaticTestHooks,
 ): Promise<Response> {
   const inspected = await inspectRegularFile(rootDirectory, pathSegments);
   if (inspected.kind !== "file") return errorResponse(404);
-  return respondWithFile(inspected.filePath, pathSegments, forceHtmlNoStore);
+  return respondWithFile(
+    rootDirectory,
+    inspected.filePath,
+    pathSegments,
+    forceHtmlNoStore,
+    testHooks,
+  );
 }
 
 async function inspectRegularFile(
@@ -229,15 +248,22 @@ async function inspectRegularFile(
 }
 
 async function respondWithFile(
+  rootDirectory: string,
   filePath: string,
   pathSegments: string[],
   forceHtmlNoStore = false,
+  testHooks?: StaticTestHooks,
 ): Promise<Response> {
   let fileHandle;
   try {
+    await testHooks?.beforeOpen?.(filePath);
     fileHandle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    const metadata = await fileHandle.stat();
-    if (!metadata.isFile()) return errorResponse(404);
+    await testHooks?.afterOpen?.(filePath);
+
+    const metadata = await fileHandle.stat({ bigint: true });
+    if (!(await validateOpenedFile(rootDirectory, pathSegments, metadata))) {
+      return errorResponse(404);
+    }
 
     const content = await fileHandle.readFile();
     const fileName = pathSegments.at(-1) ?? "";
@@ -264,6 +290,60 @@ async function respondWithFile(
   }
 }
 
+async function validateOpenedFile(
+  rootDirectory: string,
+  pathSegments: string[],
+  openedMetadata: BigIntStats,
+): Promise<boolean> {
+  if (!openedMetadata.isFile() || !hasReliableFileIdentity(openedMetadata)) return false;
+
+  const root = path.resolve(rootDirectory);
+  const candidate = path.resolve(root, ...pathSegments);
+
+  try {
+    const rootMetadata = await lstat(root, { bigint: true });
+    if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) return false;
+
+    const canonicalRoot = await realpath(root);
+    let finalMetadata: BigIntStats | null = null;
+    for (let index = 0; index < pathSegments.length; index += 1) {
+      const currentPath = path.join(root, ...pathSegments.slice(0, index + 1));
+      const metadata = await lstat(currentPath, { bigint: true });
+      const isLastSegment = index === pathSegments.length - 1;
+
+      if (metadata.isSymbolicLink()) return false;
+      if (isLastSegment) {
+        if (!metadata.isFile()) return false;
+        finalMetadata = metadata;
+      } else if (!metadata.isDirectory()) {
+        return false;
+      }
+    }
+
+    if (!finalMetadata || !hasReliableFileIdentity(finalMetadata)) return false;
+
+    const expectedCanonicalPath = path.resolve(canonicalRoot, ...pathSegments);
+    const canonicalCandidate = await realpath(candidate);
+    if (
+      canonicalCandidate !== expectedCanonicalPath ||
+      !isWithinRoot(canonicalRoot, canonicalCandidate)
+    ) {
+      return false;
+    }
+
+    return (
+      openedMetadata.dev === finalMetadata.dev &&
+      openedMetadata.ino === finalMetadata.ino
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasReliableFileIdentity(metadata: BigIntStats): boolean {
+  return metadata.dev >= BigInt(0) && metadata.ino > BigInt(0);
+}
+
 function isWithinRoot(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -288,9 +368,13 @@ function isHashedAsset(pathSegments: string[]): boolean {
 
 function loginRedirect(request: Request): Response {
   const requestUrl = new URL(request.url);
-  const loginUrl = new URL("/login", requestUrl.origin);
-  loginUrl.searchParams.set("redirect", `${requestUrl.pathname}${requestUrl.search}`);
-  return Response.redirect(loginUrl, 307);
+  const searchParams = new URLSearchParams({
+    redirect: `${requestUrl.pathname}${requestUrl.search}`,
+  });
+  return new Response(null, {
+    status: 307,
+    headers: { Location: `/login?${searchParams.toString()}` },
+  });
 }
 
 function errorResponse(status: 400 | 404): Response {
