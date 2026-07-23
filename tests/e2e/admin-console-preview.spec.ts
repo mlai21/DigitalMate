@@ -52,6 +52,7 @@ for (const baseline of QWENPAW_CONSOLE_ROUTE_BASELINES) {
 
     await expectConsolePage(page, baseline);
     await expect(page).not.toHaveURL(/\/login(?:[/?#]|$)/);
+    await expect(page.locator("body")).not.toContainText("QwenPaw");
 
     if ("caseInsensitivePath" in baseline) {
       await page.goto(`/admin-preview${baseline.caseInsensitivePath}`);

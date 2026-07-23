@@ -22,6 +22,8 @@
 | RED：项目选择配置守护 | `npm test -- --run tests/unit/playwright-config.test.ts` | 修复前 1/3 通过；iPad Mini 与 Mobile Chrome 均因 `testMatch` 缺失失败 |
 | RED：非 ACP 路由大小写语义 | `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts --grep '深层刷新 /models'` | 修复前 0/3 通过；三个视口的 `/MODELS` 都得到带 `core.models` 身份的空页面 |
 | RED：安全标签与局部大小写补丁契约 | `npm test -- --run tests/unit/qwenpaw-console-scripts.test.ts -t '真实验证并应用四个补丁'` | 先因 ReactNode 安全标签回退及 ACP 专属 `caseSensitive` 表达式缺失失败；补齐后通过 |
+| RED：可见品牌自动化契约 | 临时在现有路由循环中注入可见 `QwenPaw`，再运行 `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts --grep 'Console 深层刷新 /inbox$'` | 三个视口 0/3 通过、退出码 1；均由新增的 `body` 可见文本断言捕获，证明契约会对泄漏报错 |
+| GREEN：可见品牌自动化契约 | 移除临时故障注入后，运行 `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts --grep 'Console 深层刷新 /inbox$'` | 三个视口 3/3 通过、退出码 0，耗时 37.8 秒 |
 | Playwright 项目列表 | `npx playwright test tests/e2e/chat.spec.ts --list`；`npx playwright test tests/e2e/admin-console-preview.spec.ts --list` | chat 仅 Desktop Chrome 3 项；Console preview 三项目共 90 项 |
 | 项目选择配置守护 | `npm test -- --run tests/unit/playwright-config.test.ts` | 3/3 通过 |
 | 既有 chat app E2E | `npm run test:e2e:app -- tests/e2e/chat.spec.ts` | 仅 Desktop Chrome 运行，3/3 通过，耗时 49.7 秒 |
@@ -48,7 +50,7 @@ Playwright 的 `webServer` 在每轮 E2E 启动前执行 `npm run console:build`
 | Console 独立构建 | `npm run console:build` | 0 | TypeScript 与 Vite 生产构建成功，转换 15110 个模块；静态产物原子发布到 `public/_admin-console` |
 | 根 TypeScript | `npm run typecheck` | 0 | `tsc --noEmit` 无错误 |
 | 根全量测试 | `npm test` | 0 | 83 个测试文件、828 项测试全部通过 |
-| Console 三视口 E2E | `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts` | 0 | Desktop Chrome、iPad Mini、Mobile Chrome 共 90/90 通过，耗时 1.5 分钟 |
+| Console 三视口 E2E | `npm run test:e2e:app -- tests/e2e/admin-console-preview.spec.ts` | 0 | Desktop Chrome、iPad Mini、Mobile Chrome 共 90/90 通过，耗时 1.3 分钟；其中 25 个非 Chat 路由 × 3 个视口包含 75 次可见 `QwenPaw` 负向断言 |
 | 根生产构建 | `npm run build` | 0 | 再次完成 Console 构建；Next.js 生产编译、TypeScript、34 个静态页面生成和路由收集全部成功 |
 | 空白检查 | `git diff --check` | 0 | 执行总验证后与文档更新后复验均无空白错误 |
 
@@ -67,7 +69,9 @@ Console 构建继续报告上游既有 peer dependency、循环 chunk、大 chun
 |---|---|---:|---|
 | 许可与元数据存在 | `test -f vendor/qwenpaw-console/LICENSE && test -f vendor/qwenpaw-console/UPSTREAM.md && test -f vendor/qwenpaw-console/SHA256SUMS` | 0 | Apache License 2.0、来源说明与哈希清单齐全 |
 | 清单摘要与逐文件校验 | `shasum -a 256 vendor/qwenpaw-console/SHA256SUMS && (cd vendor/qwenpaw-console && shasum -a 256 -c SHA256SUMS --quiet)` | 0 | 864 项逐一通过；清单 SHA-256 为 `04459760c48b596c2521dbfcd182660c5784adbecc654ed98d3eb4dc7e85a53a`，与 `UPSTREAM.md` 一致 |
-| 构建产物原始品牌扫描 | `rg -n "QwenPaw\|Qwen" public/_admin-console --glob '*.js' --glob '*.html'` | 0 | 仅 1 个主 bundle 命中：`QwenPaw` 97 次、`Qwen` 14 次；分类如下 |
+| 构建产物原始品牌扫描 | `rg -n 'QwenPaw|Qwen' public/_admin-console --glob '*.js' --glob '*.html'` | 0 | 仅 1 个主 bundle 命中；分类如下 |
+| `QwenPaw` 原始命中计数 | `rg -o 'QwenPaw' public/_admin-console --glob '*.js' --glob '*.html' \| wc -l` | 0 | 97 次 |
+| 独立 `Qwen` 原始命中计数 | `rg -o --pcre2 'Qwen(?!Paw)' public/_admin-console --glob '*.js' --glob '*.html' \| wc -l` | 0 | 14 次 |
 
 原始 bundle 的品牌命中分类：
 
@@ -80,8 +84,10 @@ Console 构建继续报告上游既有 peer dependency、循环 chunk、大 chun
 - 14 次 `Qwen` 均来自 7 个 `Qwen/Qwen3-0.6B-GGUF` 模型仓库示例 ID；
   每个 ID 含 2 次 `Qwen`，属于模型专名而非 Console 产品品牌。
 
-额外使用一次性 Playwright 核验脚本登录预览入口，按中文浅色主题逐页读取 25 个
-非 Chat 内置路由的 `body.innerText`：25/25 页面均无可见 `QwenPaw` 文案。
+现有 Playwright 路由循环会在页面身份与规范 URL 断言后，检查 `body` 可见文本不含
+`QwenPaw`。25 个非 Chat 内置路由在 Desktop Chrome、iPad Mini、Mobile Chrome
+下共执行 75 次页面级品牌断言，且包含在上述可重复运行的 90 项 E2E 中。该断言只禁止
+Console 产品品牌 `QwenPaw`，不禁止模型专名中的独立 `Qwen`。
 构建产物中的必要兼容标识已列入
 `vendor/qwenpaw-console/UPSTREAM.md`，不作为用户可见品牌使用。
 
@@ -92,7 +98,7 @@ Git。总验证开始前工作树干净，构建与 E2E 没有产生待提交文
 ## 导航与交互基线
 
 - `tests/e2e/admin-console.routes.ts` 固定 26 个上游内置路由，并为 25 个非 Chat 页面逐项声明期望 URL、稳定路由 ID 与页面文本。
-- 除 `/chat` 外的 25 个 Console 路由均在 Desktop Chrome、iPad Mini、Mobile Chrome 下完成鉴权后的深层刷新，共 75 个路由用例；每项同时断言精确 URL、`data-console-route`、非空页面和稳定文本，不再以 Console 外壳出现作为成功。
+- 除 `/chat` 外的 25 个 Console 路由均在 Desktop Chrome、iPad Mini、Mobile Chrome 下完成鉴权后的深层刷新，共 75 个路由用例；每项同时断言精确 URL、`data-console-route`、非空页面、稳定文本和无可见 `QwenPaw`，不再以 Console 外壳出现作为成功。
 - `/admin-preview/` 规范化到 `/admin-preview/inbox`；大小写别名 `/admin-preview/ACP` 规范化到 `/admin-preview/acp`。两条 ACP 注册路由采用大小写敏感匹配，确保别名重定向不会被前置 `/acp` 路由截获。
 - 大小写敏感只应用于已确认的 `core.acp` 与 `core.acp-alias` 两条路由；其他内置路由和插件路由保持上游默认的大小写不敏感语义。`/admin-preview/MODELS` 在三个视口均继续渲染 `core.models` 页面且保持非空。
 - 未知路由在三个视口均保持原 URL，页面容器为空；负向用例证明它不能满足任一注册页面基线。
@@ -122,7 +128,7 @@ Git。总验证开始前工作树干净，构建与 E2E 没有产生待提交文
 | Console 测试与构建 | 1165/1165 通过；独立生产构建退出码 0 |
 | 根工程 | TypeScript 退出码 0；828/828 测试通过；生产构建退出码 0 |
 | 三视口预览 | 90/90 通过；26 个内置路由、Chat 跳转、主题、截图和旧后台边界均受保护 |
-| 许可与品牌 | Apache License 2.0 与来源元数据齐全；25 个渲染页面无可见 `QwenPaw` |
+| 许可与品牌 | Apache License 2.0 与来源元数据齐全；25 个非 Chat 路由 × 3 个视口自动断言无可见 `QwenPaw` |
 | 构建产物 | `public/_admin-console` 被 Git 忽略，0 个文件受跟踪 |
 
 本里程碑没有切换正式 `/admin`，旧后台仍由现有 Next 页面提供。当前新增运行入口仅为
