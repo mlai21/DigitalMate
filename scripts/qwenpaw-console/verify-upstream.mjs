@@ -16,6 +16,12 @@ const SNAPSHOT_DIRECTORY_PATHS = new Set([
   "reference/tests/contract/channels",
   "reference/tests/fixtures/channels",
 ]);
+const UPSTREAM_METADATA_FIELDS = [
+  "Repository",
+  "Tag",
+  "Commit",
+  "Directory SHA-256",
+];
 
 function comparePosixPaths(left, right) {
   if (left < right) {
@@ -85,6 +91,72 @@ function validateManifestPath(relativePath) {
   }
 }
 
+async function readSnapshotMetadata(filePath, missingMessage) {
+  const entry = await lstat(filePath).catch((error) => {
+    if (error?.code === "ENOENT") {
+      throw new Error(missingMessage);
+    }
+    throw error;
+  });
+  if (entry.isSymbolicLink()) {
+    throw new Error("symbolic link not allowed");
+  }
+  if (!entry.isFile()) {
+    throw new Error("non-regular snapshot metadata");
+  }
+
+  return readFile(filePath, "utf8").catch((error) => {
+    if (error?.code === "ENOENT") {
+      throw new Error(missingMessage);
+    }
+    if (error?.code === "EISDIR") {
+      throw new Error("non-regular snapshot metadata");
+    }
+    throw error;
+  });
+}
+
+function parseUpstreamMetadata(metadata) {
+  const parsedFields = new Map(
+    UPSTREAM_METADATA_FIELDS.map((field) => [field, []]),
+  );
+  const exactFieldPattern =
+    /^- (Repository|Tag|Commit|Directory SHA-256): (.+)$/;
+  const fieldLikePattern =
+    /^\s*(?:-\s*)?(Repository|Tag|Commit|Directory SHA-256)\s*:/;
+
+  for (const line of metadata.split("\n")) {
+    const exactMatch = exactFieldPattern.exec(line);
+    if (exactMatch) {
+      parsedFields.get(exactMatch[1]).push(exactMatch[2]);
+      continue;
+    }
+    if (fieldLikePattern.test(line)) {
+      throw new Error("invalid upstream metadata");
+    }
+  }
+
+  if (
+    UPSTREAM_METADATA_FIELDS.some(
+      (field) => parsedFields.get(field).length !== 1,
+    )
+  ) {
+    throw new Error("invalid upstream metadata");
+  }
+
+  const directoryHash = parsedFields.get("Directory SHA-256")[0];
+  if (!/^[a-f0-9]{64}$/.test(directoryHash)) {
+    throw new Error("invalid upstream metadata");
+  }
+
+  return {
+    repository: parsedFields.get("Repository")[0],
+    tag: parsedFields.get("Tag")[0],
+    commit: parsedFields.get("Commit")[0],
+    directoryHash,
+  };
+}
+
 async function sha256File(filePath) {
   const content = await readFile(filePath);
   return createHash("sha256").update(content).digest("hex");
@@ -127,12 +199,10 @@ export function calculateDirectoryHash(entries) {
 }
 
 export async function readChecksums(checksumPath) {
-  const content = await readFile(checksumPath, "utf8").catch((error) => {
-    if (error?.code === "ENOENT") {
-      throw new Error("SHA256SUMS missing");
-    }
-    throw error;
-  });
+  const content = await readSnapshotMetadata(
+    checksumPath,
+    "SHA256SUMS missing",
+  );
 
   const lines = content.split("\n");
   if (lines.at(-1) === "") {
@@ -229,15 +299,15 @@ export async function hashSnapshotFiles(
 }
 
 export async function verifySnapshot(root = "vendor/qwenpaw-console") {
-  const metadata = await readFile(path.join(root, "UPSTREAM.md"), "utf8").catch(
-    () => {
-      throw new Error("UPSTREAM.md missing");
-    },
+  const metadata = await readSnapshotMetadata(
+    path.join(root, "UPSTREAM.md"),
+    "UPSTREAM.md missing",
   );
+  const upstreamMetadata = parseUpstreamMetadata(metadata);
   if (
-    !metadata.includes(UPSTREAM.repository) ||
-    !metadata.includes(UPSTREAM.tag) ||
-    !metadata.includes(UPSTREAM.commit)
+    upstreamMetadata.repository !== UPSTREAM.repository ||
+    upstreamMetadata.tag !== UPSTREAM.tag ||
+    upstreamMetadata.commit !== UPSTREAM.commit
   ) {
     throw new Error("upstream identity mismatch");
   }
@@ -258,12 +328,8 @@ export async function verifySnapshot(root = "vendor/qwenpaw-console") {
     throw new Error("snapshot checksum mismatch");
   }
 
-  const directoryHashMatch = metadata.match(
-    /^- Directory SHA-256: ([a-f0-9]{64})$/m,
-  );
   if (
-    !directoryHashMatch ||
-    directoryHashMatch[1] !== calculateDirectoryHash(actual)
+    upstreamMetadata.directoryHash !== calculateDirectoryHash(actual)
   ) {
     throw new Error("snapshot directory hash mismatch");
   }
