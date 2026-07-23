@@ -154,29 +154,91 @@ function isStaticResourceUrl(resourceUrl) {
   );
 }
 
-function isNonEmptyConcatenationPart(node) {
-  return !ts.isStringLiteralLike(node) || node.text.length > 0;
+function isPlusExpression(node) {
+  return (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.PlusToken
+  );
 }
 
-function isTranspiledConcatenationOperand(node) {
-  const call = node.parent;
-  if (
-    !ts.isCallExpression(call) ||
-    !ts.isPropertyAccessExpression(call.expression) ||
-    call.expression.name.text !== "concat" ||
-    !ts.isStringLiteralLike(call.expression.expression)
-  ) {
-    return false;
+function isConcatCall(node) {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === "concat"
+  );
+}
+
+function hasSyntacticallyNonEmptyConcatenationValue(node) {
+  if (ts.isParenthesizedExpression(node)) {
+    return hasSyntacticallyNonEmptyConcatenationValue(node.expression);
   }
-  const argumentIndex = call.arguments.indexOf(node);
-  if (argumentIndex === -1) {
-    return false;
+  if (ts.isStringLiteralLike(node)) {
+    return node.text.length > 0;
   }
-  const previousPart =
-    argumentIndex === 0
-      ? call.expression.expression
-      : call.arguments[argumentIndex - 1];
-  return isNonEmptyConcatenationPart(previousPart);
+  if (isPlusExpression(node)) {
+    return (
+      hasSyntacticallyNonEmptyConcatenationValue(node.left) ||
+      hasSyntacticallyNonEmptyConcatenationValue(node.right)
+    );
+  }
+  if (isConcatCall(node)) {
+    return (
+      hasSyntacticallyNonEmptyConcatenationValue(
+        node.expression.expression,
+      ) ||
+      node.arguments.some(hasSyntacticallyNonEmptyConcatenationValue)
+    );
+  }
+  return true;
+}
+
+function hasExplicitConcatenationPrefix(node) {
+  let current = node;
+  while (current.parent) {
+    const parent = current.parent;
+    if (ts.isParenthesizedExpression(parent) && parent.expression === current) {
+      current = parent;
+      continue;
+    }
+    if (isPlusExpression(parent)) {
+      if (
+        parent.right === current &&
+        hasSyntacticallyNonEmptyConcatenationValue(parent.left)
+      ) {
+        return true;
+      }
+      current = parent;
+      continue;
+    }
+    if (isConcatCall(parent)) {
+      const argumentIndex = parent.arguments.indexOf(current);
+      if (argumentIndex === -1) {
+        break;
+      }
+      const earlierParts = [
+        parent.expression.expression,
+        ...parent.arguments.slice(0, argumentIndex),
+      ];
+      if (earlierParts.some(hasSyntacticallyNonEmptyConcatenationValue)) {
+        return true;
+      }
+      current = parent;
+      continue;
+    }
+    if (
+      ts.isPropertyAccessExpression(parent) &&
+      parent.expression === current &&
+      parent.name.text === "concat" &&
+      isConcatCall(parent.parent) &&
+      parent.parent.expression === parent
+    ) {
+      current = parent.parent;
+      continue;
+    }
+    break;
+  }
+  return false;
 }
 
 function getJavaScriptResourceReferences(source) {
@@ -190,19 +252,15 @@ function getJavaScriptResourceReferences(source) {
   );
 
   const visit = (node) => {
-    if (ts.isStringLiteralLike(node) && isStaticResourceUrl(node.text)) {
-      const parent = node.parent;
-      const isConcatenatedOperand =
-        (ts.isBinaryExpression(parent) &&
-          parent.operatorToken.kind === ts.SyntaxKind.PlusToken &&
-          (parent.left === node || parent.right === node)) ||
-        isTranspiledConcatenationOperand(node);
-      if (!isConcatenatedOperand) {
-        references.push({
-          resourceUrl: node.text,
-          syntax: "javascript-string",
-        });
-      }
+    if (
+      ts.isStringLiteralLike(node) &&
+      isStaticResourceUrl(node.text) &&
+      !hasExplicitConcatenationPrefix(node)
+    ) {
+      references.push({
+        resourceUrl: node.text,
+        syntax: "javascript-string",
+      });
     }
     ts.forEachChild(node, visit);
   };

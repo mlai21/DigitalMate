@@ -1328,6 +1328,57 @@ describe("QwenPaw Console isolated test runner", () => {
 
   it.each([
     {
+      label: "非空字面量加号前缀",
+      source: 'const loader = "assets" + "/loader.js";\n',
+    },
+    {
+      label: "动态加号前缀",
+      source: 'const loader = prefix + "/loader.js";\n',
+    },
+    {
+      label: "嵌套加号链外层动态前缀",
+      source: 'const loader = prefix + ("" + "/loader.js");\n',
+    },
+    {
+      label: "concat 链较早的非空前缀",
+      source:
+        'const loader = "".concat("assets", "", "/loader.js");\n',
+    },
+  ])("$label 不会把片段资源误判为根资源", async ({ source }) => {
+    const testing = Reflect.get(consoleTestScript, "__testing") as
+      | {
+          validateConsoleBuild: (workdir: string) => Promise<unknown>;
+        }
+      | undefined;
+    expect(testing).toBeDefined();
+    if (!testing) {
+      return;
+    }
+
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-dist-concat-"),
+    );
+    const distRoot = path.join(temporaryRoot, "dist");
+    const scriptPath = path.join(distRoot, "assets", "app.js");
+    await mkdir(path.dirname(scriptPath), { recursive: true });
+    await writeFile(path.join(distRoot, "index.html"), "<main></main>\n");
+    await writeFile(
+      path.join(distRoot, "digitalmate-logo.svg"),
+      "<svg />\n",
+    );
+    await writeFile(scriptPath, source);
+
+    try {
+      await expect(
+        testing.validateConsoleBuild(temporaryRoot),
+      ).resolves.toBeDefined();
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
       label: "独立 JavaScript 缺失资源",
       relativePath: "assets/app.js",
       source: 'const avatar = "/missing.svg";\n',
@@ -1355,6 +1406,41 @@ describe("QwenPaw Console isolated test runner", () => {
         'const avatar = "/_admin-console/assets/../online.svg";\n',
       expected:
         "invalid build resource path: /_admin-console/assets/../online.svg",
+    },
+    {
+      label: "空字面量加号前缀",
+      relativePath: "assets/app.js",
+      source: 'const avatar = "" + "/missing.svg";\n',
+      expected:
+        "build resource outside /_admin-console/: /missing.svg",
+    },
+    {
+      label: "只有后缀的加号拼接",
+      relativePath: "assets/app.js",
+      source: 'const worker = "/worker.js" + suffix;\n',
+      expected:
+        "build resource outside /_admin-console/: /worker.js",
+    },
+    {
+      label: "只有后缀的 concat 拼接",
+      relativePath: "assets/app.js",
+      source: 'const worker = "/worker.js".concat(suffix);\n',
+      expected:
+        "build resource outside /_admin-console/: /worker.js",
+    },
+    {
+      label: "全空 concat 前缀链",
+      relativePath: "assets/app.js",
+      source: 'const avatar = "".concat("", "/missing.svg");\n',
+      expected:
+        "build resource outside /_admin-console/: /missing.svg",
+    },
+    {
+      label: "嵌套全空加号前缀链",
+      relativePath: "assets/app.js",
+      source: 'const avatar = "" + ("" + "/missing.svg");\n',
+      expected:
+        "build resource outside /_admin-console/: /missing.svg",
     },
   ])("$label 会被产物扫描拒绝", async ({ relativePath, source, expected }) => {
     const testing = Reflect.get(consoleTestScript, "__testing") as
@@ -1419,7 +1505,6 @@ describe("QwenPaw Console isolated test runner", () => {
       'const avatar = "/_admin-console/online.svg";\n' +
         'const monacoLoader = config.paths.vs + "/loader.js";\n' +
         'const transpiledLoader = "".concat(config.paths.vs, "/loader.js");\n' +
-        'const monacoWorker = "/worker.js" + config.paths.vs;\n' +
         '// const ignored = "/commented.svg";\n' +
         '/* const ignoredToo = "/commented-too.svg"; */\n',
     );
@@ -1450,7 +1535,6 @@ describe("QwenPaw Console isolated test runner", () => {
         'const avatar = "/_admin-console/online.svg";\n' +
           'const monacoLoader = config.paths.vs + "/loader.js";\n' +
           'const transpiledLoader = "".concat(config.paths.vs, "/loader.js");\n' +
-          'const monacoWorker = "/worker.js" + config.paths.vs;\n' +
           '// const ignored = "/commented.svg";\n' +
           '/* const ignoredToo = "/commented-too.svg"; */\n',
       );
