@@ -124,6 +124,9 @@ describe("database schema", () => {
     expect(schema).toContain("ON messages(user_id, agent_id, client_turn_id, role)");
     expect(schema).toContain("idx_channel_identities_agent_external_user");
     expect(schema).toContain("idx_channel_messages_agent_external_message");
+    expect(schema).toContain("idx_skills_user_identity");
+    expect(schema).toContain("skill_revisions_skill_user_fkey");
+    expect(schema).toContain("skill_usage_logs_skill_user_fkey");
     expect(schema).toMatch(
       /INSERT INTO digital_agents[\s\S]+WHERE NOT EXISTS \([\s\S]+is_default = true[\s\S]+ON CONFLICT \(user_id, slug\)/,
     );
@@ -145,15 +148,45 @@ describe("database schema", () => {
     expect(seed).not.toContain("repositories.agents");
     expect(seed).not.toContain("createRepositories");
     expect(seed).not.toContain("getOrCreateDefault(user.id)");
-    expect(seed).toContain("pg_advisory_xact_lock");
+    expect(seed).toContain("DATABASE_BOOTSTRAP_LOCK_SQL");
     expect(seed).toContain("BEGIN");
     expect(seed).toContain("COMMIT");
     expect(seed).toContain("INSERT INTO users");
     expect(seed).toContain("INSERT INTO settings");
-    expect(seed.indexOf("pg_advisory_xact_lock")).toBeLessThan(seed.indexOf("SELECT id, display_name FROM users"));
-    expect(seed.indexOf("pg_advisory_xact_lock")).toBeLessThan(seed.indexOf("INSERT INTO users"));
+    expect(seed.indexOf("client.query(DATABASE_BOOTSTRAP_LOCK_SQL)")).toBeLessThan(
+      seed.indexOf("SELECT id, display_name FROM users"),
+    );
+    expect(seed.indexOf("client.query(DATABASE_BOOTSTRAP_LOCK_SQL)")).toBeLessThan(
+      seed.indexOf("INSERT INTO users"),
+    );
     expect(seed.indexOf("WHERE user_id = $1 AND is_default = true")).toBeLessThan(
       seed.indexOf("INSERT INTO digital_agents"),
+    );
+  });
+
+  it("serializes schema migration and seed with one shared bootstrap lock", async () => {
+    const migrate = await readFile(path.join(process.cwd(), "src/server/db/migrate.ts"), "utf8");
+    const seed = await readFile(path.join(process.cwd(), "src/server/db/seed.ts"), "utf8");
+    const bootstrapLock = await readFile(
+      path.join(process.cwd(), "src/server/db/bootstrap-lock.ts"),
+      "utf8",
+    );
+
+    for (const source of [migrate, seed]) {
+      expect(source).toContain('from "@/server/db/bootstrap-lock"');
+      expect(source).toContain("DATABASE_BOOTSTRAP_LOCK_SQL");
+      expect(source).toContain('client.query("BEGIN")');
+      expect(source).toContain('client.query("COMMIT")');
+      expect(source).toContain('client.query("ROLLBACK")');
+      expect(source).toContain("client.release()");
+    }
+    expect(bootstrapLock).toContain("pg_advisory_xact_lock(1146050617::bigint)");
+
+    expect(migrate.indexOf('client.query("BEGIN")')).toBeLessThan(
+      migrate.indexOf("client.query(DATABASE_BOOTSTRAP_LOCK_SQL)"),
+    );
+    expect(migrate.indexOf("client.query(DATABASE_BOOTSTRAP_LOCK_SQL)")).toBeLessThan(
+      migrate.indexOf("client.query(schema)"),
     );
   });
 });

@@ -487,15 +487,8 @@ async function readClientTurnMigration(): Promise<string> {
   const columnMigration = schema.match(
     /ALTER TABLE IF EXISTS messages\s+ADD COLUMN IF NOT EXISTS client_turn_id uuid;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_payload_hash text;[\s\S]*?ADD COLUMN IF NOT EXISTS client_turn_execution_started_at timestamptz;/,
   )?.[0];
-  const uniqueIndex = schema.match(
-    /CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role[\s\S]*?WHERE client_turn_id IS NOT NULL;/,
-  )?.[0];
-  if (!columnMigration || !uniqueIndex) throw new Error("client_turn_migration_missing");
+  if (!columnMigration) throw new Error("client_turn_migration_missing");
   return `${columnMigration}
-ALTER TABLE messages
-  ADD COLUMN IF NOT EXISTS agent_id uuid NOT NULL
-  DEFAULT '00000000-0000-4000-8000-000000000001';
-${uniqueIndex}
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_role
   ON messages(user_id, client_turn_id, role)
   WHERE client_turn_id IS NOT NULL;`;
@@ -670,7 +663,7 @@ describe("message attachment PostgreSQL concurrency", () => {
     expect(tokenColumn.rows).toHaveLength(1);
   });
 
-  it("migrates client turn columns and its partial role uniqueness idempotently", async () => {
+  it("keeps only the legacy client turn uniqueness used by the transition repository", async () => {
     await databasePool.query(await readClientTurnMigration());
     const columns = await databasePool.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns
@@ -684,13 +677,18 @@ describe("message attachment PostgreSQL concurrency", () => {
       "client_turn_id",
       "client_turn_payload_hash",
     ]);
-    const index = await databasePool.query<{ indexdef: string }>(
-      `SELECT indexdef FROM pg_indexes
-       WHERE schemaname = current_schema() AND indexname = 'idx_messages_client_turn_agent_role'`,
+    const indexes = await databasePool.query<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef
+       FROM pg_indexes
+       WHERE schemaname = current_schema()
+         AND indexname IN ('idx_messages_client_turn_role', 'idx_messages_client_turn_agent_role')
+       ORDER BY indexname`,
     );
-    expect(index.rows[0].indexdef).toContain("UNIQUE");
-    expect(index.rows[0].indexdef).toContain("(user_id, agent_id, client_turn_id, role)");
-    expect(index.rows[0].indexdef).toContain("WHERE (client_turn_id IS NOT NULL)");
+    expect(indexes.rows).toHaveLength(1);
+    expect(indexes.rows[0].indexname).toBe("idx_messages_client_turn_role");
+    expect(indexes.rows[0].indexdef).toContain("UNIQUE");
+    expect(indexes.rows[0].indexdef).toContain("(user_id, client_turn_id, role)");
+    expect(indexes.rows[0].indexdef).toContain("WHERE (client_turn_id IS NOT NULL)");
   });
 
   it("returns the same user turn after an accepted event is lost", async () => {

@@ -1,3 +1,4 @@
+import { DATABASE_BOOTSTRAP_LOCK_SQL } from "@/server/db/bootstrap-lock";
 import { getPool } from "@/server/db/client";
 import { defaultSettings } from "@/server/settings/defaults";
 
@@ -6,7 +7,7 @@ async function main() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(1146050617::bigint)");
+    await client.query(DATABASE_BOOTSTRAP_LOCK_SQL);
     const existingUser = await client.query<{ id: string; display_name: string }>(
       "SELECT id, display_name FROM users ORDER BY created_at ASC, id ASC LIMIT 1",
     );

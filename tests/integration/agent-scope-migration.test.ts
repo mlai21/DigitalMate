@@ -1,13 +1,13 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
 import EmbeddedPostgres from "embedded-postgres";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 const AGENT_SCOPED_TABLES = [
   "projects",
@@ -50,6 +50,8 @@ const TASK_RUN_A = "10000000-0000-4000-8000-000000000061";
 const TASK_RUN_B = "20000000-0000-4000-8000-000000000062";
 const GOAL_A = "10000000-0000-4000-8000-000000000071";
 const GOAL_B = "20000000-0000-4000-8000-000000000072";
+const SKILL_A = "10000000-0000-4000-8000-000000000091";
+const SKILL_B = "20000000-0000-4000-8000-000000000092";
 const CLIENT_TURN_ID = "30000000-0000-4000-8000-000000000001";
 const MIGRATION_MARKER = "-- BEGIN DEFAULT DIGITAL AGENT MIGRATION";
 
@@ -59,6 +61,8 @@ describe("default digital agent PostgreSQL migration", () => {
   let databasePool: Pool;
   let embeddedPostgres: EmbeddedPostgres | null = null;
   let embeddedDatabaseDirectory: string | null = null;
+  let migrationFixtureDirectory: string;
+  let migrationSchemaPath: string;
   let databaseUrl: string;
   let migratedSchema: string;
 
@@ -82,15 +86,20 @@ describe("default digital agent PostgreSQL migration", () => {
     }
 
     adminPool = new Pool({ connectionString: databaseUrl });
+    const sourceSchema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
+    migratedSchema = adaptSchemaForEmbeddedPostgres(sourceSchema);
+    migrationFixtureDirectory = await mkdtemp(path.join(os.tmpdir(), "digitalmate-migration-fixture-"));
+    migrationSchemaPath = path.join(migrationFixtureDirectory, "schema.sql");
+    await writeFile(migrationSchemaPath, migratedSchema);
+  }, 60_000);
+
+  beforeEach(async () => {
     await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
     databasePool = new Pool({
       connectionString: databaseUrl,
       options: `-c search_path=${schemaName} -c statement_timeout=15000 -c lock_timeout=5000`,
     });
     await installVectorCompatibility(databasePool);
-
-    const sourceSchema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
-    migratedSchema = adaptSchemaForEmbeddedPostgres(sourceSchema);
     const migrationOffset = migratedSchema.indexOf(MIGRATION_MARKER);
     const legacySchema = migrationOffset === -1 ? migratedSchema : migratedSchema.slice(0, migrationOffset);
     await databasePool.query(legacySchema);
@@ -103,17 +112,21 @@ describe("default digital agent PostgreSQL migration", () => {
         WHERE source_task_id IS NOT NULL;
     `);
     await seedLegacyRows(databasePool);
-  }, 60_000);
+  });
+
+  afterEach(async () => {
+    await databasePool?.end();
+    await adminPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+  });
 
   afterAll(async () => {
-    await databasePool?.end();
-    if (adminPool) {
-      await adminPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
-      await adminPool.end();
-    }
+    await adminPool?.end();
     await embeddedPostgres?.stop();
     if (embeddedDatabaseDirectory) {
       await rm(embeddedDatabaseDirectory, { recursive: true, force: true });
+    }
+    if (migrationFixtureDirectory) {
+      await rm(migrationFixtureDirectory, { recursive: true, force: true });
     }
   });
 
@@ -159,6 +172,27 @@ describe("default digital agent PostgreSQL migration", () => {
         await freshPool.end();
         await adminPool.query(`DROP SCHEMA IF EXISTS "${freshSchemaName}" CASCADE`);
       }
+    }
+  });
+
+  it("serializes two real migration processes against one empty PostgreSQL schema", async () => {
+    const freshSchemaName = `${schemaName}_migration`;
+    await adminPool.query(`CREATE SCHEMA "${freshSchemaName}"`);
+    const freshPool = new Pool({
+      connectionString: adminPool.options.connectionString,
+      options: `-c search_path=${freshSchemaName} -c statement_timeout=15000 -c lock_timeout=5000`,
+    });
+    try {
+      await installVectorCompatibility(freshPool);
+      await Promise.all([
+        runMigration(databaseUrl, freshSchemaName, migrationSchemaPath),
+        runMigration(databaseUrl, freshSchemaName, migrationSchemaPath),
+      ]);
+      const columns = await readAgentColumns(freshPool);
+      expect([...columns.keys()].sort()).toEqual([...AGENT_SCOPED_TABLES].sort());
+    } finally {
+      await freshPool.end();
+      await adminPool.query(`DROP SCHEMA IF EXISTS "${freshSchemaName}" CASCADE`);
     }
   });
 
@@ -229,6 +263,7 @@ describe("default digital agent PostgreSQL migration", () => {
   });
 
   it("preserves an existing custom default and only promotes DigitalMate when no default exists", async () => {
+    await databasePool.query(migratedSchema);
     await databasePool.query(
       "INSERT INTO users (id, display_name) VALUES ($1, 'User C'), ($2, 'User D'), ($3, 'User E')",
       [USER_C, USER_D, USER_E],
@@ -269,6 +304,7 @@ describe("default digital agent PostgreSQL migration", () => {
   });
 
   it("rejects cross-user ownership and parent rows from another agent", async () => {
+    await databasePool.query(migratedSchema);
     const agents = await readDefaultAgents(databasePool);
     const agentA = agents.find((row) => row.user_id === USER_A)!.id;
     const agentB = agents.find((row) => row.user_id === USER_B)!.id;
@@ -302,9 +338,44 @@ describe("default digital agent PostgreSQL migration", () => {
         [GOAL_A, agentB],
       ),
     ).rejects.toMatchObject({ code: "23503" });
+
+    const crossUserSkillReferences = await Promise.allSettled([
+      databasePool.query(
+        `INSERT INTO skill_revisions (user_id, skill_id, proposed_content, reason)
+         VALUES ($1, $2, 'wrong revision', 'wrong owner')`,
+        [USER_A, SKILL_B],
+      ),
+      databasePool.query(
+        `INSERT INTO skill_usage_logs (user_id, agent_id, skill_id, conversation_id)
+         VALUES ($1, $2, $3, $4)`,
+        [USER_A, agentA, SKILL_B, CONVERSATION_A],
+      ),
+    ]);
+    for (const result of crossUserSkillReferences) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") {
+        expect(result.reason).toMatchObject({ code: "23503" });
+      }
+    }
+
+    await expect(
+      databasePool.query(
+        `INSERT INTO skill_revisions (user_id, skill_id, proposed_content, reason)
+         VALUES ($1, $2, 'legal revision', 'same owner')`,
+        [USER_A, SKILL_A],
+      ),
+    ).resolves.toBeDefined();
+    await expect(
+      databasePool.query(
+        `INSERT INTO skill_usage_logs (user_id, agent_id, skill_id, conversation_id)
+         VALUES ($1, $2, $3, $4)`,
+        [USER_A, agentA, SKILL_A, CONVERSATION_A],
+      ),
+    ).resolves.toBeDefined();
   });
 
   it("scopes legacy business uniqueness by agent after the replacement index exists", async () => {
+    await databasePool.query(migratedSchema);
     const agents = await readDefaultAgents(databasePool);
     const agentA = agents.find((row) => row.user_id === USER_A)!.id;
     const secondAgent = (
@@ -658,5 +729,34 @@ async function runSeed(databaseUrl: string, schemaName: string): Promise<void> {
   const [exitCode, signal] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
   if (exitCode !== 0) {
     throw new Error(`seed_failed:${exitCode ?? signal ?? "unknown"}:${stderr}`);
+  }
+}
+
+async function runMigration(databaseUrl: string, schemaName: string, schemaPath: string): Promise<void> {
+  const scopedUrl = new URL(databaseUrl);
+  scopedUrl.searchParams.set("options", `-c search_path=${schemaName}`);
+  const child = spawn(
+    process.execPath,
+    [
+      path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
+      "tests/fixtures/run-schema-migration.ts",
+    ],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_URL: scopedUrl.toString(),
+        DIGITALMATE_TEST_SCHEMA_PATH: schemaPath,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  const [exitCode, signal] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
+  if (exitCode !== 0) {
+    throw new Error(`migration_failed:${exitCode ?? signal ?? "unknown"}:${stderr}`);
   }
 }

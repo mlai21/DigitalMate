@@ -252,6 +252,39 @@ CREATE TABLE IF NOT EXISTS skill_usage_logs (
 
 ALTER TABLE IF EXISTS skill_usage_logs ADD COLUMN IF NOT EXISTS triggered_by text NOT NULL DEFAULT 'auto';
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_user_identity
+  ON skills(id, user_id);
+
+DO $skill_owner_constraints$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'skill_revisions'::regclass
+      AND conname = 'skill_revisions_skill_user_fkey'
+  ) THEN
+    ALTER TABLE skill_revisions
+      ADD CONSTRAINT skill_revisions_skill_user_fkey
+      FOREIGN KEY (skill_id, user_id)
+      REFERENCES skills(id, user_id)
+      ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'skill_usage_logs'::regclass
+      AND conname = 'skill_usage_logs_skill_user_fkey'
+  ) THEN
+    ALTER TABLE skill_usage_logs
+      ADD CONSTRAINT skill_usage_logs_skill_user_fkey
+      FOREIGN KEY (skill_id, user_id)
+      REFERENCES skills(id, user_id)
+      ON DELETE CASCADE;
+  END IF;
+END
+$skill_owner_constraints$;
+
 CREATE TABLE IF NOT EXISTS task_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
