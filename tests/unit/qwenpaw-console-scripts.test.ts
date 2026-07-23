@@ -1,8 +1,13 @@
 import {
+  access,
+  chmod,
   cp,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
+  readdir,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -10,10 +15,53 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { UPSTREAM } from "../../scripts/qwenpaw-console/sync.mjs";
+import * as qwenpawSync from "../../scripts/qwenpaw-console/sync.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
 
+const { UPSTREAM } = qwenpawSync;
 const SNAPSHOT_ROOT = path.resolve("vendor/qwenpaw-console");
+const SOURCE_MAPPING_CASES = [
+  {
+    source: "console",
+    destination: "console",
+    kind: "directory",
+  },
+  {
+    source: "LICENSE",
+    destination: "LICENSE",
+    kind: "file",
+  },
+  {
+    source: "src/qwenpaw/app/channels",
+    destination: "reference/src/qwenpaw/app/channels",
+    kind: "directory",
+  },
+  {
+    source: "src/qwenpaw/config/config.py",
+    destination: "reference/src/qwenpaw/config/config.py",
+    kind: "file",
+  },
+  {
+    source: "src/qwenpaw/app/routers/config.py",
+    destination: "reference/src/qwenpaw/app/routers/config.py",
+    kind: "file",
+  },
+  {
+    source: "tests/unit/channels",
+    destination: "reference/tests/unit/channels",
+    kind: "directory",
+  },
+  {
+    source: "tests/contract/channels",
+    destination: "reference/tests/contract/channels",
+    kind: "directory",
+  },
+  {
+    source: "tests/fixtures/channels",
+    destination: "reference/tests/fixtures/channels",
+    kind: "directory",
+  },
+] as const;
 const IDENTITY_FIELDS = [
   {
     field: "Repository",
@@ -31,6 +79,23 @@ const IDENTITY_FIELDS = [
     invalid: "0000000000000000000000000000000000000000",
   },
 ] as const;
+
+type FileOperationOverrides = {
+  lstat?: typeof lstat;
+  rename?: typeof rename;
+  rm?: typeof rm;
+};
+
+type SyncTestingInterface = {
+  replaceSnapshotAtomically: (
+    stagingRoot: string,
+    destinationRoot: string,
+    options?: {
+      backupRoot?: string;
+      fileOperations?: FileOperationOverrides;
+    },
+  ) => Promise<void>;
+};
 
 async function withSnapshotCopy(
   run: (root: string) => Promise<void>,
@@ -65,6 +130,380 @@ function requireMetadataFieldLine(metadata: string, field: string): string {
   }
   return matchingLines[0];
 }
+
+function requireSyncTestingInterface(): SyncTestingInterface {
+  const testing = Reflect.get(qwenpawSync, "__testing") as
+    | SyncTestingInterface
+    | undefined;
+  expect(testing).toBeDefined();
+  return testing as SyncTestingInterface;
+}
+
+async function createFakeUpstream(root: string): Promise<void> {
+  for (const [index, mapping] of SOURCE_MAPPING_CASES.entries()) {
+    const sourcePath = path.join(root, ...mapping.source.split("/"));
+    const content = `mapping-${index}:${mapping.source}\n`;
+    if (mapping.kind === "directory") {
+      await mkdir(sourcePath, { recursive: true });
+      await writeFile(path.join(sourcePath, "mapping.txt"), content, "utf8");
+    } else {
+      await mkdir(path.dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, content, "utf8");
+    }
+  }
+}
+
+async function withFakeUpstream(
+  run: (context: {
+    destinationRoot: string;
+    fixtureRoot: string;
+    temporaryRoot: string;
+  }) => Promise<void>,
+): Promise<void> {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "dm-qwenpaw-sync-"));
+  const fixtureRoot = path.join(temporaryRoot, "upstream-fixture");
+  const fakeBinRoot = path.join(temporaryRoot, "bin");
+  const fakeGitPath = path.join(fakeBinRoot, "git");
+  const destinationRoot = path.join(temporaryRoot, "vendor", "qwenpaw-console");
+  await mkdir(fixtureRoot, { recursive: true });
+  await mkdir(fakeBinRoot, { recursive: true });
+  await createFakeUpstream(fixtureRoot);
+  await writeFile(
+    fakeGitPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("clone")) {
+  fs.cpSync(process.env.DM_QWENPAW_FIXTURE, args.at(-1), { recursive: true });
+} else if (args.includes("rev-parse")) {
+  process.stdout.write("${UPSTREAM.commit}\\n");
+} else {
+  process.exitCode = 2;
+}
+`,
+    "utf8",
+  );
+  await chmod(fakeGitPath, 0o755);
+
+  const previousPath = process.env.PATH;
+  const previousFixture = process.env.DM_QWENPAW_FIXTURE;
+  process.env.PATH = `${fakeBinRoot}${path.delimiter}${previousPath ?? ""}`;
+  process.env.DM_QWENPAW_FIXTURE = fixtureRoot;
+
+  try {
+    await run({ destinationRoot, fixtureRoot, temporaryRoot });
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+    if (previousFixture === undefined) {
+      delete process.env.DM_QWENPAW_FIXTURE;
+    } else {
+      process.env.DM_QWENPAW_FIXTURE = previousFixture;
+    }
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+async function createReplacementFixture(): Promise<{
+  backupRoot: string;
+  destinationRoot: string;
+  stagingRoot: string;
+  temporaryRoot: string;
+}> {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "dm-qwenpaw-replace-"));
+  const destinationRoot = path.join(temporaryRoot, "qwenpaw-console");
+  const stagingRoot = path.join(temporaryRoot, "staging");
+  const backupRoot = path.join(temporaryRoot, "backup");
+  await mkdir(destinationRoot);
+  await mkdir(stagingRoot);
+  await writeFile(path.join(destinationRoot, "old.txt"), "old snapshot\n");
+  await writeFile(path.join(stagingRoot, "new.txt"), "new snapshot\n");
+  return { backupRoot, destinationRoot, stagingRoot, temporaryRoot };
+}
+
+async function expectPathMissing(targetPath: string): Promise<void> {
+  await expect(access(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+describe("QwenPaw Console sync", () => {
+  it("无网络同步 8 个精确来源映射", async () => {
+    await withFakeUpstream(async ({ destinationRoot }) => {
+      await qwenpawSync.syncSnapshot(destinationRoot);
+
+      for (const [index, mapping] of SOURCE_MAPPING_CASES.entries()) {
+        const destinationPath = path.join(
+          destinationRoot,
+          ...mapping.destination.split("/"),
+        );
+        const contentPath =
+          mapping.kind === "directory"
+            ? path.join(destinationPath, "mapping.txt")
+            : destinationPath;
+        await expect(readFile(contentPath, "utf8")).resolves.toBe(
+          `mapping-${index}:${mapping.source}\n`,
+        );
+
+        if (mapping.source !== mapping.destination) {
+          await expectPathMissing(
+            path.join(destinationRoot, ...mapping.source.split("/")),
+          );
+        }
+      }
+
+      const parentEntries = await readdir(path.dirname(destinationRoot));
+      expect(parentEntries).toEqual(["qwenpaw-console"]);
+    });
+  });
+
+  it("拒绝符号链接来源", async () => {
+    await withFakeUpstream(async ({ destinationRoot, fixtureRoot }) => {
+      const licensePath = path.join(fixtureRoot, "LICENSE");
+      const externalLicense = path.join(fixtureRoot, "external-license");
+      await rm(licensePath);
+      await writeFile(externalLicense, "external\n");
+      await symlink("external-license", licensePath);
+
+      await expect(
+        qwenpawSync.syncSnapshot(destinationRoot),
+      ).rejects.toThrow("symbolic link not allowed");
+      await expectPathMissing(destinationRoot);
+    });
+  });
+
+  it("复制前拒绝来源类型不符", async () => {
+    await withFakeUpstream(async ({ destinationRoot, fixtureRoot }) => {
+      const licensePath = path.join(fixtureRoot, "LICENSE");
+      await rm(licensePath);
+      await mkdir(licensePath);
+
+      await expect(
+        qwenpawSync.syncSnapshot(destinationRoot),
+      ).rejects.toThrow("source snapshot path invalid");
+      await expectPathMissing(destinationRoot);
+    });
+  });
+
+  it("替换成功后清理 staging 和 backup", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      await testing.replaceSnapshotAtomically(
+        fixture.stagingRoot,
+        fixture.destinationRoot,
+        { backupRoot: fixture.backupRoot },
+      );
+
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "new.txt"), "utf8"),
+      ).resolves.toBe("new snapshot\n");
+      await expectPathMissing(fixture.stagingRoot);
+      await expectPathMissing(fixture.backupRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("staging 安装失败后成功回滚且不留临时目录", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      await expect(
+        testing.replaceSnapshotAtomically(
+          fixture.stagingRoot,
+          fixture.destinationRoot,
+          {
+            backupRoot: fixture.backupRoot,
+            fileOperations: {
+              rename: async (sourcePath, destinationPath) => {
+                if (
+                  sourcePath === fixture.stagingRoot &&
+                  destinationPath === fixture.destinationRoot
+                ) {
+                  throw new Error("injected install failure");
+                }
+                await rename(sourcePath, destinationPath);
+              },
+            },
+          },
+        ),
+      ).rejects.toThrow("injected install failure");
+
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "old.txt"), "utf8"),
+      ).resolves.toBe("old snapshot\n");
+      await expectPathMissing(fixture.stagingRoot);
+      await expectPathMissing(fixture.backupRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("回滚冲突时保留可定位 backup 和旧快照", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      let replacementError: unknown;
+      try {
+        await testing.replaceSnapshotAtomically(
+          fixture.stagingRoot,
+          fixture.destinationRoot,
+          {
+            backupRoot: fixture.backupRoot,
+            fileOperations: {
+              rename: async (sourcePath, destinationPath) => {
+                if (
+                  sourcePath === fixture.stagingRoot &&
+                  destinationPath === fixture.destinationRoot
+                ) {
+                  await mkdir(fixture.destinationRoot);
+                  await writeFile(
+                    path.join(fixture.destinationRoot, "conflict.txt"),
+                    "concurrent writer\n",
+                  );
+                  throw new Error("injected install failure");
+                }
+                await rename(sourcePath, destinationPath);
+              },
+            },
+          },
+        );
+      } catch (error) {
+        replacementError = error;
+      }
+
+      await expect(
+        readFile(path.join(fixture.backupRoot, "old.txt"), "utf8"),
+      ).resolves.toBe("old snapshot\n");
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "conflict.txt"), "utf8"),
+      ).resolves.toBe("concurrent writer\n");
+      await expectPathMissing(fixture.stagingRoot);
+      expect(replacementError).toBeInstanceOf(Error);
+      expect((replacementError as Error).message).toContain(
+        `backup preserved at ${fixture.backupRoot}`,
+      );
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("创建 backup 失败时保留旧快照并清理 staging", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      await expect(
+        testing.replaceSnapshotAtomically(
+          fixture.stagingRoot,
+          fixture.destinationRoot,
+          {
+            backupRoot: fixture.backupRoot,
+            fileOperations: {
+              rename: async (sourcePath, destinationPath) => {
+                if (
+                  sourcePath === fixture.destinationRoot &&
+                  destinationPath === fixture.backupRoot
+                ) {
+                  throw new Error("injected backup failure");
+                }
+                await rename(sourcePath, destinationPath);
+              },
+            },
+          },
+        ),
+      ).rejects.toThrow("injected backup failure");
+
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "old.txt"), "utf8"),
+      ).resolves.toBe("old snapshot\n");
+      await expectPathMissing(fixture.stagingRoot);
+      await expectPathMissing(fixture.backupRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("故障清理失败时保留原始安装错误", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      await expect(
+        testing.replaceSnapshotAtomically(
+          fixture.stagingRoot,
+          fixture.destinationRoot,
+          {
+            backupRoot: fixture.backupRoot,
+            fileOperations: {
+              rename: async (sourcePath, destinationPath) => {
+                if (
+                  sourcePath === fixture.stagingRoot &&
+                  destinationPath === fixture.destinationRoot
+                ) {
+                  throw new Error("injected install failure");
+                }
+                await rename(sourcePath, destinationPath);
+              },
+              rm: async (targetPath, options) => {
+                if (targetPath === fixture.stagingRoot) {
+                  throw new Error("injected cleanup failure");
+                }
+                await rm(targetPath, options);
+              },
+            },
+          },
+        ),
+      ).rejects.toThrow(
+        /injected install failure.*injected cleanup failure/,
+      );
+
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "old.txt"), "utf8"),
+      ).resolves.toBe("old snapshot\n");
+      await expectPathMissing(fixture.backupRoot);
+      await expect(access(fixture.stagingRoot)).resolves.toBeUndefined();
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("安装后 backup 清理失败时保留 backup 并明确报错", async () => {
+    const fixture = await createReplacementFixture();
+    try {
+      const testing = requireSyncTestingInterface();
+      await expect(
+        testing.replaceSnapshotAtomically(
+          fixture.stagingRoot,
+          fixture.destinationRoot,
+          {
+            backupRoot: fixture.backupRoot,
+            fileOperations: {
+              rm: async (targetPath, options) => {
+                if (targetPath === fixture.backupRoot) {
+                  throw new Error("injected cleanup failure");
+                }
+                await rm(targetPath, options);
+              },
+            },
+          },
+        ),
+      ).rejects.toThrow(
+        `snapshot installed but backup cleanup failed; backup preserved at ${fixture.backupRoot}`,
+      );
+
+      await expect(
+        readFile(path.join(fixture.destinationRoot, "new.txt"), "utf8"),
+      ).resolves.toBe("new snapshot\n");
+      await expect(
+        readFile(path.join(fixture.backupRoot, "old.txt"), "utf8"),
+      ).resolves.toBe("old snapshot\n");
+      await expectPathMissing(fixture.stagingRoot);
+    } finally {
+      await rm(fixture.temporaryRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("QwenPaw Console snapshot", () => {
   it("将 vendor 和生成目录排除在根类型检查之外", async () => {
