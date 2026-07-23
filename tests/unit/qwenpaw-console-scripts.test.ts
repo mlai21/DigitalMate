@@ -15,7 +15,16 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  PATCHES,
+  __testing as prepareTesting,
+  prepareConsole,
+} from "../../scripts/qwenpaw-console/prepare.mjs";
 import * as qwenpawSync from "../../scripts/qwenpaw-console/sync.mjs";
+import {
+  COMMANDS as CONSOLE_TEST_COMMANDS,
+  runPreparedConsoleTests,
+} from "../../scripts/qwenpaw-console/test.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
 
 const { UPSTREAM } = qwenpawSync;
@@ -792,4 +801,178 @@ describe("QwenPaw Console snapshot", () => {
       );
     });
   });
+});
+
+describe("QwenPaw Console patch preparation", () => {
+  it("固定四个补丁的不可变应用顺序", () => {
+    expect(PATCHES).toEqual([
+      "0001-brand.patch",
+      "0002-theme.patch",
+      "0003-route-auth.patch",
+      "0004-api-compat.patch",
+    ]);
+    expect(Object.isFrozen(PATCHES)).toBe(true);
+    expect(Reflect.set(PATCHES, 0, "changed.patch")).toBe(false);
+    expect(PATCHES[0]).toBe("0001-brand.patch");
+  });
+
+  it(
+    "真实验证并应用四个补丁，生成 DigitalMate Console 集成树",
+    async () => {
+      const result = await prepareConsole({ keep: true });
+
+      try {
+        expect(result.applied).toEqual(PATCHES);
+        expect(result.applied).not.toBe(PATCHES);
+
+        const readPrepared = (relativePath: string) =>
+          readFile(path.join(result.workdir, ...relativePath.split("/")), "utf8");
+        const [
+          appSource,
+          indexHtml,
+          routesSource,
+          configSource,
+          requestSource,
+          agentsPageSource,
+          agentTableSource,
+          i18nSource,
+          headerSource,
+          updateContentSource,
+          layoutStyles,
+          chatSource,
+        ] = await Promise.all([
+          readPrepared("src/App.tsx"),
+          readPrepared("index.html"),
+          readPrepared("src/layouts/registry/builtinRoutes.tsx"),
+          readPrepared("src/api/config.ts"),
+          readPrepared("src/api/request.ts"),
+          readPrepared("src/pages/Settings/Agents/index.tsx"),
+          readPrepared(
+            "src/pages/Settings/Agents/components/AgentTable.tsx",
+          ),
+          readPrepared("src/i18n.ts"),
+          readPrepared("src/layouts/Header.tsx"),
+          readPrepared("src/layouts/constants.ts"),
+          readPrepared("src/layouts/index.module.less"),
+          readPrepared("src/pages/Chat/index.tsx"),
+        ]);
+
+        expect(indexHtml).toContain("<title>DigitalMate Console</title>");
+        expect(indexHtml).not.toContain("<title>QwenPaw Console</title>");
+        expect(i18nSource).toContain(
+          'return value.replace(/QwenPaw/g, "DigitalMate")',
+        );
+        expect(headerSource).toContain('src="/digitalmate-logo.svg"');
+        expect(headerSource).toContain('alt="DigitalMate"');
+        expect(headerSource).toContain("How to update DigitalMate");
+        expect(updateContentSource).toContain("How to update DigitalMate");
+        expect(updateContentSource).toContain("DigitalMate如何更新");
+        expect(layoutStyles).toContain(
+          "linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%)",
+        );
+        expect(layoutStyles).not.toContain("qwenpawBack.png");
+        expect(chatSource).toContain('avatar: extAvatar ?? "/digitalmate-logo.svg"');
+        expect(chatSource).toContain('nick: extNick ?? "DigitalMate"');
+        expect(appSource).toContain('colorPrimary: "#E8684A"');
+        expect(appSource).toContain('colorBgLayout: "#FAF7F2"');
+        expect(appSource).toContain('pathname.startsWith("/admin-preview/")');
+        expect(appSource).toContain('return "/admin-preview"');
+        expect(appSource).toContain('pathname.startsWith("/admin/")');
+        expect(appSource).toContain('return "/admin"');
+        expect(appSource).toContain(
+          'fetch("/api/admin/compat/auth/status"',
+        );
+        expect(routesSource).toContain('window.location.assign("/")');
+        expect(configSource).toContain(
+          'const API_BASE_URL = "/api/admin/compat"',
+        );
+        expect(configSource).toContain('let csrfToken = ""');
+        expect(requestSource).toContain('headers.set("x-csrf-token", csrfToken)');
+        expect(requestSource).toContain("getCsrfToken()");
+        expect(agentsPageSource).toContain(
+          'const SECONDARY_AGENT_CAPABILITY = "unsupported"',
+        );
+        expect(agentsPageSource).toContain("disabled");
+        expect(agentTableSource).toContain("secondaryAgentActionsDisabled");
+        expect(agentTableSource).toContain("disabled={deleteDisabled}");
+      } finally {
+        await rm(result.workdir, { recursive: true, force: true });
+      }
+
+      await expect(verifySnapshot(SNAPSHOT_ROOT)).resolves.toMatchObject({
+        commit: UPSTREAM.commit,
+      });
+    },
+    120_000,
+  );
+
+  it("补丁应用失败时删除本次临时目录并保持 vendor 不变", async () => {
+    const temporaryParent = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-prepare-test-"),
+    );
+    const invalidPatch = path.join(temporaryParent, "invalid.patch");
+    await writeFile(invalidPatch, "this is not a patch\n", "utf8");
+
+    try {
+      await expect(
+        prepareTesting.prepareConsoleWithDependencies(
+          { keep: true },
+          {
+            patchPaths: [
+              path.resolve("patches/qwenpaw-console/0001-brand.patch"),
+              invalidPatch,
+            ],
+            temporaryParent,
+          },
+        ),
+      ).rejects.toThrow();
+
+      expect(await readdir(temporaryParent)).toEqual(["invalid.patch"]);
+      await expect(verifySnapshot(SNAPSHOT_ROOT)).resolves.toMatchObject({
+        commit: UPSTREAM.commit,
+      });
+    } finally {
+      await rm(temporaryParent, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("QwenPaw Console isolated test runner", () => {
+  it.each([
+    { failedCommand: null, exitCode: 0 },
+    { failedCommand: 0, exitCode: 23 },
+    { failedCommand: 1, exitCode: 37 },
+  ])(
+    "命令结果为 $exitCode 时清理准备目录并精确保留退出码",
+    async ({ failedCommand, exitCode }) => {
+      const temporaryRoot = await mkdtemp(
+        path.join(tmpdir(), "dm-qwenpaw-test-runner-"),
+      );
+      const workdir = path.join(temporaryRoot, "console");
+      await mkdir(workdir);
+      const commands: Array<{ command: string; args: string[]; cwd: string }> =
+        [];
+
+      const outcome = await runPreparedConsoleTests({
+        prepare: async () => ({ workdir, applied: [...PATCHES] }),
+        runCommand: async (command, args, options) => {
+          commands.push({ command, args: [...args], cwd: options.cwd });
+          const commandIndex = commands.length - 1;
+          return commandIndex === failedCommand
+            ? { exitCode, signal: null }
+            : { exitCode: 0, signal: null };
+        },
+      });
+
+      expect(outcome).toEqual({ exitCode, signal: null });
+      expect(commands).toEqual(
+        CONSOLE_TEST_COMMANDS.slice(
+          0,
+          failedCommand === null ? undefined : failedCommand + 1,
+        ).map(([command, ...args]) => ({ command, args, cwd: workdir })),
+      );
+      await expectPathMissing(workdir);
+      await rm(temporaryRoot, { recursive: true, force: true });
+    },
+  );
 });

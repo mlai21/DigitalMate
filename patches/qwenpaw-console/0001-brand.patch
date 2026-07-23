@@ -1,0 +1,299 @@
+diff --git a/index.html b/index.html
+index 57b0834..542f70b 100644
+--- a/index.html
++++ b/index.html
+@@ -7,7 +7,7 @@
+       name="viewport"
+       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+     />
+-    <title>QwenPaw Console</title>
++    <title>DigitalMate Console</title>
+   </head>
+   <body>
+     <div id="root"></div>
+diff --git a/public/digitalmate-logo.svg b/public/digitalmate-logo.svg
+new file mode 100644
+index 0000000..7e2d4a5
+--- /dev/null
++++ b/public/digitalmate-logo.svg
+@@ -0,0 +1,6 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="240" height="48" viewBox="0 0 240 48" role="img" aria-labelledby="title">
++  <title id="title">DigitalMate</title>
++  <rect width="48" height="48" rx="14" fill="#E8684A"/>
++  <path d="M14 14h9.5c7 0 11.5 3.8 11.5 10s-4.5 10-11.5 10H14V14Zm9 15.5c4 0 6.2-1.8 6.2-5.5S27 18.5 23 18.5h-3.2v11H23Z" fill="#fff"/>
++  <text x="60" y="31" fill="#E8684A" font-family="Inter, system-ui, sans-serif" font-size="24" font-weight="650">DigitalMate</text>
++</svg>
+diff --git a/src/i18n.ts b/src/i18n.ts
+index 08a8da2..f8717e5 100644
+--- a/src/i18n.ts
++++ b/src/i18n.ts
+@@ -32,7 +32,15 @@ const resources = {
+   },
+ };
+ 
+-i18n.use(initReactI18next).init({
++const digitalMateBrand = {
++  type: "postProcessor" as const,
++  name: "digitalmateBrand",
++  process(value: string) {
++    return value.replace(/QwenPaw/g, "DigitalMate");
++  },
++};
++
++i18n.use(digitalMateBrand).use(initReactI18next).init({
+   resources,
+   lng: localStorage.getItem("language") || navigator.language || "en",
+   fallbackLng: "en",
+@@ -41,6 +49,7 @@ i18n.use(initReactI18next).init({
+   interpolation: {
+     escapeValue: false,
+   },
++  postProcess: ["digitalmateBrand"],
+ });
+ 
+ export default i18n;
+diff --git a/src/layouts/Header.tsx b/src/layouts/Header.tsx
+index ce85f49..d4df4aa 100644
+--- a/src/layouts/Header.tsx
++++ b/src/layouts/Header.tsx
+@@ -83,7 +83,7 @@ function UpdateCodeBlock({ code }: { code: string }) {
+ 
+ export default function Header() {
+   const { t, i18n } = useTranslation();
+-  const { isDark, setThemeMode } = useTheme();
++  const { setThemeMode } = useTheme();
+   const desktop = useDesktopUpdate();
+   const onDesktop = isDesktopApp();
+   const [version, setVersion] = useState<string>("");
+@@ -277,8 +277,8 @@ export default function Header() {
+     fetch(url, { cache: "no-cache" })
+       .then((res) => (res.ok ? res.text() : Promise.reject()))
+       .then((text) => {
+-        const zhPattern = /###\s*QwenPaw如何更新[\s\S]*?(?=\n###|$)/;
+-        const enPattern = /###\s*How to update QwenPaw[\s\S]*?(?=\n###|$)/;
++        const zhPattern = /###\s*DigitalMate如何更新[\s\S]*?(?=\n###|$)/;
++        const enPattern = /###\s*How to update DigitalMate[\s\S]*?(?=\n###|$)/;
+         const match = text.match(faqLang === "zh" ? zhPattern : enPattern);
+         setUpdateMarkdown(
+           match && lang !== "ru"
+@@ -345,8 +345,8 @@ export default function Header() {
+           */}
+           <Slot name="header.logo" kind="replace">
+             <img
+-              src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
+-              alt="QwenPaw"
++              src="/digitalmate-logo.svg"
++              alt="DigitalMate"
+               className={styles.logoImg}
+             />
+           </Slot>
+diff --git a/src/layouts/constants.ts b/src/layouts/constants.ts
+index 192d3b0..c8c8229 100644
+--- a/src/layouts/constants.ts
++++ b/src/layouts/constants.ts
+@@ -79,9 +79,9 @@ export const compareVersions = (a: string, b: string): number => {
+ // ── Update markdown ───────────────────────────────────────────────────────
+ // TODO
+ export const UPDATE_MD: Record<string, string> = {
+-  zh: `### QwenPaw如何更新
++  zh: `### DigitalMate如何更新
+ 
+-要更新 QwenPaw 到最新版本，可根据你的安装方式选择对应方法：
++要更新 DigitalMate 到最新版本，可根据你的安装方式选择对应方法：
+ 
+ 1. 如果你使用的是一键安装脚本，直接重新运行安装命令即可自动升级。
+ 
+@@ -94,7 +94,7 @@ qwenpaw update
+ 3. 如果你是从源码安装，进入项目目录并拉取最新代码后重新安装：
+ 
+ \`\`\`
+-cd QwenPaw
++cd DigitalMate
+ git pull origin main
+ cd console && npm ci && npm run build
+ cd .. && mkdir -p src/qwenpaw/console
+@@ -111,9 +111,9 @@ docker run -p 127.0.0.1:8088:8088 -v qwenpaw-data:/app/working -v qwenpaw-secret
+ 
+ 升级后重启服务 qwenpaw app。`,
+ 
+-  ru: `### Как обновить QwenPaw
++  ru: `### Как обновить DigitalMate
+ 
+-Чтобы обновить QwenPaw, выберите способ в зависимости от типа установки:
++Чтобы обновить DigitalMate, выберите способ в зависимости от типа установки:
+ 
+ 1. Если вы устанавливали через однострочный скрипт, повторно запустите установщик для обновления.
+ 
+@@ -126,7 +126,7 @@ qwenpaw update
+ 3. Если устанавливали из исходников, получите последние изменения и переустановите:
+ 
+ \`\`\`
+-cd QwenPaw
++cd DigitalMate
+ git pull origin main
+ cd console && npm ci && npm run build
+ cd .. && mkdir -p src/qwenpaw/console
+@@ -143,9 +143,9 @@ docker run -p 127.0.0.1:8088:8088 -v qwenpaw-data:/app/working -v qwenpaw-secret
+ 
+ After upgrading, restart the service with \`qwenpaw app\`.`,
+ 
+-  en: `### How to update QwenPaw
++  en: `### How to update DigitalMate
+ 
+-To update QwenPaw, use the method matching your installation type:
++To update DigitalMate, use the method matching your installation type:
+ 
+ 1. If installed via one-line script, re-run the installer to upgrade.
+ 
+@@ -158,7 +158,7 @@ qwenpaw update
+ 3. If installed from source, pull the latest code and reinstall:
+ 
+ \`\`\`
+-cd QwenPaw
++cd DigitalMate
+ git pull origin main
+ cd console && npm ci && npm run build
+ cd .. && mkdir -p src/qwenpaw/console
+diff --git a/src/layouts/index.module.less b/src/layouts/index.module.less
+index 32443a0..c719394 100644
+--- a/src/layouts/index.module.less
++++ b/src/layouts/index.module.less
+@@ -744,8 +744,8 @@
+ }
+ 
+ .updateModalBanner {
+-  background: url("/public/qwenpawBack.png") no-repeat center top;
+-  background-size: contain;
++  background: linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%);
++  border-top: 3px solid #e8684a;
+   padding: 48px 28px 0px;
+   display: flex;
+   align-items: flex-start;
+diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
+index 4c903f0..05e7203 100644
+--- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
++++ b/src/pages/Chat/OptionsPanel/defaultConfig.ts
+@@ -7,7 +7,7 @@ const defaultConfig = {
+     prefix: "qwenpaw",
+     leftHeader: {
+       logo: "",
+-      title: "Work with QwenPaw",
++      title: "Work with DigitalMate",
+     },
+     bubbleList: {
+       userMessageAnchors: {
+diff --git a/src/pages/Chat/index.tsx b/src/pages/Chat/index.tsx
+index 3ff65b9..aef35eb 100644
+--- a/src/pages/Chat/index.tsx
++++ b/src/pages/Chat/index.tsx
+@@ -2749,8 +2749,8 @@ export default function ChatPage() {
+       },
+       welcome: {
+         ...i18nConfig.welcome,
+-        nick: extNick ?? "QwenPaw",
+-        avatar: extAvatar ?? "/qwenpaw.png",
++        nick: extNick ?? "DigitalMate",
++        avatar: extAvatar ?? "/digitalmate-logo.svg",
+         ...(extGreeting !== undefined ? { greeting: extGreeting } : {}),
+         ...(extDescription !== undefined
+           ? { description: extDescription }
+diff --git a/src/pages/Login/index.tsx b/src/pages/Login/index.tsx
+index 9604940..48d4d31 100644
+--- a/src/pages/Login/index.tsx
++++ b/src/pages/Login/index.tsx
+@@ -100,8 +100,8 @@ export default function LoginPage() {
+       >
+         <div style={{ textAlign: "center", marginBottom: 32 }}>
+           <img
+-            src={isDark ? "/logo-dark.svg" : "/logo-light.svg"}
+-            alt="QwenPaw"
++            src="/digitalmate-logo.svg"
++            alt="DigitalMate"
+             style={{ height: 48, marginBottom: 12 }}
+           />
+           <h2 style={{ margin: 0, fontWeight: 600, fontSize: 20 }}>
+diff --git a/src/pages/Settings/Market/components/SkillIcon.tsx b/src/pages/Settings/Market/components/SkillIcon.tsx
+index 8c19007..fe2360c 100644
+--- a/src/pages/Settings/Market/components/SkillIcon.tsx
++++ b/src/pages/Settings/Market/components/SkillIcon.tsx
+@@ -2,7 +2,7 @@ import { useState } from "react";
+ import styles from "./SkillIcon.module.less";
+ 
+ export const SOURCE_LABELS: Record<string, string> = {
+-  qwenpaw: "QwenPaw",
++  qwenpaw: "DigitalMate",
+   clawhub: "ClawHub",
+   modelscope: "ModelScope",
+   aliyun: "Aliyun",
+diff --git a/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx b/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
+index b1c8842..616c3a6 100644
+--- a/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
++++ b/src/pages/Settings/PluginManager/components/MarketPluginList.test.tsx
+@@ -102,7 +102,7 @@ describe("MarketPluginList", () => {
+     expect(invoke).not.toHaveBeenCalled();
+   });
+ 
+-  it("shows the QwenPaw compatibility versions returned by the market", () => {
++  it("shows the DigitalMate compatibility versions returned by the market", () => {
+     hoisted.plugins.push(
+       makePlugin("https://platform.agentscope.io/plugins/agentscope/demo", [
+         "1.x",
+@@ -112,6 +112,6 @@ describe("MarketPluginList", () => {
+ 
+     render(<MarketPluginList onInstalled={vi.fn()} />);
+ 
+-    expect(screen.getByText("QwenPaw 1.x, 2.x")).toBeInTheDocument();
++    expect(screen.getByText("DigitalMate 1.x, 2.x")).toBeInTheDocument();
+   });
+ });
+diff --git a/src/pages/Settings/PluginManager/components/MarketPluginList.tsx b/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
+index e410e4b..c02afc9 100644
+--- a/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
++++ b/src/pages/Settings/PluginManager/components/MarketPluginList.tsx
+@@ -197,7 +197,7 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                         color={isCompatible(entry) ? "green" : "orange"}
+                         style={{ margin: 0, fontSize: 11 }}
+                       >
+-                        {`QwenPaw ${entry.qwenpaw_compat_labels.join(", ")}`}
++                        {`DigitalMate ${entry.qwenpaw_compat_labels.join(", ")}`}
+                       </Tag>
+                     )}
+                 </div>
+@@ -234,9 +234,9 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                 <Tooltip
+                   title={
+                     !isCompatible(entry)
+-                      ? `This plugin is labeled for QwenPaw ${
++                      ? `This plugin is labeled for DigitalMate ${
+                           entry.qwenpaw_compat_labels?.join(", ") ?? "unknown"
+-                        }; compatibility with QwenPaw ${
++                        }; compatibility with DigitalMate ${
+                           qwenpawVersion ?? "unknown"
+                         } is unverified.`
+                       : undefined
+@@ -259,7 +259,7 @@ export function MarketPluginList({ onInstalled }: MarketPluginListProps) {
+                           ),
+                           content: t("pluginManager.compatWarningContent", {
+                             defaultValue:
+-                              "This plugin is labeled for QwenPaw {{labels}}. Your QwenPaw version is {{version}}. Installing it may cause errors. Are you sure you want to continue?",
++                              "This plugin is labeled for DigitalMate {{labels}}. Your DigitalMate version is {{version}}. Installing it may cause errors. Are you sure you want to continue?",
+                             labels:
+                               entry.qwenpaw_compat_labels?.join(", ") ??
+                               "unknown",
+diff --git a/src/tauri/BackendLoadingPage.tsx b/src/tauri/BackendLoadingPage.tsx
+index 19fa2ae..ef148a9 100644
+--- a/src/tauri/BackendLoadingPage.tsx
++++ b/src/tauri/BackendLoadingPage.tsx
+@@ -52,7 +52,11 @@ export default function BackendLoadingPage({
+       style={style}
+     >
+       <div className={styles.card}>
+-        <img src="/qwenpaw.png" alt="QwenPaw" className={styles.logo} />
++        <img
++          src="/digitalmate-logo.svg"
++          alt="DigitalMate"
++          className={styles.logo}
++        />
+ 
+         <Progress
+           type="dashboard"

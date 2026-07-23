@@ -1,0 +1,628 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 3439cb8..64c9d47 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -30,6 +30,7 @@ import { DesktopUpdateProvider } from "./contexts/DesktopUpdateContext";
+ import { UpdateTakeoverGate } from "./components/UpdateTakeoverPage";
+ import { languageApi } from "./api/modules/language";
+ import { useUploadLimitStore } from "./stores/uploadLimitStore";
++import { setCsrfToken } from "./api/config";
+ import CloseWindowPrompt from "./tauri/CloseWindowPrompt";
+ import { isTauri } from "@tauri-apps/api/core";
+ import "./styles/layout.css";
+@@ -76,8 +77,12 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+         }
+         const result = (await response.json()) as {
+           authenticated?: boolean;
++          csrf_token?: string;
+         };
+         if (cancelled) return;
++        setCsrfToken(
++          typeof result.csrf_token === "string" ? result.csrf_token : "",
++        );
+         setStatus(result.authenticated === true ? "ok" : "auth-required");
+       } catch {
+         if (!cancelled) setStatus("auth-required");
+diff --git a/src/api/authHeaders.ts b/src/api/authHeaders.ts
+index 9786946..dbaeb49 100644
+--- a/src/api/authHeaders.ts
++++ b/src/api/authHeaders.ts
+@@ -1,11 +1,11 @@
+-import { getApiToken } from "./config";
++import { getCsrfToken } from "./config";
+ 
+-/** Authorization + X-Agent-Id for API requests. Caller sets Content-Type when needed. */
++/** In-memory CSRF + X-Agent-Id headers. Caller sets Content-Type when needed. */
+ export function buildAuthHeaders(): Record<string, string> {
+   const headers: Record<string, string> = {};
+-  const token = getApiToken();
+-  if (token) {
+-    headers.Authorization = `Bearer ${token}`;
++  const csrfToken = getCsrfToken();
++  if (csrfToken) {
++    headers["x-csrf-token"] = csrfToken;
+   }
+   try {
+     // Read from sessionStorage first (per-tab agent), fall back to localStorage
+diff --git a/src/api/config.test.ts b/src/api/config.test.ts
+index 429ed33..0697b69 100644
+--- a/src/api/config.test.ts
++++ b/src/api/config.test.ts
+@@ -1,76 +1,50 @@
+ import { describe, it, expect, beforeEach } from "vitest";
+-import { getApiUrl, getApiToken, setAuthToken, clearAuthToken } from "./config";
+-
+-// VITE_API_BASE_URL / TOKEN are declared globals in config.ts — set via globalThis
+-const setViteBase = (v: string) => {
+-  (globalThis as any).VITE_API_BASE_URL = v;
+-};
+-const setToken = (v: string) => {
+-  (globalThis as any).TOKEN = v;
+-};
++import {
++  clearAuthToken,
++  getApiToken,
++  getApiUrl,
++  getCsrfToken,
++  setAuthToken,
++  setCsrfToken,
++} from "./config";
+ 
+ describe("getApiUrl", () => {
+-  beforeEach(() => setViteBase(""));
+-
+-  it("prepends /api prefix when base is empty", () => {
+-    expect(getApiUrl("/models")).toBe("/api/models");
++  it("uses the same-origin DigitalMate compatibility base", () => {
++    expect(getApiUrl("/models")).toBe("/api/admin/compat/models");
+   });
+ 
+   it("auto-prepends / when path does not start with /", () => {
+-    expect(getApiUrl("models")).toBe("/api/models");
+-  });
+-
+-  it("correctly concatenates when base URL is set", () => {
+-    setViteBase("http://localhost:8088");
+-    expect(getApiUrl("/models")).toBe("http://localhost:8088/api/models");
++    expect(getApiUrl("models")).toBe("/api/admin/compat/models");
+   });
+ 
+   it("correctly handles nested paths", () => {
+     expect(getApiUrl("/models/openai/config")).toBe(
+-      "/api/models/openai/config",
++      "/api/admin/compat/models/openai/config",
+     );
+   });
+ });
+ 
+-describe("getApiToken", () => {
++describe("same-origin auth compatibility", () => {
+   beforeEach(() => {
+     localStorage.clear();
+-    setToken("");
++    setCsrfToken("");
+   });
+ 
+-  it("returns token from localStorage when present", () => {
++  it("never reads bearer tokens from browser storage", () => {
+     localStorage.setItem("qwenpaw_auth_token", "stored-token");
+-    expect(getApiToken()).toBe("stored-token");
+-  });
+-
+-  it("falls back to TOKEN global variable when localStorage has no token", () => {
+-    setToken("build-time-token");
+-    expect(getApiToken()).toBe("build-time-token");
+-  });
+-
+-  it("returns empty string when neither is set", () => {
+     expect(getApiToken()).toBe("");
+   });
+-});
+-
+-describe("setAuthToken / clearAuthToken", () => {
+-  beforeEach(() => localStorage.clear());
+ 
+-  it("setAuthToken writes to localStorage", () => {
++  it("legacy token mutators do not write browser storage", () => {
+     setAuthToken("my-token");
+-    expect(localStorage.getItem("qwenpaw_auth_token")).toBe("my-token");
+-  });
+-
+-  it("clearAuthToken removes token from localStorage", () => {
+-    localStorage.setItem("qwenpaw_auth_token", "my-token");
+     clearAuthToken();
++    expect(getApiToken()).toBe("");
+     expect(localStorage.getItem("qwenpaw_auth_token")).toBeNull();
+   });
+ 
+-  it("getApiToken returns empty string after clearAuthToken", () => {
+-    setToken("");
+-    setAuthToken("my-token");
+-    clearAuthToken();
+-    expect(getApiToken()).toBe("");
++  it("keeps the CSRF token in module memory", () => {
++    setCsrfToken("csrf-value");
++    expect(getCsrfToken()).toBe("csrf-value");
++    expect(localStorage.length).toBe(0);
+   });
+ });
+diff --git a/src/api/config.ts b/src/api/config.ts
+index 6bef907..d31e3b0 100644
+--- a/src/api/config.ts
++++ b/src/api/config.ts
+@@ -1,41 +1,36 @@
+-declare const VITE_API_BASE_URL: string;
+-declare const TOKEN: string;
+-
+-const AUTH_TOKEN_KEY = "qwenpaw_auth_token";
++const API_BASE_URL = "/api/admin/compat";
++let csrfToken = "";
+ 
+ /**
+  * Get the full API URL with /api prefix
+  * @param path - API path (e.g., "/models", "/skills")
+- * @returns Full API URL (e.g., "http://localhost:8088/api/models" or "/api/models")
++ * @returns Same-origin DigitalMate compatibility API URL
+  */
+ export function getApiUrl(path: string): string {
+-  const base = VITE_API_BASE_URL || "";
+-  const apiPrefix = "/api";
+   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+-  return `${base}${apiPrefix}${normalizedPath}`;
++  return `${API_BASE_URL}${normalizedPath}`;
+ }
+ 
+ /**
+- * Get the API token - checks localStorage first (auth login),
+- * then falls back to the build-time TOKEN constant.
+- * @returns API token string or empty string
++ * Legacy compatibility exports intentionally keep bearer tokens out of
++ * cookies and browser storage. DigitalMate authentication is same-origin.
+  */
+ export function getApiToken(): string {
+-  const stored = localStorage.getItem(AUTH_TOKEN_KEY);
+-  if (stored) return stored;
+-  return typeof TOKEN !== "undefined" ? TOKEN : "";
++  return "";
+ }
+ 
+-/**
+- * Store the auth token in localStorage after login.
+- */
+-export function setAuthToken(token: string): void {
+-  localStorage.setItem(AUTH_TOKEN_KEY, token);
++export function setAuthToken(_token: string): void {
++  // No-op: the host application owns its same-origin login session.
+ }
+ 
+-/**
+- * Remove the auth token from localStorage (logout / 401).
+- */
+ export function clearAuthToken(): void {
+-  localStorage.removeItem(AUTH_TOKEN_KEY);
++  // No-op: Console never owns the host login session.
++}
++
++export function setCsrfToken(token: string): void {
++  csrfToken = token;
++}
++
++export function getCsrfToken(): string {
++  return csrfToken;
+ }
+diff --git a/src/api/modules/auth.test.ts b/src/api/modules/auth.test.ts
+index 5fad1d8..f8e611d 100644
+--- a/src/api/modules/auth.test.ts
++++ b/src/api/modules/auth.test.ts
+@@ -1,10 +1,13 @@
+-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++import { describe, it, expect, vi, afterEach } from "vitest";
+ import { authApi } from "./auth";
+ 
+ // auth.ts uses fetch directly (not the request wrapper), so mock global fetch
+ vi.mock("../config", () => ({
+   getApiUrl: (path: string) => `/api${path}`,
+ }));
++vi.mock("../authHeaders", () => ({
++  buildAuthHeaders: () => ({ "x-csrf-token": "csrf-value" }),
++}));
+ 
+ function mockFetch(status: number, body: unknown) {
+   global.fetch = vi.fn().mockResolvedValue({
+@@ -109,9 +112,6 @@ describe("authApi.getStatus", () => {
+ });
+ 
+ describe("authApi.updateProfile", () => {
+-  beforeEach(() => {
+-    localStorage.clear();
+-  });
+   afterEach(() => vi.clearAllMocks());
+ 
+   it("sends POST to /api/auth/update-profile", async () => {
+@@ -132,12 +132,12 @@ describe("authApi.updateProfile", () => {
+     expect(body.new_password).toBeNull();
+   });
+ 
+-  it("reads token from localStorage and injects Authorization header", async () => {
+-    localStorage.setItem("qwenpaw_auth_token", "my-token");
++  it("injects the in-memory CSRF header without browser token storage", async () => {
+     mockFetch(200, { token: "t", username: "alice" });
+     await authApi.updateProfile("oldpass");
+     const headers = (fetch as any).mock.calls[0][1].headers;
+-    expect(headers.Authorization).toBe("Bearer my-token");
++    expect(headers["x-csrf-token"]).toBe("csrf-value");
++    expect(headers.Authorization).toBeUndefined();
+   });
+ 
+   it("throws detail error on update failure", async () => {
+diff --git a/src/api/modules/auth.ts b/src/api/modules/auth.ts
+index b056f37..3a63d23 100644
+--- a/src/api/modules/auth.ts
++++ b/src/api/modules/auth.ts
+@@ -1,4 +1,5 @@
+ import { getApiUrl } from "../config";
++import { buildAuthHeaders } from "../authHeaders";
+ 
+ export interface LoginResponse {
+   token: string;
+@@ -15,7 +16,7 @@ export const authApi = {
+   login: async (username: string, password: string): Promise<LoginResponse> => {
+     const res = await fetch(getApiUrl("/auth/login"), {
+       method: "POST",
+-      headers: { "Content-Type": "application/json" },
++      headers: { ...buildAuthHeaders(), "Content-Type": "application/json" },
+       body: JSON.stringify({ username, password }),
+     });
+     if (!res.ok) {
+@@ -31,7 +32,7 @@ export const authApi = {
+   ): Promise<LoginResponse> => {
+     const res = await fetch(getApiUrl("/auth/register"), {
+       method: "POST",
+-      headers: { "Content-Type": "application/json" },
++      headers: { ...buildAuthHeaders(), "Content-Type": "application/json" },
+       body: JSON.stringify({ username, password }),
+     });
+     if (!res.ok) {
+@@ -52,12 +53,11 @@ export const authApi = {
+     newUsername?: string,
+     newPassword?: string,
+   ): Promise<LoginResponse> => {
+-    const token = localStorage.getItem("qwenpaw_auth_token") || "";
+     const res = await fetch(getApiUrl("/auth/update-profile"), {
+       method: "POST",
+       headers: {
++        ...buildAuthHeaders(),
+         "Content-Type": "application/json",
+-        Authorization: `Bearer ${token}`,
+       },
+       body: JSON.stringify({
+         current_password: currentPassword,
+diff --git a/src/api/modules/skill.ts b/src/api/modules/skill.ts
+index 60a1356..9b4b9b9 100644
+--- a/src/api/modules/skill.ts
++++ b/src/api/modules/skill.ts
+@@ -11,9 +11,6 @@ import type {
+   WorkspaceSkillSummary,
+ } from "../types";
+ 
+-// Declare VITE_API_BASE_URL as global (injected by Vite)
+-declare const VITE_API_BASE_URL: string;
+-
+ // Simple in-memory cache with TTL
+ const CACHE_TTL_MS = 30000; // 30 seconds
+ const apiCache = new Map<string, { data: unknown; timestamp: number }>();
+@@ -63,11 +60,6 @@ export function invalidateSkillCache(options?: {
+   }
+ }
+ 
+-function getStreamApiUrl(): string {
+-  const base = typeof VITE_API_BASE_URL === "string" ? VITE_API_BASE_URL : "";
+-  return `${base}/api`;
+-}
+-
+ async function _uploadZip(
+   endpoint: string,
+   file: File,
+@@ -526,11 +518,10 @@ export const skillApi = {
+     signal: AbortSignal,
+     language: string = "en",
+   ): Promise<void> {
+-    const apiUrl = getStreamApiUrl();
+-
+-    const response = await fetch(`${apiUrl}/skills/ai/optimize/stream`, {
++    const response = await fetch(getApiUrl("/skills/ai/optimize/stream"), {
+       method: "POST",
+       headers: {
++        ...buildAuthHeaders(),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({ content, language }),
+diff --git a/src/api/request.test.ts b/src/api/request.test.ts
+index ce94f9a..eb870f9 100644
+--- a/src/api/request.test.ts
++++ b/src/api/request.test.ts
+@@ -5,6 +5,7 @@ import { request } from "./request";
+ vi.mock("./config", () => ({
+   getApiUrl: (path: string) => `/api${path}`,
+   getApiToken: vi.fn(() => ""),
++  getCsrfToken: vi.fn(() => ""),
+   clearAuthToken: vi.fn(),
+ }));
+ 
+@@ -12,7 +13,7 @@ vi.mock("./authHeaders", () => ({
+   buildAuthHeaders: vi.fn(() => ({})),
+ }));
+ 
+-import { clearAuthToken } from "./config";
++import { clearAuthToken, getCsrfToken } from "./config";
+ import { buildAuthHeaders } from "./authHeaders";
+ 
+ // Helper: create a mock Response
+@@ -42,6 +43,7 @@ function mockFetch(
+ describe("request", () => {
+   beforeEach(() => {
+     vi.mocked(buildAuthHeaders).mockReturnValue({});
++    vi.mocked(getCsrfToken).mockReturnValue("");
+     Object.defineProperty(window, "location", {
+       value: { pathname: "/chat", href: "" },
+       writable: true,
+@@ -70,6 +72,19 @@ describe("request", () => {
+     expect(headers.get("Content-Type")).toBe("application/json");
+   });
+ 
++  it("adds the in-memory CSRF token to write requests only", async () => {
++    vi.mocked(getCsrfToken).mockReturnValue("csrf-value");
++    mockFetch(200, { data: "ok" });
++
++    await request("/models", { method: "POST", body: "{}" });
++    let headers: Headers = (fetch as any).mock.calls[0][1].headers;
++    expect(headers.get("x-csrf-token")).toBe("csrf-value");
++
++    await request("/models");
++    headers = (fetch as any).mock.calls[1][1].headers;
++    expect(headers.has("x-csrf-token")).toBe(false);
++  });
++
+   it("PUT request automatically adds Content-Type", async () => {
+     mockFetch(200, { status: "ok" });
+     await request("/models/active", { method: "PUT", body: "{}" });
+diff --git a/src/api/request.ts b/src/api/request.ts
+index 7f4cb7d..7367558 100644
+--- a/src/api/request.ts
++++ b/src/api/request.ts
+@@ -1,4 +1,4 @@
+-import { getApiUrl, clearAuthToken } from "./config";
++import { getApiUrl, clearAuthToken, getCsrfToken } from "./config";
+ import { buildAuthHeaders } from "./authHeaders";
+ 
+ function getErrorMessageFromBody(
+@@ -54,6 +54,16 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
+     }
+   }
+ 
++  const csrfToken = getCsrfToken();
++  if (
++    method &&
++    ["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase()) &&
++    csrfToken &&
++    !headers.has("x-csrf-token")
++  ) {
++    headers.set("x-csrf-token", csrfToken);
++  }
++
+   return headers;
+ }
+ 
+diff --git a/src/locales/en.json b/src/locales/en.json
+index b5f9dc4..28f7b45 100644
+--- a/src/locales/en.json
++++ b/src/locales/en.json
+@@ -474,6 +474,7 @@
+     "description": "Description",
+     "workspace": "Workspace Path",
+     "create": "Create Agent",
++    "secondaryAgentUnsupported": "This release supports the default digital avatar only. Creating, cloning, and deleting additional avatars is not available yet.",
+     "createTitle": "Create New Agent",
+     "createSuccess": "Agent created successfully",
+     "createFailed": "Failed to create agent",
+diff --git a/src/locales/zh.json b/src/locales/zh.json
+index 98e9c36..1f52ce0 100644
+--- a/src/locales/zh.json
++++ b/src/locales/zh.json
+@@ -257,6 +257,7 @@
+     "description": "描述",
+     "workspace": "工作区路径",
+     "create": "创建智能体",
++    "secondaryAgentUnsupported": "本期仅支持默认数字分身，新增、克隆与删除其他分身暂未开放。",
+     "createTitle": "创建新智能体",
+     "createSuccess": "智能体创建成功",
+     "createFailed": "智能体创建失败",
+diff --git a/src/pages/Settings/Agents/components/AgentTable.test.tsx b/src/pages/Settings/Agents/components/AgentTable.test.tsx
+index 62c02e5..459afed 100644
+--- a/src/pages/Settings/Agents/components/AgentTable.test.tsx
++++ b/src/pages/Settings/Agents/components/AgentTable.test.tsx
+@@ -40,4 +40,24 @@ describe("AgentTable", () => {
+       screen.getByRole("button", { name: "agent.unpinAgent" }),
+     ).toBeInTheDocument();
+   });
++
++  it("accurately disables secondary avatar deletion when unsupported", () => {
++    renderWithProviders(
++      <AgentTable
++        agents={[agent("secondary", false)]}
++        loading={false}
++        reordering={false}
++        onEdit={vi.fn()}
++        onDelete={vi.fn()}
++        onToggle={vi.fn()}
++        onPin={vi.fn()}
++        onReorder={vi.fn()}
++        secondaryAgentActionsDisabled
++      />,
++    );
++
++    expect(
++      screen.getByTitle("agent.secondaryAgentUnsupported"),
++    ).toBeDisabled();
++  });
+ });
+diff --git a/src/pages/Settings/Agents/components/AgentTable.tsx b/src/pages/Settings/Agents/components/AgentTable.tsx
+index 5bdc7fb..8935540 100644
+--- a/src/pages/Settings/Agents/components/AgentTable.tsx
++++ b/src/pages/Settings/Agents/components/AgentTable.tsx
+@@ -32,6 +32,7 @@ interface AgentTableProps {
+   onToggle: (agentId: string, currentEnabled: boolean) => void;
+   onPin: (agentId: string, currentPinned: boolean) => void;
+   onReorder: (activeId: string, overId: string) => void;
++  secondaryAgentActionsDisabled?: boolean;
+ }
+ 
+ export function AgentTable({
+@@ -43,6 +44,7 @@ export function AgentTable({
+   onToggle,
+   onPin,
+   onReorder,
++  secondaryAgentActionsDisabled = false,
+ }: AgentTableProps) {
+   const { t } = useTranslation();
+   const { isDark } = useTheme();
+@@ -163,6 +165,8 @@ export function AgentTable({
+           record.startup_status === "pending" ||
+           record.startup_status === "starting";
+         const toggleDisabled = record.id === "default" || startupInProgress;
++        const deleteDisabled =
++          secondaryAgentActionsDisabled || toggleDisabled;
+         const pinActionLabel =
+           record.id === "default"
+             ? t("agent.defaultPinned")
+@@ -237,7 +241,7 @@ export function AgentTable({
+               title={t("agent.deleteConfirm")}
+               description={t("agent.deleteConfirmDesc")}
+               onConfirm={() => onDelete(record.id)}
+-              disabled={toggleDisabled}
++              disabled={deleteDisabled}
+               okText={t("common.confirm")}
+               cancelText={t("common.cancel")}
+             >
+@@ -246,10 +250,12 @@ export function AgentTable({
+                 size="middle"
+                 danger
+                 icon={<DeleteOutlined />}
+-                disabled={toggleDisabled}
++                disabled={deleteDisabled}
+                 style={record.id === "default" ? disabledStyle : undefined}
+                 title={
+-                  record.id === "default"
++                  secondaryAgentActionsDisabled
++                    ? t("agent.secondaryAgentUnsupported")
++                    : record.id === "default"
+                     ? t("agent.defaultNotDeletable")
+                     : startupInProgress
+                     ? t("agent.status.waitUntilStarted")
+diff --git a/src/pages/Settings/Agents/index.tsx b/src/pages/Settings/Agents/index.tsx
+index 20bea0b..1c5818f 100644
+--- a/src/pages/Settings/Agents/index.tsx
++++ b/src/pages/Settings/Agents/index.tsx
+@@ -1,5 +1,5 @@
+ import { useState, useRef, useCallback } from "react";
+-import { Card, Button, Form } from "antd";
++import { Card, Button, Form, Tooltip } from "antd";
+ import { useAppMessage } from "../../../hooks/useAppMessage";
+ import { PlusOutlined } from "@ant-design/icons";
+ import { useTranslation } from "react-i18next";
+@@ -13,6 +13,8 @@ import { PageHeader } from "@/components/PageHeader";
+ import { reorderAgents } from "./reorder";
+ import styles from "./index.module.less";
+ 
++const SECONDARY_AGENT_CAPABILITY = "unsupported";
++
+ export default function AgentsPage() {
+   const { t, i18n } = useTranslation();
+   const {
+@@ -32,6 +34,8 @@ export default function AgentsPage() {
+   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+   const installedSkillsRef = useRef<string[]>([]);
+   const { message } = useAppMessage();
++  const secondaryAgentActionsDisabled =
++    SECONDARY_AGENT_CAPABILITY === "unsupported";
+ 
+   const handleCreate = () => {
+     setEditingAgent(null);
+@@ -193,13 +197,18 @@ export default function AgentsPage() {
+         current={t("agent.agents")}
+         extra={
+           <div className={styles.headerRight}>
+-            <Button
+-              type="primary"
+-              icon={<PlusOutlined />}
+-              onClick={handleCreate}
+-            >
+-              {t("agent.create")}
+-            </Button>
++            <Tooltip title={t("agent.secondaryAgentUnsupported")}>
++              <span>
++                <Button
++                  type="primary"
++                  icon={<PlusOutlined />}
++                  onClick={handleCreate}
++                  disabled={secondaryAgentActionsDisabled}
++                >
++                  {t("agent.create")}
++                </Button>
++              </span>
++            </Tooltip>
+           </div>
+         }
+       />
+@@ -214,6 +223,7 @@ export default function AgentsPage() {
+           onToggle={handleToggle}
+           onPin={handlePin}
+           onReorder={handleReorder}
++          secondaryAgentActionsDisabled={secondaryAgentActionsDisabled}
+         />
+       </Card>
+ 
+diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
+index 5607a73..de360b3 100644
+--- a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
++++ b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
+@@ -6,6 +6,7 @@ import {
+   buildMarketDownloadUrl,
+   type MarketPluginEntry,
+ } from "@/api/modules/pluginMarket";
++import { getApiUrl } from "@/api/config";
+ import { installPlugin } from "@/api/modules/plugin";
+ 
+ /**
+@@ -54,7 +55,7 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
+ 
+   useEffect(() => {
+     const controller = new AbortController();
+-    fetch("/api/version", { signal: controller.signal })
++    fetch(getApiUrl("/version"), { signal: controller.signal })
+       .then((res) => {
+         if (!res.ok) {
+           throw new Error(`HTTP ${res.status}`);
+diff --git a/src/plugins/hostExternals.ts b/src/plugins/hostExternals.ts
+index 0eff169..41b020a 100644
+--- a/src/plugins/hostExternals.ts
++++ b/src/plugins/hostExternals.ts
+@@ -31,8 +31,6 @@ import type {
+   QwenPawChatNamespace,
+ } from "./types/qwenpaw";
+ 
+-declare const VITE_API_BASE_URL: string;
+-
+ // ─────────────────────────────────────────────────────────────────────────────
+ // Public types
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -223,8 +221,7 @@ function ensurePluginsGroup(): void {
+ }
+ 
+ export function installHostExternals(): void {
+-  const apiBaseUrl =
+-    typeof VITE_API_BASE_URL !== "undefined" ? VITE_API_BASE_URL : "";
++  const apiBaseUrl = getApiUrl("").replace(/\/$/, "");
+ 
+   if (!window.QwenPaw) {
+     (window as any).QwenPaw = {} as WindowNamespace;
