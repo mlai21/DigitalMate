@@ -626,7 +626,7 @@ index 32443a037535fd7a8b48d0d74a22ea8cc9dec410..c719394e66fc5c15f3f083b727090a3e
    display: flex;
    align-items: flex-start;
 diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
-index 4c903f0891d626b8654648b1bac8ee6c56935cde..05e7203330a07060306ace8213a4150eaff4083c 100644
+index 4c903f0891d626b8654648b1bac8ee6c56935cde..51b66019bb730990aa7a8a8664a49b9856cbf141 100644
 --- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
 +++ b/src/pages/Chat/OptionsPanel/defaultConfig.ts
 @@ -7,7 +7,7 @@ const defaultConfig = {
@@ -638,6 +638,15 @@ index 4c903f0891d626b8654648b1bac8ee6c56935cde..05e7203330a07060306ace8213a4150e
      },
      bubbleList: {
        userMessageAnchors: {
+@@ -27,7 +27,7 @@ const defaultConfig = {
+     greeting: "Hello, how can I help you today?",
+     description:
+       "I am a helpful assistant that can help you with your questions.",
+-    avatar: "/online.svg",
++    avatar: `${import.meta.env.BASE_URL}online.svg`,
+     prompts: [
+       {
+         value: "Let's start a new journey!",
 diff --git a/src/pages/Chat/index.tsx b/src/pages/Chat/index.tsx
 index 3ff65b997ac52ba155827331abb5ee2f768693d3..a89d42482ec44dfa79026291e40c65e1413d74c6 100644
 --- a/src/pages/Chat/index.tsx

@@ -24,7 +24,7 @@ index db4877f854ae7593dcbef3a07912cb7431f9fa12..53fb39ad9a1980830ea4ecd938326ad9
        >
          <AntdApp>
 diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
-index 05e7203330a07060306ace8213a4150eaff4083c..1974e8ccccd57a0ea4fafda9429cc4078c84b155 100644
+index 51b66019bb730990aa7a8a8664a49b9856cbf141..43b338a2a34bdb58117d8a3e9949741ec0273032 100644
 --- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
 +++ b/src/pages/Chat/OptionsPanel/defaultConfig.ts
 @@ -3,6 +3,6 @@ import type { TFunction } from "i18next";

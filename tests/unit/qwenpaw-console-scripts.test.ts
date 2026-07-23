@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import {
   access,
   chmod,
@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
@@ -240,6 +241,134 @@ async function createReplacementFixture(): Promise<{
 
 async function expectPathMissing(targetPath: string): Promise<void> {
   await expect(access(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+async function runRealSignalLifecycleTest(
+  signal: "SIGINT" | "SIGTERM",
+  phase: "prepare" | "cleanup",
+): Promise<{
+  commandLogPath: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  temporaryRoot: string;
+  workdir: string;
+}> {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), `dm-qwenpaw-${phase}-signal-`),
+  );
+  const fixturePath = path.join(temporaryRoot, "signal-fixture.mjs");
+  const workdir = path.join(temporaryRoot, "console");
+  const commandLogPath = path.join(temporaryRoot, "commands.log");
+  const runnerUrl = pathToFileURL(
+    path.resolve("scripts/qwenpaw-console/test.mjs"),
+  ).href;
+  await writeFile(
+    fixturePath,
+    `
+import { appendFile, mkdir, rm } from "node:fs/promises";
+import { runPreparedConsoleTests } from ${JSON.stringify(runnerUrl)};
+
+const phase = ${JSON.stringify(phase)};
+const workdir = ${JSON.stringify(workdir)};
+const commandLogPath = ${JSON.stringify(commandLogPath)};
+const waitForSignal = () => new Promise((resolve) => setTimeout(resolve, 500));
+
+const outcome = await runPreparedConsoleTests({
+  prepare: async () => {
+    await mkdir(workdir, { recursive: true });
+    if (phase === "prepare") {
+      process.stdout.write("READY:prepare\\n");
+      await waitForSignal();
+    }
+    return { workdir, applied: [] };
+  },
+  runCommand: async (command) => {
+    await appendFile(commandLogPath, \`\${command}\\n\`);
+    return { exitCode: 0, signal: null };
+  },
+  validateBuild: async () => ({
+    indexPath: "",
+    logoPath: "",
+    resourceUrls: [],
+  }),
+  cleanup: async (target) => {
+    if (phase === "cleanup") {
+      process.stdout.write("READY:cleanup\\n");
+      await waitForSignal();
+    }
+    await rm(target, { recursive: true, force: true });
+  },
+});
+
+if (outcome.signal) {
+  process.kill(process.pid, outcome.signal);
+} else {
+  process.exitCode = outcome.exitCode;
+}
+`,
+    "utf8",
+  );
+
+  const child = spawn(process.execPath, [fixturePath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`signal fixture did not reach ${phase}`)),
+      10_000,
+    );
+    const inspectOutput = () => {
+      if (stdout.includes(`READY:${phase}\n`)) {
+        clearTimeout(timeout);
+        child.stdout.off("data", inspectOutput);
+        resolve();
+      }
+    };
+    child.stdout.on("data", inspectOutput);
+    child.once("exit", (exitCode, exitSignal) => {
+      if (!stdout.includes(`READY:${phase}\n`)) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            `signal fixture exited before ${phase}: ${exitCode}/${exitSignal}`,
+          ),
+        );
+      }
+    });
+  });
+
+  try {
+    await ready;
+    expect(child.kill(signal)).toBe(true);
+    const result = await new Promise<{
+      exitCode: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (exitCode, exitSignal) =>
+        resolve({ exitCode, signal: exitSignal }),
+      );
+    });
+    return { ...result, commandLogPath, stderr, temporaryRoot, workdir };
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 describe("QwenPaw Console sync", () => {
@@ -914,6 +1043,7 @@ describe("QwenPaw Console patch preparation", () => {
         updateContentSource,
         layoutStyles,
         chatSource,
+        defaultConfigSource,
         codingToggleSource,
         projectSelectSource,
         desktopUpdateSource,
@@ -945,6 +1075,7 @@ describe("QwenPaw Console patch preparation", () => {
         readPrepared("src/layouts/constants.ts"),
         readPrepared("src/layouts/index.module.less"),
         readPrepared("src/pages/Chat/index.tsx"),
+        readPrepared("src/pages/Chat/OptionsPanel/defaultConfig.ts"),
         readPrepared("src/components/CodingModeToggle/index.tsx"),
         readPrepared("src/components/ProjectSelectModal/index.tsx"),
         readPrepared("src/contexts/DesktopUpdateContext.tsx"),
@@ -988,6 +1119,10 @@ describe("QwenPaw Console patch preparation", () => {
       expect(layoutStyles).not.toContain("qwenpawBack.png");
       expect(chatSource).toContain("avatar: extAvatar ?? DIGITALMATE_LOGO_URL");
       expect(chatSource).toContain('nick: extNick ?? "DigitalMate"');
+      expect(defaultConfigSource).toContain(
+        "`${import.meta.env.BASE_URL}online.svg`",
+      );
+      expect(defaultConfigSource).not.toContain('avatar: "/online.svg"');
       for (const brandedSource of [
         headerSource,
         chatSource,
@@ -1206,19 +1341,71 @@ describe("QwenPaw Console isolated test runner", () => {
       path.join(tmpdir(), "dm-qwenpaw-dist-"),
     );
     const distRoot = path.join(temporaryRoot, "dist");
-    await mkdir(path.join(distRoot, "assets"), { recursive: true });
-    await writeFile(path.join(distRoot, "assets", "app.js"), "export {};\n");
+    const scriptPath = path.join(distRoot, "assets", "chunks", "app.js");
+    const stylesheetPath = path.join(
+      distRoot,
+      "assets",
+      "styles",
+      "app.css",
+    );
+    await mkdir(path.dirname(scriptPath), { recursive: true });
+    await mkdir(path.dirname(stylesheetPath), { recursive: true });
+    await writeFile(
+      scriptPath,
+      'const avatar = "/_admin-console/online.svg";\n' +
+        'const monacoLoader = config.paths.vs + "/loader.js";\n',
+    );
+    await writeFile(
+      stylesheetPath,
+      '.avatar{background-image:url("/_admin-console/online.svg")}\n',
+    );
     await writeFile(path.join(distRoot, "online.svg"), "<svg />\n");
     await writeFile(path.join(distRoot, "digitalmate-logo.svg"), "<svg />\n");
 
     try {
       await writeFile(
         path.join(distRoot, "index.html"),
-        '<script src="/_admin-console/assets/app.js"></script><link href="/_admin-console/online.svg">',
+        '<script src="/_admin-console/assets/chunks/app.js"></script>' +
+          '<link rel="stylesheet" href="/_admin-console/assets/styles/app.css">' +
+          '<link href="/_admin-console/online.svg">',
       );
       await expect(
         testing.validateConsoleBuild(temporaryRoot),
       ).resolves.toBeDefined();
+
+      await writeFile(scriptPath, 'const avatar = "/online.svg";\n');
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "outside /_admin-console/",
+      );
+      await writeFile(
+        scriptPath,
+        'const avatar = "/_admin-console/online.svg";\n' +
+          'const monacoLoader = config.paths.vs + "/loader.js";\n',
+      );
+
+      await writeFile(
+        stylesheetPath,
+        '.avatar{background-image:url("/online.svg")}\n',
+      );
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "outside /_admin-console/",
+      );
+      await writeFile(
+        stylesheetPath,
+        '.avatar{background-image:url("/_admin-console/online.svg")}\n',
+      );
+
+      await writeFile(
+        scriptPath,
+        'const avatar = "/_admin-console/missing.svg";\n',
+      );
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "missing build asset",
+      );
+      await writeFile(
+        scriptPath,
+        'const avatar = "/_admin-console/online.svg";\n',
+      );
 
       await writeFile(
         path.join(distRoot, "index.html"),
@@ -1239,7 +1426,7 @@ describe("QwenPaw Console isolated test runner", () => {
       await rm(path.join(distRoot, "digitalmate-logo.svg"));
       await writeFile(
         path.join(distRoot, "index.html"),
-        '<script src="/_admin-console/assets/app.js"></script>',
+        '<script src="/_admin-console/assets/chunks/app.js"></script>',
       );
       await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
         "digitalmate-logo.svg",
@@ -1307,6 +1494,40 @@ describe("QwenPaw Console isolated test runner", () => {
       expect(cleanupCount).toBe(1);
     },
   );
+
+  it("prepare 阶段收到真实 SIGINT 后清理目录且不执行命令", async () => {
+    const result = await runRealSignalLifecycleTest("SIGINT", "prepare");
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGINT",
+      });
+      await expectPathMissing(result.workdir);
+      await expectPathMissing(result.commandLogPath);
+      expect(result.stderr).toBe("");
+    } finally {
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("cleanup 阶段收到真实 SIGTERM 后完成清理并按原信号退出", async () => {
+    const result = await runRealSignalLifecycleTest("SIGTERM", "cleanup");
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGTERM",
+      });
+      await expectPathMissing(result.workdir);
+      await expect(readFile(result.commandLogPath, "utf8")).resolves.toBe(
+        "npm\nnpm\nnpm\n",
+      );
+      expect(result.stderr).toBe("");
+    } finally {
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("信号与清理异常同时发生时保留信号", async () => {
     const cleanupError = new Error("injected cleanup failure");
