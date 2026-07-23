@@ -170,7 +170,7 @@ index 48d64ec..4830205 100644
 -    );
 -  }
 -  return <Navigate to={codingMode ? "/coding" : "/chat"} replace />;
-+  return <Navigate to="/channels" replace />;
++  return <Navigate to="/inbox" replace />;
 +}
 +
 +function DigitalMateHomeRedirect() {

@@ -1,18 +1,12 @@
 diff --git a/src/App.tsx b/src/App.tsx
-index 3439cb8..64c9d47 100644
+index 3439cb878d8c2634226a8174edc52f957a58d4b0..64c9d47a4d8d6fe43b9a97e8e4dcfeb9ec286764 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -30,6 +30,7 @@ import { DesktopUpdateProvider } from "./contexts/DesktopUpdateContext";
- import { UpdateTakeoverGate } from "./components/UpdateTakeoverPage";
- import { languageApi } from "./api/modules/language";
+@@ -32,2 +32,3 @@ import { languageApi } from "./api/modules/language";
  import { useUploadLimitStore } from "./stores/uploadLimitStore";
 +import { setCsrfToken } from "./api/config";
  import CloseWindowPrompt from "./tauri/CloseWindowPrompt";
- import { isTauri } from "@tauri-apps/api/core";
- import "./styles/layout.css";
-@@ -76,8 +77,12 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
-         }
-         const result = (await response.json()) as {
+@@ -78,4 +79,8 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
            authenticated?: boolean;
 +          csrf_token?: string;
          };
@@ -21,13 +15,11 @@ index 3439cb8..64c9d47 100644
 +          typeof result.csrf_token === "string" ? result.csrf_token : "",
 +        );
          setStatus(result.authenticated === true ? "ok" : "auth-required");
-       } catch {
-         if (!cancelled) setStatus("auth-required");
 diff --git a/src/api/authHeaders.ts b/src/api/authHeaders.ts
-index 9786946..dbaeb49 100644
+index 9786946bc56fc894982d03d41a72b7d900a5a385..dbaeb496a18707b6ce14f53e70e6450a016a17c3 100644
 --- a/src/api/authHeaders.ts
 +++ b/src/api/authHeaders.ts
-@@ -1,11 +1,11 @@
+@@ -1,9 +1,9 @@
 -import { getApiToken } from "./config";
 +import { getCsrfToken } from "./config";
  
@@ -42,13 +34,11 @@ index 9786946..dbaeb49 100644
 +  if (csrfToken) {
 +    headers["x-csrf-token"] = csrfToken;
    }
-   try {
-     // Read from sessionStorage first (per-tab agent), fall back to localStorage
 diff --git a/src/api/config.test.ts b/src/api/config.test.ts
-index 429ed33..0697b69 100644
+index 429ed33572a3f6709817f9ca005826403726ed13..0697b69fc3877562be5ea82bf937b3c36ecc4450 100644
 --- a/src/api/config.test.ts
 +++ b/src/api/config.test.ts
-@@ -1,76 +1,50 @@
+@@ -1,17 +1,14 @@
  import { describe, it, expect, beforeEach } from "vitest";
 -import { getApiUrl, getApiToken, setAuthToken, clearAuthToken } from "./config";
 -
@@ -76,7 +66,7 @@ index 429ed33..0697b69 100644
 +  it("uses the same-origin DigitalMate compatibility base", () => {
 +    expect(getApiUrl("/models")).toBe("/api/admin/compat/models");
    });
- 
+@@ -19,8 +16,3 @@ describe("getApiUrl", () => {
    it("auto-prepends / when path does not start with /", () => {
 -    expect(getApiUrl("models")).toBe("/api/models");
 -  });
@@ -86,14 +76,12 @@ index 429ed33..0697b69 100644
 -    expect(getApiUrl("/models")).toBe("http://localhost:8088/api/models");
 +    expect(getApiUrl("models")).toBe("/api/admin/compat/models");
    });
- 
-   it("correctly handles nested paths", () => {
+@@ -29,3 +21,3 @@ describe("getApiUrl", () => {
      expect(getApiUrl("/models/openai/config")).toBe(
 -      "/api/models/openai/config",
 +      "/api/admin/compat/models/openai/config",
      );
-   });
- });
+@@ -34,34 +26,17 @@ describe("getApiUrl", () => {
  
 -describe("getApiToken", () => {
 +describe("same-origin auth compatibility", () => {
@@ -133,7 +121,7 @@ index 429ed33..0697b69 100644
      clearAuthToken();
 +    expect(getApiToken()).toBe("");
      expect(localStorage.getItem("qwenpaw_auth_token")).toBeNull();
-   });
+@@ -69,7 +44,6 @@ describe("setAuthToken / clearAuthToken", () => {
  
 -  it("getApiToken returns empty string after clearAuthToken", () => {
 -    setToken("");
@@ -145,12 +133,11 @@ index 429ed33..0697b69 100644
 +    expect(getCsrfToken()).toBe("csrf-value");
 +    expect(localStorage.length).toBe(0);
    });
- });
 diff --git a/src/api/config.ts b/src/api/config.ts
-index 6bef907..d31e3b0 100644
+index 6bef907169a575f5a0eb32b71f1812d317a279fb..d31e3b036859aedc9ce3bb2bbd08d359f17a96c7 100644
 --- a/src/api/config.ts
 +++ b/src/api/config.ts
-@@ -1,41 +1,36 @@
+@@ -1,5 +1,3 @@
 -declare const VITE_API_BASE_URL: string;
 -declare const TOKEN: string;
 -
@@ -158,8 +145,7 @@ index 6bef907..d31e3b0 100644
 +const API_BASE_URL = "/api/admin/compat";
 +let csrfToken = "";
  
- /**
-  * Get the full API URL with /api prefix
+@@ -8,9 +6,7 @@ const AUTH_TOKEN_KEY = "qwenpaw_auth_token";
   * @param path - API path (e.g., "/models", "/skills")
 - * @returns Full API URL (e.g., "http://localhost:8088/api/models" or "/api/models")
 + * @returns Same-origin DigitalMate compatibility API URL
@@ -171,7 +157,7 @@ index 6bef907..d31e3b0 100644
 -  return `${base}${apiPrefix}${normalizedPath}`;
 +  return `${API_BASE_URL}${normalizedPath}`;
  }
- 
+@@ -18,24 +14,23 @@ export function getApiUrl(path: string): string {
  /**
 - * Get the API token - checks localStorage first (auth login),
 - * then falls back to the build-time TOKEN constant.
@@ -211,109 +197,76 @@ index 6bef907..d31e3b0 100644
 +  return csrfToken;
  }
 diff --git a/src/api/modules/auth.test.ts b/src/api/modules/auth.test.ts
-index 5fad1d8..f8e611d 100644
+index 5fad1d8417ab977c43365a0a70458e80d5d52e94..f8e611d150f73694fe34f797453e46ec83a1c72f 100644
 --- a/src/api/modules/auth.test.ts
 +++ b/src/api/modules/auth.test.ts
-@@ -1,10 +1,13 @@
+@@ -1,2 +1,2 @@
 -import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 +import { describe, it, expect, vi, afterEach } from "vitest";
  import { authApi } from "./auth";
- 
- // auth.ts uses fetch directly (not the request wrapper), so mock global fetch
- vi.mock("../config", () => ({
-   getApiUrl: (path: string) => `/api${path}`,
+@@ -7,2 +7,5 @@ vi.mock("../config", () => ({
  }));
 +vi.mock("../authHeaders", () => ({
 +  buildAuthHeaders: () => ({ "x-csrf-token": "csrf-value" }),
 +}));
  
- function mockFetch(status: number, body: unknown) {
-   global.fetch = vi.fn().mockResolvedValue({
-@@ -109,9 +112,6 @@ describe("authApi.getStatus", () => {
- });
- 
+@@ -111,5 +114,2 @@ describe("authApi.getStatus", () => {
  describe("authApi.updateProfile", () => {
 -  beforeEach(() => {
 -    localStorage.clear();
 -  });
    afterEach(() => vi.clearAllMocks());
- 
-   it("sends POST to /api/auth/update-profile", async () => {
-@@ -132,12 +132,12 @@ describe("authApi.updateProfile", () => {
-     expect(body.new_password).toBeNull();
-   });
+@@ -134,4 +134,3 @@ describe("authApi.updateProfile", () => {
  
 -  it("reads token from localStorage and injects Authorization header", async () => {
 -    localStorage.setItem("qwenpaw_auth_token", "my-token");
 +  it("injects the in-memory CSRF header without browser token storage", async () => {
      mockFetch(200, { token: "t", username: "alice" });
-     await authApi.updateProfile("oldpass");
+@@ -139,3 +138,4 @@ describe("authApi.updateProfile", () => {
      const headers = (fetch as any).mock.calls[0][1].headers;
 -    expect(headers.Authorization).toBe("Bearer my-token");
 +    expect(headers["x-csrf-token"]).toBe("csrf-value");
 +    expect(headers.Authorization).toBeUndefined();
    });
- 
-   it("throws detail error on update failure", async () => {
 diff --git a/src/api/modules/auth.ts b/src/api/modules/auth.ts
-index b056f37..3a63d23 100644
+index b056f374ea92da01a45ee7b4da4034e240787185..3a63d235247bfcf49469e52756738367cef31160 100644
 --- a/src/api/modules/auth.ts
 +++ b/src/api/modules/auth.ts
-@@ -1,4 +1,5 @@
+@@ -1,2 +1,3 @@
  import { getApiUrl } from "../config";
 +import { buildAuthHeaders } from "../authHeaders";
  
- export interface LoginResponse {
-   token: string;
-@@ -15,7 +16,7 @@ export const authApi = {
-   login: async (username: string, password: string): Promise<LoginResponse> => {
-     const res = await fetch(getApiUrl("/auth/login"), {
+@@ -17,3 +18,3 @@ export const authApi = {
        method: "POST",
 -      headers: { "Content-Type": "application/json" },
 +      headers: { ...buildAuthHeaders(), "Content-Type": "application/json" },
        body: JSON.stringify({ username, password }),
-     });
-     if (!res.ok) {
-@@ -31,7 +32,7 @@ export const authApi = {
-   ): Promise<LoginResponse> => {
-     const res = await fetch(getApiUrl("/auth/register"), {
+@@ -33,3 +34,3 @@ export const authApi = {
        method: "POST",
 -      headers: { "Content-Type": "application/json" },
 +      headers: { ...buildAuthHeaders(), "Content-Type": "application/json" },
        body: JSON.stringify({ username, password }),
-     });
-     if (!res.ok) {
-@@ -52,12 +53,11 @@ export const authApi = {
-     newUsername?: string,
-     newPassword?: string,
+@@ -54,3 +55,2 @@ export const authApi = {
    ): Promise<LoginResponse> => {
 -    const token = localStorage.getItem("qwenpaw_auth_token") || "";
      const res = await fetch(getApiUrl("/auth/update-profile"), {
-       method: "POST",
+@@ -58,4 +58,4 @@ export const authApi = {
        headers: {
 +        ...buildAuthHeaders(),
          "Content-Type": "application/json",
 -        Authorization: `Bearer ${token}`,
        },
-       body: JSON.stringify({
-         current_password: currentPassword,
 diff --git a/src/api/modules/skill.ts b/src/api/modules/skill.ts
-index 60a1356..9b4b9b9 100644
+index 60a1356b5ff6383bd0b83acc70565eff940c63dc..9b4b9b922b350f2ded0b01228ec7e85ae73ad97b 100644
 --- a/src/api/modules/skill.ts
 +++ b/src/api/modules/skill.ts
-@@ -11,9 +11,6 @@ import type {
-   WorkspaceSkillSummary,
- } from "../types";
+@@ -13,5 +13,2 @@ import type {
  
 -// Declare VITE_API_BASE_URL as global (injected by Vite)
 -declare const VITE_API_BASE_URL: string;
 -
  // Simple in-memory cache with TTL
- const CACHE_TTL_MS = 30000; // 30 seconds
- const apiCache = new Map<string, { data: unknown; timestamp: number }>();
-@@ -63,11 +60,6 @@ export function invalidateSkillCache(options?: {
-   }
- }
+@@ -65,7 +62,2 @@ export function invalidateSkillCache(options?: {
  
 -function getStreamApiUrl(): string {
 -  const base = typeof VITE_API_BASE_URL === "string" ? VITE_API_BASE_URL : "";
@@ -321,11 +274,7 @@ index 60a1356..9b4b9b9 100644
 -}
 -
  async function _uploadZip(
-   endpoint: string,
-   file: File,
-@@ -526,11 +518,10 @@ export const skillApi = {
-     signal: AbortSignal,
-     language: string = "en",
+@@ -528,7 +520,6 @@ export const skillApi = {
    ): Promise<void> {
 -    const apiUrl = getStreamApiUrl();
 -
@@ -335,40 +284,24 @@ index 60a1356..9b4b9b9 100644
        headers: {
 +        ...buildAuthHeaders(),
          "Content-Type": "application/json",
-       },
-       body: JSON.stringify({ content, language }),
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..eb870f9 100644
+index ce94f9a6a471da073610f25b48fe9ae79d05b3ac..eb870f91434f3553aaf375d2969a216066f4f1d9 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
-@@ -5,6 +5,7 @@ import { request } from "./request";
- vi.mock("./config", () => ({
-   getApiUrl: (path: string) => `/api${path}`,
+@@ -7,2 +7,3 @@ vi.mock("./config", () => ({
    getApiToken: vi.fn(() => ""),
 +  getCsrfToken: vi.fn(() => ""),
    clearAuthToken: vi.fn(),
- }));
- 
-@@ -12,7 +13,7 @@ vi.mock("./authHeaders", () => ({
-   buildAuthHeaders: vi.fn(() => ({})),
- }));
+@@ -14,3 +15,3 @@ vi.mock("./authHeaders", () => ({
  
 -import { clearAuthToken } from "./config";
 +import { clearAuthToken, getCsrfToken } from "./config";
  import { buildAuthHeaders } from "./authHeaders";
- 
- // Helper: create a mock Response
-@@ -42,6 +43,7 @@ function mockFetch(
- describe("request", () => {
-   beforeEach(() => {
+@@ -44,2 +45,3 @@ describe("request", () => {
      vi.mocked(buildAuthHeaders).mockReturnValue({});
 +    vi.mocked(getCsrfToken).mockReturnValue("");
      Object.defineProperty(window, "location", {
-       value: { pathname: "/chat", href: "" },
-       writable: true,
-@@ -70,6 +72,19 @@ describe("request", () => {
-     expect(headers.get("Content-Type")).toBe("application/json");
-   });
+@@ -72,2 +74,15 @@ describe("request", () => {
  
 +  it("adds the in-memory CSRF token to write requests only", async () => {
 +    vi.mocked(getCsrfToken).mockReturnValue("csrf-value");
@@ -384,21 +317,15 @@ index ce94f9a..eb870f9 100644
 +  });
 +
    it("PUT request automatically adds Content-Type", async () => {
-     mockFetch(200, { status: "ok" });
-     await request("/models/active", { method: "PUT", body: "{}" });
 diff --git a/src/api/request.ts b/src/api/request.ts
-index 7f4cb7d..7367558 100644
+index 7f4cb7db038488d1446a2eccaa32688c28498f5f..7367558ee72c200aef92eb0ef9cac8e14c8cb97e 100644
 --- a/src/api/request.ts
 +++ b/src/api/request.ts
-@@ -1,4 +1,4 @@
+@@ -1,2 +1,2 @@
 -import { getApiUrl, clearAuthToken } from "./config";
 +import { getApiUrl, clearAuthToken, getCsrfToken } from "./config";
  import { buildAuthHeaders } from "./authHeaders";
- 
- function getErrorMessageFromBody(
-@@ -54,6 +54,16 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
-     }
-   }
+@@ -56,2 +56,12 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
  
 +  const csrfToken = getCsrfToken();
 +  if (
@@ -411,45 +338,196 @@ index 7f4cb7d..7367558 100644
 +  }
 +
    return headers;
- }
- 
+diff --git a/src/components/CodingModeToggle/index.tsx b/src/components/CodingModeToggle/index.tsx
+index af2ea5897e7c757c8ccec51ef6533b4f50016bf8..27ed808354474d3356b0a71c7596893f07241396 100644
+--- a/src/components/CodingModeToggle/index.tsx
++++ b/src/components/CodingModeToggle/index.tsx
+@@ -18,3 +18,4 @@ import styles from "./index.module.less";
+ const CONFIRMED_KEY = "qwenpaw-coding-mode-confirmed";
++const CODING_CAPABILITY = "unsupported" as const;
+-
++
+ export default function CodingModeToggle() {
+@@ -30,2 +31,3 @@ export default function CodingModeToggle() {
+   const [showProjectSelect, setShowProjectSelect] = useState(false);
++  const codingUnavailable = CODING_CAPABILITY === "unsupported";
+   /** Remember sidebar mode before switching to coding, so we can restore on exit */
+@@ -136,3 +138,5 @@ export default function CodingModeToggle() {
+         title={
+-          codingMode
++          codingUnavailable
++            ? t("codingMode.unavailableDigitalMate")
++            : codingMode
+             ? t("codingMode.exitTooltip")
+@@ -145,6 +149,8 @@ export default function CodingModeToggle() {
+           className={`${styles.toggle} ${codingMode ? styles.active : ""}`}
+-          onClick={() => void toggle()}
+-          disabled={loading || !initialized}
++          onClick={codingUnavailable ? undefined : () => void toggle()}
++          disabled={codingUnavailable || loading || !initialized}
+           aria-label={
+-            codingMode
++            codingUnavailable
++              ? t("codingMode.unavailableDigitalMate")
++              : codingMode
+               ? t("codingMode.exitTooltip")
+@@ -186,3 +192,3 @@ export default function CodingModeToggle() {
+       <ProjectSelectModal
+-        open={showProjectSelect}
++        open={!codingUnavailable && showProjectSelect}
+         onClose={() => {
+diff --git a/src/components/ProjectSelectModal/index.tsx b/src/components/ProjectSelectModal/index.tsx
+index dcb6a8b0ae5a0c3e66c571561a2fdb336804d4ea..c15f571b2ae2cb87bf720613b132399a92863703 100644
+--- a/src/components/ProjectSelectModal/index.tsx
++++ b/src/components/ProjectSelectModal/index.tsx
+@@ -12,3 +12,3 @@
+ import { useState, useRef, useEffect } from "react";
+-import { Modal, Tabs, Input, Button, Alert, List } from "antd";
++import { Modal, Tabs, Input, Button, Alert, List, Tooltip } from "antd";
+ import {
+@@ -43,1 +43,3 @@ interface ProjectSelectModalProps {
++const CODING_PROJECT_MUTATIONS_SUPPORTED = false;
++
+ // ---------------------------------------------------------------------------
+@@ -813,9 +815,14 @@ export default function ProjectSelectModal({
+       key: "clone",
++      disabled: !CODING_PROJECT_MUTATIONS_SUPPORTED,
+       label: (
+-        <span className={styles.tabLabel}>
+-          <GitBranch size={13} />
+-          {t("codingMode.tabClone")}
+-        </span>
++        <Tooltip title={t("codingMode.unavailableDigitalMate")}>
++          <span className={styles.tabLabel}>
++            <GitBranch size={13} />
++            {t("codingMode.tabClone")}
++          </span>
++        </Tooltip>
+       ),
+-      children: <CloneTab onDone={(p) => void handleCloneDone(p)} />,
++      children: CODING_PROJECT_MUTATIONS_SUPPORTED ? (
++        <CloneTab onDone={(p) => void handleCloneDone(p)} />
++      ) : null,
+     },
+@@ -833,9 +840,14 @@ export default function ProjectSelectModal({
+       key: "local",
++      disabled: !CODING_PROJECT_MUTATIONS_SUPPORTED,
+       label: (
+-        <span className={styles.tabLabel}>
+-          <FolderOpen size={13} />
+-          {t("codingMode.tabLocal")}
+-        </span>
++        <Tooltip title={t("codingMode.unavailableDigitalMate")}>
++          <span className={styles.tabLabel}>
++            <FolderOpen size={13} />
++            {t("codingMode.tabLocal")}
++          </span>
++        </Tooltip>
+       ),
+-      children: <LocalPathTab onSelect={handleLocalDone} />,
++      children: CODING_PROJECT_MUTATIONS_SUPPORTED ? (
++        <LocalPathTab onSelect={handleLocalDone} />
++      ) : null,
+     },
+@@ -843,9 +855,14 @@ export default function ProjectSelectModal({
+       key: "new",
++      disabled: !CODING_PROJECT_MUTATIONS_SUPPORTED,
+       label: (
+-        <span className={styles.tabLabel}>
+-          <PlusCircle size={13} />
+-          {t("codingMode.tabNew")}
+-        </span>
++        <Tooltip title={t("codingMode.unavailableDigitalMate")}>
++          <span className={styles.tabLabel}>
++            <PlusCircle size={13} />
++            {t("codingMode.tabNew")}
++          </span>
++        </Tooltip>
+       ),
+-      children: <NewProjectTab onDone={handleNewDone} />,
++      children: CODING_PROJECT_MUTATIONS_SUPPORTED ? (
++        <NewProjectTab onDone={handleNewDone} />
++      ) : null,
+     },
+diff --git a/src/layouts/registry/builtinRoutes.tsx b/src/layouts/registry/builtinRoutes.tsx
+index e8f9fd1935c29b147e3639488bf9307ff985e3c6..dd0d4f746959f60a9c22fe6a5357e8636d0ec356 100644
+--- a/src/layouts/registry/builtinRoutes.tsx
++++ b/src/layouts/registry/builtinRoutes.tsx
+@@ -15,3 +15,5 @@
+ import { Suspense, useEffect } from "react";
++import { Result } from "antd";
+ import { Navigate } from "react-router-dom";
++import { useTranslation } from "react-i18next";
+ import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
+@@ -24,1 +26,3 @@ import CodingPage from "../../pages/Coding";
++const CODING_CAPABILITY = "unsupported" as const;
++
+ // Lazy pages
+@@ -69,1 +73,15 @@ function DigitalMateHomeRedirect() {
++function CodingCapabilityRoute() {
++  const { t } = useTranslation();
++  if (CODING_CAPABILITY === "unsupported") {
++    return (
++      <Result
++        status="info"
++        title={t("codingMode.unavailableTitle")}
++        subTitle={t("codingMode.unavailableDigitalMate")}
++      />
++    );
++  }
++  return <CodingPage />;
++}
++
+ /** Synonym for /acp. Kept for plugins / external links that reference uppercase. */
+@@ -76,3 +94,3 @@ export const BUILTIN_ROUTES: Route[] = [
+   { id: "core.chat", path: "/chat/*", component: DigitalMateHomeRedirect },
+-  { id: "core.coding", path: "/coding/*", component: CodingPage },
++  { id: "core.coding", path: "/coding/*", component: CodingCapabilityRoute },
+   { id: "core.channels", path: "/channels", component: ChannelsPage },
 diff --git a/src/locales/en.json b/src/locales/en.json
-index b5f9dc4..28f7b45 100644
+index b5f9dc47b24d9809f78fce11704fc982fd370eb9..57113bc62cfe63dc8f6e16402e439a4d3c290f42 100644
 --- a/src/locales/en.json
 +++ b/src/locales/en.json
-@@ -474,6 +474,7 @@
-     "description": "Description",
-     "workspace": "Workspace Path",
+@@ -476,2 +476,3 @@
      "create": "Create Agent",
 +    "secondaryAgentUnsupported": "This release supports the default digital avatar only. Creating, cloning, and deleting additional avatars is not available yet.",
      "createTitle": "Create New Agent",
-     "createSuccess": "Agent created successfully",
-     "createFailed": "Failed to create agent",
+@@ -2713,2 +2714,4 @@
+     "title": "Coding Mode",
++    "unavailableTitle": "Coding mode is not available",
++    "unavailableDigitalMate": "Coding and sandbox capabilities are frozen in this DigitalMate release. This entry is retained for a future reviewed enablement.",
+     "experimental": "Experimental Feature",
 diff --git a/src/locales/zh.json b/src/locales/zh.json
-index 98e9c36..1f52ce0 100644
+index 98e9c3695e4ef74c4d2477da635ce6611536a6b6..591d7d556ac85037704169fc71543dea753b4f5a 100644
 --- a/src/locales/zh.json
 +++ b/src/locales/zh.json
-@@ -257,6 +257,7 @@
-     "description": "描述",
-     "workspace": "工作区路径",
+@@ -259,2 +259,3 @@
      "create": "创建智能体",
 +    "secondaryAgentUnsupported": "本期仅支持默认数字分身，新增、克隆与删除其他分身暂未开放。",
      "createTitle": "创建新智能体",
-     "createSuccess": "智能体创建成功",
-     "createFailed": "智能体创建失败",
+@@ -2732,2 +2733,4 @@
+     "title": "编程模式",
++    "unavailableTitle": "编程模式暂未开放",
++    "unavailableDigitalMate": "当前 DigitalMate 版本已冻结编程与沙箱能力；该入口仅为后续评审启用保留。",
+     "experimental": "实验性功能",
 diff --git a/src/pages/Settings/Agents/components/AgentTable.test.tsx b/src/pages/Settings/Agents/components/AgentTable.test.tsx
-index 62c02e5..459afed 100644
+index 62c02e5135a948671e2c752842471586ce2dd2bf..5ce6595203255f4f8f246bda13c51767c42519d9 100644
 --- a/src/pages/Settings/Agents/components/AgentTable.test.tsx
 +++ b/src/pages/Settings/Agents/components/AgentTable.test.tsx
-@@ -40,4 +40,24 @@ describe("AgentTable", () => {
-       screen.getByRole("button", { name: "agent.unpinAgent" }),
-     ).toBeInTheDocument();
+@@ -42,2 +42,35 @@ describe("AgentTable", () => {
    });
 +
 +  it("accurately disables secondary avatar deletion when unsupported", () => {
 +    renderWithProviders(
 +      <AgentTable
-+        agents={[agent("secondary", false)]}
++        agents={[
++          agent("default", true),
++          agent("secondary", false),
++          {
++            ...agent("starting", false),
++            startup_status: "starting",
++          },
++        ]}
 +        loading={false}
 +        reordering={false}
 +        onEdit={vi.fn()}
@@ -461,96 +539,69 @@ index 62c02e5..459afed 100644
 +      />,
 +    );
 +
++    expect(screen.getByTitle("agent.defaultNotDeletable")).toBeDisabled();
 +    expect(
 +      screen.getByTitle("agent.secondaryAgentUnsupported"),
 +    ).toBeDisabled();
++    expect(
++      screen
++        .getAllByTitle("agent.status.waitUntilStarted")
++        .every((button) => button.hasAttribute("disabled")),
++    ).toBe(true);
 +  });
  });
 diff --git a/src/pages/Settings/Agents/components/AgentTable.tsx b/src/pages/Settings/Agents/components/AgentTable.tsx
-index 5bdc7fb..8935540 100644
+index 5bdc7fba7e983f1531bb12165d4388841ad0a738..2f8e9e12998975a29afe9373617895f51727011a 100644
 --- a/src/pages/Settings/Agents/components/AgentTable.tsx
 +++ b/src/pages/Settings/Agents/components/AgentTable.tsx
-@@ -32,6 +32,7 @@ interface AgentTableProps {
-   onToggle: (agentId: string, currentEnabled: boolean) => void;
-   onPin: (agentId: string, currentPinned: boolean) => void;
+@@ -34,2 +34,3 @@ interface AgentTableProps {
    onReorder: (activeId: string, overId: string) => void;
 +  secondaryAgentActionsDisabled?: boolean;
  }
- 
- export function AgentTable({
-@@ -43,6 +44,7 @@ export function AgentTable({
-   onToggle,
-   onPin,
+@@ -45,2 +46,3 @@ export function AgentTable({
    onReorder,
 +  secondaryAgentActionsDisabled = false,
  }: AgentTableProps) {
-   const { t } = useTranslation();
-   const { isDark } = useTheme();
-@@ -163,6 +165,8 @@ export function AgentTable({
-           record.startup_status === "pending" ||
-           record.startup_status === "starting";
+@@ -165,2 +167,4 @@ export function AgentTable({
          const toggleDisabled = record.id === "default" || startupInProgress;
 +        const deleteDisabled =
 +          secondaryAgentActionsDisabled || toggleDisabled;
          const pinActionLabel =
-           record.id === "default"
-             ? t("agent.defaultPinned")
-@@ -237,7 +241,7 @@ export function AgentTable({
-               title={t("agent.deleteConfirm")}
-               description={t("agent.deleteConfirmDesc")}
+@@ -239,3 +243,3 @@ export function AgentTable({
                onConfirm={() => onDelete(record.id)}
 -              disabled={toggleDisabled}
 +              disabled={deleteDisabled}
                okText={t("common.confirm")}
-               cancelText={t("common.cancel")}
-             >
-@@ -246,10 +250,12 @@ export function AgentTable({
-                 size="middle"
-                 danger
+@@ -248,3 +252,3 @@ export function AgentTable({
                  icon={<DeleteOutlined />}
 -                disabled={toggleDisabled}
 +                disabled={deleteDisabled}
                  style={record.id === "default" ? disabledStyle : undefined}
-                 title={
--                  record.id === "default"
-+                  secondaryAgentActionsDisabled
-+                    ? t("agent.secondaryAgentUnsupported")
-+                    : record.id === "default"
-                     ? t("agent.defaultNotDeletable")
-                     : startupInProgress
+@@ -255,2 +259,4 @@ export function AgentTable({
                      ? t("agent.status.waitUntilStarted")
++                    : secondaryAgentActionsDisabled
++                    ? t("agent.secondaryAgentUnsupported")
+                     : undefined
 diff --git a/src/pages/Settings/Agents/index.tsx b/src/pages/Settings/Agents/index.tsx
-index 20bea0b..1c5818f 100644
+index 20bea0b9479b61964082399ec1e83cda6107de91..1c5818f55fe6eff9a4244e2f14ae34155bf776b9 100644
 --- a/src/pages/Settings/Agents/index.tsx
 +++ b/src/pages/Settings/Agents/index.tsx
-@@ -1,5 +1,5 @@
+@@ -1,3 +1,3 @@
  import { useState, useRef, useCallback } from "react";
 -import { Card, Button, Form } from "antd";
 +import { Card, Button, Form, Tooltip } from "antd";
  import { useAppMessage } from "../../../hooks/useAppMessage";
- import { PlusOutlined } from "@ant-design/icons";
- import { useTranslation } from "react-i18next";
-@@ -13,6 +13,8 @@ import { PageHeader } from "@/components/PageHeader";
- import { reorderAgents } from "./reorder";
- import styles from "./index.module.less";
+@@ -15,2 +15,4 @@ import styles from "./index.module.less";
  
 +const SECONDARY_AGENT_CAPABILITY = "unsupported";
 +
  export default function AgentsPage() {
-   const { t, i18n } = useTranslation();
-   const {
-@@ -32,6 +34,8 @@ export default function AgentsPage() {
-   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
-   const installedSkillsRef = useRef<string[]>([]);
+@@ -34,2 +36,4 @@ export default function AgentsPage() {
    const { message } = useAppMessage();
 +  const secondaryAgentActionsDisabled =
 +    SECONDARY_AGENT_CAPABILITY === "unsupported";
  
-   const handleCreate = () => {
-     setEditingAgent(null);
-@@ -193,13 +197,18 @@ export default function AgentsPage() {
-         current={t("agent.agents")}
-         extra={
+@@ -195,9 +199,14 @@ export default function AgentsPage() {
            <div className={styles.headerRight}>
 -            <Button
 -              type="primary"
@@ -572,57 +623,37 @@ index 20bea0b..1c5818f 100644
 +              </span>
 +            </Tooltip>
            </div>
-         }
-       />
-@@ -214,6 +223,7 @@ export default function AgentsPage() {
-           onToggle={handleToggle}
-           onPin={handlePin}
+@@ -216,2 +225,3 @@ export default function AgentsPage() {
            onReorder={handleReorder}
 +          secondaryAgentActionsDisabled={secondaryAgentActionsDisabled}
          />
-       </Card>
- 
 diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
-index 5607a73..de360b3 100644
+index 5607a73375464d82298c55df6af7ab8c7b15e85f..de360b355fe9e3fc72cf7057be599731aa254fa3 100644
 --- a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
 +++ b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
-@@ -6,6 +6,7 @@ import {
-   buildMarketDownloadUrl,
-   type MarketPluginEntry,
+@@ -8,2 +8,3 @@ import {
  } from "@/api/modules/pluginMarket";
 +import { getApiUrl } from "@/api/config";
  import { installPlugin } from "@/api/modules/plugin";
- 
- /**
-@@ -54,7 +55,7 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
- 
-   useEffect(() => {
+@@ -56,3 +57,3 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
      const controller = new AbortController();
 -    fetch("/api/version", { signal: controller.signal })
 +    fetch(getApiUrl("/version"), { signal: controller.signal })
        .then((res) => {
-         if (!res.ok) {
-           throw new Error(`HTTP ${res.status}`);
 diff --git a/src/plugins/hostExternals.ts b/src/plugins/hostExternals.ts
-index 0eff169..41b020a 100644
+index 0eff1694e753c1b8b24ea10b18c793aed7666087..41b020a0bb09095d60aea72119960ed9abeb927d 100644
 --- a/src/plugins/hostExternals.ts
 +++ b/src/plugins/hostExternals.ts
-@@ -31,8 +31,6 @@ import type {
-   QwenPawChatNamespace,
- } from "./types/qwenpaw";
+@@ -33,4 +33,2 @@ import type {
  
 -declare const VITE_API_BASE_URL: string;
 -
  // ─────────────────────────────────────────────────────────────────────────────
- // Public types
- // ─────────────────────────────────────────────────────────────────────────────
-@@ -223,8 +221,7 @@ function ensurePluginsGroup(): void {
- }
- 
+@@ -225,5 +223,4 @@ function ensurePluginsGroup(): void {
  export function installHostExternals(): void {
 -  const apiBaseUrl =
 -    typeof VITE_API_BASE_URL !== "undefined" ? VITE_API_BASE_URL : "";
 +  const apiBaseUrl = getApiUrl("").replace(/\/$/, "");
- 
+-
++
    if (!window.QwenPaw) {
-     (window as any).QwenPaw = {} as WindowNamespace;

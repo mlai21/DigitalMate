@@ -840,6 +840,10 @@ describe("QwenPaw Console patch preparation", () => {
           updateContentSource,
           layoutStyles,
           chatSource,
+          codingToggleSource,
+          projectSelectSource,
+          desktopUpdateSource,
+          agentTableTestSource,
         ] = await Promise.all([
           readPrepared("src/App.tsx"),
           readPrepared("index.html"),
@@ -855,6 +859,12 @@ describe("QwenPaw Console patch preparation", () => {
           readPrepared("src/layouts/constants.ts"),
           readPrepared("src/layouts/index.module.less"),
           readPrepared("src/pages/Chat/index.tsx"),
+          readPrepared("src/components/CodingModeToggle/index.tsx"),
+          readPrepared("src/components/ProjectSelectModal/index.tsx"),
+          readPrepared("src/contexts/DesktopUpdateContext.tsx"),
+          readPrepared(
+            "src/pages/Settings/Agents/components/AgentTable.test.tsx",
+          ),
         ]);
 
         expect(indexHtml).toContain("<title>DigitalMate Console</title>");
@@ -864,7 +874,6 @@ describe("QwenPaw Console patch preparation", () => {
         );
         expect(headerSource).toContain('src="/digitalmate-logo.svg"');
         expect(headerSource).toContain('alt="DigitalMate"');
-        expect(headerSource).toContain("How to update DigitalMate");
         expect(updateContentSource).toContain("How to update DigitalMate");
         expect(updateContentSource).toContain("DigitalMate如何更新");
         expect(layoutStyles).toContain(
@@ -883,6 +892,35 @@ describe("QwenPaw Console patch preparation", () => {
           'fetch("/api/admin/compat/auth/status"',
         );
         expect(routesSource).toContain('window.location.assign("/")');
+        expect.soft(routesSource).toContain(
+          'return <Navigate to="/inbox" replace />',
+        );
+        expect.soft(routesSource).not.toContain(
+          'return <Navigate to="/channels" replace />',
+        );
+        expect.soft(routesSource).toContain(
+          'path: "/coding/*", component: CodingCapabilityRoute',
+        );
+        expect.soft(codingToggleSource).toContain(
+          'const CODING_CAPABILITY = "unsupported"',
+        );
+        expect.soft(codingToggleSource).toContain(
+          "disabled={codingUnavailable || loading || !initialized}",
+        );
+        expect.soft(codingToggleSource).not.toContain(
+          "onClick={() => void toggle()}",
+        );
+        expect.soft(projectSelectSource).toContain(
+          "const CODING_PROJECT_MUTATIONS_SUPPORTED = false",
+        );
+        expect.soft(
+          projectSelectSource.match(
+            /disabled: !CODING_PROJECT_MUTATIONS_SUPPORTED/g,
+          ),
+        ).toHaveLength(3);
+        expect.soft(projectSelectSource).toContain(
+          't("codingMode.unavailableDigitalMate")',
+        );
         expect(configSource).toContain(
           'const API_BASE_URL = "/api/admin/compat"',
         );
@@ -895,6 +933,35 @@ describe("QwenPaw Console patch preparation", () => {
         expect(agentsPageSource).toContain("disabled");
         expect(agentTableSource).toContain("secondaryAgentActionsDisabled");
         expect(agentTableSource).toContain("disabled={deleteDisabled}");
+        expect.soft(agentTableSource).toMatch(
+          /record\.id === "default"\s*\?\s*t\("agent\.defaultNotDeletable"\)\s*:\s*startupInProgress\s*\?\s*t\("agent\.status\.waitUntilStarted"\)\s*:\s*secondaryAgentActionsDisabled\s*\?\s*t\("agent\.secondaryAgentUnsupported"\)/,
+        );
+        expect.soft(agentTableTestSource).toContain(
+          'screen.getByTitle("agent.defaultNotDeletable")',
+        );
+        expect.soft(agentTableTestSource).toContain(
+          'screen.getByTitle("agent.secondaryAgentUnsupported")',
+        );
+        expect.soft(agentTableTestSource).toMatch(
+          /screen\s*\.getAllByTitle\("agent\.status\.waitUntilStarted"\)/,
+        );
+        expect.soft(headerSource).not.toContain("fetch(PYPI_URL)");
+        expect.soft(headerSource).not.toContain(
+          "qwenpaw.agentscope.io/docs/faq",
+        );
+        expect.soft(headerSource).toContain(
+          "setUpdateMarkdown(UPDATE_MD[lang] ?? UPDATE_MD.en)",
+        );
+        expect.soft(desktopUpdateSource).not.toContain("checkDesktopUpdate");
+        expect.soft(desktopUpdateSource).not.toContain("checkCachedUpdate");
+        for (const upstreamCommand of [
+          "qwenpaw update",
+          "src/qwenpaw/console",
+          "agentscope/qwenpaw",
+          "qwenpaw app",
+        ]) {
+          expect.soft(updateContentSource).not.toContain(upstreamCommand);
+        }
       } finally {
         await rm(result.workdir, { recursive: true, force: true });
       }
