@@ -25,6 +25,7 @@ import {
   COMMANDS as CONSOLE_TEST_COMMANDS,
   runPreparedConsoleTests,
 } from "../../scripts/qwenpaw-console/test.mjs";
+import * as consoleTestScript from "../../scripts/qwenpaw-console/test.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
 
 const { UPSTREAM } = qwenpawSync;
@@ -142,8 +143,7 @@ function requireMetadataFieldLine(metadata: string, field: string): string {
 
 function requireSyncTestingInterface(): SyncTestingInterface {
   const testing = Reflect.get(qwenpawSync, "__testing") as
-    | SyncTestingInterface
-    | undefined;
+    SyncTestingInterface | undefined;
   expect(testing).toBeDefined();
   return testing as SyncTestingInterface;
 }
@@ -222,7 +222,9 @@ async function createReplacementFixture(): Promise<{
   stagingRoot: string;
   temporaryRoot: string;
 }> {
-  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "dm-qwenpaw-replace-"));
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "dm-qwenpaw-replace-"),
+  );
   const destinationRoot = path.join(temporaryRoot, "qwenpaw-console");
   const stagingRoot = path.join(temporaryRoot, "staging");
   const backupRoot = path.join(temporaryRoot, "backup");
@@ -275,9 +277,9 @@ describe("QwenPaw Console sync", () => {
       await writeFile(externalLicense, "external\n");
       await symlink("external-license", licensePath);
 
-      await expect(
-        qwenpawSync.syncSnapshot(destinationRoot),
-      ).rejects.toThrow("symbolic link not allowed");
+      await expect(qwenpawSync.syncSnapshot(destinationRoot)).rejects.toThrow(
+        "symbolic link not allowed",
+      );
       await expectPathMissing(destinationRoot);
     });
   });
@@ -288,9 +290,9 @@ describe("QwenPaw Console sync", () => {
       await rm(licensePath);
       await mkdir(licensePath);
 
-      await expect(
-        qwenpawSync.syncSnapshot(destinationRoot),
-      ).rejects.toThrow("source snapshot path invalid");
+      await expect(qwenpawSync.syncSnapshot(destinationRoot)).rejects.toThrow(
+        "source snapshot path invalid",
+      );
       await expectPathMissing(destinationRoot);
     });
   });
@@ -463,9 +465,7 @@ describe("QwenPaw Console sync", () => {
             },
           },
         ),
-      ).rejects.toThrow(
-        /injected install failure.*injected cleanup failure/,
-      );
+      ).rejects.toThrow(/injected install failure.*injected cleanup failure/);
 
       await expect(
         readFile(path.join(fixture.destinationRoot, "old.txt"), "utf8"),
@@ -539,9 +539,7 @@ describe("QwenPaw Console snapshot", () => {
         "utf8",
       );
       expect(upstream).toContain("v2.0.0.post3");
-      expect(upstream).toContain(
-        "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
-      );
+      expect(upstream).toContain("fef7e64d984f4332d0b84a343cd209bd3ea5d316");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -609,7 +607,11 @@ describe("QwenPaw Console snapshot", () => {
 
   it("拒绝未登记载荷文件", async () => {
     await withSnapshotCopy(async (root) => {
-      await writeFile(path.join(root, "UNREGISTERED.txt"), "unexpected\n", "utf8");
+      await writeFile(
+        path.join(root, "UNREGISTERED.txt"),
+        "unexpected\n",
+        "utf8",
+      );
 
       await expect(verifySnapshot(root)).rejects.toThrow(
         "unregistered snapshot file",
@@ -730,7 +732,9 @@ describe("QwenPaw Console snapshot", () => {
 
   it("拒绝缺少固定快照路径", async () => {
     await withSnapshotCopy(async (root) => {
-      await rm(path.join(root, "reference", "src", "qwenpaw", "config", "config.py"));
+      await rm(
+        path.join(root, "reference", "src", "qwenpaw", "config", "config.py"),
+      );
 
       await expect(verifySnapshot(root)).rejects.toThrow(
         "required snapshot path missing",
@@ -816,162 +820,246 @@ describe("QwenPaw Console patch preparation", () => {
     expect(PATCHES[0]).toBe("0001-brand.patch");
   });
 
-  it(
-    "真实验证并应用四个补丁，生成 DigitalMate Console 集成树",
-    async () => {
-      const result = await prepareConsole({ keep: true });
+  it("四个补丁使用零上下文格式且没有行尾空白", async () => {
+    for (const patchName of PATCHES) {
+      const patchSource = await readFile(
+        path.resolve("patches/qwenpaw-console", patchName),
+        "utf8",
+      );
+      expect.soft(patchSource).toMatch(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m);
+      expect.soft(patchSource).not.toMatch(/^ .+$/m);
+      expect.soft(patchSource).not.toMatch(/[ \t]+$/m);
+    }
+  });
 
-      try {
-        expect(result.applied).toEqual(PATCHES);
-        expect(result.applied).not.toBe(PATCHES);
+  it("keep=false 清理目录后不返回失效路径", async () => {
+    const result = await prepareConsole();
 
-        const readPrepared = (relativePath: string) =>
-          readFile(path.join(result.workdir, ...relativePath.split("/")), "utf8");
-        const [
-          appSource,
-          indexHtml,
-          routesSource,
-          configSource,
-          requestSource,
-          agentsPageSource,
-          agentTableSource,
-          i18nSource,
-          headerSource,
-          updateContentSource,
-          layoutStyles,
-          chatSource,
-          codingToggleSource,
-          projectSelectSource,
-          desktopUpdateSource,
-          agentTableTestSource,
-        ] = await Promise.all([
-          readPrepared("src/App.tsx"),
-          readPrepared("index.html"),
-          readPrepared("src/layouts/registry/builtinRoutes.tsx"),
-          readPrepared("src/api/config.ts"),
-          readPrepared("src/api/request.ts"),
-          readPrepared("src/pages/Settings/Agents/index.tsx"),
-          readPrepared(
-            "src/pages/Settings/Agents/components/AgentTable.tsx",
-          ),
-          readPrepared("src/i18n.ts"),
-          readPrepared("src/layouts/Header.tsx"),
-          readPrepared("src/layouts/constants.ts"),
-          readPrepared("src/layouts/index.module.less"),
-          readPrepared("src/pages/Chat/index.tsx"),
-          readPrepared("src/components/CodingModeToggle/index.tsx"),
-          readPrepared("src/components/ProjectSelectModal/index.tsx"),
-          readPrepared("src/contexts/DesktopUpdateContext.tsx"),
-          readPrepared(
-            "src/pages/Settings/Agents/components/AgentTable.test.tsx",
-          ),
-        ]);
+    expect(result).toEqual({
+      workdir: null,
+      applied: [...PATCHES],
+    });
+  }, 120_000);
 
-        expect(indexHtml).toContain("<title>DigitalMate Console</title>");
-        expect(indexHtml).not.toContain("<title>QwenPaw Console</title>");
-        expect(i18nSource).toContain(
-          'return value.replace(/QwenPaw/g, "DigitalMate")',
-        );
-        expect(headerSource).toContain('src="/digitalmate-logo.svg"');
-        expect(headerSource).toContain('alt="DigitalMate"');
-        expect(updateContentSource).toContain("How to update DigitalMate");
-        expect(updateContentSource).toContain("DigitalMate如何更新");
-        expect(layoutStyles).toContain(
-          "linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%)",
-        );
-        expect(layoutStyles).not.toContain("qwenpawBack.png");
-        expect(chatSource).toContain('avatar: extAvatar ?? "/digitalmate-logo.svg"');
-        expect(chatSource).toContain('nick: extNick ?? "DigitalMate"');
-        expect(appSource).toContain('colorPrimary: "#E8684A"');
-        expect(appSource).toContain('colorBgLayout: "#FAF7F2"');
-        expect(appSource).toContain('pathname.startsWith("/admin-preview/")');
-        expect(appSource).toContain('return "/admin-preview"');
-        expect(appSource).toContain('pathname.startsWith("/admin/")');
-        expect(appSource).toContain('return "/admin"');
-        expect(appSource).toContain(
-          'fetch("/api/admin/compat/auth/status"',
-        );
-        expect(routesSource).toContain('window.location.assign("/")');
-        expect.soft(routesSource).toContain(
-          'return <Navigate to="/inbox" replace />',
-        );
-        expect.soft(routesSource).not.toContain(
-          'return <Navigate to="/channels" replace />',
-        );
-        expect.soft(routesSource).toContain(
-          'path: "/coding/*", component: CodingCapabilityRoute',
-        );
-        expect.soft(codingToggleSource).toContain(
-          'const CODING_CAPABILITY = "unsupported"',
-        );
-        expect.soft(codingToggleSource).toContain(
-          "disabled={codingUnavailable || loading || !initialized}",
-        );
-        expect.soft(codingToggleSource).not.toContain(
-          "onClick={() => void toggle()}",
-        );
-        expect.soft(projectSelectSource).toContain(
-          "const CODING_PROJECT_MUTATIONS_SUPPORTED = false",
-        );
-        expect.soft(
+  it("真实验证并应用四个补丁，生成 DigitalMate Console 集成树", async () => {
+    const result = await prepareConsole({ keep: true });
+    if (!result.workdir) {
+      throw new Error("keep=true did not preserve the prepared directory");
+    }
+    const workdir = result.workdir;
+
+    try {
+      expect(result.applied).toEqual(PATCHES);
+      expect(result.applied).not.toBe(PATCHES);
+
+      const readPrepared = (relativePath: string) =>
+        readFile(path.join(workdir, ...relativePath.split("/")), "utf8");
+      const readPreparedOptional = (relativePath: string) =>
+        readPrepared(relativePath).catch(() => "");
+      const [
+        appSource,
+        indexHtml,
+        routesSource,
+        configSource,
+        requestSource,
+        agentsPageSource,
+        agentTableSource,
+        i18nSource,
+        headerSource,
+        updateContentSource,
+        layoutStyles,
+        chatSource,
+        codingToggleSource,
+        projectSelectSource,
+        desktopUpdateSource,
+        agentTableTestSource,
+        viteConfigSource,
+        brandingSource,
+        logoSource,
+        loginSource,
+        backendLoadingSource,
+        agentSelectorSource,
+        agentSelectorTestSource,
+        authHeadersSource,
+        authHeadersTestSource,
+        requestTestSource,
+        skillSource,
+        skillTestSource,
+        pluginLoaderSource,
+        chatApiSource,
+      ] = await Promise.all([
+        readPrepared("src/App.tsx"),
+        readPrepared("index.html"),
+        readPrepared("src/layouts/registry/builtinRoutes.tsx"),
+        readPrepared("src/api/config.ts"),
+        readPrepared("src/api/request.ts"),
+        readPrepared("src/pages/Settings/Agents/index.tsx"),
+        readPrepared("src/pages/Settings/Agents/components/AgentTable.tsx"),
+        readPrepared("src/i18n.ts"),
+        readPrepared("src/layouts/Header.tsx"),
+        readPrepared("src/layouts/constants.ts"),
+        readPrepared("src/layouts/index.module.less"),
+        readPrepared("src/pages/Chat/index.tsx"),
+        readPrepared("src/components/CodingModeToggle/index.tsx"),
+        readPrepared("src/components/ProjectSelectModal/index.tsx"),
+        readPrepared("src/contexts/DesktopUpdateContext.tsx"),
+        readPrepared(
+          "src/pages/Settings/Agents/components/AgentTable.test.tsx",
+        ),
+        readPrepared("vite.config.ts"),
+        readPreparedOptional("src/constants/branding.ts"),
+        readPreparedOptional("public/digitalmate-logo.svg"),
+        readPrepared("src/pages/Login/index.tsx"),
+        readPrepared("src/tauri/BackendLoadingPage.tsx"),
+        readPrepared("src/components/AgentSelector/index.tsx"),
+        readPreparedOptional(
+          "src/components/AgentSelector/AgentSelector.test.tsx",
+        ),
+        readPrepared("src/api/authHeaders.ts"),
+        readPreparedOptional("src/api/authHeaders.test.ts"),
+        readPreparedOptional("src/api/request.test.ts"),
+        readPrepared("src/api/modules/skill.ts"),
+        readPreparedOptional("src/api/modules/skill.test.ts"),
+        readPrepared("src/plugins/usePluginLoader.ts"),
+        readPrepared("src/api/modules/chat.ts"),
+      ]);
+
+      expect(indexHtml).toContain("<title>DigitalMate Console</title>");
+      expect(indexHtml).not.toContain("<title>QwenPaw Console</title>");
+      expect.soft(viteConfigSource).toContain('base: "/_admin-console/"');
+      expect.soft(brandingSource).toContain("import.meta.env.BASE_URL");
+      expect.soft(brandingSource).toContain("digitalmate-logo.svg");
+      expect.soft(logoSource).toMatch(/<svg[\s>]/);
+      expect(i18nSource).toContain(
+        'return value.replace(/QwenPaw/g, "DigitalMate")',
+      );
+      expect(headerSource).toContain("DIGITALMATE_LOGO_URL");
+      expect(headerSource).toContain('alt="DigitalMate"');
+      expect(updateContentSource).toContain("How to update DigitalMate");
+      expect(updateContentSource).toContain("DigitalMate如何更新");
+      expect(layoutStyles).toContain(
+        "linear-gradient(135deg, #faf7f2 0%, #f7ddd6 100%)",
+      );
+      expect(layoutStyles).not.toContain("qwenpawBack.png");
+      expect(chatSource).toContain("avatar: extAvatar ?? DIGITALMATE_LOGO_URL");
+      expect(chatSource).toContain('nick: extNick ?? "DigitalMate"');
+      for (const brandedSource of [
+        headerSource,
+        chatSource,
+        loginSource,
+        backendLoadingSource,
+      ]) {
+        expect.soft(brandedSource).toContain("DIGITALMATE_LOGO_URL");
+        expect.soft(brandedSource).not.toContain('"/digitalmate-logo.svg"');
+      }
+      expect(appSource).toContain('colorPrimary: "#E8684A"');
+      expect(appSource).toContain('colorBgLayout: "#FAF7F2"');
+      expect(appSource).toContain('pathname.startsWith("/admin-preview/")');
+      expect(appSource).toContain('return "/admin-preview"');
+      expect(appSource).toContain('pathname.startsWith("/admin/")');
+      expect(appSource).toContain('return "/admin"');
+      expect(appSource).toContain('fetch("/api/admin/compat/auth/status"');
+      expect(routesSource).toContain('window.location.assign("/")');
+      expect
+        .soft(routesSource)
+        .toContain('return <Navigate to="/inbox" replace />');
+      expect
+        .soft(routesSource)
+        .not.toContain('return <Navigate to="/channels" replace />');
+      expect
+        .soft(routesSource)
+        .toContain('path: "/coding/*", component: CodingCapabilityRoute');
+      expect
+        .soft(codingToggleSource)
+        .toContain('const CODING_CAPABILITY = "unsupported"');
+      expect
+        .soft(codingToggleSource)
+        .toContain("disabled={codingUnavailable || loading || !initialized}");
+      expect
+        .soft(codingToggleSource)
+        .not.toContain("onClick={() => void toggle()}");
+      expect
+        .soft(projectSelectSource)
+        .toContain("const CODING_PROJECT_MUTATIONS_SUPPORTED = false");
+      expect
+        .soft(
           projectSelectSource.match(
             /disabled: !CODING_PROJECT_MUTATIONS_SUPPORTED/g,
           ),
-        ).toHaveLength(3);
-        expect.soft(projectSelectSource).toContain(
-          't("codingMode.unavailableDigitalMate")',
-        );
-        expect(configSource).toContain(
-          'const API_BASE_URL = "/api/admin/compat"',
-        );
-        expect(configSource).toContain('let csrfToken = ""');
-        expect(requestSource).toContain('headers.set("x-csrf-token", csrfToken)');
-        expect(requestSource).toContain("getCsrfToken()");
-        expect(agentsPageSource).toContain(
-          'const SECONDARY_AGENT_CAPABILITY = "unsupported"',
-        );
-        expect(agentsPageSource).toContain("disabled");
-        expect(agentTableSource).toContain("secondaryAgentActionsDisabled");
-        expect(agentTableSource).toContain("disabled={deleteDisabled}");
-        expect.soft(agentTableSource).toMatch(
-          /record\.id === "default"\s*\?\s*t\("agent\.defaultNotDeletable"\)\s*:\s*startupInProgress\s*\?\s*t\("agent\.status\.waitUntilStarted"\)\s*:\s*secondaryAgentActionsDisabled\s*\?\s*t\("agent\.secondaryAgentUnsupported"\)/,
-        );
-        expect.soft(agentTableTestSource).toContain(
-          'screen.getByTitle("agent.defaultNotDeletable")',
-        );
-        expect.soft(agentTableTestSource).toContain(
-          'screen.getByTitle("agent.secondaryAgentUnsupported")',
-        );
-        expect.soft(agentTableTestSource).toMatch(
-          /screen\s*\.getAllByTitle\("agent\.status\.waitUntilStarted"\)/,
-        );
-        expect.soft(headerSource).not.toContain("fetch(PYPI_URL)");
-        expect.soft(headerSource).not.toContain(
-          "qwenpaw.agentscope.io/docs/faq",
-        );
-        expect.soft(headerSource).toContain(
-          "setUpdateMarkdown(UPDATE_MD[lang] ?? UPDATE_MD.en)",
-        );
-        expect.soft(desktopUpdateSource).not.toContain("checkDesktopUpdate");
-        expect.soft(desktopUpdateSource).not.toContain("checkCachedUpdate");
-        for (const upstreamCommand of [
-          "qwenpaw update",
-          "src/qwenpaw/console",
-          "agentscope/qwenpaw",
-          "qwenpaw app",
-        ]) {
-          expect.soft(updateContentSource).not.toContain(upstreamCommand);
-        }
-      } finally {
-        await rm(result.workdir, { recursive: true, force: true });
+        )
+        .toHaveLength(3);
+      expect
+        .soft(projectSelectSource)
+        .toContain('t("codingMode.unavailableDigitalMate")');
+      expect(configSource).toContain(
+        'const API_BASE_URL = "/api/admin/compat"',
+      );
+      expect(configSource).toContain('let csrfToken = ""');
+      expect(requestSource).toContain("buildMutationHeaders");
+      expect.soft(authHeadersSource).toContain("buildMutationHeaders");
+      expect
+        .soft(authHeadersSource)
+        .toContain('new Set(["POST", "PUT", "PATCH", "DELETE"])');
+      expect.soft(authHeadersTestSource).toContain('"GET"');
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        expect.soft(authHeadersTestSource).toContain(`"${method}"`);
       }
+      expect.soft(requestTestSource).toContain("x-csrf-token");
+      expect.soft(skillSource).toContain("buildMutationHeaders");
+      expect.soft(skillTestSource).toContain("x-csrf-token");
+      expect.soft(pluginLoaderSource).not.toContain("Authorization");
+      expect.soft(pluginLoaderSource).not.toContain("Bearer");
+      expect.soft(pluginLoaderSource).not.toContain("getApiToken");
+      expect.soft(chatApiSource).not.toContain("getApiToken");
+      expect(agentsPageSource).toContain(
+        'const SECONDARY_AGENT_CAPABILITY = "unsupported"',
+      );
+      expect(agentsPageSource).toContain("disabled");
+      expect(agentTableSource).toContain("secondaryAgentActionsDisabled");
+      expect(agentTableSource).toContain("disabled={deleteDisabled}");
+      expect
+        .soft(agentTableSource)
+        .toMatch(
+          /record\.id === "default"\s*\?\s*t\("agent\.defaultNotDeletable"\)\s*:\s*startupInProgress\s*\?\s*t\("agent\.status\.waitUntilStarted"\)\s*:\s*secondaryActionsDisabled\s*\?\s*t\("agent\.secondaryAgentUnsupported"\)/,
+        );
+      expect
+        .soft(agentTableTestSource)
+        .toContain('screen.getByTitle("agent.defaultNotDeletable")');
+      expect
+        .soft(agentSelectorSource)
+        .toContain('.filter((agent) => agent.id === "default")');
+      expect
+        .soft(agentSelectorTestSource)
+        .toContain("does not show secondary agent");
+      expect
+        .soft(agentTableTestSource)
+        .toContain("does not invoke secondary agent actions");
+      expect
+        .soft(agentTableTestSource)
+        .toContain("does not reorder secondary agents");
+      expect.soft(headerSource).not.toContain("fetch(PYPI_URL)");
+      expect.soft(headerSource).not.toContain("qwenpaw.agentscope.io/docs/faq");
+      expect
+        .soft(headerSource)
+        .toContain("setUpdateMarkdown(UPDATE_MD[lang] ?? UPDATE_MD.en)");
+      expect.soft(desktopUpdateSource).not.toContain("checkDesktopUpdate");
+      expect.soft(desktopUpdateSource).not.toContain("checkCachedUpdate");
+      for (const upstreamCommand of [
+        "qwenpaw update",
+        "src/qwenpaw/console",
+        "agentscope/qwenpaw",
+        "qwenpaw app",
+      ]) {
+        expect.soft(updateContentSource).not.toContain(upstreamCommand);
+      }
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
 
-      await expect(verifySnapshot(SNAPSHOT_ROOT)).resolves.toMatchObject({
-        commit: UPSTREAM.commit,
-      });
-    },
-    120_000,
-  );
+    await expect(verifySnapshot(SNAPSHOT_ROOT)).resolves.toMatchObject({
+      commit: UPSTREAM.commit,
+    });
+  }, 120_000);
 
   it("补丁应用失败时删除本次临时目录并保持 vendor 不变", async () => {
     const temporaryParent = await mkdtemp(
@@ -1009,6 +1097,7 @@ describe("QwenPaw Console isolated test runner", () => {
     { failedCommand: null, exitCode: 0 },
     { failedCommand: 0, exitCode: 23 },
     { failedCommand: 1, exitCode: 37 },
+    { failedCommand: 2, exitCode: 41 },
   ])(
     "命令结果为 $exitCode 时清理准备目录并精确保留退出码",
     async ({ failedCommand, exitCode }) => {
@@ -1019,6 +1108,7 @@ describe("QwenPaw Console isolated test runner", () => {
       await mkdir(workdir);
       const commands: Array<{ command: string; args: string[]; cwd: string }> =
         [];
+      let validationCount = 0;
 
       const outcome = await runPreparedConsoleTests({
         prepare: async () => ({ workdir, applied: [...PATCHES] }),
@@ -1029,6 +1119,10 @@ describe("QwenPaw Console isolated test runner", () => {
             ? { exitCode, signal: null }
             : { exitCode: 0, signal: null };
         },
+        validateBuild: async () => {
+          validationCount += 1;
+          return { indexPath: "", logoPath: "", resourceUrls: [] };
+        },
       });
 
       expect(outcome).toEqual({ exitCode, signal: null });
@@ -1038,8 +1132,171 @@ describe("QwenPaw Console isolated test runner", () => {
           failedCommand === null ? undefined : failedCommand + 1,
         ).map(([command, ...args]) => ({ command, args, cwd: workdir })),
       );
+      expect(validationCount).toBe(failedCommand === null ? 1 : 0);
       await expectPathMissing(workdir);
       await rm(temporaryRoot, { recursive: true, force: true });
     },
   );
+
+  it("严格按依赖、测试、生产构建的顺序运行", () => {
+    expect(CONSOLE_TEST_COMMANDS).toEqual([
+      ["npm", "ci"],
+      ["npm", "run", "test:run"],
+      ["npm", "run", "build:prod"],
+    ]);
+  });
+
+  it("校验生产入口资源均位于部署前缀且存在，并要求品牌图标被复制", async () => {
+    const testing = Reflect.get(consoleTestScript, "__testing") as
+      | {
+          validateConsoleBuild: (workdir: string) => Promise<unknown>;
+        }
+      | undefined;
+    expect(testing).toBeDefined();
+    if (!testing) {
+      return;
+    }
+
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-dist-"),
+    );
+    const distRoot = path.join(temporaryRoot, "dist");
+    await mkdir(path.join(distRoot, "assets"), { recursive: true });
+    await writeFile(path.join(distRoot, "assets", "app.js"), "export {};\n");
+    await writeFile(path.join(distRoot, "online.svg"), "<svg />\n");
+    await writeFile(path.join(distRoot, "digitalmate-logo.svg"), "<svg />\n");
+
+    try {
+      await writeFile(
+        path.join(distRoot, "index.html"),
+        '<script src="/_admin-console/assets/app.js"></script><link href="/_admin-console/online.svg">',
+      );
+      await expect(
+        testing.validateConsoleBuild(temporaryRoot),
+      ).resolves.toBeDefined();
+
+      await writeFile(
+        path.join(distRoot, "index.html"),
+        '<script src="/assets/app.js"></script>',
+      );
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "outside /_admin-console/",
+      );
+
+      await writeFile(
+        path.join(distRoot, "index.html"),
+        '<script src="/_admin-console/assets/missing.js"></script>',
+      );
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "missing build asset",
+      );
+
+      await rm(path.join(distRoot, "digitalmate-logo.svg"));
+      await writeFile(
+        path.join(distRoot, "index.html"),
+        '<script src="/_admin-console/assets/app.js"></script>',
+      );
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        "digitalmate-logo.svg",
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("执行异常与清理异常同时发生时保留执行异常并附加清理错误", async () => {
+    const primaryError = new Error("injected spawn failure");
+    const cleanupError = new Error("injected cleanup failure");
+
+    await expect(
+      runPreparedConsoleTests({
+        prepare: async () => ({ workdir: "/virtual/console", applied: [] }),
+        runCommand: async () => {
+          throw primaryError;
+        },
+        cleanup: async () => {
+          throw cleanupError;
+        },
+      }),
+    ).rejects.toBe(primaryError);
+    expect(Reflect.get(primaryError, "cleanupError")).toBe(cleanupError);
+  });
+
+  it("非零退出和清理异常同时发生时保留原退出码", async () => {
+    const cleanupError = new Error("injected cleanup failure");
+
+    await expect(
+      runPreparedConsoleTests({
+        prepare: async () => ({ workdir: "/virtual/console", applied: [] }),
+        runCommand: async () => ({ exitCode: 29, signal: null }),
+        cleanup: async () => {
+          throw cleanupError;
+        },
+      }),
+    ).resolves.toEqual({
+      exitCode: 29,
+      signal: null,
+      cleanupError,
+    });
+  });
+
+  it.each(["SIGINT", "SIGTERM"] as const)(
+    "%s 中断后停止后续命令、完成清理并保留信号",
+    async (signal) => {
+      const commands: string[] = [];
+      let cleanupCount = 0;
+
+      const outcome = await runPreparedConsoleTests({
+        prepare: async () => ({ workdir: "/virtual/console", applied: [] }),
+        runCommand: async (command) => {
+          commands.push(command);
+          return { exitCode: 1, signal };
+        },
+        cleanup: async () => {
+          cleanupCount += 1;
+        },
+      });
+
+      expect(outcome).toEqual({ exitCode: 1, signal });
+      expect(commands).toEqual(["npm"]);
+      expect(cleanupCount).toBe(1);
+    },
+  );
+
+  it("信号与清理异常同时发生时保留信号", async () => {
+    const cleanupError = new Error("injected cleanup failure");
+
+    await expect(
+      runPreparedConsoleTests({
+        prepare: async () => ({ workdir: "/virtual/console", applied: [] }),
+        runCommand: async () => ({ exitCode: 1, signal: "SIGTERM" }),
+        cleanup: async () => {
+          throw cleanupError;
+        },
+      }),
+    ).resolves.toEqual({
+      exitCode: 1,
+      signal: "SIGTERM",
+      cleanupError,
+    });
+  });
+
+  it("命令成功但清理失败时抛出清理错误", async () => {
+    const cleanupError = new Error("injected cleanup failure");
+
+    await expect(
+      runPreparedConsoleTests({
+        prepare: async () => ({ workdir: "/virtual/console", applied: [] }),
+        runCommand: async () => ({ exitCode: 0, signal: null }),
+        validateBuild: async () => ({
+          indexPath: "",
+          logoPath: "",
+          resourceUrls: [],
+        }),
+        cleanup: async () => {
+          throw cleanupError;
+        },
+      }),
+    ).rejects.toBe(cleanupError);
+  });
 });

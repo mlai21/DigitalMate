@@ -2,37 +2,19 @@ diff --git a/src/App.tsx b/src/App.tsx
 index db4877f..53fb39a 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -131,6 +131,9 @@ function AppInner() {
-   const { isDark } = useTheme();
-   const { loading: pluginsLoading } = usePlugins();
-   const selectedTheme = isDark ? bailianDarkTheme : bailianTheme;
+@@ -133,0 +134,3 @@ function AppInner() {
 +  const digitalMateThemeTokens = isDark
 +    ? { colorPrimary: "#E8684A", colorBgLayout: "#1F1B19" }
 +    : { colorPrimary: "#E8684A", colorBgLayout: "#FAF7F2" };
-   const lang = i18n.resolvedLanguage || i18n.language || "en";
-   const [antdLocale, setAntdLocale] = useState<Locale>(
-     antdLocaleMap[lang] ?? enUS,
-@@ -197,9 +200,7 @@ function AppInner() {
-           algorithm: isDark
-             ? antdTheme.darkAlgorithm
-             : antdTheme.defaultAlgorithm,
+@@ -200,3 +203 @@ function AppInner() {
 -          token: {
 -            colorPrimary: "#FF7F16",
 -          },
 +          token: digitalMateThemeTokens,
-         }}
-       >
-         <AntdApp>
 diff --git a/src/pages/Chat/OptionsPanel/defaultConfig.ts b/src/pages/Chat/OptionsPanel/defaultConfig.ts
 index 05e7203..1974e8c 100644
 --- a/src/pages/Chat/OptionsPanel/defaultConfig.ts
 +++ b/src/pages/Chat/OptionsPanel/defaultConfig.ts
-@@ -2,7 +2,7 @@ import type { TFunction } from "i18next";
- 
- const defaultConfig = {
-   theme: {
+@@ -5 +5 @@ const defaultConfig = {
 -    colorPrimary: "#FF7F16",
 +    colorPrimary: "#E8684A",
-     darkMode: false,
-     prefix: "qwenpaw",
-     leftHeader: {

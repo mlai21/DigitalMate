@@ -30,8 +30,12 @@ async function applyPatch(workdir, patchPath) {
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     maxBuffer: 10 * 1024 * 1024,
   };
-  await execFileAsync("git", ["apply", "--check", patchPath], options);
-  await execFileAsync("git", ["apply", patchPath], options);
+  await execFileAsync(
+    "git",
+    ["apply", "--unidiff-zero", "--check", patchPath],
+    options,
+  );
+  await execFileAsync("git", ["apply", "--unidiff-zero", patchPath], options);
 }
 
 async function removePreparedDirectory(workdir, originalError) {
@@ -75,11 +79,11 @@ async function prepareConsoleWithDependencies(
     }
 
     await verify();
-    const result = { workdir, applied: [...applied] };
     if (!keep) {
       await removePreparedDirectory(workdir);
+      return { workdir: null, applied: [...applied] };
     }
-    return result;
+    return { workdir, applied: [...applied] };
   } catch (error) {
     await removePreparedDirectory(workdir, error);
     throw error;
