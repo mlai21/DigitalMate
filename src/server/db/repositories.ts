@@ -125,8 +125,27 @@ const ATTACHMENT_EXPORT_COLUMNS = [
   "id", "user_id", "agent_id", "message_id", "kind", "file_name", "mime_type",
   "size_bytes", "text_truncated", "status", "error_code", "created_at", "updated_at",
 ] as const;
-const INTERNAL_EXPORT_KEY_PATTERN =
-  /(?:^|_)(?:secret|ciphertext|nonce|auth_tag|token|temporary|reply|poll)(?:_|$)/i;
+const SENSITIVE_EXPORT_KEY_SEGMENTS = new Set([
+  "secret",
+  "token",
+  "nonce",
+  "ciphertext",
+  "password",
+  "credential",
+  "credentials",
+]);
+const SENSITIVE_EXPORT_KEY_CONCEPTS = new Set([
+  "authtag",
+  "apikey",
+  "privatekey",
+  "accesskey",
+  "storagekey",
+  "storagepath",
+  "extractedtext",
+  "replytoken",
+  "pollcursor",
+  "temporarypath",
+]);
 
 export type DbUser = {
   id: string;
@@ -278,8 +297,55 @@ export type DbProactiveTask = {
 export function createRepositories(providedPool?: Pool, providedTurnLockPool?: Pool) {
   const pool = providedPool ?? getPool();
   const turnLockPool = providedTurnLockPool ?? (providedPool ? pool : getTurnLockPool());
+  const agents = createAgentRepository(pool);
+
+  async function acquireUserDataMutationLock(userId: string): Promise<() => Promise<void>> {
+    const lockKey = `user-data-mutation:${userId}`;
+    while (true) {
+      const client = await turnLockPool.connect();
+      let locked = false;
+      try {
+        const result = await client.query<{ locked: boolean }>(
+          "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+          [lockKey],
+        );
+        locked = result.rows[0]?.locked === true;
+      } catch (error) {
+        client.release(true);
+        throw error;
+      }
+      if (!locked) {
+        client.release();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        try {
+          const result = await client.query<{ unlocked: boolean }>(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
+            [lockKey],
+          );
+          if (result.rows[0]?.unlocked !== true) {
+            throw new Error("user_data_mutation_lock_not_held");
+          }
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      };
+    }
+  }
+
   return {
-    agents: createAgentRepository(pool),
+    agents,
+    userDataMutations: {
+      acquireLock: acquireUserDataMutationLock,
+    },
     agentSettings: createAgentSettingsRepository(pool),
     users: {
       async ensureDefault(): Promise<DbUser> {
@@ -903,47 +969,6 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       },
     },
     messageAttachments: {
-      async acquireUserMutationLock(userId: string): Promise<() => Promise<void>> {
-        const lockKey = `attachment-mutation:${userId}`;
-        while (true) {
-          const client = await turnLockPool.connect();
-          let locked = false;
-          try {
-            const result = await client.query<{ locked: boolean }>(
-              "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
-              [lockKey],
-            );
-            locked = result.rows[0]?.locked === true;
-          } catch (error) {
-            client.release(true);
-            throw error;
-          }
-          if (!locked) {
-            client.release();
-            await new Promise((resolve) => setTimeout(resolve, 25));
-            continue;
-          }
-
-          let released = false;
-          return async () => {
-            if (released) return;
-            released = true;
-            try {
-              const result = await client.query<{ unlocked: boolean }>(
-                "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
-                [lockKey],
-              );
-              if (result.rows[0]?.unlocked !== true) {
-                throw new Error("attachment_mutation_lock_not_held");
-              }
-              client.release();
-            } catch (error) {
-              client.release(true);
-              throw error;
-            }
-          };
-        }
-      },
       async createDraft(scope: AgentScope, input: {
         kind: AttachmentKind;
         fileName: string;
@@ -1816,10 +1841,47 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         );
         return result.rows.map(mapSkillRow);
       },
-      async findEnabled(userId: string, query: string): Promise<SkillContext[]> {
+      async listEnabledForAgent(scope: AgentScope): Promise<DbSkill[]> {
+        const result = await pool.query(
+          `SELECT skill.*
+           FROM skills AS skill
+           JOIN digital_agents AS agent
+             ON agent.user_id = skill.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = skill.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'skill'
+            AND resource_grant.resource_id = skill.id::text
+           WHERE skill.user_id = $1
+             AND skill.status = 'enabled'
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
+           ORDER BY skill.updated_at DESC
+           LIMIT 100`,
+          [scope.userId, scope.agentId],
+        );
+        return result.rows.map(mapSkillRow);
+      },
+      async findEnabled(scope: AgentScope, query: string): Promise<SkillContext[]> {
         const result = await pool.query<{ id: string; name: string; trigger: string; content: string }>(
-          "SELECT id, name, trigger, content FROM skills WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 50",
-          [userId],
+          `SELECT skill.id, skill.name, skill.trigger, skill.content
+           FROM skills AS skill
+           JOIN digital_agents AS agent
+             ON agent.user_id = skill.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = skill.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'skill'
+            AND resource_grant.resource_id = skill.id::text
+           WHERE skill.user_id = $1
+             AND skill.status = 'enabled'
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
+           ORDER BY skill.updated_at DESC
+           LIMIT 50`,
+          [scope.userId, scope.agentId],
         );
         // Auto-matching is deliberately strict (PRD 6.3: prefer no skill over a
         // wrong skill) — only inject when the name or trigger clearly matches.
@@ -1830,18 +1892,47 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
           .slice(0, 3)
           .map(({ id, name, trigger, content }) => ({ id, name, trigger, content }));
       },
-      async findByIds(userId: string, skillIds: string[]): Promise<SkillContext[]> {
+      async findByIds(scope: AgentScope, skillIds: string[]): Promise<SkillContext[]> {
         if (skillIds.length === 0) return [];
         const result = await pool.query<{ id: string; name: string; trigger: string; content: string }>(
-          "SELECT id, name, trigger, content FROM skills WHERE user_id = $1 AND id = ANY($2::uuid[]) AND status = 'enabled'",
-          [userId, skillIds],
+          `SELECT skill.id, skill.name, skill.trigger, skill.content
+           FROM skills AS skill
+           JOIN digital_agents AS agent
+             ON agent.user_id = skill.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = skill.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'skill'
+            AND resource_grant.resource_id = skill.id::text
+           WHERE skill.user_id = $1
+             AND skill.id = ANY($3::uuid[])
+             AND skill.status = 'enabled'
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)`,
+          [scope.userId, scope.agentId, skillIds],
         );
         return result.rows;
       },
-      async findEnabledByName(userId: string, name: string): Promise<{ id: string; name: string } | null> {
+      async findEnabledByName(scope: AgentScope, name: string): Promise<{ id: string; name: string } | null> {
         const result = await pool.query<{ id: string; name: string }>(
-          "SELECT id, name FROM skills WHERE user_id = $1 AND lower(name) = lower($2) AND status = 'enabled' LIMIT 1",
-          [userId, name],
+          `SELECT skill.id, skill.name
+           FROM skills AS skill
+           JOIN digital_agents AS agent
+             ON agent.user_id = skill.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = skill.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'skill'
+            AND resource_grant.resource_id = skill.id::text
+           WHERE skill.user_id = $1
+             AND lower(skill.name) = lower($3)
+             AND skill.status = 'enabled'
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
+           LIMIT 1`,
+          [scope.userId, scope.agentId, name],
         );
         return result.rows[0] ?? null;
       },
@@ -2068,18 +2159,42 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         ]);
         return result.rows;
       },
-      async listEnabled(userId: string): Promise<EnabledToolContext[]> {
+      async listEnabled(scope: AgentScope): Promise<EnabledToolContext[]> {
         const result = await pool.query<{
+          id: string;
           name: string;
           description: string;
           command: string;
           kind: "script" | "mcp";
           mcpToolName: string | null;
         }>(
-          "SELECT name, description, command, kind, mcp_tool_name AS \"mcpToolName\" FROM tool_registrations WHERE user_id = $1 AND status = 'enabled' ORDER BY updated_at DESC LIMIT 20",
-          [userId],
+          `SELECT tool.id, tool.name, tool.description, tool.command, tool.kind,
+                  tool.mcp_tool_name AS "mcpToolName"
+           FROM tool_registrations AS tool
+           JOIN digital_agents AS agent
+             ON agent.user_id = tool.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = tool.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'tool'
+            AND resource_grant.resource_id = tool.id::text
+           WHERE tool.user_id = $1
+             AND tool.status = 'enabled'
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
+           ORDER BY tool.updated_at DESC
+           LIMIT 20`,
+          [scope.userId, scope.agentId],
         );
-        return result.rows;
+        return result.rows
+          .map((row) => ({
+            name: row.name,
+            description: row.description,
+            command: row.command,
+            kind: row.kind,
+            mcpToolName: row.mcpToolName,
+          }));
       },
       async setStatus(userId: string, id: string, status: "enabled" | "disabled" | "rejected"): Promise<void> {
         await pool.query("UPDATE tool_registrations SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
@@ -2547,8 +2662,15 @@ function sanitizeExportValue(value: unknown): unknown {
 }
 
 function isInternalExportKey(key: string): boolean {
-  const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
-  return INTERNAL_EXPORT_KEY_PATTERN.test(normalized);
+  const segments = key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .split(/[^a-zA-Z0-9]+/)
+    .map((segment) => segment.toLowerCase())
+    .filter(Boolean);
+  const concept = segments.join("");
+  return SENSITIVE_EXPORT_KEY_CONCEPTS.has(concept)
+    || segments.some((segment) => SENSITIVE_EXPORT_KEY_SEGMENTS.has(segment));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

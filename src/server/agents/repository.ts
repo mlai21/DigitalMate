@@ -23,6 +23,18 @@ export function createAgentRepository(providedPool?: Pool) {
 
   return {
     getDefault,
+    async getActive(scope: { userId: string; agentId: string }): Promise<DigitalAgent | null> {
+      const result = await pool.query(
+        `SELECT *
+         FROM digital_agents
+         WHERE user_id = $1
+           AND id = $2
+           AND status = 'active'
+         LIMIT 1`,
+        [scope.userId, scope.agentId],
+      );
+      return result.rows[0] ? mapAgent(result.rows[0]) : null;
+    },
     async ensureDefault(userId: string): Promise<DigitalAgent> {
       const existing = await getDefault(userId);
       if (existing) return existing;

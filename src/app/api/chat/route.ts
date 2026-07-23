@@ -10,6 +10,7 @@ import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-sear
 import { loadAttachmentContext } from "@/server/attachments/context";
 import { readAttachment } from "@/server/attachments/storage";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
+import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
@@ -19,7 +20,10 @@ import { supportsImageInput } from "@/server/llm/catalog";
 import type { LlmMessage } from "@/server/llm/types";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
-import { resolveDefaultAgentScope } from "@/server/agents/service";
+import {
+  assertAuthorizedModelRoutes,
+  resolveDefaultAgentScope,
+} from "@/server/agents/service";
 import type { AgentScope } from "@/server/agents/types";
 
 export const runtime = "nodejs";
@@ -103,6 +107,12 @@ export async function POST(request: Request) {
   const historyRows = await repositories.messages.recentHistory(scope, conversationId, 12, clientTurnId);
   const settings = await repositories.settings.get(scope);
   const env = readEnv();
+  await assertAuthorizedModelRoutes(
+    scope,
+    ["main", "light"],
+    settings.modelRouting,
+    repositories.agents,
+  );
   const { client, model } = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
   let currentAttachments = await loadTurnAttachments({
@@ -226,7 +236,7 @@ export async function POST(request: Request) {
     createSkillMode = true;
     if (command.rest) agentMessage = command.rest;
   } else if (command?.kind === "use_skill") {
-    const skill = await repositories.skills.findEnabledByName(user.id, command.name);
+    const skill = await repositories.skills.findEnabledByName(scope, command.name);
     if (skill) {
       if (!explicitSkillIds.includes(skill.id)) explicitSkillIds.push(skill.id);
       agentMessage = command.rest || buildExplicitSkillFallbackMessage(skill.name);
@@ -244,12 +254,21 @@ export async function POST(request: Request) {
       let assistantText = "";
       let executionAccepted = false;
       let releaseExecutionLock: (() => Promise<void>) | undefined;
+      let releaseUserConnection: (() => void) | undefined;
+      try {
+        releaseUserConnection = userConnectionDisconnector.registerUserConnection(user.id);
+      } catch {
+        safeEnqueue(controller, encoder, { type: "error", message: "个人数据正在清理，请稍后重试。" });
+        safeClose(controller);
+        return;
+      }
       try {
         releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(scope, clientTurnId);
       } catch {
         console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
         safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
         safeClose(controller);
+        releaseUserConnection();
         return;
       }
       try {
@@ -462,6 +481,7 @@ export async function POST(request: Request) {
             console.error("chat_turn_lock_release_failed", { code: "turn_lock_release_failed" });
           });
         }
+        releaseUserConnection?.();
       }
     },
   });

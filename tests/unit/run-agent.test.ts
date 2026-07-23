@@ -824,7 +824,10 @@ describe("runAgent", () => {
       void chunk;
     }
 
-    expect(findByIds).toHaveBeenCalledWith("user-1", ["skill-9"]);
+    expect(findByIds).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      ["skill-9"],
+    );
     expect(findEnabled).not.toHaveBeenCalled();
     expect(recordUsage).toHaveBeenCalledWith(
       { userId: "user-1", agentId: "agent-1" },

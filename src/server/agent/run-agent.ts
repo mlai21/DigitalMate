@@ -49,8 +49,8 @@ export type RunAgentInput = AgentScope & {
       latest(scope: AgentScope, conversationId: string): Promise<string | null>;
     };
     skills?: {
-      findEnabled(userId: string, query: string): Promise<SkillContext[]>;
-      findByIds?(userId: string, skillIds: string[]): Promise<SkillContext[]>;
+      findEnabled(scope: AgentScope, query: string): Promise<SkillContext[]>;
+      findByIds?(scope: AgentScope, skillIds: string[]): Promise<SkillContext[]>;
       create?(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
       recordUsage?(
         scope: AgentScope,
@@ -63,7 +63,7 @@ export type RunAgentInput = AgentScope & {
       findAppliedSuggestions(scope: AgentScope): Promise<string[]>;
     };
     toolRegistrations?: {
-      listEnabled(userId: string): Promise<EnabledToolContext[]>;
+      listEnabled(scope: AgentScope): Promise<EnabledToolContext[]>;
     };
     llmUsage?: {
       create(input: LlmUsageLogInput): Promise<unknown> | unknown;
@@ -158,6 +158,7 @@ const createSkillTool: LlmTool = {
 };
 
 export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
+  const scope = { userId: input.userId, agentId: input.agentId };
   const hasAttachmentContext =
     input.attachmentToolGuard === true
     || (input.attachments?.length ?? 0) > 0
@@ -167,15 +168,15 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   // slash panel or /skill-name, load them unconditionally and skip fuzzy
   // auto-matching entirely (PRD P1-11).
   const [memories, explicitSkills, autoSkills, reflectionSuggestions, enabledTools] = await Promise.all([
-    input.repositories.memories.findRelevant({ userId: input.userId, agentId: input.agentId }, input.message),
+    input.repositories.memories.findRelevant(scope, input.message),
     !hasAttachmentContext && explicitSkillIds.length > 0 && input.repositories.skills?.findByIds
-      ? input.repositories.skills.findByIds(input.userId, explicitSkillIds)
+      ? input.repositories.skills.findByIds(scope, explicitSkillIds)
       : Promise.resolve([] as SkillContext[]),
     hasAttachmentContext || explicitSkillIds.length > 0
       ? Promise.resolve([] as SkillContext[])
-      : input.repositories.skills?.findEnabled(input.userId, input.message) ?? Promise.resolve([]),
-    input.repositories.reflections?.findAppliedSuggestions({ userId: input.userId, agentId: input.agentId }) ?? Promise.resolve([]),
-    input.repositories.toolRegistrations?.listEnabled(input.userId) ?? Promise.resolve([]),
+      : input.repositories.skills?.findEnabled(scope, input.message) ?? Promise.resolve([]),
+    input.repositories.reflections?.findAppliedSuggestions(scope) ?? Promise.resolve([]),
+    input.repositories.toolRegistrations?.listEnabled(scope) ?? Promise.resolve([]),
   ]);
   const conversationSummary = await input.repositories.conversationSummaries?.latest(
     { userId: input.userId, agentId: input.agentId },

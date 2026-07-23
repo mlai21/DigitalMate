@@ -137,6 +137,8 @@ const mocks = vi.hoisted(() => {
     createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
       agents: {
         getDefault: vi.fn(async () => defaultAgent),
+        getActive: vi.fn(async () => ({ ...defaultAgent, inheritsUserResources: true })),
+        listResourceGrants: vi.fn(async () => []),
       },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
@@ -430,7 +432,11 @@ describe("chat route", () => {
       lastMessageAt: new Date("2026-07-14T00:02:00Z"),
     };
     mocks.createRepositories.mockReturnValueOnce({
-      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
+      agents: {
+        getDefault: vi.fn(async () => mocks.defaultAgent),
+        getActive: vi.fn(async () => ({ ...mocks.defaultAgent, inheritsUserResources: true })),
+        listResourceGrants: vi.fn(async () => []),
+      },
       conversations: {
         listWithStats: vi.fn(async () => [conversation]),
         getOrCreateDefault: vi.fn(async () => conversation),
@@ -520,7 +526,11 @@ describe("chat route", () => {
       lastMessageAt: new Date("2026-07-14T00:02:00Z"),
     };
     mocks.createRepositories.mockReturnValueOnce({
-      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
+      agents: {
+        getDefault: vi.fn(async () => mocks.defaultAgent),
+        getActive: vi.fn(async () => ({ ...mocks.defaultAgent, inheritsUserResources: true })),
+        listResourceGrants: vi.fn(async () => []),
+      },
       conversations: {
         listWithStats: vi.fn(async () => [conversation]),
         getOrCreateDefault: vi.fn(async () => conversation),
@@ -1549,7 +1559,11 @@ describe("chat route", () => {
   it("rejects conversation ids that do not belong to the current user", async () => {
     const messagesCreate = vi.fn();
     mocks.createRepositories.mockReturnValueOnce({
-      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
+      agents: {
+        getDefault: vi.fn(async () => mocks.defaultAgent),
+        getActive: vi.fn(async () => ({ ...mocks.defaultAgent, inheritsUserResources: true })),
+        listResourceGrants: vi.fn(async () => []),
+      },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
         get: vi.fn(async () => null),
@@ -1593,7 +1607,11 @@ describe("chat route", () => {
   it("stores urgent reminder metadata for delivery policy", async () => {
     const createTask = vi.fn(async () => undefined);
     mocks.createRepositories.mockReturnValueOnce({
-      agents: { getDefault: vi.fn(async () => mocks.defaultAgent) },
+      agents: {
+        getDefault: vi.fn(async () => mocks.defaultAgent),
+        getActive: vi.fn(async () => ({ ...mocks.defaultAgent, inheritsUserResources: true })),
+        listResourceGrants: vi.fn(async () => []),
+      },
       conversations: {
         getOrCreateDefault: vi.fn(async () => ({ id: "conversation-1" })),
         get: vi.fn(async () => ({ id: "conversation-1" })),

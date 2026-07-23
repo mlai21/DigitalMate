@@ -5,7 +5,10 @@ import type { AppEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
-import { resolveDefaultAgentScope } from "@/server/agents/service";
+import {
+  assertAuthorizedModelRoutes,
+  resolveDefaultAgentScope,
+} from "@/server/agents/service";
 
 export function scheduleChannelMessageHandling(input: {
   env: AppEnv;
@@ -28,6 +31,12 @@ async function processChannelMessage(input: { env: AppEnv; message: NormalizedCh
   const user = await repositories.users.ensureDefault();
   const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(
+    scope,
+    ["main", "light"],
+    settings.modelRouting,
+    repositories.agents,
+  );
   const { client, model } = getLlmClient("main", input.env, settings.modelRouting);
   const light = getLlmClient("light", input.env, settings.modelRouting);
 

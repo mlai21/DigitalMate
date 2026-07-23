@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ATTACHMENT_CLEANUP_INTERVAL_MS,
   cleanupStaleAttachments,
+  runAttachmentCleanupRound,
   startAttachmentCleanupScheduler,
 } from "@/server/attachments/cleanup";
 import type { DbMessageAttachment } from "@/server/db/repositories";
@@ -57,6 +58,30 @@ afterEach(async () => {
 });
 
 describe("stale attachment cleanup", () => {
+  it("cleans drafts per active agent but scans global storage once per round", async () => {
+    const root = await createTemporaryRoot();
+    const orphan = "30000000-0000-4000-8000-000000000090";
+    await writeFile(path.join(root, orphan), "orphan");
+    const old = new Date("2026-07-12T00:00:00.000Z");
+    await utimes(path.join(root, orphan), old, old);
+    const repositories = createRepositories([]);
+    repositories.messageAttachments.listExistingStorageKeys.mockResolvedValue([]);
+
+    await runAttachmentCleanupRound({
+      scopes: [
+        scope,
+        { userId: scope.userId, agentId: "10000000-0000-4000-8000-000000000002" },
+      ],
+      repositories,
+      storageDirectory: root,
+      now: () => new Date("2026-07-14T00:30:00.000Z"),
+    });
+
+    expect(repositories.messageAttachments.claimExpiredDrafts).toHaveBeenCalledTimes(2);
+    expect(repositories.messageAttachments.listExistingStorageKeys).toHaveBeenCalledTimes(1);
+    expect(await readdir(root)).not.toContain(orphan);
+  });
+
   it("deletes every claimed file and row with the same deletion token", async () => {
     const first = claimedAttachment(
       "10000000-0000-4000-8000-000000000001",

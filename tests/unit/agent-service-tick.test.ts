@@ -56,4 +56,24 @@ describe("active agent tick", () => {
     expect(executed).not.toContain("user-1:agent-disabled");
     expect(listActiveAgents).toHaveBeenCalledTimes(3);
   });
+
+  it("continues with later agents when the asynchronous error reporter also rejects", async () => {
+    const executed: string[] = [];
+    const runTick = createActiveAgentTickRunner({
+      listActiveAgents: async () => [
+        { id: "agent-a", userId: "user-1", status: "active" as const },
+        { id: "agent-b", userId: "user-1", status: "active" as const },
+      ],
+      execute: async (scope) => {
+        executed.push(scope.agentId);
+        if (scope.agentId === "agent-a") throw new Error("execute_failed");
+      },
+      onError: async () => {
+        throw new Error("report_failed");
+      },
+    });
+
+    await expect(runTick()).resolves.toBeUndefined();
+    expect(executed).toEqual(["agent-a", "agent-b"]);
+  });
 });

@@ -17,6 +17,9 @@ vi.mock("@/server/auth/current-user", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    userDataMutations: {
+      acquireLock: vi.fn(async () => vi.fn(async () => undefined)),
+    },
     agents: {
       getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
     },

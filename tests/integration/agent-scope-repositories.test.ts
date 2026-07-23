@@ -6,8 +6,14 @@ import path from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { runAgent } from "@/server/agent/run-agent";
+import {
+  assertAuthorizedModelRoutes,
+  createAgentService,
+} from "@/server/agents/service";
 import type { AgentScope } from "@/server/agents/types";
 import { createRepositories } from "@/server/db/repositories";
+import type { LlmStreamInput } from "@/server/llm/types";
 import { defaultSettings } from "@/server/settings/defaults";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
@@ -50,6 +56,109 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       await rm(databaseDirectory, { recursive: true, force: true });
     }
   });
+
+  it("enforces inherited and explicit resource grants in the real execution path", async () => {
+    const repositories = createRepositories(pool);
+    const skills = await pool.query<{ id: string; name: string }>(
+      `INSERT INTO skills (user_id, name, trigger, content, status)
+       VALUES
+         ($1, 'allowed-skill', 'resource matrix', 'A_ONLY_SKILL_CONTENT', 'enabled'),
+         ($1, 'inherited-skill', 'resource matrix', 'B_ONLY_SKILL_CONTENT', 'enabled')
+       RETURNING id, name`,
+      [USER_ID],
+    );
+    const tools = await pool.query<{ id: string; name: string }>(
+      `INSERT INTO tool_registrations (
+         user_id, name, description, command, status
+       )
+       VALUES
+         ($1, 'allowed_tool', 'A only tool', 'echo A', 'enabled'),
+         ($1, 'inherited_tool', 'B inherited tool', 'echo B', 'enabled')
+       RETURNING id, name`,
+      [USER_ID],
+    );
+    const skillA = skills.rows.find((row) => row.name === "allowed-skill")!;
+    const skillB = skills.rows.find((row) => row.name === "inherited-skill")!;
+    const toolA = tools.rows.find((row) => row.name === "allowed_tool")!;
+
+    await pool.query(
+      `INSERT INTO agent_resource_grants (
+         user_id, agent_id, resource_type, resource_id, enabled
+       )
+       VALUES
+         ($1, $2, 'skill', $4, true),
+         ($1, $2, 'tool', $5, true),
+         ($1, $2, 'model', 'model-main', true),
+         ($1, $3, 'skill', $4, false),
+         ($1, $3, 'tool', $5, false),
+         ($1, $3, 'model', 'model-main', false)`,
+      [USER_ID, AGENT_A, AGENT_B, skillA.id, toolA.id],
+    );
+
+    await expect(
+      repositories.skills.findByIds(scopeA, [skillA.id, skillB.id]),
+    ).resolves.toEqual([
+      expect.objectContaining({ id: skillA.id }),
+    ]);
+    await expect(
+      repositories.skills.findByIds(scopeB, [skillA.id, skillB.id]),
+    ).resolves.toEqual([
+      expect.objectContaining({ id: skillB.id }),
+    ]);
+    await expect(repositories.toolRegistrations.listEnabled(scopeA))
+      .resolves.toEqual([
+        expect.objectContaining({ name: "allowed_tool" }),
+      ]);
+    await expect(repositories.toolRegistrations.listEnabled(scopeB))
+      .resolves.toEqual([
+        expect.objectContaining({ name: "inherited_tool" }),
+      ]);
+
+    const requestsA: LlmStreamInput[] = [];
+    const requestsB: LlmStreamInput[] = [];
+    await collectAgentOutput(scopeA, requestsA, repositories);
+    await collectAgentOutput(scopeB, requestsB, repositories);
+    const promptA = requestsA[0]?.messages.map((message) => message.content).join("\n") ?? "";
+    const promptB = requestsB[0]?.messages.map((message) => message.content).join("\n") ?? "";
+    expect(promptA).toContain("A_ONLY_SKILL_CONTENT");
+    expect(promptA).not.toContain("B_ONLY_SKILL_CONTENT");
+    expect(requestsA[0]?.tools?.map((tool) => tool.name)).toContain("allowed_tool");
+    expect(requestsA[0]?.tools?.map((tool) => tool.name)).not.toContain("inherited_tool");
+    expect(promptB).toContain("B_ONLY_SKILL_CONTENT");
+    expect(promptB).not.toContain("A_ONLY_SKILL_CONTENT");
+    expect(requestsB[0]?.tools?.map((tool) => tool.name)).toContain("inherited_tool");
+    expect(requestsB[0]?.tools?.map((tool) => tool.name)).not.toContain("allowed_tool");
+
+    const routing = { main: "model-main", light: "model-light" };
+    await expect(
+      assertAuthorizedModelRoutes(scopeA, ["main"], routing, repositories.agents),
+    ).resolves.toBeUndefined();
+    await expect(
+      assertAuthorizedModelRoutes(scopeA, ["light"], routing, repositories.agents),
+    ).rejects.toThrow("model_resource_unauthorized");
+    await expect(
+      assertAuthorizedModelRoutes(scopeB, ["main"], routing, repositories.agents),
+    ).rejects.toThrow("model_resource_unauthorized");
+    await expect(
+      assertAuthorizedModelRoutes(scopeB, ["light"], routing, repositories.agents),
+    ).resolves.toBeUndefined();
+
+    const deniedLlm = { calls: 0 };
+    await expect((async () => {
+      await assertAuthorizedModelRoutes(scopeB, ["main"], routing, repositories.agents);
+      deniedLlm.calls += 1;
+    })()).rejects.toThrow("model_resource_unauthorized");
+    expect(deniedLlm.calls).toBe(0);
+
+    const agentService = createAgentService(repositories.agents);
+    await expect(
+      agentService.listAuthorizedResourceIds(
+        scopeB,
+        "skill",
+        [skillA.id, skillB.id],
+      ),
+    ).resolves.toEqual([skillB.id]);
+  }, 30_000);
 
   it("isolates two agents across domain APIs and converges clear to one canonical default", async () => {
     const repositories = createRepositories(pool);
@@ -247,6 +356,42 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     await expect(repositories.taskArtifacts.list(scopeA)).resolves.toEqual([]);
   }, 30_000);
 });
+
+async function collectAgentOutput(
+  scope: AgentScope,
+  requests: LlmStreamInput[],
+  repositories: ReturnType<typeof createRepositories>,
+) {
+  for await (const chunk of runAgent({
+    ...scope,
+    conversationId: "20000000-0000-4000-8000-000000000001",
+    message: "resource matrix",
+    history: [],
+    persona: defaultSettings.persona,
+    llm: {
+      async *stream(request) {
+        requests.push(request);
+        yield { type: "text" as const, text: "ok" };
+      },
+      async completeText() {
+        return "ok";
+      },
+    },
+    model: "model-main",
+    repositories: {
+      memories: { findRelevant: async () => [] },
+      skills: repositories.skills,
+      toolRegistrations: repositories.toolRegistrations,
+      toolLogs: { create: async () => undefined },
+    },
+    search: {
+      run: async () => ({ summary: "", results: [] }),
+    },
+  })) {
+    // Exhaust the generator so the captured request covers prompt and tools.
+    void chunk;
+  }
+}
 
 function goalContract(label: string) {
   return {

@@ -3,7 +3,11 @@ import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { redirectUrl } from "@/server/http/redirect";
-import { defaultArtifactRoot, writeArtifactFile } from "@/server/tasks/artifacts";
+import {
+  createArtifactFileLocator,
+  defaultArtifactRoot,
+  writeArtifactFile,
+} from "@/server/tasks/artifacts";
 import { buildSpreadsheetSummaryFiles } from "@/server/tasks/csv";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
@@ -21,45 +25,56 @@ export async function POST(request: Request) {
   const repositories = createRepositories();
   const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const inputSummary = `表格汇总：${file.name}`;
-  const taskRunId = await repositories.taskRuns.create(scope, {
-    kind: "spreadsheet",
-    inputSummary,
-    metadata: { fileName: file.name, size: file.size },
-  });
+  const releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
 
   try {
-    const files = await buildSpreadsheetSummaryFiles({
-      fileName: file.name,
-      mimeType: file.type,
-      buffer: Buffer.from(await file.arrayBuffer()),
-    });
-    for (const taskFile of files) {
-      const stored = await writeArtifactFile({
-        root: defaultArtifactRoot(),
-        userId: user.id,
-        taskRunId,
-        fileName: taskFile.fileName,
-        mimeType: taskFile.mimeType,
-        buffer: taskFile.buffer,
-      });
-      await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
-    }
-    await completeTaskWithSkillDraft(repositories, {
-      scope,
-      taskRunId,
+    const taskRunId = await repositories.taskRuns.create(scope, {
       kind: "spreadsheet",
       inputSummary,
-      outputSummary: "表格汇总报告和图表已生成。",
+      metadata: { fileName: file.name, size: file.size },
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await repositories.taskRuns.fail(scope, taskRunId, message);
-    await recordEventReflection(repositories, {
-      scope,
-      event: "task_failure",
-      summary: `${inputSummary} 失败：${message}`,
-      source: { taskRunId, taskKind: "spreadsheet" },
-    }).catch(() => undefined);
+    try {
+      const files = await buildSpreadsheetSummaryFiles({
+        fileName: file.name,
+        mimeType: file.type,
+        buffer: Buffer.from(await file.arrayBuffer()),
+      });
+      for (const taskFile of files) {
+        const stored = createArtifactFileLocator({
+          userId: user.id,
+          taskRunId,
+          fileName: taskFile.fileName,
+          mimeType: taskFile.mimeType,
+        });
+        await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
+        await writeArtifactFile({
+          root: defaultArtifactRoot(),
+          userId: user.id,
+          taskRunId,
+          fileName: taskFile.fileName,
+          mimeType: taskFile.mimeType,
+          buffer: taskFile.buffer,
+        });
+      }
+      await completeTaskWithSkillDraft(repositories, {
+        scope,
+        taskRunId,
+        kind: "spreadsheet",
+        inputSummary,
+        outputSummary: "表格汇总报告和图表已生成。",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await repositories.taskRuns.fail(scope, taskRunId, message);
+      await recordEventReflection(repositories, {
+        scope,
+        event: "task_failure",
+        summary: `${inputSummary} 失败：${message}`,
+        source: { taskRunId, taskKind: "spreadsheet" },
+      }).catch(() => undefined);
+    }
+  } finally {
+    await releaseMutationLock();
   }
 
   return NextResponse.redirect(redirectUrl(request, "/admin/tasks"), { status: 303 });

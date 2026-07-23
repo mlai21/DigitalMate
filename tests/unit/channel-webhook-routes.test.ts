@@ -203,6 +203,13 @@ function fakeRepositories() {
         userId: "user-1",
         status: "active",
       })),
+      getActive: vi.fn(async () => ({
+        id: "agent-1",
+        userId: "user-1",
+        status: "active",
+        inheritsUserResources: true,
+      })),
+      listResourceGrants: vi.fn(async () => []),
     },
     settings: {
       get: vi.fn(async () => ({

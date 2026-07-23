@@ -3,7 +3,11 @@ import { requireCurrentUser } from "@/server/auth/current-user";
 import { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { redirectUrl } from "@/server/http/redirect";
-import { defaultArtifactRoot, writeArtifactFile } from "@/server/tasks/artifacts";
+import {
+  createArtifactFileLocator,
+  defaultArtifactRoot,
+  writeArtifactFile,
+} from "@/server/tasks/artifacts";
 import { summarizeSpreadsheetFile } from "@/server/tasks/csv";
 import { buildPresentation, parsePresentationOutline } from "@/server/tasks/presentation";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
@@ -25,49 +29,60 @@ export async function POST(request: Request) {
   const repositories = createRepositories();
   const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const inputSummary = `PPT 生成：${title}`;
-  const taskRunId = await repositories.taskRuns.create(scope, {
-    kind: "presentation",
-    inputSummary,
-    metadata: {
-      slideCount: slides.length,
-      ...(isUploadedFile(dataFile) ? { dataFileName: dataFile.name, dataFileSize: dataFile.size } : {}),
-    },
-  });
+  const releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
 
   try {
-    const dataSummary = isUploadedFile(dataFile)
-      ? await summarizeSpreadsheetFile({
-          fileName: dataFile.name,
-          mimeType: dataFile.type,
-          buffer: Buffer.from(await dataFile.arrayBuffer()),
-        })
-      : undefined;
-    const pptx = await buildPresentation({ title, slides, dataSummary });
-    const stored = await writeArtifactFile({
-      root: defaultArtifactRoot(),
-      userId: user.id,
-      taskRunId,
-      fileName: pptx.fileName,
-      mimeType: pptx.mimeType,
-      buffer: pptx.buffer,
-    });
-    await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
-    await completeTaskWithSkillDraft(repositories, {
-      scope,
-      taskRunId,
+    const taskRunId = await repositories.taskRuns.create(scope, {
       kind: "presentation",
       inputSummary,
-      outputSummary: "PPT 文件已生成。",
+      metadata: {
+        slideCount: slides.length,
+        ...(isUploadedFile(dataFile) ? { dataFileName: dataFile.name, dataFileSize: dataFile.size } : {}),
+      },
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await repositories.taskRuns.fail(scope, taskRunId, message);
-    await recordEventReflection(repositories, {
-      scope,
-      event: "task_failure",
-      summary: `${inputSummary} 失败：${message}`,
-      source: { taskRunId, taskKind: "presentation" },
-    }).catch(() => undefined);
+    try {
+      const dataSummary = isUploadedFile(dataFile)
+        ? await summarizeSpreadsheetFile({
+            fileName: dataFile.name,
+            mimeType: dataFile.type,
+            buffer: Buffer.from(await dataFile.arrayBuffer()),
+          })
+        : undefined;
+      const pptx = await buildPresentation({ title, slides, dataSummary });
+      const stored = createArtifactFileLocator({
+        userId: user.id,
+        taskRunId,
+        fileName: pptx.fileName,
+        mimeType: pptx.mimeType,
+      });
+      await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
+      await writeArtifactFile({
+        root: defaultArtifactRoot(),
+        userId: user.id,
+        taskRunId,
+        fileName: pptx.fileName,
+        mimeType: pptx.mimeType,
+        buffer: pptx.buffer,
+      });
+      await completeTaskWithSkillDraft(repositories, {
+        scope,
+        taskRunId,
+        kind: "presentation",
+        inputSummary,
+        outputSummary: "PPT 文件已生成。",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await repositories.taskRuns.fail(scope, taskRunId, message);
+      await recordEventReflection(repositories, {
+        scope,
+        event: "task_failure",
+        summary: `${inputSummary} 失败：${message}`,
+        source: { taskRunId, taskKind: "presentation" },
+      }).catch(() => undefined);
+    }
+  } finally {
+    await releaseMutationLock();
   }
 
   return NextResponse.redirect(redirectUrl(request, "/admin/tasks"), { status: 303 });

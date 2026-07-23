@@ -53,7 +53,7 @@ type ChannelRepositories = {
     }): Promise<unknown> | unknown;
   };
   skills?: {
-    findEnabledByName?(userId: string, name: string): Promise<{ id: string; name: string } | null>;
+    findEnabledByName?(scope: AgentScope, name: string): Promise<{ id: string; name: string } | null>;
   };
   settings: {
     get(scope: AgentScope): Promise<{
@@ -152,7 +152,7 @@ export async function handleChannelMessage(input: {
     createSkillMode = true;
     if (command.rest) agentMessage = command.rest;
   } else if (command?.kind === "use_skill" && input.repositories.skills?.findEnabledByName) {
-    const skill = await input.repositories.skills.findEnabledByName(input.scope.userId, command.name);
+    const skill = await input.repositories.skills.findEnabledByName(input.scope, command.name);
     if (skill) {
       explicitSkillIds.push(skill.id);
       agentMessage = command.rest || buildExplicitSkillFallbackMessage(skill.name);

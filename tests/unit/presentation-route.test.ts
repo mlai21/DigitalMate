@@ -3,10 +3,26 @@ import { strFromU8, unzipSync } from "fflate";
 import { POST as postPresentationTask } from "@/app/api/tasks/presentation/route";
 
 const routeMocks = vi.hoisted(() => ({
+  callOrder: [] as string[],
   requireCurrentUser: vi.fn(async () => ({ id: "user-1" })),
-  taskArtifactsCreate: vi.fn(async () => "artifact-id"),
-  taskRunsComplete: vi.fn(async () => undefined),
-  taskRunsCreate: vi.fn(async () => "task-1"),
+  acquireLock: vi.fn(async () => {
+    routeMocks.callOrder.push("lock");
+    return routeMocks.releaseLock;
+  }),
+  releaseLock: vi.fn(async () => {
+    routeMocks.callOrder.push("unlock");
+  }),
+  taskArtifactsCreate: vi.fn(async () => {
+    routeMocks.callOrder.push("locator");
+    return "artifact-id";
+  }),
+  taskRunsComplete: vi.fn(async () => {
+    routeMocks.callOrder.push("complete");
+  }),
+  taskRunsCreate: vi.fn(async () => {
+    routeMocks.callOrder.push("task");
+    return "task-1";
+  }),
   skillsCreate: vi.fn(async () => undefined),
   storedBuffers: [] as Buffer[],
 }));
@@ -17,6 +33,9 @@ vi.mock("@/server/auth/current-user", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    userDataMutations: {
+      acquireLock: routeMocks.acquireLock,
+    },
     agents: {
       getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
     },
@@ -39,7 +58,13 @@ vi.mock("@/server/tasks/artifacts", async (importOriginal) => {
   return {
     ...actual,
     defaultArtifactRoot: vi.fn(() => "/tmp/digitalmate-test-artifacts"),
+    createArtifactFileLocator: vi.fn((input: { fileName: string; mimeType: string }) => ({
+      fileName: input.fileName,
+      mimeType: input.mimeType,
+      storagePath: `user-1/task-1/${input.fileName}`,
+    })),
     writeArtifactFile: vi.fn(async (input: { fileName: string; mimeType: string; buffer: Buffer }) => {
+      routeMocks.callOrder.push("file");
       routeMocks.storedBuffers.push(input.buffer);
       return {
         fileName: input.fileName,
@@ -53,6 +78,7 @@ vi.mock("@/server/tasks/artifacts", async (importOriginal) => {
 describe("presentation task route", () => {
   it("includes uploaded spreadsheet data in the generated pptx artifact", async () => {
     routeMocks.storedBuffers.length = 0;
+    routeMocks.callOrder.length = 0;
     const form = new FormData();
     form.set("title", "销售汇报");
     form.set("outline", "结论\n- 华东表现最好");
@@ -66,6 +92,14 @@ describe("presentation task route", () => {
     expect(response.status).toBe(303);
     expect(routeMocks.storedBuffers).toHaveLength(1);
     expect(pptxText(routeMocks.storedBuffers[0])).toContain("数据概览");
+    expect(routeMocks.callOrder).toEqual([
+      "lock",
+      "task",
+      "locator",
+      "file",
+      "complete",
+      "unlock",
+    ]);
   });
 });
 

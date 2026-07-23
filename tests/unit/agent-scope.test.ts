@@ -140,7 +140,7 @@ describe("AgentScope", () => {
     }
   });
 
-  it("inherits user resources only for the default agent unless an explicit grant overrides it", async () => {
+  it("batches resource authorization and lets explicit grants override each agent's inheritance policy", async () => {
     const baseAgent = {
       userId: "user-1",
       slug: "digitalmate",
@@ -152,37 +152,58 @@ describe("AgentScope", () => {
       updatedAt: new Date("2026-07-21T00:00:00Z"),
     };
     const listResourceGrants = vi.fn<(...args: unknown[]) => Promise<AgentResourceGrant[]>>(
-      async () => [],
+      async (_userId, agentId) => agentId === "agent-b"
+        ? [{
+            userId: "user-1",
+            agentId: "agent-b",
+            resourceType: "skill",
+            resourceId: "skill-allowed",
+            enabled: true,
+          }, {
+            userId: "user-1",
+            agentId: "agent-b",
+            resourceType: "skill",
+            resourceId: "skill-denied",
+            enabled: false,
+          }]
+        : [{
+            userId: "user-1",
+            agentId: "agent-a",
+            resourceType: "skill",
+            resourceId: "skill-denied",
+            enabled: false,
+          }],
     );
     const repository = {
-      listActive: vi.fn(async () => [
-        { ...baseAgent, id: "agent-a", isDefault: true },
-        { ...baseAgent, id: "agent-b", isDefault: false },
-      ]),
+      getActive: vi.fn(async (scope: AgentScope) => scope.agentId === "agent-a"
+        ? { ...baseAgent, id: "agent-a", isDefault: true }
+        : {
+            ...baseAgent,
+            id: "agent-b",
+            isDefault: false,
+            inheritsUserResources: false,
+          }),
       listResourceGrants,
     } as unknown as AgentRepository;
     const service = createAgentService(repository);
 
-    await expect(service.canUseUserResource(scopeA, "skill", "skill-1")).resolves.toBe(true);
-    await expect(service.canUseUserResource(scopeB, "skill", "skill-1")).resolves.toBe(false);
+    await expect(
+      service.listAuthorizedResourceIds(
+        scopeA,
+        "skill",
+        ["skill-inherited", "skill-denied"],
+      ),
+    ).resolves.toEqual(["skill-inherited"]);
+    await expect(
+      service.listAuthorizedResourceIds(
+        scopeB,
+        "skill",
+        ["skill-allowed", "skill-denied", "skill-unlisted"],
+      ),
+    ).resolves.toEqual(["skill-allowed"]);
 
-    listResourceGrants.mockResolvedValueOnce([{
-      userId: "user-1",
-      agentId: "agent-b",
-      resourceType: "skill",
-      resourceId: "skill-1",
-      enabled: true,
-    }]);
-    await expect(service.canUseUserResource(scopeB, "skill", "skill-1")).resolves.toBe(true);
-
-    listResourceGrants.mockResolvedValueOnce([{
-      userId: "user-1",
-      agentId: "agent-a",
-      resourceType: "skill",
-      resourceId: "skill-1",
-      enabled: false,
-    }]);
-    await expect(service.canUseUserResource(scopeA, "skill", "skill-1")).resolves.toBe(false);
+    expect(repository.getActive).toHaveBeenCalledTimes(2);
+    expect(listResourceGrants).toHaveBeenCalledTimes(2);
   });
 
   it("uses the shared AgentScope type throughout the run-agent execution contracts", async () => {

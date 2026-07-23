@@ -21,7 +21,7 @@ type ImprovableSkill = {
 
 type ImprovementRepositories = {
   skills: {
-    listEnabled(userId: string): Promise<ImprovableSkill[]>;
+    listEnabledForAgent(scope: AgentScope): Promise<ImprovableSkill[]>;
   };
   skillRevisions: {
     create(input: { userId: string; skillId: string; proposedContent: string; reason: string }): Promise<unknown> | unknown;
@@ -114,7 +114,7 @@ export async function processSkillImprovement(input: {
   scope: AgentScope;
   threshold?: number;
 }): Promise<{ proposed: number }> {
-  const skills = await input.repositories.skills.listEnabled(input.scope.userId);
+  const skills = await input.repositories.skills.listEnabledForAgent(input.scope);
   let proposed = 0;
 
   for (const skill of skills) {

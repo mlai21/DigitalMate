@@ -16,6 +16,20 @@ export type StoredArtifactFile = {
   storagePath: string;
 };
 
+export function createArtifactFileLocator(input: {
+  userId: string;
+  taskRunId: string;
+  fileName: string;
+  mimeType: string;
+}): StoredArtifactFile {
+  const fileName = safeArtifactFileName(input.fileName);
+  return {
+    fileName,
+    mimeType: input.mimeType,
+    storagePath: path.posix.join(input.userId, input.taskRunId, fileName),
+  };
+}
+
 export function defaultArtifactRoot(): string {
   return path.join(process.cwd(), "data", "artifacts");
 }
@@ -26,12 +40,12 @@ export function safeArtifactFileName(fileName: string): string {
 }
 
 export async function writeArtifactFile(input: ArtifactFileInput): Promise<StoredArtifactFile> {
-  const fileName = safeArtifactFileName(input.fileName);
-  const storagePath = path.posix.join(input.userId, input.taskRunId, fileName);
+  const stored = createArtifactFileLocator(input);
+  const { storagePath } = stored;
   const absolutePath = resolveArtifactPath(input.root, storagePath);
   await mkdir(path.dirname(absolutePath), { recursive: true });
   await writeFile(absolutePath, input.buffer);
-  return { fileName, mimeType: input.mimeType, storagePath };
+  return stored;
 }
 
 export async function readArtifactFile(root: string, storagePath: string): Promise<Buffer> {

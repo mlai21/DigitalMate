@@ -13,7 +13,8 @@ const mocks = vi.hoisted(() => ({
   callOrder: [] as string[],
   attachmentStorageDir: "",
   requireCurrentUser: vi.fn(async () => ({ id: USER_ID })),
-  disconnectUser: vi.fn(async () => undefined),
+  disconnectUser: vi.fn(async () => mocks.releaseConnectionDrain),
+  releaseConnectionDrain: vi.fn(),
   listAttachmentStorageKeys: vi.fn(async () => [OWNED_KEY]),
   clear: vi.fn(async () => undefined),
   acquireUserMutationLock: vi.fn(async () => vi.fn(async () => undefined)),
@@ -63,14 +64,16 @@ describe("admin personal data clear route", () => {
     mocks.requireCurrentUser.mockResolvedValue({ id: USER_ID });
     mocks.disconnectUser.mockImplementation(async () => {
       mocks.callOrder.push("disconnect");
+      return mocks.releaseConnectionDrain;
     });
+    mocks.releaseConnectionDrain.mockReset();
     mocks.createRepositories.mockReturnValue({
+      userDataMutations: {
+        acquireLock: mocks.acquireUserMutationLock,
+      },
       personalData: {
         listAttachmentStorageKeys: mocks.listAttachmentStorageKeys,
         clear: mocks.clear,
-      },
-      messageAttachments: {
-        acquireUserMutationLock: mocks.acquireUserMutationLock,
       },
     });
   });
@@ -96,6 +99,7 @@ describe("admin personal data clear route", () => {
     expect(mocks.acquireUserMutationLock).toHaveBeenCalledWith(USER_ID);
     expect(mocks.disconnectUser).toHaveBeenCalledWith(USER_ID);
     expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
     expect(mocks.callOrder).toEqual(["disconnect", "artifacts", "database"]);
     await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readAttachment(root, OTHER_KEY)).resolves.toEqual(Buffer.from("other-user"));
@@ -141,6 +145,7 @@ describe("admin personal data clear route", () => {
       })
       .mockImplementationOnce(async () => {
         mocks.callOrder.push("disconnect");
+        return mocks.releaseConnectionDrain;
       });
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 

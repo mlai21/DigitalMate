@@ -4,7 +4,10 @@ import { buildConversationSummary, shouldCompactConversation } from "@/server/ag
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
-import { cleanupStaleAttachments, startAttachmentCleanupScheduler } from "@/server/attachments/cleanup";
+import {
+  runAttachmentCleanupRound,
+  startAttachmentCleanupScheduler,
+} from "@/server/attachments/cleanup";
 import { sendChannelMessage } from "@/server/channels/outbound";
 import { readEnv } from "@/server/config/env";
 import { closePool } from "@/server/db/client";
@@ -18,6 +21,7 @@ import { processGoalLoops } from "@/server/goals/orchestrator";
 import { verifyGoalStep } from "@/server/goals/verifier";
 import { getLlmClient } from "@/server/llm/router";
 import type { AgentScope } from "@/server/agents/types";
+import { assertAuthorizedModelRoutes } from "@/server/agents/service";
 
 const intervalMs = 15_000;
 const skillImprovementIntervalMs = 24 * 60 * 60 * 1000;
@@ -32,13 +36,12 @@ async function main() {
   const env = readEnv();
   const cleanupScheduler = startAttachmentCleanupScheduler({
     run: async () => {
-      for (const agent of await repositories.agents.listActive()) {
-        await cleanupStaleAttachments({
-          scope: { userId: agent.userId, agentId: agent.id },
-          repositories,
-          storageDirectory: env.attachmentStorageDir,
-        });
-      }
+      const agents = await repositories.agents.listActive();
+      await runAttachmentCleanupRound({
+        scopes: agents.map((agent) => ({ userId: agent.userId, agentId: agent.id })),
+        repositories,
+        storageDirectory: env.attachmentStorageDir,
+      });
     },
   });
   const shutdown = new AbortController();
@@ -101,6 +104,12 @@ async function processAgentTick(
 async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(
+    scope,
+    ["main", "light"],
+    settings.modelRouting,
+    repositories.agents,
+  );
   const main = getLlmClient("main", env, settings.modelRouting);
   const light = getLlmClient("light", env, settings.modelRouting);
 
@@ -171,6 +180,7 @@ async function processSkillImprovementJob(repositories: ReturnType<typeof create
 
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   const outcome = await processSkillImprovement({
@@ -190,6 +200,7 @@ async function processMemoryMessages(repositories: ReturnType<typeof createRepos
 
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   for (const message of messages) {
@@ -202,6 +213,7 @@ async function processMemoryMessages(repositories: ReturnType<typeof createRepos
 async function processMemoryConsolidation(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   for (const kind of Object.keys(MEMORY_CAPACITY_LIMITS) as Array<keyof typeof MEMORY_CAPACITY_LIMITS>) {
@@ -253,6 +265,7 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
     .join("\n");
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
+  await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
   const generated = await generateReflectionWithLlm({ llm: client, model, digest });
   const reflection =

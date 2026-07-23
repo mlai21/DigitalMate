@@ -13,9 +13,10 @@ export async function POST(request: Request) {
   const user = await requireCurrentUser();
   const repositories = createRepositories();
   let releaseMutationLock: (() => Promise<void>) | undefined;
+  let releaseConnectionDrain: (() => void) | undefined;
   try {
-    releaseMutationLock = await repositories.messageAttachments.acquireUserMutationLock(user.id);
-    await userConnectionDisconnector.disconnectUser(user.id);
+    releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
+    releaseConnectionDrain = await userConnectionDisconnector.disconnectUser(user.id);
     const storageKeys = await repositories.personalData.listAttachmentStorageKeys(user.id);
     const storageRoot = readEnv().attachmentStorageDir;
     // Delete blobs first. If any deletion fails, DB keys remain available for a safe retry.
@@ -32,9 +33,10 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ error: "personal_data_clear_failed" }, { status: 500 });
   } finally {
+    releaseConnectionDrain?.();
     if (releaseMutationLock) {
       await releaseMutationLock().catch(() => {
-        console.error("attachment_mutation_lock_release_failed", { code: "attachment_mutation_lock_release_failed" });
+        console.error("user_data_mutation_lock_release_failed", { code: "user_data_mutation_lock_release_failed" });
       });
     }
   }

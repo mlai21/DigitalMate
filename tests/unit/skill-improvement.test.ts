@@ -33,7 +33,7 @@ function buildRepositories(overrides?: {
   hasPending?: boolean;
 }) {
   return {
-    skills: { listEnabled: async () => [baseSkill] },
+    skills: { listEnabledForAgent: async () => [baseSkill] },
     skillRevisions: {
       create: vi.fn(),
       hasPendingForSkill: async () => overrides?.hasPending ?? false,

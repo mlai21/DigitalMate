@@ -72,6 +72,8 @@ describe("personal data helpers", () => {
       updated_at: new Date("2026-07-14T00:00:00Z"),
       metadata: {
         label: "合法元数据",
+        poll_interval: 30,
+        replyStyle: "温暖简洁",
         token: "SENTINEL_TOKEN_VALUE",
         nested: {
           reply_secret: "SENTINEL_REPLY_VALUE",
@@ -80,6 +82,21 @@ describe("personal data helpers", () => {
           temporaryPath: "SENTINEL_CAMEL_TEMPORARY_VALUE",
           authTag: "SENTINEL_CAMEL_AUTH_TAG_VALUE",
         },
+        nestedArray: [{
+          apiKey: "SENTINEL_API_KEY_VALUE",
+          password: "SENTINEL_PASSWORD_VALUE",
+          credentials: "SENTINEL_CREDENTIALS_VALUE",
+          private_key: "SENTINEL_PRIVATE_KEY_VALUE",
+          "access-key": "SENTINEL_ACCESS_KEY_VALUE",
+          storageKey: "SENTINEL_STORAGE_KEY_VALUE",
+          storage_path: "SENTINEL_STORAGE_PATH_VALUE",
+          extractedText: "SENTINEL_NESTED_EXTRACTED_TEXT_VALUE",
+          "reply-token": "SENTINEL_REPLY_TOKEN_VALUE",
+          poll_cursor: "SENTINEL_POLL_CURSOR_VALUE",
+          "temporary-path": "SENTINEL_TEMPORARY_PATH_VALUE",
+          pollInterval: 60,
+          reply_style: "自然",
+        }],
       },
       raw_payload: { poll_token: "SENTINEL_RAW_VALUE" },
       storage_path: "SENTINEL_ARTIFACT_PATH",
@@ -131,6 +148,18 @@ describe("personal data helpers", () => {
     }
     expect(serialized).toContain("agent_id");
     expect(serialized).toContain("合法元数据");
+    expect(exported.tables.task_runs).toEqual([
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          poll_interval: 30,
+          replyStyle: "温暖简洁",
+          nestedArray: [{
+            pollInterval: 60,
+            reply_style: "自然",
+          }],
+        }),
+      }),
+    ]);
     for (const [statement] of query.mock.calls) {
       expect(String(statement)).not.toMatch(/\bSELECT\s+\*/i);
       expect(String(statement)).not.toMatch(/\b\w+\.\*/i);

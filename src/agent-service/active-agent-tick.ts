@@ -39,7 +39,11 @@ export function createActiveAgentTickRunner(
         await options.execute(scope);
       } catch (error) {
         if (!options.onError) throw error;
-        await options.onError(error, scope);
+        try {
+          await options.onError(error, scope);
+        } catch {
+          // Reporting is best-effort and must not suppress later agent scopes.
+        }
       } finally {
         running.delete(key);
       }

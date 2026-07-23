@@ -96,7 +96,7 @@ export async function POST(request: Request) {
   }
   let releaseMutationLock: (() => Promise<void>) | undefined;
   try {
-    releaseMutationLock = await repositories.messageAttachments.acquireUserMutationLock(user.id);
+    releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
   } catch {
     return errorResponse("attachment_upload_failed", 500);
   }
@@ -154,7 +154,7 @@ export async function POST(request: Request) {
   } finally {
     if (releaseMutationLock) {
       await releaseMutationLock().catch(() => {
-        console.error("attachment_mutation_lock_release_failed", { code: "attachment_mutation_lock_release_failed" });
+        console.error("user_data_mutation_lock_release_failed", { code: "user_data_mutation_lock_release_failed" });
       });
     }
   }

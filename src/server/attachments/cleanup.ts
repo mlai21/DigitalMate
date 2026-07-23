@@ -56,6 +56,7 @@ export async function cleanupStaleAttachments(options: {
   deleteFile?: typeof deleteAttachment;
   now?: () => Date;
   logger?: CleanupLogger;
+  includeStorageCleanup?: boolean;
 }): Promise<AttachmentCleanupResult> {
   const deleteFile = options.deleteFile ?? deleteAttachment;
   const logger = options.logger ?? console;
@@ -119,13 +120,11 @@ export async function cleanupStaleAttachments(options: {
     }
   }
 
-  const now = options.now?.() ?? new Date();
-  result.temporaryFiles = await cleanupStaleTemporaryFiles(options.storageDirectory, now);
-  result.orphanedFiles = await cleanupOrphanedFinalFiles(
-    options.repositories,
-    options.storageDirectory,
-    now,
-  );
+  if (options.includeStorageCleanup !== false) {
+    const storage = await cleanupAttachmentStorage(options);
+    result.temporaryFiles = storage.temporaryFiles;
+    result.orphanedFiles = storage.orphanedFiles;
+  }
 
   if (result.failed > 0 || result.temporaryFiles.failed > 0 || result.orphanedFiles.failed > 0) {
     logger.error(
@@ -138,6 +137,44 @@ export async function cleanupStaleAttachments(options: {
   }
 
   return result;
+}
+
+export async function cleanupAttachmentStorage(options: {
+  repositories: AttachmentCleanupRepositories;
+  storageDirectory: string;
+  now?: () => Date;
+}): Promise<Pick<AttachmentCleanupResult, "temporaryFiles" | "orphanedFiles">> {
+  const now = options.now?.() ?? new Date();
+  const temporaryFiles = await cleanupStaleTemporaryFiles(options.storageDirectory, now);
+  const orphanedFiles = await cleanupOrphanedFinalFiles(
+    options.repositories,
+    options.storageDirectory,
+    now,
+  );
+  return { temporaryFiles, orphanedFiles };
+}
+
+export async function runAttachmentCleanupRound(options: {
+  scopes: AgentScope[];
+  repositories: AttachmentCleanupRepositories;
+  storageDirectory: string;
+  deleteFile?: typeof deleteAttachment;
+  now?: () => Date;
+  logger?: CleanupLogger;
+}): Promise<{
+  scopes: AttachmentCleanupResult[];
+  storage: Pick<AttachmentCleanupResult, "temporaryFiles" | "orphanedFiles">;
+}> {
+  const scopes: AttachmentCleanupResult[] = [];
+  for (const scope of options.scopes) {
+    scopes.push(await cleanupStaleAttachments({
+      ...options,
+      scope,
+      includeStorageCleanup: false,
+    }));
+  }
+  const storage = await cleanupAttachmentStorage(options);
+  return { scopes, storage };
 }
 
 async function cleanupOrphanedFinalFiles(

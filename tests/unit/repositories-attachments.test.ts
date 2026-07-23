@@ -878,22 +878,45 @@ describe("message attachment PostgreSQL concurrency", () => {
     await releaseSecond();
   });
 
-  it("serializes attachment uploads and personal-data clearing for one user", async () => {
-    const repositories = createRepositories(databasePool);
+  it("serializes user data mutations across independent repository processes in both directions", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const firstLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const secondLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const firstRepositories = createRepositories(databasePool, firstLockPool);
+    const secondRepositories = createRepositories(databasePool, secondLockPool);
     const userId = "50000000-0000-4000-8000-000000000010";
-    const releaseUpload = await repositories.messageAttachments.acquireUserMutationLock(userId);
-    let clearLockAcquired = false;
-    const clearLock = repositories.messageAttachments.acquireUserMutationLock(userId).then((release) => {
-      clearLockAcquired = true;
-      return release;
-    });
+    try {
+      const releaseUpload = await firstRepositories.userDataMutations.acquireLock(userId);
+      let clearLockAcquired = false;
+      const clearLock = secondRepositories.userDataMutations.acquireLock(userId).then((release) => {
+        clearLockAcquired = true;
+        return release;
+      });
 
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(clearLockAcquired).toBe(false);
-    await releaseUpload();
-    const releaseClear = await clearLock;
-    expect(clearLockAcquired).toBe(true);
-    await releaseClear();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(clearLockAcquired).toBe(false);
+      await releaseUpload();
+      const releaseClear = await clearLock;
+      expect(clearLockAcquired).toBe(true);
+      await releaseClear();
+
+      const releaseClearFirst = await secondRepositories.userDataMutations.acquireLock(userId);
+      let uploadLockAcquired = false;
+      const uploadLock = firstRepositories.userDataMutations.acquireLock(userId).then((release) => {
+        uploadLockAcquired = true;
+        return release;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(uploadLockAcquired).toBe(false);
+      await releaseClearFirst();
+      const releaseUploadSecond = await uploadLock;
+      expect(uploadLockAcquired).toBe(true);
+      await releaseUploadSecond();
+    } finally {
+      await firstLockPool.end();
+      await secondLockPool.end();
+    }
   });
 
   it("keeps the business pool available while many copies wait for one turn lock", async () => {

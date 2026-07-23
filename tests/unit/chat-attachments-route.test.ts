@@ -65,6 +65,9 @@ vi.mock("@/server/config/env", () => ({
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
+    userDataMutations: {
+      acquireLock: mocks.acquireUserMutationLock,
+    },
     agents: {
       getDefault: vi.fn(async () => ({
         id: mocks.draft.agentId,
@@ -80,7 +83,6 @@ vi.mock("@/server/db/repositories", () => ({
       deleteDraft: mocks.deleteDraft,
       get: mocks.getForUser,
       releaseDeletionClaim: mocks.releaseDeletionClaim,
-      acquireUserMutationLock: mocks.acquireUserMutationLock,
     },
   })),
 }));
