@@ -1,14 +1,38 @@
-import { createRepositories } from "@/server/db/repositories";
 import { getPool } from "@/server/db/client";
+import { defaultSettings } from "@/server/settings/defaults";
 
 async function main() {
-  const repositories = createRepositories();
-  const user = await repositories.users.ensureDefault();
   const pool = getPool();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 1146050617))", [user.id]);
+    await client.query("SELECT pg_advisory_xact_lock(1146050617::bigint)");
+    const existingUser = await client.query<{ id: string; display_name: string }>(
+      "SELECT id, display_name FROM users ORDER BY created_at ASC, id ASC LIMIT 1",
+    );
+    const user =
+      existingUser.rows[0] ??
+      (
+        await client.query<{ id: string; display_name: string }>(
+          "INSERT INTO users (display_name) VALUES ($1) RETURNING id, display_name",
+          ["Tang"],
+        )
+      ).rows[0];
+
+    await client.query(
+      `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [
+        user.id,
+        defaultSettings.persona,
+        defaultSettings.proactivity,
+        defaultSettings.modelRouting,
+        defaultSettings.cadence,
+        defaultSettings.search,
+      ],
+    );
+
     const existingDefault = await client.query<{ id: string }>(
       "SELECT id FROM digital_agents WHERE user_id = $1 AND is_default = true LIMIT 1",
       [user.id],
@@ -62,7 +86,7 @@ async function main() {
       [user.id, agentId, "和 DigitalMate 的对话"],
     );
     await client.query("COMMIT");
-    console.log(`Seeded default user ${user.displayName} and agent ${agentId}.`);
+    console.log(`Seeded default user ${user.display_name} and agent ${agentId}.`);
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;

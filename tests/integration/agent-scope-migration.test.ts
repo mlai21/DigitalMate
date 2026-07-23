@@ -117,51 +117,48 @@ describe("default digital agent PostgreSQL migration", () => {
     }
   });
 
-  it("installs the final schema and seeds the default identity twice on an empty PostgreSQL schema", async () => {
-    const freshSchemaName = `${schemaName}_fresh`;
-    await adminPool.query(`CREATE SCHEMA "${freshSchemaName}"`);
-    const freshPool = new Pool({
-      connectionString: adminPool.options.connectionString,
-      options: `-c search_path=${freshSchemaName} -c statement_timeout=15000 -c lock_timeout=5000`,
-    });
-    try {
-      await installVectorCompatibility(freshPool);
-      await freshPool.query(migratedSchema);
-      await freshPool.query(migratedSchema);
-      const columns = await readAgentColumns(freshPool);
-      expect([...columns.keys()].sort()).toEqual([...AGENT_SCOPED_TABLES].sort());
-      await freshPool.query("INSERT INTO users (id, display_name) VALUES ($1, 'Seed User')", [USER_C]);
-      await freshPool.query(
-        `INSERT INTO settings (user_id, persona)
-         VALUES ($1, '{"name":"Seed Agent"}'::jsonb)`,
-        [USER_C],
-      );
-      await freshPool.query(
-        `INSERT INTO digital_agents (user_id, slug, display_name, is_default)
-         VALUES ($1, 'digitalmate', 'DigitalMate', false)`,
-        [USER_C],
-      );
-      await Promise.all([runSeed(databaseUrl, freshSchemaName), runSeed(databaseUrl, freshSchemaName)]);
-      await runSeed(databaseUrl, freshSchemaName);
-      await runSeed(databaseUrl, freshSchemaName);
-      const seedCounts = await freshPool.query<{
-        users: string;
-        agents: string;
-        conversations: string;
-      }>(
-        `SELECT
-           (SELECT count(*) FROM users) AS users,
-           (SELECT count(*) FROM digital_agents WHERE is_default = true) AS agents,
-           (SELECT count(*) FROM conversations WHERE channel = 'web') AS conversations`,
-      );
-      expect(seedCounts.rows[0]).toEqual({
-        users: "1",
-        agents: "1",
-        conversations: "1",
+  it("serializes two real seed processes from a completely empty PostgreSQL schema", async () => {
+    for (let round = 0; round < 3; round += 1) {
+      const freshSchemaName = `${schemaName}_fresh_${round}`;
+      await adminPool.query(`CREATE SCHEMA "${freshSchemaName}"`);
+      const freshPool = new Pool({
+        connectionString: adminPool.options.connectionString,
+        options: `-c search_path=${freshSchemaName} -c statement_timeout=15000 -c lock_timeout=5000`,
       });
-    } finally {
-      await freshPool.end();
-      await adminPool.query(`DROP SCHEMA IF EXISTS "${freshSchemaName}" CASCADE`);
+      try {
+        await installVectorCompatibility(freshPool);
+        await freshPool.query(migratedSchema);
+        await freshPool.query(migratedSchema);
+        const columns = await readAgentColumns(freshPool);
+        expect([...columns.keys()].sort()).toEqual([...AGENT_SCOPED_TABLES].sort());
+        await Promise.all([runSeed(databaseUrl, freshSchemaName), runSeed(databaseUrl, freshSchemaName)]);
+        await runSeed(databaseUrl, freshSchemaName);
+        await runSeed(databaseUrl, freshSchemaName);
+        const seedCounts = await freshPool.query<{
+          users: string;
+          settings: string;
+          agents: string;
+          defaults: string;
+          conversations: string;
+        }>(
+          `SELECT
+             (SELECT count(*) FROM users) AS users,
+             (SELECT count(*) FROM settings) AS settings,
+             (SELECT count(*) FROM digital_agents) AS agents,
+             (SELECT count(*) FROM digital_agents WHERE is_default = true) AS defaults,
+             (SELECT count(*) FROM conversations WHERE channel = 'web') AS conversations`,
+        );
+        expect(seedCounts.rows[0], `round:${round}`).toEqual({
+          users: "1",
+          settings: "1",
+          agents: "1",
+          defaults: "1",
+          conversations: "1",
+        });
+      } finally {
+        await freshPool.end();
+        await adminPool.query(`DROP SCHEMA IF EXISTS "${freshSchemaName}" CASCADE`);
+      }
     }
   });
 

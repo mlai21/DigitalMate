@@ -143,10 +143,15 @@ describe("database schema", () => {
     expect(seed).toContain("INSERT INTO conversations (user_id, agent_id, title)");
     expect(seed.indexOf("INSERT INTO digital_agents")).toBeLessThan(seed.indexOf("INSERT INTO conversations"));
     expect(seed).not.toContain("repositories.agents");
+    expect(seed).not.toContain("createRepositories");
     expect(seed).not.toContain("getOrCreateDefault(user.id)");
     expect(seed).toContain("pg_advisory_xact_lock");
     expect(seed).toContain("BEGIN");
     expect(seed).toContain("COMMIT");
+    expect(seed).toContain("INSERT INTO users");
+    expect(seed).toContain("INSERT INTO settings");
+    expect(seed.indexOf("pg_advisory_xact_lock")).toBeLessThan(seed.indexOf("SELECT id, display_name FROM users"));
+    expect(seed.indexOf("pg_advisory_xact_lock")).toBeLessThan(seed.indexOf("INSERT INTO users"));
     expect(seed.indexOf("WHERE user_id = $1 AND is_default = true")).toBeLessThan(
       seed.indexOf("INSERT INTO digital_agents"),
     );
