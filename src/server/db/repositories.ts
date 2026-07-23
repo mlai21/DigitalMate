@@ -30,6 +30,103 @@ import { createAgentSettingsRepository } from "@/server/settings/agent-settings"
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
+const PERSONAL_DATA_EXPORT_COLUMNS = {
+  digital_agents: [
+    "id", "user_id", "slug", "display_name", "persona", "status", "is_default",
+    "inherits_user_resources", "created_at", "updated_at",
+  ],
+  agent_settings: [
+    "user_id", "agent_id", "persona", "proactivity", "cadence", "search",
+    "model_routing_override", "revision", "updated_at",
+  ],
+  agent_resource_grants: [
+    "user_id", "agent_id", "resource_type", "resource_id", "enabled", "created_at",
+  ],
+  projects: ["id", "user_id", "agent_id", "name", "description", "created_at", "updated_at"],
+  conversations: [
+    "id", "user_id", "agent_id", "channel", "title", "project_id", "pinned", "created_at", "updated_at",
+  ],
+  messages: [
+    "id", "user_id", "agent_id", "conversation_id", "role", "content",
+    "visible_to_user", "memory_processed", "created_at",
+  ],
+  conversation_summaries: [
+    "id", "user_id", "agent_id", "conversation_id", "summary", "message_count", "created_at",
+  ],
+  memory_entries: [
+    "id", "user_id", "agent_id", "kind", "content", "confidence",
+    "source_message_id", "expires_at", "deleted_at", "created_at",
+  ],
+  tool_call_logs: [
+    "id", "user_id", "agent_id", "conversation_id", "goal_id", "tool_name",
+    "input_summary", "output_summary", "status", "duration_ms", "error", "created_at",
+  ],
+  proactive_tasks: [
+    "id", "user_id", "agent_id", "conversation_id", "kind", "content",
+    "scheduled_at", "status", "metadata", "sent_at", "created_at", "updated_at",
+  ],
+  channel_identities: [
+    "id", "user_id", "agent_id", "channel", "external_user_id", "display_name", "created_at", "updated_at",
+  ],
+  channel_messages: [
+    "id", "user_id", "agent_id", "conversation_id", "channel", "external_conversation_id",
+    "external_message_id", "sender_id", "chat_type", "text", "occurred_at", "created_at",
+  ],
+  interjection_decisions: [
+    "id", "user_id", "agent_id", "conversation_id", "channel_message_id", "channel",
+    "external_conversation_id", "should_interject", "reason", "created_at",
+  ],
+  reflections: [
+    "id", "user_id", "agent_id", "positives", "negatives", "suggestions",
+    "source_window", "status", "created_at",
+  ],
+  skills: [
+    "id", "user_id", "name", "trigger", "content", "status", "source", "source_url",
+    "version", "scan_report", "usage_count", "last_used_at", "created_at", "updated_at",
+  ],
+  skill_revisions: [
+    "id", "user_id", "skill_id", "proposed_content", "reason", "status", "created_at", "updated_at",
+  ],
+  skill_usage_logs: [
+    "id", "user_id", "agent_id", "skill_id", "conversation_id", "triggered_by", "created_at",
+  ],
+  task_runs: [
+    "id", "user_id", "agent_id", "conversation_id", "kind", "status", "input_summary",
+    "output_summary", "error", "metadata", "created_at", "updated_at",
+  ],
+  task_artifacts: [
+    "id", "user_id", "agent_id", "task_run_id", "file_name", "mime_type", "metadata", "created_at",
+  ],
+  tool_registrations: [
+    "id", "user_id", "name", "description", "kind", "status",
+    "requires_confirmation", "created_at", "updated_at",
+  ],
+  llm_usage_logs: [
+    "id", "user_id", "agent_id", "conversation_id", "purpose", "model",
+    "input_tokens", "output_tokens", "total_tokens", "created_at",
+  ],
+  memory_jobs: [
+    "id", "user_id", "agent_id", "conversation_id", "status", "created_at", "updated_at",
+  ],
+  goals: [
+    "id", "user_id", "agent_id", "title", "contract", "status", "progress_summary",
+    "report_draft", "budget_used", "no_progress_rounds", "needs_human_prompt",
+    "conversation_id", "next_run_at", "finished_at", "created_at", "updated_at",
+  ],
+  settings: [
+    "id", "user_id", "persona", "proactivity", "model_routing", "cadence", "search", "updated_at",
+  ],
+} as const;
+const GOAL_STEP_EXPORT_COLUMNS = [
+  "id", "agent_id", "goal_id", "round", "phase", "intent", "evidence", "candidate",
+  "verify_result", "failed_paths", "tokens_used", "duration_ms", "error", "created_at",
+] as const;
+const ATTACHMENT_EXPORT_COLUMNS = [
+  "id", "user_id", "agent_id", "message_id", "kind", "file_name", "mime_type",
+  "size_bytes", "text_truncated", "status", "error_code", "created_at", "updated_at",
+] as const;
+const INTERNAL_EXPORT_KEY_PATTERN =
+  /(?:^|_)(?:secret|ciphertext|nonce|auth_tag|token|temporary|reply|poll)(?:_|$)/i;
 
 export type DbUser = {
   id: string;
@@ -2023,57 +2120,31 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
     },
     personalData: {
       async export(userId: string) {
-        const tables = [
-          "digital_agents",
-          "agent_settings",
-          "agent_resource_grants",
-          "projects",
-          "conversations",
-          "messages",
-          "conversation_summaries",
-          "memory_entries",
-          "tool_call_logs",
-          "proactive_tasks",
-          "channel_identities",
-          "channel_messages",
-          "interjection_decisions",
-          "reflections",
-          "skills",
-          "skill_revisions",
-          "skill_usage_logs",
-          "task_runs",
-          "task_artifacts",
-          "tool_registrations",
-          "llm_usage_logs",
-          "memory_jobs",
-          "goals",
-          "settings",
-        ];
         const exported: Record<string, unknown[]> = {};
-        for (const table of tables) {
-          const result = await pool.query(`SELECT * FROM ${table} WHERE user_id = $1`, [userId]);
-          exported[table] = result.rows;
+        for (const [table, columns] of Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)) {
+          const result = await pool.query(
+            `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1`,
+            [userId],
+          );
+          exported[table] = result.rows.map((row) => pickExportRow(row, columns));
         }
         const goalSteps = await pool.query(
-          `SELECT goal_steps.*
+          `SELECT ${GOAL_STEP_EXPORT_COLUMNS.map((column) => `goal_steps.${column}`).join(", ")}
            FROM goal_steps
            JOIN goals ON goals.id = goal_steps.goal_id
            WHERE goals.user_id = $1
            ORDER BY goal_steps.created_at ASC, goal_steps.id ASC`,
           [userId],
         );
-        exported.goal_steps = goalSteps.rows;
+        exported.goal_steps = goalSteps.rows.map((row) => pickExportRow(row, GOAL_STEP_EXPORT_COLUMNS));
         const attachments = await pool.query(
-          `SELECT id, user_id, agent_id, message_id, kind, file_name, mime_type, size_bytes,
-                  extracted_text, text_truncated, status, error_code, created_at, updated_at
+          `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
            FROM message_attachments
            WHERE user_id = $1
            ORDER BY created_at ASC, id ASC`,
           [userId],
         );
-        // Extracted text is derived from the user's own file and therefore belongs in their export.
-        // Internal storage capabilities and deletion claim tokens are deliberately not exported.
-        exported.message_attachments = attachments.rows;
+        exported.message_attachments = attachments.rows.map((row) => pickExportRow(row, ATTACHMENT_EXPORT_COLUMNS));
         return buildPersonalDataExport({ userId, exportedAt: new Date(), tables: exported });
       },
       async listAttachmentStorageKeys(userId: string): Promise<string[]> {
@@ -2087,72 +2158,127 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         return result.rows.map((row) => row.storage_key);
       },
       async clear(userId: string): Promise<void> {
-        const tables = [
-          "goals",
-          "skill_usage_logs",
-          "skill_revisions",
-          "task_artifacts",
-          "task_runs",
-          "tool_registrations",
-          "skills",
-          "reflections",
-          "interjection_decisions",
-          "channel_messages",
-          "channel_identities",
-          "proactive_tasks",
-          "tool_call_logs",
-          "llm_usage_logs",
-          "memory_jobs",
-          "conversation_summaries",
-          "memory_entries",
-          "message_attachments",
-          "messages",
-          "conversations",
-          "projects",
-          "agent_resource_grants",
-        ];
-        for (const table of tables) {
-          await pool.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const selectedAgent = await client.query<{ id: string }>(
+            `SELECT id
+             FROM digital_agents
+             WHERE user_id = $1
+             ORDER BY is_default DESC, created_at ASC, id ASC
+             LIMIT 1
+             FOR UPDATE`,
+            [userId],
+          );
+          let defaultAgentId = selectedAgent.rows[0]?.id ?? null;
+
+          const tables = [
+            "goals",
+            "skill_usage_logs",
+            "skill_revisions",
+            "task_artifacts",
+            "task_runs",
+            "tool_registrations",
+            "skills",
+            "reflections",
+            "interjection_decisions",
+            "channel_messages",
+            "channel_identities",
+            "proactive_tasks",
+            "tool_call_logs",
+            "llm_usage_logs",
+            "memory_jobs",
+            "conversation_summaries",
+            "memory_entries",
+            "message_attachments",
+            "messages",
+            "conversations",
+            "projects",
+            "agent_resource_grants",
+          ];
+          for (const table of tables) {
+            await client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
+          }
+
+          if (defaultAgentId) {
+            // Delete other agents before claiming the canonical slug so a
+            // non-default "digitalmate" row cannot violate the unique key.
+            await client.query(
+              "DELETE FROM digital_agents WHERE user_id = $1 AND id <> $2",
+              [userId, defaultAgentId],
+            );
+            await client.query(
+              `UPDATE digital_agents
+               SET slug = 'digitalmate',
+                   display_name = 'DigitalMate',
+                   persona = '{}'::jsonb,
+                   status = 'active',
+                   is_default = true,
+                   inherits_user_resources = true,
+                   updated_at = now()
+               WHERE user_id = $1 AND id = $2`,
+              [userId, defaultAgentId],
+            );
+          } else {
+            const createdAgent = await client.query<{ id: string }>(
+              `INSERT INTO digital_agents (
+                 user_id, slug, display_name, persona, status, is_default, inherits_user_resources
+               )
+               VALUES ($1, 'digitalmate', 'DigitalMate', '{}'::jsonb, 'active', true, true)
+               RETURNING id`,
+              [userId],
+            );
+            defaultAgentId = createdAgent.rows[0].id;
+          }
+
+          await client.query(
+            `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (user_id) DO UPDATE
+             SET persona = EXCLUDED.persona,
+                 proactivity = EXCLUDED.proactivity,
+                 model_routing = EXCLUDED.model_routing,
+                 cadence = EXCLUDED.cadence,
+                 search = EXCLUDED.search,
+                 updated_at = now()`,
+            [
+              userId,
+              defaultSettings.persona,
+              defaultSettings.proactivity,
+              defaultSettings.modelRouting,
+              defaultSettings.cadence,
+              defaultSettings.search,
+            ],
+          );
+          await client.query(
+            `INSERT INTO agent_settings (
+               user_id, agent_id, persona, proactivity, cadence, search, model_routing_override
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb)
+             ON CONFLICT (user_id, agent_id) DO UPDATE
+             SET persona = EXCLUDED.persona,
+                 proactivity = EXCLUDED.proactivity,
+                 cadence = EXCLUDED.cadence,
+                 search = EXCLUDED.search,
+                 model_routing_override = '{}'::jsonb,
+                 revision = agent_settings.revision + 1,
+                 updated_at = now()`,
+            [
+              userId,
+              defaultAgentId,
+              defaultSettings.persona,
+              defaultSettings.proactivity,
+              defaultSettings.cadence,
+              defaultSettings.search,
+            ],
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
         }
-        await ensureSettings(pool, userId);
-        await pool.query(
-          `UPDATE settings
-           SET persona = $2, proactivity = $3, model_routing = $4, cadence = $5, search = $6, updated_at = now()
-           WHERE user_id = $1`,
-          [
-            userId,
-            defaultSettings.persona,
-            defaultSettings.proactivity,
-            defaultSettings.modelRouting,
-            defaultSettings.cadence,
-            defaultSettings.search,
-          ],
-        );
-        await pool.query(
-          `UPDATE agent_settings
-           SET persona = $2,
-               proactivity = $3,
-               cadence = $4,
-               search = $5,
-               model_routing_override = '{}'::jsonb,
-               revision = revision + 1,
-               updated_at = now()
-           WHERE user_id = $1`,
-          [
-            userId,
-            defaultSettings.persona,
-            defaultSettings.proactivity,
-            defaultSettings.cadence,
-            defaultSettings.search,
-          ],
-        );
-        await pool.query(
-          `UPDATE digital_agents
-           SET persona = '{}'::jsonb,
-               updated_at = now()
-           WHERE user_id = $1`,
-          [userId],
-        );
       },
     },
   };
@@ -2396,6 +2522,33 @@ function mapProactiveTask(row: Record<string, unknown>): DbProactiveTask {
     status: String(row.status),
     metadata: isRecord(row.metadata) ? row.metadata : {},
   };
+}
+
+function pickExportRow(
+  row: Record<string, unknown>,
+  columns: readonly string[],
+): Record<string, unknown> {
+  return Object.fromEntries(
+    columns
+      .filter((column) => Object.hasOwn(row, column))
+      .map((column) => [column, sanitizeExportValue(row[column])]),
+  );
+}
+
+function sanitizeExportValue(value: unknown): unknown {
+  if (value instanceof Date) return value;
+  if (Array.isArray(value)) return value.map(sanitizeExportValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !isInternalExportKey(key))
+      .map(([key, nestedValue]) => [key, sanitizeExportValue(nestedValue)]),
+  );
+}
+
+function isInternalExportKey(key: string): boolean {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+  return INTERNAL_EXPORT_KEY_PATTERN.test(normalized);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

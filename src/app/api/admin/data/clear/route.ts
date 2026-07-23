@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteAttachment } from "@/server/attachments/storage";
+import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
@@ -14,14 +15,15 @@ export async function POST(request: Request) {
   let releaseMutationLock: (() => Promise<void>) | undefined;
   try {
     releaseMutationLock = await repositories.messageAttachments.acquireUserMutationLock(user.id);
+    await userConnectionDisconnector.disconnectUser(user.id);
     const storageKeys = await repositories.personalData.listAttachmentStorageKeys(user.id);
     const storageRoot = readEnv().attachmentStorageDir;
     // Delete blobs first. If any deletion fails, DB keys remain available for a safe retry.
     for (const storageKey of storageKeys) {
       await deleteAttachment(storageRoot, storageKey);
     }
-    await repositories.personalData.clear(user.id);
     await deleteArtifactTree(defaultArtifactRoot(), user.id);
+    await repositories.personalData.clear(user.id);
     return NextResponse.redirect(redirectUrl(request, "/admin/settings?cleared=1"), { status: 303 });
   } catch (error) {
     console.error("personal_data_clear_failed", {

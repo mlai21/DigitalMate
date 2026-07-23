@@ -52,4 +52,30 @@ describe("agent settings", () => {
     expect(params.slice(0, 2)).toEqual(["user-1", "agent-1"]);
     expect(params[7]).toBe(4);
   });
+
+  it("fills and validates legacy partial user routing before applying an agent override", async () => {
+    const query = vi.fn(async (sql: unknown) => {
+      if (String(sql).includes("INSERT INTO agent_settings")) return { rows: [] };
+      return {
+        rows: [{
+          persona: {},
+          proactivity: {},
+          cadence: {},
+          search: {},
+          model_routing_override: { light: 42 },
+          revision: 1,
+          model_routing: { main: "legacy-main" },
+        }],
+      };
+    });
+    const repository = createAgentSettingsRepository({ query } as unknown as Pool);
+
+    await expect(repository.get(scope)).resolves.toMatchObject({
+      modelRouting: {
+        main: "legacy-main",
+        light: "gemini-3-5-flash-openai",
+      },
+      modelRoutingOverride: {},
+    });
+  });
 });

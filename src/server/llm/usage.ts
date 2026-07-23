@@ -1,8 +1,7 @@
 import type { LlmMessage, LlmPurpose } from "@/server/llm/types";
+import type { AgentScope } from "@/server/agents/types";
 
-export type LlmUsageLogInput = {
-  userId: string;
-  agentId: string;
+export type LlmUsageLogInput = AgentScope & {
   conversationId?: string | null;
   purpose: LlmPurpose;
   model: string;

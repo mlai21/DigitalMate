@@ -1,3 +1,5 @@
+import { pathToFileURL } from "node:url";
+import { createActiveAgentTickRunner } from "@/agent-service/active-agent-tick";
 import { buildConversationSummary, shouldCompactConversation } from "@/server/agent/compaction";
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
@@ -40,6 +42,17 @@ async function main() {
     },
   });
   const shutdown = new AbortController();
+  const runActiveAgentTick = createActiveAgentTickRunner({
+    listActiveAgents: () => repositories.agents.listActive(),
+    execute: (scope) => processAgentTick(repositories, scope),
+    onError: (error, scope) => {
+      console.error("agent_tick_failed", {
+        userId: scope.userId,
+        agentId: scope.agentId,
+        errorType: error instanceof Error ? "Error" : "NonError",
+      });
+    },
+  });
   const requestShutdown = () => shutdown.abort();
   process.once("SIGINT", requestShutdown);
   process.once("SIGTERM", requestShutdown);
@@ -48,12 +61,12 @@ async function main() {
   try {
     await cleanupScheduler.initialRun;
     if (process.env.AGENT_ONCE === "1") {
-      await tick(repositories);
+      await runActiveAgentTick();
       return;
     }
 
     while (!shutdown.signal.aborted) {
-      await tick(repositories);
+      await runActiveAgentTick();
       await sleep(intervalMs, shutdown.signal);
     }
   } finally {
@@ -67,22 +80,22 @@ async function main() {
   }
 }
 
-async function tick(repositories: ReturnType<typeof createRepositories>) {
+async function processAgentTick(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+) {
   const env = readEnv();
-  for (const agent of await repositories.agents.listActive()) {
-    const scope = { userId: agent.userId, agentId: agent.id } satisfies AgentScope;
-    await processDueProactiveTasks({
-      scope,
-      repositories,
-      sendChannel: (target, text) => sendChannelMessage(env, target, text),
-    });
-    await processMemoryMessages(repositories, scope);
-    await processMemoryConsolidation(repositories, scope);
-    await processConversationCompaction(repositories, scope);
-    await processDailyReflection(repositories, scope);
-    await processSkillImprovementJob(repositories, scope);
-    await processGoalLoopsJob(repositories, scope);
-  }
+  await processDueProactiveTasks({
+    scope,
+    repositories,
+    sendChannel: (target, text) => sendChannelMessage(env, target, text),
+  });
+  await processMemoryMessages(repositories, scope);
+  await processMemoryConsolidation(repositories, scope);
+  await processConversationCompaction(repositories, scope);
+  await processDailyReflection(repositories, scope);
+  await processSkillImprovementJob(repositories, scope);
+  await processGoalLoopsJob(repositories, scope);
 }
 
 async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
@@ -282,7 +295,16 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+export function isDirectAgentServiceEntry(
+  metaUrl = import.meta.url,
+  entryPath = process.argv[1],
+): boolean {
+  return Boolean(entryPath) && metaUrl === pathToFileURL(entryPath).href;
+}
+
+if (isDirectAgentServiceEntry()) {
+  void main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

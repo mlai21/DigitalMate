@@ -7,10 +7,9 @@ import type { SkillInstallOutcome } from "@/server/skills/install";
 import type { LlmAttachment, LlmClient, LlmMessage, LlmPurpose, LlmTool, LlmToolCall } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount, type LlmUsageLogInput } from "@/server/llm/usage";
 import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/server/tasks/tools";
+import type { AgentScope } from "@/server/agents/types";
 
-export type ToolLogInput = {
-  userId: string;
-  agentId: string;
+export type ToolLogInput = AgentScope & {
   conversationId: string | null;
   goalId?: string | null;
   toolName: string;
@@ -34,9 +33,7 @@ export type EnabledToolContext = {
   command: string;
 };
 
-export type RunAgentInput = {
-  userId: string;
-  agentId: string;
+export type RunAgentInput = AgentScope & {
   conversationId: string;
   message: string;
   attachments?: LlmAttachment[];
@@ -46,24 +43,24 @@ export type RunAgentInput = {
   model: string;
   repositories: {
     memories: {
-      findRelevant(scope: { userId: string; agentId: string }, query: string): Promise<RankableMemory[]>;
+      findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]>;
     };
     conversationSummaries?: {
-      latest(scope: { userId: string; agentId: string }, conversationId: string): Promise<string | null>;
+      latest(scope: AgentScope, conversationId: string): Promise<string | null>;
     };
     skills?: {
       findEnabled(userId: string, query: string): Promise<SkillContext[]>;
       findByIds?(userId: string, skillIds: string[]): Promise<SkillContext[]>;
       create?(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
       recordUsage?(
-        scope: { userId: string; agentId: string },
+        scope: AgentScope,
         skillIds: string[],
         conversationId: string | null,
         triggeredBy?: "auto" | "explicit",
       ): Promise<unknown> | unknown;
     };
     reflections?: {
-      findAppliedSuggestions(scope: { userId: string; agentId: string }): Promise<string[]>;
+      findAppliedSuggestions(scope: AgentScope): Promise<string[]>;
     };
     toolRegistrations?: {
       listEnabled(userId: string): Promise<EnabledToolContext[]>;

@@ -74,13 +74,14 @@ export function createAgentSettingsRepository(providedPool?: Pool) {
       const row = result.rows[0];
       if (!row) throw new Error("agent_settings_not_found");
       const modelRoutingOverride = asModelRoutingOverride(row.model_routing_override);
+      const userModelRouting = asModelRouting(row.model_routing);
       return {
         persona: mergeSettings(defaultSettings.persona, row.persona),
         proactivity: mergeSettings(defaultSettings.proactivity, row.proactivity),
         cadence: mergeSettings(defaultSettings.cadence, row.cadence),
         search: mergeSettings(defaultSettings.search, row.search),
         modelRouting: {
-          ...(row.model_routing ?? defaultSettings.modelRouting),
+          ...userModelRouting,
           ...modelRoutingOverride,
         },
         modelRoutingOverride,
@@ -133,6 +134,14 @@ function asModelRoutingOverride(
   if (typeof row.main === "string" && row.main) override.main = row.main;
   if (typeof row.light === "string" && row.light) override.light = row.light;
   return override;
+}
+
+function asModelRouting(value: unknown): ModelRoutingSettings {
+  const partial = asModelRoutingOverride(value);
+  return {
+    main: partial.main ?? defaultSettings.modelRouting.main,
+    light: partial.light ?? defaultSettings.modelRouting.light,
+  };
 }
 
 function mergeSettings<T extends Record<string, unknown>>(defaults: T, value: unknown): T {

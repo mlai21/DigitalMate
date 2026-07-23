@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -10,6 +12,7 @@ import {
 } from "@/server/agents/repository";
 import {
   createAgentService,
+  resolveDefaultAgentScope,
 } from "@/server/agents/service";
 import type { AgentResourceGrant, AgentScope } from "@/server/agents/types";
 import { createRepositories } from "@/server/db/repositories";
@@ -57,6 +60,32 @@ describe("AgentScope", () => {
     expect(String(query.mock.calls[0]?.[0])).toContain("user_id = $1");
     expect(String(query.mock.calls[0]?.[0])).toContain("is_default = true");
     expect(String(query.mock.calls[1]?.[0])).toContain("status = 'active'");
+  });
+
+  it("rejects a disabled or archived default agent consistently in both resolvers", async () => {
+    for (const status of ["disabled", "archived"] as const) {
+      const inactiveAgent = {
+        id: "agent-a",
+        userId: "user-1",
+        slug: "digitalmate",
+        displayName: "DigitalMate",
+        persona: {},
+        status,
+        isDefault: true,
+        inheritsUserResources: true,
+        createdAt: new Date("2026-07-21T00:00:00Z"),
+        updatedAt: new Date("2026-07-21T00:00:00Z"),
+      };
+      const repository = {
+        ensureDefault: vi.fn(async () => inactiveAgent),
+        getDefault: vi.fn(async () => inactiveAgent),
+      } as unknown as AgentRepository;
+
+      await expect(createAgentService(repository).getDefaultScope("user-1"))
+        .rejects.toThrow("default_agent_not_found");
+      await expect(resolveDefaultAgentScope("user-1", repository))
+        .rejects.toThrow("default_agent_not_found");
+    }
   });
 
   it("same user's agents cannot read each other's memories", async () => {
@@ -154,5 +183,19 @@ describe("AgentScope", () => {
       enabled: false,
     }]);
     await expect(service.canUseUserResource(scopeA, "skill", "skill-1")).resolves.toBe(false);
+  });
+
+  it("uses the shared AgentScope type throughout the run-agent execution contracts", async () => {
+    const [runAgentSource, usageSource] = await Promise.all([
+      readFile(path.join(process.cwd(), "src/server/agent/run-agent.ts"), "utf8"),
+      readFile(path.join(process.cwd(), "src/server/llm/usage.ts"), "utf8"),
+    ]);
+
+    expect(runAgentSource).toContain('import type { AgentScope } from "@/server/agents/types"');
+    expect(runAgentSource).not.toMatch(/scope:\s*\{\s*userId:\s*string;\s*agentId:\s*string\s*\}/);
+    expect(runAgentSource).toMatch(/export type RunAgentInput = AgentScope & \{/);
+    expect(runAgentSource).toMatch(/export type ToolLogInput = AgentScope & \{/);
+    expect(usageSource).toContain('import type { AgentScope } from "@/server/agents/types"');
+    expect(usageSource).toMatch(/export type LlmUsageLogInput = AgentScope & \{/);
   });
 });

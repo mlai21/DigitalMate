@@ -5,6 +5,7 @@ export function createAgentService(repository: AgentRepository = createAgentRepo
   return {
     async getDefaultScope(userId: string): Promise<AgentScope> {
       const agent = await repository.ensureDefault(userId);
+      if (agent.status !== "active") throw new Error("default_agent_not_found");
       return { userId, agentId: agent.id };
     },
 
