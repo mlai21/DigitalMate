@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { prepareConsole } from "./prepare.mjs";
 
 const CONSOLE_BASE_PATH = "/_admin-console/";
@@ -61,9 +62,12 @@ async function removePreparedConsole(workdir) {
   await rm(workdir, { recursive: true, force: true });
 }
 
-function getBuildResourceUrls(indexHtml) {
-  return [...indexHtml.matchAll(/\b(?:href|src)=["']([^"']+)["']/g)].map(
-    ([, resourceUrl]) => resourceUrl,
+function getHtmlResourceReferences(source) {
+  return [...source.matchAll(/\b(?:href|src)=["']([^"']+)["']/g)].map(
+    ([, resourceUrl]) => ({
+      resourceUrl,
+      syntax: "html-attribute",
+    }),
   );
 }
 
@@ -131,9 +135,12 @@ async function listBuildFiles(root, current = root) {
   return files;
 }
 
-function getCssResourceUrls(source) {
+function getCssResourceReferences(source) {
   return [...source.matchAll(/url\(\s*(["']?)([^'")]+)\1\s*\)/gi)].map(
-    ([, , resourceUrl]) => resourceUrl.trim(),
+    ([, , resourceUrl]) => ({
+      resourceUrl: resourceUrl.trim(),
+      syntax: "css-url",
+    }),
   );
 }
 
@@ -147,27 +154,73 @@ function isStaticResourceUrl(resourceUrl) {
   );
 }
 
-function getJavaScriptResourceUrls(source) {
-  const resourceUrls = [];
-  const stringLiteral =
-    /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|`((?:\\.|[^`\\])*)`/g;
-  for (const match of source.matchAll(stringLiteral)) {
-    const rawValue = match[1] ?? match[2] ?? match[3] ?? "";
-    if (rawValue.includes("${")) {
-      continue;
-    }
-    const resourceUrl = rawValue.replaceAll("\\/", "/");
-    if (isStaticResourceUrl(resourceUrl)) {
-      resourceUrls.push(resourceUrl);
-    }
+function isNonEmptyConcatenationPart(node) {
+  return !ts.isStringLiteralLike(node) || node.text.length > 0;
+}
+
+function isTranspiledConcatenationOperand(node) {
+  const call = node.parent;
+  if (
+    !ts.isCallExpression(call) ||
+    !ts.isPropertyAccessExpression(call.expression) ||
+    call.expression.name.text !== "concat" ||
+    !ts.isStringLiteralLike(call.expression.expression)
+  ) {
+    return false;
   }
-  return resourceUrls;
+  const argumentIndex = call.arguments.indexOf(node);
+  if (argumentIndex === -1) {
+    return false;
+  }
+  const previousPart =
+    argumentIndex === 0
+      ? call.expression.expression
+      : call.arguments[argumentIndex - 1];
+  return isNonEmptyConcatenationPart(previousPart);
+}
+
+function getJavaScriptResourceReferences(source) {
+  const references = [];
+  const sourceFile = ts.createSourceFile(
+    "bundle.js",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+
+  const visit = (node) => {
+    if (ts.isStringLiteralLike(node) && isStaticResourceUrl(node.text)) {
+      const parent = node.parent;
+      const isConcatenatedOperand =
+        (ts.isBinaryExpression(parent) &&
+          parent.operatorToken.kind === ts.SyntaxKind.PlusToken &&
+          (parent.left === node || parent.right === node)) ||
+        isTranspiledConcatenationOperand(node);
+      if (!isConcatenatedOperand) {
+        references.push({
+          resourceUrl: node.text,
+          syntax: "javascript-string",
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
+  return references;
 }
 
 function resolveBuildResourcePath(distRoot, resourcePath) {
   const relativePath = decodeURIComponent(
     resourcePath.slice(CONSOLE_BASE_PATH.length),
   );
+  if (
+    relativePath.includes("\\") ||
+    relativePath.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new Error(`invalid build resource path: ${resourcePath}`);
+  }
   const absolutePath = path.resolve(distRoot, relativePath);
   if (
     absolutePath !== distRoot &&
@@ -180,9 +233,7 @@ function resolveBuildResourcePath(distRoot, resourcePath) {
 
 async function validateBuildResource(
   distRoot,
-  distFiles,
-  resourceUrl,
-  { requirePrefixed = false } = {},
+  { resourceUrl },
 ) {
   if (
     resourceUrl.startsWith("data:") ||
@@ -194,13 +245,9 @@ async function validateBuildResource(
   }
   const resourcePath = resourceUrl.split(/[?#]/, 1)[0];
   if (!resourcePath.startsWith(CONSOLE_BASE_PATH)) {
-    const rootRelativePath = decodeURIComponent(resourcePath.slice(1));
-    if (requirePrefixed || distFiles.has(rootRelativePath)) {
-      throw new Error(
-        `build resource outside ${CONSOLE_BASE_PATH}: ${resourceUrl}`,
-      );
-    }
-    return;
+    throw new Error(
+      `build resource outside ${CONSOLE_BASE_PATH}: ${resourceUrl}`,
+    );
   }
   const absolutePath = resolveBuildResourcePath(distRoot, resourcePath);
   await requireRegularFile(absolutePath, "missing build asset");
@@ -223,7 +270,6 @@ async function validateConsoleBuild(workdir) {
   const indexPath = path.join(distRoot, "index.html");
   await requireRegularFile(indexPath, "build entry");
   const buildFiles = await listBuildFiles(distRoot);
-  const distFiles = new Set(buildFiles.map(({ relativePath }) => relativePath));
   const resourceUrls = [];
 
   for (const { absolutePath, relativePath } of buildFiles) {
@@ -232,23 +278,18 @@ async function validateConsoleBuild(workdir) {
       continue;
     }
     const source = await readFile(absolutePath, "utf8");
-    let discoveredUrls = [];
-    let requirePrefixed = false;
+    let references = [];
     if (extension === ".html") {
-      discoveredUrls = getBuildResourceUrls(source);
-      requirePrefixed = true;
+      references = getHtmlResourceReferences(source);
     } else if (extension === ".css") {
-      discoveredUrls = getCssResourceUrls(source).filter((resourceUrl) =>
-        isStaticResourceUrl(resourceUrl),
-      );
+      references = getCssResourceReferences(source);
     } else {
-      discoveredUrls = getJavaScriptResourceUrls(source);
+      references = getJavaScriptResourceReferences(source);
     }
-    for (const resourceUrl of discoveredUrls) {
+    for (const reference of references) {
+      const { resourceUrl } = reference;
       resourceUrls.push(resourceUrl);
-      await validateBuildResource(distRoot, distFiles, resourceUrl, {
-        requirePrefixed,
-      });
+      await validateBuildResource(distRoot, reference);
     }
   }
 

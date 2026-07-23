@@ -1326,6 +1326,70 @@ describe("QwenPaw Console isolated test runner", () => {
     ]);
   });
 
+  it.each([
+    {
+      label: "独立 JavaScript 缺失资源",
+      relativePath: "assets/app.js",
+      source: 'const avatar = "/missing.svg";\n',
+      expected:
+        "build resource outside /_admin-console/: /missing.svg",
+    },
+    {
+      label: "CSS 缺失资源",
+      relativePath: "assets/app.css",
+      source: '.avatar{background:url("/missing.svg")}\n',
+      expected:
+        "build resource outside /_admin-console/: /missing.svg",
+    },
+    {
+      label: "JavaScript 非前缀点段资源",
+      relativePath: "assets/app.js",
+      source: 'const avatar = "/assets/../online.svg";\n',
+      expected:
+        "build resource outside /_admin-console/: /assets/../online.svg",
+    },
+    {
+      label: "JavaScript 前缀内点段资源",
+      relativePath: "assets/app.js",
+      source:
+        'const avatar = "/_admin-console/assets/../online.svg";\n',
+      expected:
+        "invalid build resource path: /_admin-console/assets/../online.svg",
+    },
+  ])("$label 会被产物扫描拒绝", async ({ relativePath, source, expected }) => {
+    const testing = Reflect.get(consoleTestScript, "__testing") as
+      | {
+          validateConsoleBuild: (workdir: string) => Promise<unknown>;
+        }
+      | undefined;
+    expect(testing).toBeDefined();
+    if (!testing) {
+      return;
+    }
+
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-dist-context-"),
+    );
+    const distRoot = path.join(temporaryRoot, "dist");
+    const resourcePath = path.join(distRoot, ...relativePath.split("/"));
+    await mkdir(path.dirname(resourcePath), { recursive: true });
+    await writeFile(path.join(distRoot, "index.html"), "<main></main>\n");
+    await writeFile(
+      path.join(distRoot, "digitalmate-logo.svg"),
+      "<svg />\n",
+    );
+    await writeFile(path.join(distRoot, "online.svg"), "<svg />\n");
+    await writeFile(resourcePath, source);
+
+    try {
+      await expect(testing.validateConsoleBuild(temporaryRoot)).rejects.toThrow(
+        expected,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("校验生产入口资源均位于部署前缀且存在，并要求品牌图标被复制", async () => {
     const testing = Reflect.get(consoleTestScript, "__testing") as
       | {
@@ -1353,7 +1417,11 @@ describe("QwenPaw Console isolated test runner", () => {
     await writeFile(
       scriptPath,
       'const avatar = "/_admin-console/online.svg";\n' +
-        'const monacoLoader = config.paths.vs + "/loader.js";\n',
+        'const monacoLoader = config.paths.vs + "/loader.js";\n' +
+        'const transpiledLoader = "".concat(config.paths.vs, "/loader.js");\n' +
+        'const monacoWorker = "/worker.js" + config.paths.vs;\n' +
+        '// const ignored = "/commented.svg";\n' +
+        '/* const ignoredToo = "/commented-too.svg"; */\n',
     );
     await writeFile(
       stylesheetPath,
@@ -1380,7 +1448,11 @@ describe("QwenPaw Console isolated test runner", () => {
       await writeFile(
         scriptPath,
         'const avatar = "/_admin-console/online.svg";\n' +
-          'const monacoLoader = config.paths.vs + "/loader.js";\n',
+          'const monacoLoader = config.paths.vs + "/loader.js";\n' +
+          'const transpiledLoader = "".concat(config.paths.vs, "/loader.js");\n' +
+          'const monacoWorker = "/worker.js" + config.paths.vs;\n' +
+          '// const ignored = "/commented.svg";\n' +
+          '/* const ignoredToo = "/commented-too.svg"; */\n',
       );
 
       await writeFile(
