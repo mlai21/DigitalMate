@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import {
   chmod,
   cp,
@@ -15,8 +14,9 @@ import { fileURLToPath } from "node:url";
 import { prepareConsole } from "./prepare.mjs";
 import {
   createSignalLifecycle,
-  validateConsoleBuild,
-} from "./test.mjs";
+  runManagedSpawn,
+} from "./process-lifecycle.mjs";
+import { validateConsoleBuild } from "./validate-build.mjs";
 
 const SCRIPT_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(SCRIPT_ROOT, "../..");
@@ -43,32 +43,11 @@ const defaultFileOperations = Object.freeze({
 });
 
 function spawnCommand(command, args, options) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: process.env,
-      stdio: "inherit",
-    });
-    options.signalLifecycle?.attachChild(child);
-    child.once("error", (error) => {
-      options.signalLifecycle?.detachChild(child);
-      if (!settled) {
-        settled = true;
-        reject(error);
-      }
-    });
-    child.once("close", (exitCode, signal) => {
-      options.signalLifecycle?.detachChild(child);
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve({
-        exitCode: exitCode ?? (signal || options.signalLifecycle?.signal ? 1 : 0),
-        signal: signal ?? options.signalLifecycle?.signal ?? null,
-      });
-    });
+  return runManagedSpawn(command, args, {
+    cwd: options.cwd,
+    env: process.env,
+    signalLifecycle: options.signalLifecycle,
+    stdio: "inherit",
   });
 }
 
@@ -388,6 +367,7 @@ async function publishConsoleBuild(
 const defaultDependencies = Object.freeze({
   cleanupPrepared: (workdir) =>
     rm(workdir, { recursive: true, force: true }),
+  createLifecycle: createSignalLifecycle,
   prepare: prepareConsole,
   publicRoot: DEFAULT_PUBLIC_ROOT,
   publishBuild: publishConsoleBuild,
@@ -398,7 +378,7 @@ const defaultDependencies = Object.freeze({
 /** @param {Partial<typeof defaultDependencies>} dependencies */
 export async function buildConsole(dependencies = defaultDependencies) {
   const resolved = { ...defaultDependencies, ...dependencies };
-  const signalLifecycle = createSignalLifecycle();
+  const signalLifecycle = resolved.createLifecycle();
   let workdir;
   let result;
   let primaryError;
@@ -406,7 +386,10 @@ export async function buildConsole(dependencies = defaultDependencies) {
   signalLifecycle.install();
   try {
     try {
-      const prepared = await resolved.prepare({ keep: true });
+      const prepared = await resolved.prepare({
+        keep: true,
+        signalLifecycle,
+      });
       workdir = prepared.workdir;
       if (!workdir) {
         throw new Error("Console preparation did not return a workdir");
@@ -420,10 +403,7 @@ export async function buildConsole(dependencies = defaultDependencies) {
           cwd: workdir,
           signalLifecycle,
         });
-        if (
-          outcome.signal &&
-          outcome.signal !== signalLifecycle.signal
-        ) {
+        if (outcome.signal && !signalLifecycle.signal) {
           throw createCommandError(command, args, outcome);
         }
         if (outcome.exitCode !== 0 && !signalLifecycle.signal) {

@@ -1,12 +1,14 @@
-import { execFile } from "node:child_process";
 import { cp, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  createSignalLifecycle,
+  runManagedExecFile,
+  throwIfSignalRecorded,
+} from "./process-lifecycle.mjs";
 import { verifySnapshot } from "./verify-upstream.mjs";
 
-const execFileAsync = promisify(execFile);
 const SCRIPT_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(SCRIPT_ROOT, "../..");
 const SNAPSHOT_ROOT = path.join(REPOSITORY_ROOT, "vendor/qwenpaw-console");
@@ -24,14 +26,23 @@ const DEFAULT_PATCH_PATHS = Object.freeze(
   PATCHES.map((patchName) => path.join(PATCH_ROOT, patchName)),
 );
 
-async function applyPatch(workdir, patchPath) {
+async function applyPatch(
+  workdir,
+  patchPath,
+  signalLifecycle,
+  runExecFile,
+) {
   const options = {
     cwd: workdir,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     maxBuffer: 10 * 1024 * 1024,
+    signalLifecycle,
   };
-  await execFileAsync("git", ["apply", "--check", patchPath], options);
-  await execFileAsync("git", ["apply", patchPath], options);
+  throwIfSignalRecorded(signalLifecycle, "patch-check");
+  await runExecFile("git", ["apply", "--check", patchPath], options);
+  throwIfSignalRecorded(signalLifecycle, "patch-apply");
+  await runExecFile("git", ["apply", patchPath], options);
+  throwIfSignalRecorded(signalLifecycle, "patch-applied");
 }
 
 async function removePreparedDirectory(workdir, originalError) {
@@ -49,15 +60,23 @@ async function removePreparedDirectory(workdir, originalError) {
   }
 }
 
+/**
+ * @param {{
+ *   keep?: boolean,
+ *   signalLifecycle?: ReturnType<typeof createSignalLifecycle>,
+ * }} [options]
+ */
 async function prepareConsoleWithDependencies(
-  { keep = false } = {},
+  { keep = false, signalLifecycle } = {},
   {
     patchPaths = DEFAULT_PATCH_PATHS,
+    runExecFile = runManagedExecFile,
     temporaryParent = os.tmpdir(),
     verify = () => verifySnapshot(SNAPSHOT_ROOT),
   } = {},
 ) {
   await verify();
+  throwIfSignalRecorded(signalLifecycle, "initial-verification");
   const workdir = await mkdtemp(
     path.join(temporaryParent, "digitalmate-qwenpaw-console-"),
   );
@@ -68,15 +87,24 @@ async function prepareConsoleWithDependencies(
       force: false,
       recursive: true,
     });
+    throwIfSignalRecorded(signalLifecycle, "snapshot-copy");
 
     for (const patchPath of patchPaths) {
-      await applyPatch(workdir, path.resolve(patchPath));
+      await applyPatch(
+        workdir,
+        path.resolve(patchPath),
+        signalLifecycle,
+        runExecFile,
+      );
       applied.push(path.basename(patchPath));
     }
 
+    throwIfSignalRecorded(signalLifecycle, "final-verification");
     await verify();
+    throwIfSignalRecorded(signalLifecycle, "final-verification");
     if (!keep) {
       await removePreparedDirectory(workdir);
+      throwIfSignalRecorded(signalLifecycle, "prepared-cleanup");
       return { workdir: null, applied: [...applied] };
     }
     return { workdir, applied: [...applied] };
@@ -86,8 +114,26 @@ async function prepareConsoleWithDependencies(
   }
 }
 
-export function prepareConsole(options = {}) {
-  return prepareConsoleWithDependencies(options);
+export async function prepareConsole(options = {}) {
+  if (options.signalLifecycle) {
+    return prepareConsoleWithDependencies(options);
+  }
+
+  const signalLifecycle = createSignalLifecycle();
+  signalLifecycle.install();
+  try {
+    const result = await prepareConsoleWithDependencies({
+      ...options,
+      signalLifecycle,
+    });
+    if (signalLifecycle.signal && result.workdir) {
+      await removePreparedDirectory(result.workdir);
+    }
+    throwIfSignalRecorded(signalLifecycle, "preparation-complete");
+    return result;
+  } finally {
+    signalLifecycle.remove();
+  }
 }
 
 export const __testing = Object.freeze({
@@ -107,6 +153,14 @@ if (isMain) {
       console.error(
         error instanceof Error ? error.message : "Console preparation failed",
       );
-      process.exitCode = 1;
+      const signal =
+        error && typeof error === "object"
+          ? Reflect.get(error, "signal")
+          : undefined;
+      if (signal) {
+        process.kill(process.pid, signal);
+      } else {
+        process.exitCode = 1;
+      }
     });
 }

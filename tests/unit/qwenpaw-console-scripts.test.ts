@@ -29,6 +29,11 @@ import {
   __testing as prepareTesting,
   prepareConsole,
 } from "../../scripts/qwenpaw-console/prepare.mjs";
+import {
+  createSignalLifecycle as createProcessSignalLifecycle,
+  getWindowsTreeKillCommand,
+  runManagedSpawn,
+} from "../../scripts/qwenpaw-console/process-lifecycle.mjs";
 import * as qwenpawSync from "../../scripts/qwenpaw-console/sync.mjs";
 import {
   COMMANDS as CONSOLE_TEST_COMMANDS,
@@ -600,9 +605,19 @@ if (recordedSignal) {
   }
 }
 
-async function runRealConsoleBuildCliSignalTest(): Promise<{
+async function runRealConsoleBuildCliSignalTest({
+  ignoreFirstSignal = false,
+  grandchildIgnoresFirstSignal = ignoreFirstSignal,
+  secondSignal = null,
+}: {
+  grandchildIgnoresFirstSignal?: boolean;
+  ignoreFirstSignal?: boolean;
+  secondSignal?: "SIGINT" | "SIGTERM" | null;
+} = {}): Promise<{
   exitCode: number | null;
   fakeNpmPid: number;
+  grandchildLogPath: string;
+  grandchildPid: number;
   signal: NodeJS.Signals | null;
   stderr: string;
   temporaryRoot: string;
@@ -613,19 +628,56 @@ async function runRealConsoleBuildCliSignalTest(): Promise<{
   const fakeBinRoot = path.join(temporaryRoot, "bin");
   const fakeNpmPath = path.join(fakeBinRoot, "npm");
   const fakeNpmPidPath = path.join(temporaryRoot, "fake-npm.pid");
+  const grandchildLogPath = path.join(temporaryRoot, "grandchild.log");
+  const grandchildReadyPath = path.join(temporaryRoot, "grandchild.ready");
   await mkdir(fakeBinRoot);
   await writeFile(
     fakeNpmPath,
     `#!/usr/bin/env node
 const fs = require("node:fs");
-fs.writeFileSync(${JSON.stringify(fakeNpmPidPath)}, String(process.pid));
+const { spawn } = require("node:child_process");
+const ignoreFirstSignal = ${JSON.stringify(ignoreFirstSignal)};
+const grandchild = spawn(
+  process.execPath,
+  [
+    "-e",
+    ${JSON.stringify(`
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(grandchildReadyPath)}, "ready");
+if (${JSON.stringify(grandchildIgnoresFirstSignal)}) {
+  process.on("SIGINT", () =>
+    fs.appendFileSync(${JSON.stringify(grandchildLogPath)}, "SIGINT\\n"),
+  );
+  process.on("SIGTERM", () =>
+    fs.appendFileSync(${JSON.stringify(grandchildLogPath)}, "SIGTERM\\n"),
+  );
+}
+setInterval(() => {}, 1000);
+`)},
+  ],
+  { stdio: "ignore" },
+);
+fs.writeFileSync(
+  ${JSON.stringify(fakeNpmPidPath)},
+  process.pid + "\\n" + grandchild.pid,
+);
 const finish = (signal) => {
-  fs.appendFileSync(${JSON.stringify(fakeNpmPidPath)}, "\\n" + signal);
-  process.exit(128);
+  fs.appendFileSync(
+    ${JSON.stringify(fakeNpmPidPath)},
+    "\\n" + (ignoreFirstSignal ? "IGNORED:" : "") + signal,
+  );
+  if (!ignoreFirstSignal) {
+    process.exit(128);
+  }
 };
 process.on("SIGINT", () => finish("SIGINT"));
 process.on("SIGTERM", () => finish("SIGTERM"));
-process.stdout.write("READY:fake-npm\\n");
+const readyTimer = setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(grandchildReadyPath)})) {
+    clearInterval(readyTimer);
+    process.stdout.write("READY:fake-npm\\n");
+  }
+}, 5);
 setInterval(() => {}, 1000);
 `,
     "utf8",
@@ -686,19 +738,31 @@ setInterval(() => {}, 1000);
   try {
     await ready;
     expect(child.kill("SIGTERM")).toBe(true);
+    if (secondSignal) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(child.kill(secondSignal)).toBe(true);
+    }
     const closed = await new Promise<{
       exitCode: number | null;
       signal: NodeJS.Signals | null;
     }>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Console build CLI did not exit after signal"));
+      }, 10_000);
       child.once("error", reject);
-      child.once("close", (exitCode, exitSignal) =>
-        resolve({ exitCode, signal: exitSignal }),
-      );
+      child.once("close", (exitCode, exitSignal) => {
+        clearTimeout(timeout);
+        resolve({ exitCode, signal: exitSignal });
+      });
     });
-    const [pidLine] = (await readFile(fakeNpmPidPath, "utf8")).split("\n");
+    const [pidLine, grandchildPidLine] = (
+      await readFile(fakeNpmPidPath, "utf8")
+    ).split("\n");
     return {
       ...closed,
       fakeNpmPid: Number(pidLine),
+      grandchildLogPath,
+      grandchildPid: Number(grandchildPidLine),
       stderr,
       temporaryRoot,
     };
@@ -1610,6 +1674,91 @@ describe("QwenPaw Console patch preparation", () => {
       await rm(temporaryParent, { recursive: true, force: true });
     }
   });
+
+  it("git apply --check 活动进程收到组信号后停止后续 apply 并清理 workdir", async () => {
+    const temporaryParent = await mkdtemp(
+      path.join(tmpdir(), "dm-qwenpaw-prepare-signal-"),
+    );
+    const childPidPath = path.join(temporaryParent, "git-child.pid");
+    const patchPath = path.resolve(
+      "patches/qwenpaw-console/0001-brand.patch",
+    );
+    const calls: string[][] = [];
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 1_000,
+    });
+    let childPid = 0;
+
+    lifecycle.install();
+    try {
+      await expect(
+        prepareTesting.prepareConsoleWithDependencies(
+          { keep: true, signalLifecycle: lifecycle },
+          {
+            patchPaths: [patchPath],
+            runExecFile: async (command, args, options) => {
+              if (!options?.signalLifecycle) {
+                throw new Error("signal lifecycle missing from git command");
+              }
+              calls.push([command, ...args]);
+              const running = runManagedSpawn(
+                process.execPath,
+                [
+                  "-e",
+                  `require("node:fs").writeFileSync(${JSON.stringify(
+                    childPidPath,
+                  )}, String(process.pid)); setInterval(() => {}, 1000);`,
+                ],
+                {
+                  signalLifecycle: options.signalLifecycle,
+                  stdio: "ignore",
+                },
+              );
+              const deadline = Date.now() + 5_000;
+              while (Date.now() < deadline) {
+                try {
+                  childPid = Number(await readFile(childPidPath, "utf8"));
+                  break;
+                } catch {
+                  await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+              }
+              if (!childPid) {
+                throw new Error("managed git fixture did not start");
+              }
+              process.emit("SIGTERM", "SIGTERM");
+              await running;
+              return { stdout: "", stderr: "" };
+            },
+            temporaryParent,
+            verify: async () => ({
+              files: 1,
+              commit: UPSTREAM.commit,
+            }),
+          },
+        ),
+      ).rejects.toMatchObject({
+        signal: "SIGTERM",
+        stage: "patch-apply",
+      });
+
+      expect(calls).toEqual([
+        ["git", "apply", "--check", patchPath],
+      ]);
+      expect(() => process.kill(childPid, 0)).toThrow();
+      expect(await readdir(temporaryParent)).toEqual(["git-child.pid"]);
+    } finally {
+      lifecycle.remove();
+      if (childPid) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // Expected: process-group forwarding already reaped the child.
+        }
+      }
+      await rm(temporaryParent, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("QwenPaw Console isolated test runner", () => {
@@ -2600,12 +2749,18 @@ describe("QwenPaw Console atomic static build", () => {
       "scripts/qwenpaw-console/build.mjs",
       "utf8",
     );
+    const prepareSource = await readFile(
+      "scripts/qwenpaw-console/prepare.mjs",
+      "utf8",
+    );
     expect(buildSource).not.toContain(
       "consoleTestTesting.validateConsoleBuild",
     );
     expect(buildSource).not.toMatch(
       /import\s*\{\s*__testing\b[^}]*\}\s*from\s*["']\.\/test\.mjs["']/,
     );
+    expect(buildSource).not.toContain('from "./test.mjs"');
+    expect(prepareSource).not.toContain('from "./test.mjs"');
   });
 
   it("CLI 错误详情同时包含回滚 backup 路径与每个 cleanup 阶段路径", () => {
@@ -2637,37 +2792,22 @@ describe("QwenPaw Console atomic static build", () => {
     ]);
   });
 
-  it("signal lifecycle 只记录首个信号且不会向同一 child 重复转发", () => {
-    const createLifecycle = Reflect.get(
-      consoleTestScript,
-      "createSignalLifecycle",
-    ) as
-      | (() => {
-          signal: NodeJS.Signals | null;
-          install: () => void;
-          remove: () => void;
-          attachChild: (child: {
-            killed: boolean;
-            kill: (signal: NodeJS.Signals) => boolean;
-          }) => void;
-          detachChild: (child: object) => void;
-        })
-      | undefined;
-    expect(createLifecycle).toBeTypeOf("function");
-    if (!createLifecycle) {
-      return;
-    }
-    const forwardedSignals: NodeJS.Signals[] = [];
-    const child = {
-      killed: false,
-      kill(signal: NodeJS.Signals) {
-        forwardedSignals.push(signal);
-        return true;
-      },
-    };
+  it("signal lifecycle 保留首信号，并将第二个信号升级为进程组 SIGKILL", () => {
+    const forwardedSignals: Array<{
+      pid: number;
+      signal: NodeJS.Signals;
+    }> = [];
+    const child = { pid: 4242 };
     const beforeSigint = process.listenerCount("SIGINT");
     const beforeSigterm = process.listenerCount("SIGTERM");
-    const lifecycle = createLifecycle();
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      killProcess: (pid: number, signal: NodeJS.Signals) => {
+        forwardedSignals.push({ pid, signal });
+        return true;
+      },
+      platform: "darwin",
+    });
 
     lifecycle.install();
     try {
@@ -2675,7 +2815,10 @@ describe("QwenPaw Console atomic static build", () => {
       process.emit("SIGTERM", "SIGTERM");
       process.emit("SIGINT", "SIGINT");
       expect(lifecycle.signal).toBe("SIGTERM");
-      expect(forwardedSignals).toEqual(["SIGTERM"]);
+      expect(forwardedSignals).toEqual([
+        { pid: -4242, signal: "SIGTERM" },
+        { pid: -4242, signal: "SIGKILL" },
+      ]);
       lifecycle.detachChild(child);
     } finally {
       lifecycle.remove();
@@ -2683,6 +2826,104 @@ describe("QwenPaw Console atomic static build", () => {
 
     expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
     expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  });
+
+  it("signal lifecycle 在有界超时后自动强杀仍活动的进程组", async () => {
+    const forwardedSignals: Array<{
+      pid: number;
+      signal: NodeJS.Signals;
+    }> = [];
+    const child = { pid: 5252 };
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 20,
+      killProcess: (pid: number, signal: NodeJS.Signals) => {
+        forwardedSignals.push({ pid, signal });
+        return true;
+      },
+      platform: "linux",
+    });
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGINT", "SIGINT");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(lifecycle.signal).toBe("SIGINT");
+      expect(forwardedSignals).toEqual([
+        { pid: -5252, signal: "SIGINT" },
+        { pid: -5252, signal: "SIGKILL" },
+      ]);
+      lifecycle.detachChild(child);
+    } finally {
+      lifecycle.remove();
+    }
+  });
+
+  it("进程组终止与探测失败只记诊断，仍会清理定时器和监听器", async () => {
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+    let clearedTimers = 0;
+    const lifecycle = createProcessSignalLifecycle({
+      forceKillTimeoutMs: 60_000,
+      killProcess: () => {
+        const error = Object.assign(new Error("permission denied"), {
+          code: "EPERM",
+        });
+        throw error;
+      },
+      platform: "linux",
+      timerOperations: {
+        clearTimeout: (timer) => {
+          clearedTimers += 1;
+          clearTimeout(timer);
+        },
+        setTimeout,
+      },
+      treeExitTimeoutMs: 0,
+    });
+    const child = { pid: 6262 };
+
+    lifecycle.install();
+    try {
+      lifecycle.attachChild(child);
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(lifecycle.settleChild(child)).resolves.toBeUndefined();
+      expect(lifecycle.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "graceful",
+            target: "process-group",
+          }),
+          expect.objectContaining({
+            action: "force",
+            target: "process-group",
+          }),
+          expect.objectContaining({
+            action: "settle-timeout",
+            target: "process-group",
+          }),
+        ]),
+      );
+      expect(clearedTimers).toBeGreaterThan(0);
+    } finally {
+      lifecycle.remove();
+    }
+
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  });
+
+  it("Windows 进程树终止命令始终含 /T，强杀阶段额外含 /F", () => {
+    expect(getWindowsTreeKillCommand(1234)).toEqual({
+      command: "taskkill",
+      args: ["/PID", "1234", "/T"],
+    });
+    expect(
+      getWindowsTreeKillCommand(1234, { force: true }),
+    ).toEqual({
+      command: "taskkill",
+      args: ["/PID", "1234", "/T", "/F"],
+    });
   });
 
   it("prepare 返回前收到信号时不启动命令、校验或发布并等待清理", async () => {
@@ -2792,7 +3033,7 @@ describe("QwenPaw Console atomic static build", () => {
     20_000,
   );
 
-  it("真实 CLI 在 command 阶段转发 SIGTERM、清理 prepared 且无孤儿 npm", async () => {
+  it("真实 CLI 向 npm 进程组转发 SIGTERM 且不遗留 npm 或 grandchild", async () => {
     const result = await runRealConsoleBuildCliSignalTest();
 
     try {
@@ -2807,6 +3048,7 @@ describe("QwenPaw Console atomic static build", () => {
       );
       expect(pidLog).toContain("\nSIGTERM");
       expect(() => process.kill(result.fakeNpmPid, 0)).toThrow();
+      expect(() => process.kill(result.grandchildPid, 0)).toThrow();
       const temporaryEntries = await readdir(result.temporaryRoot);
       expect(
         temporaryEntries.filter((entry) =>
@@ -2821,6 +3063,83 @@ describe("QwenPaw Console atomic static build", () => {
         process.kill(result.fakeNpmPid, "SIGKILL");
       } catch {
         // The expected path: the forwarded signal already reaped fake npm.
+      }
+      try {
+        process.kill(result.grandchildPid, "SIGKILL");
+      } catch {
+        // The expected path: the process-group signal reaped the grandchild.
+      }
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it("direct npm 响应首信号退出后仍会强杀忽略信号的 grandchild", async () => {
+    const result = await runRealConsoleBuildCliSignalTest({
+      grandchildIgnoresFirstSignal: true,
+    });
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGTERM",
+        stderr: "",
+      });
+      await expect(readFile(result.grandchildLogPath, "utf8")).resolves.toContain(
+        "SIGTERM",
+      );
+      expect(() => process.kill(result.fakeNpmPid, 0)).toThrow();
+      expect(() => process.kill(result.grandchildPid, 0)).toThrow();
+      expect(
+        (await readdir(result.temporaryRoot)).filter((entry) =>
+          entry.startsWith("digitalmate-qwenpaw-console-"),
+        ),
+      ).toEqual([]);
+    } finally {
+      for (const pid of [result.fakeNpmPid, result.grandchildPid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Expected after settleChild force-kills the remaining process group.
+        }
+      }
+      await rm(result.temporaryRoot, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it("真实 CLI 第二个信号会强杀忽略首信号的 npm 进程组并保留首信号退出语义", async () => {
+    const result = await runRealConsoleBuildCliSignalTest({
+      ignoreFirstSignal: true,
+      secondSignal: "SIGINT",
+    });
+
+    try {
+      expect(result).toMatchObject({
+        exitCode: null,
+        signal: "SIGTERM",
+        stderr: "",
+      });
+      const pidLog = await readFile(
+        path.join(result.temporaryRoot, "fake-npm.pid"),
+        "utf8",
+      );
+      expect(pidLog).toContain("\nIGNORED:SIGTERM");
+      await expect(readFile(result.grandchildLogPath, "utf8")).resolves.toContain(
+        "SIGTERM",
+      );
+      expect(() => process.kill(result.fakeNpmPid, 0)).toThrow();
+      expect(() => process.kill(result.grandchildPid, 0)).toThrow();
+      expect(
+        (await readdir(result.temporaryRoot)).filter((entry) =>
+          entry.startsWith("digitalmate-qwenpaw-console-"),
+        ),
+      ).toEqual([]);
+    } finally {
+      for (const pid of [result.fakeNpmPid, result.grandchildPid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Expected after the second signal kills the detached process group.
+        }
       }
       await rm(result.temporaryRoot, { recursive: true, force: true });
     }
