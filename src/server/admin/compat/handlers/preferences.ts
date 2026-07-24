@@ -3,6 +3,7 @@ import {
   AdminCompatError,
   type AdminCompatHandler,
 } from "@/server/admin/compat/types";
+import { readAdminCompatJson } from "@/server/admin/compat/json";
 
 export const supportedConsoleLanguages = [
   "en",
@@ -44,7 +45,9 @@ export const putLanguage: AdminCompatHandler = async ({
   resources,
   scope,
 }) => {
-  const input = languageBodySchema.parse(await readJson(request));
+  const input = languageBodySchema.parse(
+    await readAdminCompatJson(request),
+  );
   const current = await resources.userPreferences.get(scope.userId);
   const updated = await resources.userPreferences.update(scope.userId, {
     language: input.language,
@@ -73,7 +76,9 @@ export const putUserTimezone: AdminCompatHandler = async ({
   resources,
   scope,
 }) => {
-  const input = timezoneBodySchema.parse(await readJson(request));
+  const input = timezoneBodySchema.parse(
+    await readAdminCompatJson(request),
+  );
   const timezone = normalizeIanaTimezone(input.timezone);
   if (!timezone) {
     throw new AdminCompatError(
@@ -102,17 +107,5 @@ export function normalizeIanaTimezone(value: string): string | null {
     }).resolvedOptions().timeZone;
   } catch {
     return null;
-  }
-}
-
-async function readJson(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    throw new AdminCompatError(
-      400,
-      "invalid_request",
-      "invalid_json",
-    );
   }
 }

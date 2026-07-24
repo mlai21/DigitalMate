@@ -29,8 +29,13 @@ const SAFE_HANDLER_RESPONSE_HEADERS = new Set([
   "content-language",
   "content-type",
 ]);
-const SENSITIVE_DETAIL_KEYS =
-  /(?:secret|token|password|credential|authorization|cookie|sql|stack)/i;
+const SENSITIVE_DETAIL_VALUES = [
+  /(?:token|secret|password|credential|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+/iu,
+  /(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+/iu,
+  /(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/\S+/iu,
+  /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b/u,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+] as const;
 
 type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
@@ -479,7 +484,7 @@ function mapError(error: unknown): Response {
       normalizeErrorStatus(error.status),
       error.code,
       error.publicMessage,
-      sanitizeDetails(error.details),
+      sanitizeDetails(error.code, error.details),
     );
   }
   if (error instanceof ZodError) {
@@ -507,7 +512,7 @@ function mapError(error: unknown): Response {
       501,
       "capability_disabled",
       "capability_disabled",
-      sanitizeDetails(error.details),
+      sanitizeDetails(error.code, error.details),
     );
   }
   return errorResponse(500, "internal_error", "internal_error");
@@ -552,33 +557,58 @@ function isErrorRecord(
 }
 
 function normalizeErrorStatus(status: number): number {
-  return [400, 401, 403, 404, 405, 409, 501].includes(status)
+  return [400, 401, 403, 404, 405, 409, 413, 501].includes(status)
     ? status
     : 500;
 }
 
-function sanitizeDetails(value: unknown): unknown {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value === "boolean") return value;
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : undefined;
+function sanitizeDetails(
+  errorCode: string,
+  value: unknown,
+): unknown {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    return undefined;
   }
-  if (typeof value === "string") {
-    return value.length <= 128 ? value : value.slice(0, 128);
-  }
-  if (Array.isArray(value)) {
-    return value.slice(0, 32).map(sanitizeDetails);
-  }
-  if (typeof value === "object") {
-    const sanitized: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value).slice(0, 32)) {
-      if (SENSITIVE_DETAIL_KEYS.test(key)) continue;
-      const safeEntry = sanitizeDetails(entry);
-      if (safeEntry !== undefined) sanitized[key] = safeEntry;
+
+  const details = value as Record<string, unknown>;
+  const sanitized: Record<string, unknown> = {};
+  if (errorCode === "capability_disabled") {
+    const capability = sanitizeCapability(details.capability);
+    if (capability !== undefined) {
+      sanitized.capability = capability;
     }
-    return sanitized;
   }
-  return undefined;
+  if (
+    errorCode === "config_revision_conflict" ||
+    errorCode === "revision_conflict"
+  ) {
+    const currentRevision = details.current_revision;
+    if (
+      typeof currentRevision === "number" &&
+      Number.isSafeInteger(currentRevision) &&
+      currentRevision >= 0
+    ) {
+      sanitized.current_revision = currentRevision;
+    }
+  }
+  return Object.keys(sanitized).length > 0
+    ? sanitized
+    : undefined;
+}
+
+function sanitizeCapability(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value) ||
+    SENSITIVE_DETAIL_VALUES.some((pattern) => pattern.test(value))
+  ) {
+    return undefined;
+  }
+  return value;
 }
 
 function errorResponse(

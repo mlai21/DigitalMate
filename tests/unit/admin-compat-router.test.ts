@@ -1030,6 +1030,106 @@ describe("admin compatibility exact router", () => {
     }
   });
 
+  it("only exposes allowlisted stable details and drops secret-shaped values even under safe keys", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/safe-capability-details", async () => {
+      throw new AdminCompatError(
+        501,
+        "capability_disabled",
+        "capability_disabled",
+        {
+          capability: "p2_sandbox",
+          current_revision: 7,
+          note: "token=must-not-leak",
+        },
+      );
+    });
+    router.get("/safe-revision-details", async () => {
+      throw new AdminCompatError(
+        409,
+        "config_revision_conflict",
+        "revision_conflict",
+        {
+          current_revision: 12,
+          capability: "must_not_cross_error_codes",
+          context: "postgres://admin:secret@db/private",
+        },
+      );
+    });
+
+    const safeCapability = await authenticatedRouterRequest(
+      "GET",
+      "/safe-capability-details",
+    );
+    await expect(
+      (
+        await router.dispatch(
+          safeCapability.request,
+          safeCapability.runtime,
+        )
+      ).json(),
+    ).resolves.toEqual({
+      error: {
+        code: "capability_disabled",
+        message: "capability_disabled",
+        details: { capability: "p2_sandbox" },
+      },
+    });
+
+    const safeRevision = await authenticatedRouterRequest(
+      "GET",
+      "/safe-revision-details",
+    );
+    await expect(
+      (
+        await router.dispatch(
+          safeRevision.request,
+          safeRevision.runtime,
+        )
+      ).json(),
+    ).resolves.toEqual({
+      error: {
+        code: "config_revision_conflict",
+        message: "revision_conflict",
+        details: { current_revision: 12 },
+      },
+    });
+
+    const secretValues = [
+      "token=top-secret-value",
+      "postgres://admin:password@db/private",
+      "Authorization: Bearer abc.def.ghi",
+      "Bearer abcdefghijklmnop",
+      "sk-proj-1234567890abcdef",
+    ];
+    for (const [index, secret] of secretValues.entries()) {
+      const path = `/secret-details-${index}`;
+      router.get(path, async () => {
+        throw new AdminCompatError(
+          501,
+          "capability_disabled",
+          "capability_disabled",
+          {
+            capability: secret,
+            harmless: secret,
+          },
+        );
+      });
+      const fixture = await authenticatedRouterRequest("GET", path);
+      const response = await router.dispatch(
+        fixture.request,
+        fixture.runtime,
+      );
+      const serialized = JSON.stringify(await response.json());
+
+      expect(response.status).toBe(501);
+      expect(serialized).toBe(
+        '{"error":{"code":"capability_disabled","message":"capability_disabled"}}',
+      );
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
   it("removes handler-controlled sensitive headers from successful responses", async () => {
     const router = new AdminCompatRouter();
     router.get(
@@ -1300,6 +1400,68 @@ async function coreRequest(input: {
         work(resources, request.signal),
     }),
   );
+}
+
+async function coreRawJsonRequest(input: {
+  router: AdminCompatRouter;
+  path: string;
+  body: BodyInit;
+  resources: AdminCompatResources;
+  contentLength?: string;
+}) {
+  const sessionToken = await createSessionToken(
+    userId,
+    1,
+    appSecret,
+    now,
+  );
+  const headers = new Headers({
+    accept: "application/json",
+    cookie: `${sessionCookieName}=${sessionToken}`,
+    origin: "https://mate.example",
+    "content-type": "application/json",
+    "x-csrf-token": createCsrfToken({
+      userId,
+      sessionToken,
+      secret: deriveCsrfSecret(appSecret),
+      now,
+    }),
+  });
+  if (input.contentLength !== undefined) {
+    headers.set("content-length", input.contentLength);
+  }
+  const request = new Request(
+    `https://mate.example/api/admin/compat${input.path}`,
+    {
+      method: "PUT",
+      headers,
+      body: input.body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" },
+  );
+  return input.router.dispatch(
+    request,
+    routerRuntime(options(), {
+      withUserDataLease: async (_resolvedUserId, work) =>
+        work(input.resources, request.signal),
+    }),
+  );
+}
+
+async function expectPayloadTooLarge(
+  response: Response,
+): Promise<void> {
+  expect(response.status).toBe(413);
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("x-content-type-options")).toBe(
+    "nosniff",
+  );
+  await expect(response.json()).resolves.toEqual({
+    error: {
+      code: "payload_too_large",
+      message: "payload_too_large",
+    },
+  });
 }
 
 describe("admin compatibility core contracts", () => {
@@ -1634,6 +1796,88 @@ describe("admin compatibility core contracts", () => {
     await expect(response.json()).resolves.toEqual({
       error: { code: "invalid_request", message: "invalid_json" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("x-content-type-options")).toBe(
+      "nosniff",
+    );
+  });
+
+  it("rejects an oversized declared JSON body before parsing it", async () => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRawJsonRequest({
+      router,
+      path: "/language",
+      body: JSON.stringify({ language: "zh" }),
+      contentLength: String(16 * 1024 + 1),
+      resources: preferences.resources,
+    });
+
+    await expectPayloadTooLarge(response);
+    expect(preferences.get).not.toHaveBeenCalled();
+    expect(preferences.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "missing Content-Length on language",
+      path: "/language",
+      contentLength: undefined,
+    },
+    {
+      label: "forged small Content-Length on timezone",
+      path: "/user-timezone",
+      contentLength: "2",
+    },
+  ])("limits the actual streamed JSON bytes with $label", async ({
+    path,
+    contentLength,
+  }) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const encoded = new TextEncoder().encode(
+      JSON.stringify({
+        language: "zh",
+        timezone: "Asia/Shanghai",
+        padding: "x".repeat(16 * 1024),
+      }),
+    );
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < encoded.length; offset += 1024) {
+          controller.enqueue(encoded.slice(offset, offset + 1024));
+        }
+        controller.close();
+      },
+    });
+    const response = await coreRawJsonRequest({
+      router,
+      path,
+      body: stream,
+      contentLength,
+      resources: preferences.resources,
+    });
+
+    await expectPayloadTooLarge(response);
+    expect(preferences.get).not.toHaveBeenCalled();
+    expect(preferences.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps preference HEAD responses bodyless under the shared JSON limit", async () => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "HEAD",
+      path: "/language",
+      resources: preferences.resources,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain(
+      "application/json",
+    );
+    expect(await response.text()).toBe("");
   });
 
   it.each([
