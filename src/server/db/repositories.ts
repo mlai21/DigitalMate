@@ -32,6 +32,7 @@ import {
 import type { AgentScope } from "@/server/agents/types";
 import { createAgentRepository } from "@/server/agents/repository";
 import { createAgentSettingsRepository } from "@/server/settings/agent-settings";
+import { createUserPreferencesRepository } from "@/server/settings/user-preferences";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -119,7 +120,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "conversation_id", "next_run_at", "finished_at", "created_at", "updated_at",
   ],
   settings: [
-    "id", "user_id", "persona", "proactivity", "model_routing", "cadence", "search", "updated_at",
+    "id", "user_id", "persona", "proactivity", "model_routing", "cadence", "search",
+    "language", "timezone", "revision", "updated_at",
   ],
 } as const;
 const GOAL_STEP_EXPORT_COLUMNS = [
@@ -504,6 +506,7 @@ export function createRepositories(
       acquireExclusiveClearLease,
     },
     agentSettings: createAgentSettingsRepository(pool),
+    userPreferences: createUserPreferencesRepository(pool),
     users: {
       async ensureDefault(): Promise<DbUser> {
         const existing = await pool.query<{ id: string; display_name: string }>(
@@ -2527,7 +2530,11 @@ export function createRepositories(
         await ensureSettings(pool, scope.userId);
         await createAgentSettingsRepository(pool).ensure(scope);
         await pool.query(
-          "UPDATE settings SET model_routing = $2, updated_at = now() WHERE user_id = $1",
+          `UPDATE settings
+           SET model_routing = $2,
+               revision = revision + 1,
+               updated_at = now()
+           WHERE user_id = $1`,
           [scope.userId, settings.modelRouting],
         );
         await pool.query(
@@ -2658,14 +2665,20 @@ export function createRepositories(
           }
 
           await client.query(
-            `INSERT INTO settings (user_id, persona, proactivity, model_routing, cadence, search)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            `INSERT INTO settings (
+               user_id, persona, proactivity, model_routing, cadence, search,
+               language, timezone
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (user_id) DO UPDATE
              SET persona = EXCLUDED.persona,
                  proactivity = EXCLUDED.proactivity,
                  model_routing = EXCLUDED.model_routing,
                  cadence = EXCLUDED.cadence,
                  search = EXCLUDED.search,
+                 language = EXCLUDED.language,
+                 timezone = EXCLUDED.timezone,
+                 revision = settings.revision + 1,
                  updated_at = now()`,
             [
               userId,
@@ -2674,6 +2687,8 @@ export function createRepositories(
               defaultSettings.modelRouting,
               defaultSettings.cadence,
               defaultSettings.search,
+              "zh",
+              "Asia/Shanghai",
             ],
           );
           await client.query(

@@ -366,10 +366,16 @@ CREATE TABLE IF NOT EXISTS settings (
   model_routing jsonb NOT NULL DEFAULT '{}'::jsonb,
   cadence jsonb NOT NULL DEFAULT '{}'::jsonb,
   search jsonb NOT NULL DEFAULT '{}'::jsonb,
+  language text NOT NULL DEFAULT 'zh',
+  timezone text NOT NULL DEFAULT 'Asia/Shanghai',
+  revision integer NOT NULL DEFAULT 1,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS search jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS language text NOT NULL DEFAULT 'zh';
+ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS timezone text NOT NULL DEFAULT 'Asia/Shanghai';
+ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS memory_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

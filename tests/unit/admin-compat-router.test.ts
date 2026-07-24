@@ -1,5 +1,8 @@
 import { createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import {
   createCsrfToken,
   deriveCsrfSecret,
@@ -14,6 +17,31 @@ import {
   createSessionToken,
   sessionCookieName,
 } from "@/server/auth/session";
+import {
+  AdminCompatRouter,
+  parseAdminCompatPath,
+  type AdminCompatRuntime,
+} from "@/server/admin/compat/router";
+import {
+  AdminCompatError,
+  type AdminCompatResources,
+} from "@/server/admin/compat/types";
+import {
+  createCoreAdminCompatRouter,
+  type CoreAdminCompatDependencies,
+} from "@/server/admin/compat/register-core";
+import { createUserPreferencesRepository } from "@/server/settings/user-preferences";
+import {
+  createAdminCompatRouteHandler,
+  DELETE as CATCH_ALL_DELETE,
+  GET as CATCH_ALL_GET,
+  HEAD as CATCH_ALL_HEAD,
+  OPTIONS as CATCH_ALL_OPTIONS,
+  PATCH as CATCH_ALL_PATCH,
+  POST as CATCH_ALL_POST,
+  PUT as CATCH_ALL_PUT,
+  runtime as catchAllRuntime,
+} from "@/app/api/admin/compat/[...segments]/route";
 
 const userId = "user-1";
 const appSecret = "test-app-secret-that-is-not-plaintext-csrf";
@@ -566,5 +594,1086 @@ describe("admin compatibility security boundary", () => {
     log.mockRestore();
     warn.mockRestore();
     error.mockRestore();
+  });
+});
+
+function routerRuntime(
+  security: AdminSecurityOptions,
+  overrides: Partial<AdminCompatRuntime> = {},
+): AdminCompatRuntime {
+  return {
+    security,
+    withUserDataLease: async (_userId, work) =>
+      work({} as AdminCompatResources, new AbortController().signal),
+    resolveDefaultScope: async (resolvedUserId) => ({
+      userId: resolvedUserId,
+      agentId: "agent-1",
+    }),
+    ...overrides,
+  };
+}
+
+async function authenticatedRouterRequest(
+  method: string,
+  path: string,
+  securityOverrides: Partial<AdminSecurityOptions> = {},
+): Promise<{ request: Request; runtime: AdminCompatRuntime }> {
+  const fixture = await authenticatedFixture({
+    requestUrl: `https://mate.example/api/admin/compat${path}`,
+    security: securityOverrides,
+  });
+  return {
+    request: fixture.request(method),
+    runtime: routerRuntime(fixture.security),
+  };
+}
+
+describe("admin compatibility exact router", () => {
+  it("distinguishes methods, supports GET-backed HEAD and returns an exact Allow header", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/root", async () => ({ version: "digitalmate" }));
+
+    const get = await authenticatedRouterRequest("GET", "/root");
+    const getResponse = await router.dispatch(get.request, get.runtime);
+    expect(getResponse.status).toBe(200);
+    await expect(getResponse.json()).resolves.toEqual({
+      version: "digitalmate",
+    });
+
+    const head = await authenticatedRouterRequest("HEAD", "/root");
+    const headResponse = await router.dispatch(head.request, head.runtime);
+    expect(headResponse.status).toBe(200);
+    expect(await headResponse.text()).toBe("");
+    expect(headResponse.headers.get("content-type")).toContain(
+      "application/json",
+    );
+
+    const post = await authenticatedRouterRequest("POST", "/root");
+    const postResponse = await router.dispatch(post.request, post.runtime);
+    expect(postResponse.status).toBe(405);
+    expect(postResponse.headers.get("allow")).toBe("GET, HEAD, OPTIONS");
+    await expect(postResponse.json()).resolves.toEqual({
+      error: {
+        code: "invalid_request",
+        message: "method_not_allowed",
+      },
+    });
+  });
+
+  it("does not reveal OPTIONS endpoints before authentication", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/root", async () => ({ ok: true }));
+    router.put("/root", async () => ({ ok: true }));
+
+    const unauthenticated = await router.dispatch(
+      new Request("https://mate.example/api/admin/compat/root", {
+        method: "OPTIONS",
+      }),
+      routerRuntime(options()),
+    );
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers.get("allow")).toBeNull();
+
+    const authenticated = await authenticatedRouterRequest(
+      "OPTIONS",
+      "/root",
+    );
+    const response = await router.dispatch(
+      authenticated.request,
+      authenticated.runtime,
+    );
+    expect(response.status).toBe(204);
+    expect(response.headers.get("allow")).toBe(
+      "GET, HEAD, PUT, OPTIONS",
+    );
+    expect(await response.text()).toBe("");
+  });
+
+  it("decodes each segment once and gives fixed routes priority over dynamic routes", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/agents/:agentId", async ({ params }) => ({
+      kind: "dynamic",
+      agentId: params.agentId,
+    }));
+    router.get("/agents/default", async () => ({ kind: "fixed" }));
+
+    const fixed = await authenticatedRouterRequest(
+      "GET",
+      "/agents/default",
+    );
+    await expect(
+      (await router.dispatch(fixed.request, fixed.runtime)).json(),
+    ).resolves.toEqual({ kind: "fixed" });
+
+    const dynamic = await authenticatedRouterRequest(
+      "GET",
+      "/agents/%E6%95%B0%E5%AD%97%E5%88%86%E8%BA%AB",
+    );
+    await expect(
+      (await router.dispatch(dynamic.request, dynamic.runtime)).json(),
+    ).resolves.toEqual({
+      kind: "dynamic",
+      agentId: "数字分身",
+    });
+  });
+
+  it.each([
+    ["/agents/%", "malformed percent"],
+    ["/agents/%2F", "encoded slash"],
+    ["/agents/%5C", "encoded backslash"],
+    ["/agents/%252F", "double-encoded slash"],
+    ["/agents/%252e%252e", "double-encoded dot segment"],
+    ["/agents/%00", "NUL"],
+    ["/agents/%1F", "control character"],
+    ["/agents//default", "repeated separator"],
+    ["/agents/default/", "empty trailing segment"],
+  ])("rejects unsafe path %s (%s)", async (path) => {
+    expect(() => parseAdminCompatPath(path)).toThrow(
+      expect.objectContaining({ code: "invalid_request" }),
+    );
+  });
+
+  it.each([".", "..", "%2e", "%2e%2e"])(
+    "rejects dot path segment %s before matching",
+    (segment) => {
+      expect(() => parseAdminCompatPath(`/agents/${segment}`)).toThrow(
+        expect.objectContaining({ code: "invalid_request" }),
+      );
+    },
+  );
+
+  it("fails registration when two routes are ambiguous but allows fixed-over-dynamic precedence", () => {
+    const router = new AdminCompatRouter();
+    router.get("/agents/:agentId", async () => ({}));
+    expect(() =>
+      router.get("/agents/:otherId", async () => ({})),
+    ).toThrow("admin_compat_route_conflict");
+    expect(() =>
+      router.get("/:section/default", async () => ({})),
+    ).toThrow("admin_compat_route_conflict");
+
+    const fixedRouter = new AdminCompatRouter();
+    fixedRouter.get("/agents/:agentId", async () => ({}));
+    expect(() =>
+      fixedRouter.get("/agents/default", async () => ({})),
+    ).not.toThrow();
+    expect(() =>
+      fixedRouter.put("/agents/:otherId", async () => ({})),
+    ).not.toThrow();
+  });
+
+  it("returns the same 401 for known, unknown and malformed unauthenticated paths", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/root", async () => ({ ok: true }));
+
+    const bodies: unknown[] = [];
+    for (const path of ["/root", "/unknown", "/agents/%2F"]) {
+      const response = await router.dispatch(
+        new Request(`https://mate.example/api/admin/compat${path}`),
+        routerRuntime(options()),
+      );
+      expect(response.status).toBe(401);
+      expect(response.headers.get("allow")).toBeNull();
+      bodies.push(await response.json());
+    }
+    expect(bodies).toEqual([
+      { error: { code: "unauthorized", message: "unauthorized" } },
+      { error: { code: "unauthorized", message: "unauthorized" } },
+      { error: { code: "unauthorized", message: "unauthorized" } },
+    ]);
+  });
+
+  it("checks CSRF before exposing whether a write endpoint exists", async () => {
+    const router = new AdminCompatRouter();
+    const fixture = await authenticatedFixture({
+      requestUrl:
+        "https://mate.example/api/admin/compat/not-registered",
+    });
+    const request = fixture.request("POST");
+    request.headers.delete("x-csrf-token");
+
+    const response = await router.dispatch(
+      request,
+      routerRuntime(fixture.security),
+    );
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "forbidden", message: "forbidden" },
+    });
+  });
+
+  it("maps validation, revision, disabled capability and unknown errors without leaking internals", async () => {
+    const router = new AdminCompatRouter();
+    router.put("/validation", async () => {
+      z.object({ language: z.literal("zh") }).strict().parse({
+        language: "secret-language-value",
+      });
+    });
+    router.put("/revision", async () => {
+      throw new AdminCompatError(
+        409,
+        "config_revision_conflict",
+        "revision_conflict",
+      );
+    });
+    router.post("/disabled", async () => {
+      throw new AdminCompatError(
+        501,
+        "capability_disabled",
+        "capability_disabled",
+        { capability: "p2_sandbox" },
+      );
+    });
+    router.get("/unknown", async () => {
+      throw new Error(
+        "postgres://admin:secret-password@db/internal_table",
+      );
+    });
+    router.get("/explicit-500", async () => {
+      throw new AdminCompatError(
+        500,
+        "database_failure",
+        "postgres://admin:explicit-secret@db/private_table",
+      );
+    });
+
+    const cases = [
+      ["PUT", "/validation", 400, "invalid_request"],
+      ["PUT", "/revision", 409, "config_revision_conflict"],
+      ["POST", "/disabled", 501, "capability_disabled"],
+      ["GET", "/unknown", 500, "internal_error"],
+      ["GET", "/explicit-500", 500, "internal_error"],
+    ] as const;
+    for (const [method, path, status, code] of cases) {
+      const fixture = await authenticatedRouterRequest(method, path);
+      const response = await router.dispatch(
+        fixture.request,
+        fixture.runtime,
+      );
+      const serialized = JSON.stringify(await response.json());
+      expect(response.status).toBe(status);
+      expect(serialized).toContain(`"code":"${code}"`);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("x-content-type-options")).toBe(
+        "nosniff",
+      );
+      expect(serialized).not.toContain("secret-language-value");
+      expect(serialized).not.toContain("secret-password");
+      expect(serialized).not.toContain("internal_table");
+      expect(serialized).not.toContain("stack");
+    }
+  });
+
+  it("removes handler-controlled sensitive headers from successful responses", async () => {
+    const router = new AdminCompatRouter();
+    router.get(
+      "/response",
+      async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: {
+            "content-type": "application/json",
+            "set-cookie": "session=attacker",
+            "x-internal-secret": "hidden",
+            "cache-control": "public, max-age=3600",
+          },
+        }),
+    );
+    const fixture = await authenticatedRouterRequest("GET", "/response");
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("x-internal-secret")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toEqual({ ok: true });
+  });
+
+  it("returns stable 400/404 and does not run the lease or scope resolver for unmatched paths", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/root", async () => ({ ok: true }));
+    const withLeaseSpy = vi.fn();
+    const withLease: AdminCompatRuntime["withUserDataLease"] =
+      async <T>(
+        resolvedUserId: string,
+        work: (
+          resources: AdminCompatResources,
+          signal: AbortSignal,
+        ) => Promise<T>,
+      ) => {
+        withLeaseSpy(resolvedUserId);
+        return work(
+          {} as AdminCompatResources,
+          new AbortController().signal,
+        );
+      };
+    const resolveDefaultScope = vi.fn(async () => ({
+      userId,
+      agentId: "agent-1",
+    }));
+
+    const missing = await authenticatedRouterRequest("GET", "/missing");
+    const missingResponse = await router.dispatch(
+      missing.request,
+      routerRuntime(missing.runtime.security, {
+        withUserDataLease: withLease,
+        resolveDefaultScope,
+      }),
+    );
+    expect(missingResponse.status).toBe(404);
+    await expect(missingResponse.json()).resolves.toEqual({
+      error: { code: "not_found", message: "route_not_found" },
+    });
+    expect(withLeaseSpy).not.toHaveBeenCalled();
+    expect(resolveDefaultScope).not.toHaveBeenCalled();
+
+    const malformed = await authenticatedRouterRequest(
+      "GET",
+      "/agents/%2F",
+    );
+    const malformedResponse = await router.dispatch(
+      malformed.request,
+      malformed.runtime,
+    );
+    expect(malformedResponse.status).toBe(400);
+    await expect(malformedResponse.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: "invalid_path" },
+    });
+  });
+
+  it("resolves an active default Agent only after auth and inside the shared lease", async () => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const events: string[] = [];
+    const fixture = await authenticatedRouterRequest("GET", "/root");
+    const response = await router.dispatch(
+      fixture.request,
+      routerRuntime(fixture.runtime.security, {
+        withUserDataLease: async (_resolvedUserId, work) => {
+          events.push("lease");
+          return work(
+            { marker: "leased" } as unknown as AdminCompatResources,
+            new AbortController().signal,
+          );
+        },
+        resolveDefaultScope: async (
+          resolvedUserId,
+          resources,
+        ) => {
+          events.push("scope");
+          expect(resources).toMatchObject({ marker: "leased" });
+          return {
+            userId: resolvedUserId,
+            agentId: "active-agent",
+          };
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(events).toEqual(["lease", "scope"]);
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: { userId, agentId: "active-agent" },
+        csrfVerified: false,
+        resources: expect.objectContaining({ marker: "leased" }),
+      }),
+    );
+  });
+
+  it("returns a stable conflict when the default Agent is inactive", async () => {
+    const router = new AdminCompatRouter();
+    router.get("/root", async () => ({ ok: true }));
+    const fixture = await authenticatedRouterRequest("GET", "/root");
+    const response = await router.dispatch(
+      fixture.request,
+      routerRuntime(fixture.runtime.security, {
+        resolveDefaultScope: async () => {
+          throw new AdminCompatError(
+            409,
+            "agent_inactive",
+            "active_agent_required",
+          );
+        },
+      }),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "agent_inactive",
+        message: "active_agent_required",
+      },
+    });
+  });
+});
+
+type MutableUserPreferences = {
+  language: string;
+  timezone: string;
+  revision: number;
+};
+
+function coreDependencies(
+  overrides: Partial<CoreAdminCompatDependencies> = {},
+): CoreAdminCompatDependencies {
+  return {
+    createAuthStatusResponse: async () =>
+      Response.json({
+        enabled: true,
+        authenticated: true,
+        csrf_token: "csrf-from-shared-session",
+        csrf_expires_at: 1_800_000_000,
+      }),
+    digitalMateVersion: "0.1.0",
+    upstreamTag: "v2.0.0.post3",
+    upstreamCommit:
+      "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
+    compatApiRevision: "2026-07-24.1",
+    ...overrides,
+  };
+}
+
+function preferenceResources(
+  initial: MutableUserPreferences = {
+    language: "zh",
+    timezone: "Asia/Shanghai",
+    revision: 1,
+  },
+) {
+  let current = { ...initial };
+  const get = vi.fn(async () => ({ ...current }));
+  const update = vi.fn(
+    async (
+      _resolvedUserId: string,
+      input: MutableUserPreferences & { expectedRevision: number },
+    ) => {
+      if (input.expectedRevision !== current.revision) {
+        throw Object.assign(new Error("revision_conflict"), {
+          status: 409,
+          code: "revision_conflict",
+        });
+      }
+      current = {
+        language: input.language,
+        timezone: input.timezone,
+        revision: current.revision + 1,
+      };
+      return { ...current };
+    },
+  );
+  return {
+    resources: {
+      userPreferences: { get, update },
+    } as unknown as AdminCompatResources,
+    get,
+    update,
+    read: () => ({ ...current }),
+  };
+}
+
+async function coreRequest(input: {
+  router: AdminCompatRouter;
+  method?: string;
+  path: string;
+  body?: unknown;
+  resources?: AdminCompatResources;
+  security?: Partial<AdminSecurityOptions>;
+  authenticated?: boolean;
+}) {
+  const method = input.method ?? "GET";
+  const security = options(input.security);
+  const headers = new Headers({ accept: "application/json" });
+  if (input.authenticated !== false) {
+    const sessionToken = await createSessionToken(
+      userId,
+      1,
+      appSecret,
+      now,
+    );
+    headers.set(
+      "cookie",
+      `${sessionCookieName}=${sessionToken}`,
+    );
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+      headers.set("origin", "https://mate.example");
+      headers.set(
+        "x-csrf-token",
+        createCsrfToken({
+          userId,
+          sessionToken,
+          secret: deriveCsrfSecret(appSecret),
+          now,
+        }),
+      );
+    }
+  }
+  if (input.body !== undefined) {
+    headers.set("content-type", "application/json");
+  }
+  const request = new Request(
+    `https://mate.example/api/admin/compat${input.path}`,
+    {
+      method,
+      headers,
+      body:
+        input.body === undefined
+          ? undefined
+          : JSON.stringify(input.body),
+    },
+  );
+  const resources =
+    input.resources ?? preferenceResources().resources;
+  return input.router.dispatch(
+    request,
+    routerRuntime(security, {
+      withUserDataLease: async (_resolvedUserId, work) =>
+        work(resources, request.signal),
+    }),
+  );
+}
+
+describe("admin compatibility core contracts", () => {
+  it("keeps auth status public but makes verify use the shared DigitalMate session", async () => {
+    const createAuthStatusResponse = vi.fn(async (request: Request) =>
+      Response.json({
+        enabled: true,
+        authenticated: request.headers.has("cookie"),
+        csrf_token: request.headers.has("cookie") ? "shared-csrf" : "",
+        csrf_expires_at: request.headers.has("cookie")
+          ? 1_800_000_000
+          : null,
+      }),
+    );
+    const router = createCoreAdminCompatRouter(
+      coreDependencies({ createAuthStatusResponse }),
+    );
+
+    const status = await coreRequest({
+      router,
+      path: "/auth/status",
+      authenticated: false,
+    });
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toMatchObject({
+      authenticated: false,
+      csrf_token: "",
+    });
+
+    const unauthenticatedVerify = await coreRequest({
+      router,
+      path: "/auth/verify",
+      authenticated: false,
+    });
+    expect(unauthenticatedVerify.status).toBe(401);
+
+    const authenticatedVerify = await coreRequest({
+      router,
+      path: "/auth/verify",
+    });
+    expect(authenticatedVerify.status).toBe(200);
+    await expect(authenticatedVerify.json()).resolves.toMatchObject({
+      authenticated: true,
+      csrf_token: "shared-csrf",
+    });
+
+    const plaintextPasswordAttempt = await coreRequest({
+      router,
+      method: "POST",
+      path: "/auth/verify",
+      body: { password: "must-not-be-processed" },
+    });
+    expect(plaintextPasswordAttempt.status).toBe(405);
+    expect(JSON.stringify(await plaintextPasswordAttempt.json())).not
+      .toContain("must-not-be-processed");
+  });
+
+  it("returns DigitalMate and pinned upstream identity from root and version aliases", async () => {
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    for (const path of ["/root", "/version"]) {
+      const response = await coreRequest({ router, path });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      await expect(response.json()).resolves.toEqual({
+        name: "DigitalMate",
+        version: "0.1.0",
+        upstream: {
+          tag: "v2.0.0.post3",
+          commit:
+            "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
+        },
+        compat_api_revision: "2026-07-24.1",
+      });
+    }
+  });
+
+  it.each([
+    "/language",
+    "/settings/language",
+  ])("reads and writes language through alias %s", async (path) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+
+    const get = await coreRequest({
+      router,
+      path,
+      resources: preferences.resources,
+    });
+    await expect(get.json()).resolves.toEqual({
+      language: "zh",
+      revision: 1,
+    });
+
+    const put = await coreRequest({
+      router,
+      method: "PUT",
+      path,
+      body: { language: "pt-BR", revision: 1 },
+      resources: preferences.resources,
+    });
+    expect(put.status).toBe(200);
+    await expect(put.json()).resolves.toEqual({
+      language: "pt-BR",
+      revision: 2,
+    });
+    expect(preferences.read()).toMatchObject({
+      language: "pt-BR",
+      timezone: "Asia/Shanghai",
+    });
+  });
+
+  it.each([
+    "en",
+    "zh",
+    "ja",
+    "ru",
+    "pt-BR",
+    "id",
+    "vi",
+  ])("accepts the Console-supported language %s", async (language) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "PUT",
+      path: "/language",
+      body: { language, revision: 1 },
+      resources: preferences.resources,
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      language,
+      revision: 2,
+    });
+  });
+
+  it.each([
+    {
+      body: { language: "xx", revision: 1 },
+      label: "unsupported language",
+    },
+    {
+      body: { language: "zh", revision: 1, secret: "hidden" },
+      label: "extra key",
+    },
+    {
+      body: { language: "zh", revision: 0 },
+      label: "invalid revision",
+    },
+  ])("strictly rejects invalid language input: $label", async ({ body }) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "PUT",
+      path: "/language",
+      body,
+      resources: preferences.resources,
+    });
+    expect(response.status).toBe(400);
+    const serialized = JSON.stringify(await response.json());
+    expect(serialized).toContain('"code":"invalid_request"');
+    expect(serialized).not.toContain("hidden");
+    expect(preferences.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "/user-timezone",
+    "/config/user-timezone",
+  ])("reads and writes an IANA timezone through alias %s", async (path) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const get = await coreRequest({
+      router,
+      path,
+      resources: preferences.resources,
+    });
+    await expect(get.json()).resolves.toEqual({
+      timezone: "Asia/Shanghai",
+      revision: 1,
+    });
+
+    const put = await coreRequest({
+      router,
+      method: "PUT",
+      path,
+      body: { timezone: "America/New_York", revision: 1 },
+      resources: preferences.resources,
+    });
+    expect(put.status).toBe(200);
+    await expect(put.json()).resolves.toEqual({
+      timezone: "America/New_York",
+      revision: 2,
+    });
+  });
+
+  it.each([
+    "",
+    "Shanghai",
+    "Mars/Olympus_Mons",
+    "../Asia/Shanghai",
+    "Asia/Shanghai\u0000",
+  ])("rejects invalid IANA timezone %j", async (timezone) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "PUT",
+      path: "/user-timezone",
+      body: { timezone, revision: 1 },
+      resources: preferences.resources,
+    });
+    expect(response.status).toBe(400);
+    expect(preferences.update).not.toHaveBeenCalled();
+  });
+
+  it("uses one atomic user-settings revision so concurrent writes cannot silently overwrite", async () => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+
+    const [language, timezone] = await Promise.all([
+      coreRequest({
+        router,
+        method: "PUT",
+        path: "/language",
+        body: { language: "en", revision: 1 },
+        resources: preferences.resources,
+      }),
+      coreRequest({
+        router,
+        method: "PUT",
+        path: "/user-timezone",
+        body: { timezone: "Europe/Paris", revision: 1 },
+        resources: preferences.resources,
+      }),
+    ]);
+    expect([language.status, timezone.status].sort()).toEqual([
+      200,
+      409,
+    ]);
+    const conflict =
+      language.status === 409 ? language : timezone;
+    await expect(conflict.json()).resolves.toEqual({
+      error: {
+        code: "config_revision_conflict",
+        message: "revision_conflict",
+      },
+    });
+    expect(preferences.read().revision).toBe(2);
+  });
+
+  it("accepts the upstream no-revision body while still deriving an optimistic revision", async () => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "PUT",
+      path: "/settings/language",
+      body: { language: "en" },
+      resources: preferences.resources,
+    });
+    expect(response.status).toBe(200);
+    expect(preferences.update).toHaveBeenCalledWith(
+      userId,
+      expect.objectContaining({ expectedRevision: 1 }),
+    );
+  });
+
+  it("returns a stable 400 for malformed JSON instead of an internal error", async () => {
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const sessionToken = await createSessionToken(
+      userId,
+      1,
+      appSecret,
+      now,
+    );
+    const request = new Request(
+      "https://mate.example/api/admin/compat/language",
+      {
+        method: "PUT",
+        headers: {
+          cookie: `${sessionCookieName}=${sessionToken}`,
+          origin: "https://mate.example",
+          "content-type": "application/json",
+          "x-csrf-token": createCsrfToken({
+            userId,
+            sessionToken,
+            secret: deriveCsrfSecret(appSecret),
+            now,
+          }),
+        },
+        body: '{"language":',
+      },
+    );
+    const response = await router.dispatch(
+      request,
+      routerRuntime(options(), {
+        withUserDataLease: async (_resolvedUserId, work) =>
+          work(
+            preferenceResources().resources,
+            request.signal,
+          ),
+      }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: "invalid_json" },
+    });
+  });
+
+  it.each([
+    ["/capabilities/p2-sandbox", "p2_sandbox"],
+    ["/capabilities/multi-agent", "multi_agent"],
+  ])("returns stable 501 for frozen capability %s", async (
+    path,
+    capability,
+  ) => {
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "POST",
+      path,
+    });
+    expect(response.status).toBe(501);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "capability_disabled",
+        message: "capability_disabled",
+        details: { capability },
+      },
+    });
+  });
+
+  it("keeps auth endpoints outside the user-data lease and leases every preference/root read", async () => {
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const fixture = await authenticatedFixture({
+      requestUrl:
+        "https://mate.example/api/admin/compat/auth/verify",
+    });
+    const withUserDataLeaseSpy = vi.fn();
+    const withUserDataLease: AdminCompatRuntime["withUserDataLease"] =
+      async <T>(
+        resolvedUserId: string,
+        work: (
+          resources: AdminCompatResources,
+          signal: AbortSignal,
+        ) => Promise<T>,
+      ) => {
+        withUserDataLeaseSpy(resolvedUserId);
+        return work(
+          preferenceResources().resources,
+          fixture.request("GET").signal,
+        );
+      };
+    const runtime = routerRuntime(fixture.security, {
+      withUserDataLease,
+    });
+
+    expect(
+      (
+        await router.dispatch(
+          fixture.request("GET"),
+          runtime,
+        )
+      ).status,
+    ).toBe(200);
+    expect(withUserDataLeaseSpy).not.toHaveBeenCalled();
+
+    for (const path of ["/root", "/language", "/user-timezone"]) {
+      const request = new Request(
+        `https://mate.example/api/admin/compat${path}`,
+        {
+          headers: {
+            cookie:
+              fixture.request("GET").headers.get("cookie") ?? "",
+          },
+        },
+      );
+      expect((await router.dispatch(request, runtime)).status).toBe(
+        200,
+      );
+    }
+    expect(withUserDataLeaseSpy).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("user-level Console preference persistence", () => {
+  it("declares language, timezone and one optimistic revision on user settings", async () => {
+    const schema = await readFile(
+      `${process.cwd()}/src/server/db/schema.sql`,
+      "utf8",
+    );
+    expect(schema).toMatch(
+      /CREATE TABLE IF NOT EXISTS settings[\s\S]*language text NOT NULL DEFAULT 'zh'/,
+    );
+    expect(schema).toMatch(
+      /CREATE TABLE IF NOT EXISTS settings[\s\S]*timezone text NOT NULL DEFAULT 'Asia\/Shanghai'/,
+    );
+    expect(schema).toMatch(
+      /CREATE TABLE IF NOT EXISTS settings[\s\S]*revision integer NOT NULL DEFAULT 1/,
+    );
+    expect(schema).toMatch(
+      /ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS language/,
+    );
+    expect(schema).toMatch(
+      /ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS timezone/,
+    );
+    expect(schema).toMatch(
+      /ALTER TABLE IF EXISTS settings ADD COLUMN IF NOT EXISTS revision/,
+    );
+    const repositories = await readFile(
+      `${process.cwd()}/src/server/db/repositories.ts`,
+      "utf8",
+    );
+    expect(repositories).toMatch(
+      /INSERT INTO settings \([\s\S]*language, timezone[\s\S]*ON CONFLICT \(user_id\) DO UPDATE[\s\S]*language = EXCLUDED\.language,[\s\S]*timezone = EXCLUDED\.timezone,[\s\S]*revision = settings\.revision \+ 1/,
+    );
+  });
+
+  it("reads preferences by user and atomically increments only the expected revision", async () => {
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text.includes("INSERT INTO settings")) return { rows: [] };
+      if (text.includes("SELECT language")) {
+        return {
+          rows: [
+            {
+              language: "zh",
+              timezone: "Asia/Shanghai",
+              revision: 4,
+            },
+          ],
+        };
+      }
+      return {
+        rows: [
+          {
+            language: "en",
+            timezone: "Europe/Paris",
+            revision: 5,
+          },
+        ],
+      };
+    });
+    const repository = createUserPreferencesRepository({
+      query,
+    } as unknown as Pool);
+
+    await expect(repository.get("user-1")).resolves.toEqual({
+      language: "zh",
+      timezone: "Asia/Shanghai",
+      revision: 4,
+    });
+    await expect(
+      repository.update("user-1", {
+        language: "en",
+        timezone: "Europe/Paris",
+        expectedRevision: 4,
+      }),
+    ).resolves.toEqual({
+      language: "en",
+      timezone: "Europe/Paris",
+      revision: 5,
+    });
+
+    const [sql, params] = query.mock.calls.at(-1) as unknown as [
+      string,
+      unknown[],
+    ];
+    expect(sql).toMatch(
+      /WHERE user_id = \$1[\s\S]*AND revision = \$4[\s\S]*RETURNING language, timezone, revision/,
+    );
+    expect(params).toEqual([
+      "user-1",
+      "en",
+      "Europe/Paris",
+      4,
+    ]);
+  });
+
+  it("turns an expected-revision miss into the stable router conflict", async () => {
+    const query = vi.fn(async (sql: unknown) =>
+      String(sql).includes("INSERT INTO settings")
+        ? { rows: [] }
+        : { rows: [] },
+    );
+    const repository = createUserPreferencesRepository({
+      query,
+    } as unknown as Pool);
+
+    await expect(
+      repository.update("user-1", {
+        language: "en",
+        timezone: "Europe/Paris",
+        expectedRevision: 1,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "revision_conflict",
+    });
+  });
+});
+
+describe("admin compatibility catch-all route", () => {
+  it("exports every Console HTTP method through one node runtime handler", () => {
+    expect(catchAllRuntime).toBe("nodejs");
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_HEAD);
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_OPTIONS);
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_POST);
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_PUT);
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_PATCH);
+    expect(CATCH_ALL_GET).toBe(CATCH_ALL_DELETE);
+  });
+
+  it.each([
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+  ])("forwards %s and awaited catch-all params without changing the request", async (method) => {
+    const dispatcher = vi.fn(async () =>
+      Response.json({ forwarded: true }),
+    );
+    const handler = createAdminCompatRouteHandler(dispatcher);
+    const request = new Request(
+      "https://mate.example/api/admin/compat/agents/default",
+      { method },
+    );
+    const response = await handler(request, {
+      params: Promise.resolve({
+        segments: ["agents", "default"],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(dispatcher).toHaveBeenCalledWith(request, {
+      routeSegments: ["agents", "default"],
+    });
   });
 });
