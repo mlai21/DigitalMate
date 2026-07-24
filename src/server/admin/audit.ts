@@ -1,9 +1,9 @@
 import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
-import type {
-  ChannelSecretsKey,
-  EncryptedSecret,
+import {
+  validateSecretPlaintext,
+  type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
 
 type JsonObject = Record<string, unknown>;
@@ -21,6 +21,8 @@ export type ChannelSecretChange =
 
 export type ChannelConfigConfirmationSource = Readonly<{
   type: "console";
+  // Task 7 must persist requestId as the operation ID used to recover
+  // safely from an ambiguous COMMIT result.
   requestId?: string;
 }>;
 
@@ -41,6 +43,8 @@ export type ChannelConnectionConfigUpdateResult = Readonly<{
 
 type ChannelConnectionRow = {
   id: string;
+  user_id: string;
+  agent_id: string;
   channel_type: string;
   display_name: string;
   enabled: boolean;
@@ -60,7 +64,7 @@ type PreparedSecretChange =
   | Readonly<{
       fieldName: string;
       operation: "set";
-      encrypted: EncryptedSecret;
+      plaintext: string;
     }>
   | Readonly<{
       fieldName: string;
@@ -102,7 +106,7 @@ export function createChannelConnectionAuditService(
     async update(
       input: ChannelConnectionConfigUpdate,
     ): Promise<ChannelConnectionConfigUpdateResult> {
-      const prepared = prepareUpdate(input, secretKey);
+      const prepared = prepareUpdate(input);
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -127,8 +131,9 @@ export function createChannelConnectionAuditService(
         if (updated === null) throw revisionConflict();
         await applySecretChanges(
           client,
-          before.id,
+          before,
           prepared.secretChanges,
+          secretKey,
         );
         const afterConfiguredSecrets = applyConfiguredChanges(
           beforeConfiguredSecrets,
@@ -157,7 +162,8 @@ async function lockConnection(
   input: ChannelConnectionConfigUpdate,
 ): Promise<ChannelConnectionRow | null> {
   const result = await client.query<ChannelConnectionRow>(
-    `SELECT id, channel_type, display_name, enabled, config, revision
+    `SELECT id, user_id, agent_id, channel_type, display_name,
+            enabled, config, revision
      FROM channel_connections
      WHERE id = $1
        AND user_id = $2
@@ -188,7 +194,8 @@ async function updateConnection(
        AND agent_id = $3
        AND revision = $5
        AND deleted_at IS NULL
-     RETURNING id, channel_type, display_name, enabled, config, revision`,
+     RETURNING id, user_id, agent_id, channel_type, display_name,
+               enabled, config, revision`,
     [
       input.connectionId,
       input.scope.userId,
@@ -218,8 +225,9 @@ async function readConfiguredSecretFields(
 
 async function applySecretChanges(
   client: PoolClient,
-  connectionId: string,
+  connection: ChannelConnectionRow,
   changes: readonly PreparedSecretChange[],
+  secretKey: ChannelSecretsKey,
 ): Promise<void> {
   for (const change of changes) {
     if (change.operation === "delete") {
@@ -227,11 +235,17 @@ async function applySecretChanges(
         `DELETE FROM channel_secrets
          WHERE connection_id = $1
            AND field_name = $2`,
-        [connectionId, change.fieldName],
+        [connection.id, change.fieldName],
       );
       continue;
     }
-    const storage = change.encrypted.toStorageRecord();
+    const encrypted = secretKey.encrypt(change.plaintext, {
+      userId: connection.user_id,
+      agentId: connection.agent_id,
+      connectionId: connection.id,
+      fieldName: change.fieldName,
+    });
+    const storage = encrypted.toStorageRecord();
     await client.query(
       `INSERT INTO channel_secrets (
          connection_id, field_name, ciphertext, nonce, auth_tag,
@@ -245,7 +259,7 @@ async function applySecretChanges(
            key_version = EXCLUDED.key_version,
            rotated_at = now()`,
       [
-        connectionId,
+        connection.id,
         change.fieldName,
         storage.ciphertext,
         storage.nonce,
@@ -321,7 +335,6 @@ function buildAuditSummary(
 
 function prepareUpdate(
   input: ChannelConnectionConfigUpdate,
-  secretKey: ChannelSecretsKey,
 ): PreparedUpdate {
   if (
     !Number.isSafeInteger(input.expectedRevision) ||
@@ -372,11 +385,16 @@ function prepareUpdate(
       ) {
         throw new AdminAuditError(400, "invalid_secret_change");
       }
+      try {
+        validateSecretPlaintext(change.value);
+      } catch {
+        throw new AdminAuditError(400, "invalid_secret_change");
+      }
       secretValues.push(change.value);
       return {
         fieldName: change.fieldName,
         operation: "set",
-        encrypted: secretKey.encrypt(change.value),
+        plaintext: change.value,
       };
     },
   );

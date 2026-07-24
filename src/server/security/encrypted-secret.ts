@@ -10,12 +10,26 @@ const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const AUTH_TAG_BYTES = 16;
 const CURRENT_KEY_VERSION = 1;
+const SECRET_AAD_VERSION = 1;
+const SECRET_AAD_DOMAIN = "digitalmate.channel-secret";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SECRET_FIELD_NAME_PATTERN = /^[a-z][a-z0-9_]{0,127}$/;
 
 export type SecretEncryptionErrorCode =
   | "invalid_secret_key"
   | "invalid_secret_encoding"
+  | "invalid_secret_context"
+  | "invalid_secret_plaintext"
   | "secret_key_version_unsupported"
   | "secret_authentication_failed";
+
+export type SecretEncryptionContext = Readonly<{
+  userId: string;
+  agentId: string;
+  connectionId: string;
+  fieldName: string;
+}>;
 
 export type EncryptedSecretStorageRecord = Readonly<{
   ciphertext: Buffer;
@@ -134,15 +148,22 @@ export class ChannelSecretsKey {
     return new ChannelSecretsKey(decodeKey(encoded));
   }
 
-  encrypt(plaintext: string): EncryptedSecret {
+  encrypt(
+    plaintext: string,
+    context: SecretEncryptionContext,
+  ): EncryptedSecret {
     return encryptSecret(plaintext, {
       key: this.#material,
       keyVersion: this.keyVersion,
+      context,
     });
   }
 
-  decrypt(encrypted: EncryptedSecret): string {
-    return decryptSecret(encrypted, this.#material);
+  decrypt(
+    encrypted: EncryptedSecret,
+    context: SecretEncryptionContext,
+  ): string {
+    return decryptSecret(encrypted, this.#material, context);
   }
 
   toJSON(): Readonly<{
@@ -191,6 +212,7 @@ export function encryptSecret(
   input: {
     key: Buffer;
     keyVersion: number;
+    context: SecretEncryptionContext;
   },
 ): EncryptedSecret {
   const key = validateRawKey(input.key);
@@ -199,10 +221,13 @@ export function encryptSecret(
       "secret_key_version_unsupported",
     );
   }
+  validateSecretPlaintext(plaintext);
+  const aad = encodeSecretAad(input.context);
   const nonce = randomBytes(NONCE_BYTES);
   const cipher = createCipheriv(ALGORITHM, key, nonce, {
     authTagLength: AUTH_TAG_BYTES,
   });
+  cipher.setAAD(aad);
   const ciphertext = Buffer.concat([
     cipher.update(plaintext, "utf8"),
     cipher.final(),
@@ -218,6 +243,7 @@ export function encryptSecret(
 export function decryptSecret(
   encrypted: EncryptedSecret,
   rawKey: Buffer,
+  context: SecretEncryptionContext,
 ): string {
   const key = validateRawKey(rawKey);
   if (encrypted.keyVersion !== CURRENT_KEY_VERSION) {
@@ -225,6 +251,7 @@ export function decryptSecret(
       "secret_key_version_unsupported",
     );
   }
+  const aad = encodeSecretAad(context);
   const storage = encrypted.toStorageRecord();
   try {
     const decipher = createDecipheriv(
@@ -233,6 +260,7 @@ export function decryptSecret(
       storage.nonce,
       { authTagLength: AUTH_TAG_BYTES },
     );
+    decipher.setAAD(aad);
     decipher.setAuthTag(storage.authTag);
     return Buffer.concat([
       decipher.update(storage.ciphertext),
@@ -254,6 +282,26 @@ export function encryptedSecretFromStorage(record: {
   return EncryptedSecret.fromStorage(record);
 }
 
+export function validateSecretPlaintext(plaintext: string): void {
+  for (let index = 0; index < plaintext.length; index += 1) {
+    const codeUnit = plaintext.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= plaintext.length) {
+        throw new SecretEncryptionError("invalid_secret_plaintext");
+      }
+      const nextCodeUnit = plaintext.charCodeAt(index + 1);
+      if (nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) {
+        throw new SecretEncryptionError("invalid_secret_plaintext");
+      }
+      index += 1;
+      continue;
+    }
+    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new SecretEncryptionError("invalid_secret_plaintext");
+    }
+  }
+}
+
 function validateRawKey(key: Buffer): Buffer {
   if (!Buffer.isBuffer(key) || key.length !== KEY_BYTES) {
     throw new SecretEncryptionError("invalid_secret_key");
@@ -267,6 +315,39 @@ function decodeKey(encoded: string): Buffer {
     throw new SecretEncryptionError("invalid_secret_key");
   }
   return decoded;
+}
+
+function encodeSecretAad(context: SecretEncryptionContext): Buffer {
+  const values = [
+    SECRET_AAD_DOMAIN,
+    String(SECRET_AAD_VERSION),
+    validateUuid(context.userId),
+    validateUuid(context.agentId),
+    validateUuid(context.connectionId),
+    validateFieldName(context.fieldName),
+  ];
+  const encoded = values.map((value) => Buffer.from(value, "utf8"));
+  const chunks: Buffer[] = [];
+  for (const value of encoded) {
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(value.length);
+    chunks.push(length, value);
+  }
+  return Buffer.concat(chunks);
+}
+
+function validateUuid(value: string): string {
+  if (!UUID_PATTERN.test(value)) {
+    throw new SecretEncryptionError("invalid_secret_context");
+  }
+  return value.toLowerCase();
+}
+
+function validateFieldName(value: string): string {
+  if (!SECRET_FIELD_NAME_PATTERN.test(value)) {
+    throw new SecretEncryptionError("invalid_secret_context");
+  }
+  return value;
 }
 
 function decodeStorageValue(value: Buffer | string): Buffer {

@@ -268,6 +268,12 @@ describe("channel config revision, secret and audit transaction", () => {
         authTag: stored.rows[0].auth_tag,
         keyVersion: stored.rows[0].key_version,
       }),
+      {
+        userId: USER_A,
+        agentId: AGENT_A,
+        connectionId: CONNECTION_A,
+        fieldName: "bot_token",
+      },
     );
     expect([TEST_SECRET, OTHER_SECRET]).toContain(decrypted);
     expect(connection.rows[0].config.endpoint).toBe(

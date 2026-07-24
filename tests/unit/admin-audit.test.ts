@@ -59,6 +59,29 @@ describe("channel audit public config validation", () => {
     ).rejects.toThrow("validation_passed");
     expect(connect).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["\ud800", "\udc00", "\ud800secret"])(
+    "rejects malformed UTF-16 secret changes before connecting",
+    async (secret) => {
+      if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+      const connect = vi.fn(() => {
+        throw new Error("pool_must_not_be_reached");
+      });
+      const service = createChannelConnectionAuditService(
+        { connect } as unknown as Pool,
+        KEY_STATE.key,
+      );
+
+      await expect(
+        service.update(updateInput(secret, { endpoint: "safe" })),
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_secret_change",
+        message: "invalid_secret_change",
+      });
+      expect(connect).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function updateInput(
