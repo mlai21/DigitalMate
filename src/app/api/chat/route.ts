@@ -325,7 +325,11 @@ async function handleLeasedChatRequest(
           foreground.signal.throwIfAborted();
           releaseUserConnection = userConnectionDisconnector.registerUserConnection(user.id);
           admissionStage = "turn_lock";
-          releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(scope, clientTurnId);
+          releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(
+            scope,
+            clientTurnId,
+            foreground.signal,
+          );
           admissionStage = "execution";
           foreground.signal.throwIfAborted();
 

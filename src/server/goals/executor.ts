@@ -27,7 +27,13 @@ export type ExecuteGoalStepInput = {
   llm: LlmClient;
   model: string;
   search: { run(query: string, signal?: AbortSignal): Promise<{ summary: string }> };
-  memories: { findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]> };
+  memories: {
+    findRelevant(
+      scope: AgentScope,
+      query: string,
+      signal?: AbortSignal,
+    ): Promise<RankableMemory[]>;
+  };
   toolLogs: { create(input: ToolLogInput): Promise<unknown> | unknown };
   signal?: AbortSignal;
   now?: Date;
@@ -218,6 +224,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
       const memories = await input.memories.findRelevant(
         { userId: input.goal.userId, agentId: input.goal.agentId },
         query,
+        input.signal,
       );
       input.signal?.throwIfAborted();
       const summary =

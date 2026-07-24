@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POST as postCsvTask } from "@/app/api/tasks/csv/route";
 import { buildCsvSummaryReport } from "@/server/tasks/csv";
 import { parsePresentationOutline } from "@/server/tasks/presentation";
@@ -8,8 +8,10 @@ const routeMocks = vi.hoisted(() => ({
   taskArtifactsCreate: vi.fn<(...args: unknown[]) => Promise<string>>(async () => "artifact-id"),
   releaseLease: vi.fn(async () => undefined),
   taskRunsComplete: vi.fn(async () => undefined),
+  taskRunsFail: vi.fn(async () => undefined),
   taskRunsCreate: vi.fn(async () => "task-1"),
   skillsCreate: vi.fn(async () => undefined),
+  discardPublishedTaskArtifacts: vi.fn(async () => undefined),
 }));
 
 vi.mock("@/server/auth/current-user", () => ({
@@ -32,7 +34,7 @@ vi.mock("@/server/db/repositories", () => ({
     taskRuns: {
       create: routeMocks.taskRunsCreate,
       completeWithArtifacts: routeMocks.taskRunsComplete,
-      fail: vi.fn(async () => undefined),
+      fail: routeMocks.taskRunsFail,
     },
     taskArtifacts: {
       create: routeMocks.taskArtifactsCreate,
@@ -69,7 +71,7 @@ vi.mock("@/server/tasks/artifact-publisher", () => ({
     });
     return { artifactId, ...stored };
   }),
-  discardPublishedTaskArtifacts: vi.fn(async () => undefined),
+  discardPublishedTaskArtifacts: routeMocks.discardPublishedTaskArtifacts,
 }));
 
 describe("buildCsvSummaryReport", () => {
@@ -84,8 +86,11 @@ describe("buildCsvSummaryReport", () => {
 });
 
 describe("csv task route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("stores both the spreadsheet report and generated chart artifacts", async () => {
-    routeMocks.taskArtifactsCreate.mockClear();
     const form = new FormData();
     form.set("file", new File(["region,amount\nEast,10\nWest,20\n"], "sales.csv", { type: "text/csv" }));
 
@@ -110,6 +115,29 @@ describe("csv task route", () => {
         mimeType: "image/svg+xml; charset=utf-8",
       }),
     );
+  });
+
+  it("preserves all published files and returns a stable error when completion is ambiguous", async () => {
+    routeMocks.taskRunsComplete.mockRejectedValueOnce(Object.assign(
+      new Error("connection_lost_after_commit"),
+      { code: "task_completion_ambiguous" },
+    ));
+    const form = new FormData();
+    form.set("file", new File(["region,amount\nEast,10\nWest,20\n"], "sales.csv", { type: "text/csv" }));
+
+    const response = await postCsvTask({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/csv",
+    } as Request);
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: "task_completion_ambiguous",
+    });
+    expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledTimes(2);
+    expect(routeMocks.discardPublishedTaskArtifacts).not.toHaveBeenCalled();
+    expect(routeMocks.taskRunsFail).not.toHaveBeenCalled();
+    expect(routeMocks.releaseLease).toHaveBeenCalledTimes(1);
   });
 });
 

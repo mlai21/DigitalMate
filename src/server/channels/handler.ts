@@ -23,7 +23,11 @@ type ChannelRepositories = {
     createDecision(scope: AgentScope, input: unknown): Promise<unknown> | unknown;
   };
   memories: {
-    findRelevant(scope: AgentScope, query: string): Promise<Array<{ id: string; content: string; createdAt: Date }>>;
+    findRelevant(
+      scope: AgentScope,
+      query: string,
+      signal?: AbortSignal,
+    ): Promise<Array<{ id: string; content: string; createdAt: Date }>>;
   };
   proactiveTasks: {
     create(scope: AgentScope, input: {
@@ -121,7 +125,7 @@ export async function handleChannelMessage(input: {
     const recentWindowStart = new Date(now.getTime() - 2 * 60_000);
     const [settings, memories, recentBotMessageAt, counts, recentMessageCount] = await Promise.all([
       input.repositories.settings.get(input.scope),
-      input.repositories.memories.findRelevant(input.scope, input.message.text),
+      input.repositories.memories.findRelevant(input.scope, input.message.text, input.signal),
       input.repositories.channels.recentBotMessageAt(input.scope, input.message.channel, input.message.externalConversationId),
       input.repositories.channels.sentCounts(input.scope, input.message.channel, input.message.externalConversationId, now),
       input.repositories.channels.recentMessageCount(input.scope, input.message.channel, input.message.externalConversationId, recentWindowStart),

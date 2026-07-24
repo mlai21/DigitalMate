@@ -15,6 +15,10 @@ import type { SkillDraft } from "@/server/evolution/skills";
 import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import type { LlmUsageLogInput } from "@/server/llm/usage";
 import type { ToolRegistrationDraft } from "@/server/tasks/tools";
+import {
+  TaskCompletionAmbiguousError,
+  TaskCompletionNotCommittedError,
+} from "@/server/tasks/completion-errors";
 import { defaultSettings } from "@/server/settings/defaults";
 import { DEFAULT_GOAL_BUDGET_USED, type GoalBudgetUsed, type GoalContract } from "@/server/goals/contract";
 import type { GoalStatus } from "@/server/goals/state-machine";
@@ -316,6 +320,69 @@ export function createRepositories(
   const userDataLockPool = providedUserDataLockPool
     ?? (providedPool ? turnLockPool : getUserDataLockPool());
   const agents = createAgentRepository(pool);
+
+  async function verifyTaskCompletionAfterCommitError(
+    verificationPool: Pool,
+    scope: AgentScope,
+    taskRunId: string,
+    artifactIds: string[],
+  ): Promise<"committed" | "not_committed" | "ambiguous"> {
+    let verificationClient: PoolClient | undefined;
+    let verificationFailed = false;
+    try {
+      verificationClient = await verificationPool.connect();
+      const task = await verificationClient.query<{ status: string }>(
+        `SELECT status
+         FROM task_runs
+         WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
+        [scope.userId, scope.agentId, taskRunId],
+      );
+      if (task.rows.length !== 1) return "ambiguous";
+
+      let artifactRows: Array<{ id: string; status: string }> = [];
+      if (artifactIds.length > 0) {
+        const artifacts = await verificationClient.query<{ id: string; status: string }>(
+          `SELECT id, status
+           FROM task_artifacts
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND task_run_id = $3
+             AND id = ANY($4::uuid[])`,
+          [scope.userId, scope.agentId, taskRunId, artifactIds],
+        );
+        artifactRows = artifacts.rows;
+      }
+
+      const exactArtifactIds = new Set(artifactRows.map((artifact) => artifact.id));
+      if (
+        artifactRows.length !== artifactIds.length
+        || artifactIds.some((artifactId) => !exactArtifactIds.has(artifactId))
+      ) {
+        return "ambiguous";
+      }
+
+      const allArtifactsReady = artifactRows.every((artifact) => artifact.status === "ready");
+      if (task.rows[0].status === "succeeded" && allArtifactsReady) {
+        return "committed";
+      }
+
+      const allArtifactsPending = artifactRows.every((artifact) => artifact.status === "pending");
+      if (task.rows[0].status === "running" && allArtifactsPending) {
+        return "not_committed";
+      }
+
+      return "ambiguous";
+    } catch {
+      verificationFailed = true;
+      return "ambiguous";
+    } finally {
+      if (verificationFailed) {
+        verificationClient?.release(true);
+      } else {
+        verificationClient?.release();
+      }
+    }
+  }
 
   async function ensureUserDataEpoch(userId: string): Promise<void> {
     await pool.query(
@@ -888,36 +955,43 @@ export function createRepositories(
       async acquireClientTurnExecutionLock(
         scope: AgentScope,
         clientTurnId: string,
+        signal?: AbortSignal,
       ): Promise<() => Promise<void>> {
         const lockKey = `${scope.userId}:${scope.agentId}:${clientTurnId}`;
-        const client = await turnLockPool.connect();
+        const client = await connectPoolClient(turnLockPool, signal);
+        let locked = false;
+        let destroyed = false;
+        const abortPendingQuery = () => {
+          if (destroyed) return;
+          destroyed = true;
+          client.release(true);
+        };
+        signal?.addEventListener("abort", abortPendingQuery, { once: true });
         try {
+          signal?.throwIfAborted();
           await client.query(
             "SELECT pg_advisory_lock(hashtextextended($1, 0))",
             [lockKey],
           );
+          signal?.throwIfAborted();
+          locked = true;
         } catch (error) {
-          client.release(true);
+          if (locked && !destroyed) {
+            await releaseTurnExecutionLock(client, lockKey).catch(() => undefined);
+          } else if (!destroyed) {
+            client.release(true);
+          }
+          signal?.throwIfAborted();
           throw error;
+        } finally {
+          signal?.removeEventListener("abort", abortPendingQuery);
         }
 
         let released = false;
         return async () => {
           if (released) return;
           released = true;
-          try {
-            const result = await client.query<{ unlocked: boolean }>(
-              "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
-              [lockKey],
-            );
-            if (result.rows[0]?.unlocked !== true) {
-              throw new Error("client_turn_lock_not_held");
-            }
-            client.release();
-          } catch (error) {
-            client.release(true);
-            throw error;
-          }
+          await releaseTurnExecutionLock(client, lockKey);
         };
       },
       async claimClientTurnExecution(scope: AgentScope, clientTurnId: string): Promise<boolean> {
@@ -1190,8 +1264,14 @@ export function createRepositories(
       },
     },
     memories: {
-      async findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]> {
-        const queryEmbedding = formatPgVector(await embedText(query));
+      async findRelevant(
+        scope: AgentScope,
+        query: string,
+        signal?: AbortSignal,
+      ): Promise<RankableMemory[]> {
+        signal?.throwIfAborted();
+        const queryEmbedding = formatPgVector(await embedText(query, undefined, signal));
+        signal?.throwIfAborted();
         const semanticResult = await pool.query(
           `SELECT id, content, created_at, 1 - (embedding <=> $3::vector) AS similarity
            FROM memory_entries
@@ -1200,6 +1280,7 @@ export function createRepositories(
            LIMIT 12`,
           [scope.userId, scope.agentId, queryEmbedding],
         );
+        signal?.throwIfAborted();
         const lexicalResult = await pool.query(
           `SELECT id, content, created_at
            FROM memory_entries
@@ -1207,6 +1288,7 @@ export function createRepositories(
            ORDER BY created_at DESC LIMIT 80`,
           [scope.userId, scope.agentId],
         );
+        signal?.throwIfAborted();
         return mergeMemoryCandidates(
           query,
           lexicalResult.rows.map((row) => ({ id: row.id, content: row.content, createdAt: row.created_at })),
@@ -1218,12 +1300,19 @@ export function createRepositories(
           })),
         );
       },
-      async createMany(scope: AgentScope, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void> {
+      async createMany(
+        scope: AgentScope,
+        sourceMessageId: string | null,
+        memories: ExtractedMemory[],
+        signal?: AbortSignal,
+      ): Promise<void> {
         for (const entry of memories) {
+          signal?.throwIfAborted();
           const safeContent = redactSensitiveMemory(entry.content);
           if (!safeContent) continue;
           const memory = { ...entry, content: safeContent };
-          const embedding = formatPgVector(await embedText(memory.content));
+          const embedding = formatPgVector(await embedText(memory.content, undefined, signal));
+          signal?.throwIfAborted();
           const expiresAt = memoryExpiresAt(memory);
           await pool.query(
             `INSERT INTO memory_entries (
@@ -1243,6 +1332,7 @@ export function createRepositories(
              )`,
             [scope.userId, scope.agentId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
           );
+          signal?.throwIfAborted();
         }
       },
       async listActiveByKind(scope: AgentScope, kind: MemoryKind): Promise<DbMemoryEntry[]> {
@@ -1290,16 +1380,20 @@ export function createRepositories(
         scope: AgentScope,
         memoryId: string,
         input: { kind: MemoryKind; content: string; confidence: number },
+        signal?: AbortSignal,
       ): Promise<void> {
+        signal?.throwIfAborted();
         const content = redactSensitiveMemory(input.content);
         if (!content) return;
-        const embedding = formatPgVector(await embedText(content));
+        const embedding = formatPgVector(await embedText(content, undefined, signal));
+        signal?.throwIfAborted();
         await pool.query(
           `UPDATE memory_entries
            SET kind = $4, content = $5, confidence = $6, embedding = $7::vector
            WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND deleted_at IS NULL`,
           [scope.userId, scope.agentId, memoryId, input.kind, content, input.confidence, embedding],
         );
+        signal?.throwIfAborted();
       },
       async delete(scope: AgentScope, memoryId: string): Promise<void> {
         await pool.query(
@@ -2157,6 +2251,8 @@ export function createRepositories(
         }
 
         const client = await pool.connect();
+        let commitAttempted = false;
+        let clientReleased = false;
         try {
           await client.query("BEGIN");
           if (uniqueArtifactIds.length > 0) {
@@ -2184,12 +2280,28 @@ export function createRepositories(
             [scope.userId, scope.agentId, taskRunId, outputSummary],
           );
           if (!task.rows[0]) throw new Error("task_completion_transition_failed");
+          commitAttempted = true;
           await client.query("COMMIT");
         } catch (error) {
+          if (commitAttempted) {
+            client.release(true);
+            clientReleased = true;
+            const outcome = await verifyTaskCompletionAfterCommitError(
+              pool,
+              scope,
+              taskRunId,
+              uniqueArtifactIds,
+            );
+            if (outcome === "committed") return;
+            if (outcome === "not_committed") {
+              throw new TaskCompletionNotCommittedError();
+            }
+            throw new TaskCompletionAmbiguousError();
+          }
           await client.query("ROLLBACK").catch(() => undefined);
           throw error;
         } finally {
-          client.release();
+          if (!clientReleased) client.release();
         }
       },
       async fail(scope: AgentScope, taskRunId: string, error: string): Promise<void> {
@@ -2846,6 +2958,25 @@ async function releaseAdvisoryLease(
     const result = await client.query<{ unlocked: boolean }>(sql, [lockKey]);
     if (result.rows[0]?.unlocked !== true) {
       throw new Error("user_data_lease_not_held");
+    }
+    client.release();
+  } catch (error) {
+    client.release(true);
+    throw error;
+  }
+}
+
+async function releaseTurnExecutionLock(
+  client: PoolClient,
+  lockKey: string,
+): Promise<void> {
+  try {
+    const result = await client.query<{ unlocked: boolean }>(
+      "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
+      [lockKey],
+    );
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error("client_turn_lock_not_held");
     }
     client.release();
   } catch (error) {

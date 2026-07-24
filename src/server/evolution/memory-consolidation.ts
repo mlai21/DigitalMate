@@ -50,7 +50,12 @@ type ConsolidationRepositories = {
   memories: {
     listActiveByKind(scope: AgentScope, kind: MemoryKind): Promise<MemoryEntryForConsolidation[]>;
     softDeleteMany(scope: AgentScope, memoryIds: string[]): Promise<void>;
-    createMany(scope: AgentScope, sourceMessageId: string | null, memories: ExtractedMemory[]): Promise<void>;
+    createMany(
+      scope: AgentScope,
+      sourceMessageId: string | null,
+      memories: ExtractedMemory[],
+      signal?: AbortSignal,
+    ): Promise<void>;
   };
 };
 
@@ -89,6 +94,7 @@ export async function consolidateMemoryKind(input: {
       input.scope,
       null,
       merged.map((memory) => ({ ...memory, kind: input.kind })),
+      input.signal,
     );
     return {
       kind: input.kind,

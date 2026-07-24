@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { strFromU8, unzipSync } from "fflate";
 import { POST as postPresentationTask } from "@/app/api/tasks/presentation/route";
 
@@ -96,9 +96,13 @@ vi.mock("@/server/tasks/artifact-publisher", () => ({
 }));
 
 describe("presentation task route", () => {
-  it("includes uploaded spreadsheet data in the generated pptx artifact", async () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
     routeMocks.storedBuffers.length = 0;
     routeMocks.callOrder.length = 0;
+  });
+
+  it("includes uploaded spreadsheet data in the generated pptx artifact", async () => {
     const form = new FormData();
     form.set("title", "销售汇报");
     form.set("outline", "结论\n- 华东表现最好");
@@ -123,8 +127,6 @@ describe("presentation task route", () => {
   });
 
   it("discards ready artifacts and fails the task when completion fails", async () => {
-    routeMocks.storedBuffers.length = 0;
-    routeMocks.callOrder.length = 0;
     routeMocks.taskRunsComplete.mockImplementationOnce(async () => {
       routeMocks.callOrder.push("complete");
       throw new Error("complete_failed");
@@ -157,6 +159,38 @@ describe("presentation task route", () => {
       "complete",
       "discard",
       "fail",
+      "unlock",
+    ]);
+  });
+
+  it("preserves published artifacts and returns a stable error when completion is ambiguous", async () => {
+    routeMocks.taskRunsComplete.mockImplementationOnce(async () => {
+      routeMocks.callOrder.push("complete");
+      throw Object.assign(new Error("connection_lost_after_commit"), {
+        code: "task_completion_ambiguous",
+      });
+    });
+    const form = new FormData();
+    form.set("title", "歧义提交");
+    form.set("outline", "结论\n- 等待核验");
+
+    const response = await postPresentationTask({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/presentation",
+    } as Request);
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: "task_completion_ambiguous",
+    });
+    expect(routeMocks.discardPublishedArtifacts).not.toHaveBeenCalled();
+    expect(routeMocks.taskRunsFail).not.toHaveBeenCalled();
+    expect(routeMocks.callOrder).toEqual([
+      "lock",
+      "task",
+      "locator",
+      "file",
+      "complete",
       "unlock",
     ]);
   });

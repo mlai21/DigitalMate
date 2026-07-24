@@ -16,6 +16,7 @@ import {
 import { runSandboxTask } from "@/server/tasks/sandbox";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
+import { isTaskCompletionAmbiguousError } from "@/server/tasks/completion-errors";
 
 export const runtime = "nodejs";
 
@@ -79,6 +80,12 @@ async function processSandboxTask(
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
+    if (isTaskCompletionAmbiguousError(error)) {
+      return NextResponse.json(
+        { error: "task_completion_ambiguous" },
+        { status: 500 },
+      );
+    }
     const message = error instanceof Error ? error.message : String(error);
     await discardPublishedTaskArtifacts({
       scope,

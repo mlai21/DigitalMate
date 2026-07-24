@@ -117,4 +117,26 @@ describe("sandbox task route", () => {
     );
     expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
   });
+
+  it("preserves published output and returns a stable error when completion is ambiguous", async () => {
+    mocks.taskRunComplete.mockRejectedValueOnce(Object.assign(
+      new Error("connection_lost_after_commit"),
+      { code: "task_completion_ambiguous" },
+    ));
+    const form = new FormData();
+    form.set("script", "node -e \"console.log('ok')\"");
+
+    const response = await POST({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/sandbox",
+    } as Request);
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: "task_completion_ambiguous",
+    });
+    expect(mocks.discardPublishedTaskArtifacts).not.toHaveBeenCalled();
+    expect(mocks.taskRunFail).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
+  });
 });

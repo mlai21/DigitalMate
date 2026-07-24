@@ -9,7 +9,7 @@ const memoryKinds = new Set<MemoryKind>(["episodic", "profile", "agent_self"]);
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
-  return withFreshUserDataLease(user.id, async (repositories) => {
+  return withFreshUserDataLease(user.id, async (repositories, signal) => {
     const form = await request.formData();
     const memoryId = String(form.get("memoryId") ?? "");
     const kind = String(form.get("kind") ?? "profile") as MemoryKind;
@@ -22,7 +22,7 @@ export async function POST(request: Request) {
         kind,
         content,
         confidence: Number.isFinite(confidence) ? Math.min(Math.max(confidence, 0), 1) : 0.7,
-      });
+      }, signal);
     }
 
     return NextResponse.redirect(redirectUrl(request, "/admin/memories"), { status: 303 });

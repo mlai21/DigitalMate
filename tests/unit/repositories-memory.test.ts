@@ -40,6 +40,39 @@ describe("memory repository", () => {
     expect((params as unknown[])[7]).toBeNull();
   });
 
+  it("aborts a half-open embedding before creating any memory row", async () => {
+    vi.stubEnv("EMBEDDING_BASE_URL", "https://api.example.com/v1");
+    vi.stubEnv("EMBEDDING_MODEL", "text-embedding-3-small");
+    let fetchSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+      fetchSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        if (fetchSignal) {
+          fetchSignal.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
+        } else {
+          reject(new Error("missing_embedding_signal"));
+        }
+      });
+    }));
+    const query = vi.fn(async () => ({ rows: [] }));
+    const repositories = createRepositories({ query } as unknown as Pool);
+    const abortController = new AbortController();
+
+    try {
+      const operation = repositories.memories.createMany(scope, "message-1", [
+        { kind: "profile", content: "用户喜欢周末爬山", confidence: 0.72 },
+      ], abortController.signal);
+      abortController.abort(new Error("memory_embedding_timeout"));
+
+      await expect(operation).rejects.toThrow("memory_embedding_timeout");
+      expect(fetchSignal).toBe(abortController.signal);
+      expect(query).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("fuses vector similarity with lexical relevance for recall", async () => {
     const query = vi
       .fn()

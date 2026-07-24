@@ -1,7 +1,9 @@
+import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { buildMessages, runAgent } from "@/server/agent/run-agent";
+import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { loadLlmAttachments } from "@/server/attachments/context";
-import type { DbMessageAttachment } from "@/server/db/repositories";
+import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
 import type { LlmAttachment, LlmClient, LlmStreamEvent, LlmStreamInput } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount } from "@/server/llm/usage";
 
@@ -38,6 +40,104 @@ const allowSearchGate = {
 };
 
 describe("runAgent", () => {
+  it("aborts a half-open memory embedding at the outer lease timeout before DB or usage writes", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("EMBEDDING_BASE_URL", "https://api.example.com/v1");
+    vi.stubEnv("EMBEDDING_MODEL", "text-embedding-3-small");
+    let fetchSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      fetchSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        if (fetchSignal) {
+          fetchSignal.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
+        } else {
+          setTimeout(() => reject(new Error("missing_embedding_signal")), 20);
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const memoryQuery = vi.fn(async () => ({ rows: [] }));
+    const repositories = createRepositories({ query: memoryQuery } as unknown as Pool);
+    const usageCreate = vi.fn();
+    const llmStream = vi.fn(async function* () {
+      yield { type: "text" as const, text: "不应调用" };
+    });
+    const releaseLease = vi.fn(async () => undefined);
+    const order: string[] = [];
+    releaseLease.mockImplementationOnce(async () => {
+      order.push("lease-released");
+    });
+    const leaseRepositories = {
+      userDataMutations: {
+        beginRequest: vi.fn(async (userId: string) => ({ userId, epoch: "1" })),
+        acquireSharedLease: vi.fn(async (fence: { userId: string; epoch: string }) => ({
+          ...fence,
+          mode: "shared" as const,
+          release: releaseLease,
+        })),
+      },
+    };
+
+    try {
+      const operation = withUserDataLease(
+        leaseRepositories,
+        "user-1",
+        async (_lease, signal) => {
+          try {
+            for await (const chunk of runAgent({
+              userId: "user-1",
+              agentId: "agent-1",
+              conversationId: "conversation-1",
+              message: "需要记忆",
+              history: [],
+              persona: { name: "DigitalMate", style: "温暖、克制" },
+              llm: { stream: llmStream, completeText: vi.fn() },
+              model: "mock-main",
+              repositories: {
+                memories: repositories.memories,
+                toolLogs: { create: vi.fn() },
+                llmUsage: { create: usageCreate },
+              },
+              search: { run: vi.fn() },
+              signal,
+            })) void chunk;
+          } finally {
+            order.push("work-exited");
+          }
+        },
+        { timeoutMs: 10, timeoutCode: "embedding_timeout" },
+      );
+      let settled = false;
+      const settledResult = operation.then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(settled).toBe(true);
+      const error = await settledResult;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("embedding_timeout");
+      expect(fetchSignal?.aborted).toBe(true);
+      expect(memoryQuery).not.toHaveBeenCalled();
+      expect(llmStream).not.toHaveBeenCalled();
+      expect(usageCreate).not.toHaveBeenCalled();
+      expect(order).toEqual(["work-exited", "lease-released"]);
+    } finally {
+      await vi.advanceTimersByTimeAsync(20);
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      vi.useRealTimers();
+    }
+  });
+
   it("passes AbortSignal to the model and stops between streamed events without usage writes", async () => {
     const abortController = new AbortController();
     const seenInputs: LlmStreamInput[] = [];

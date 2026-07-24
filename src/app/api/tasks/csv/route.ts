@@ -13,6 +13,7 @@ import {
 import { buildSpreadsheetSummaryFiles } from "@/server/tasks/csv";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
+import { isTaskCompletionAmbiguousError } from "@/server/tasks/completion-errors";
 
 export const runtime = "nodejs";
 
@@ -67,6 +68,12 @@ async function processSpreadsheetTask(
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
+    if (isTaskCompletionAmbiguousError(error)) {
+      return NextResponse.json(
+        { error: "task_completion_ambiguous" },
+        { status: 500 },
+      );
+    }
     const message = error instanceof Error ? error.message : String(error);
     await discardPublishedTaskArtifacts({
       scope,

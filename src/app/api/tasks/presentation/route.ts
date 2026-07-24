@@ -14,6 +14,7 @@ import { summarizeSpreadsheetFile } from "@/server/tasks/csv";
 import { buildPresentation, parsePresentationOutline } from "@/server/tasks/presentation";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
+import { isTaskCompletionAmbiguousError } from "@/server/tasks/completion-errors";
 
 export const runtime = "nodejs";
 
@@ -75,6 +76,12 @@ async function processPresentationTask(
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
+    if (isTaskCompletionAmbiguousError(error)) {
+      return NextResponse.json(
+        { error: "task_completion_ambiguous" },
+        { status: 500 },
+      );
+    }
     const message = error instanceof Error ? error.message : String(error);
     await discardPublishedTaskArtifacts({
       scope,

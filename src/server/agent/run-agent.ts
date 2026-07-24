@@ -43,7 +43,11 @@ export type RunAgentInput = AgentScope & {
   model: string;
   repositories: {
     memories: {
-      findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]>;
+      findRelevant(
+        scope: AgentScope,
+        query: string,
+        signal?: AbortSignal,
+      ): Promise<RankableMemory[]>;
     };
     conversationSummaries?: {
       latest(scope: AgentScope, conversationId: string): Promise<string | null>;
@@ -177,7 +181,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   // slash panel or /skill-name, load them unconditionally and skip fuzzy
   // auto-matching entirely (PRD P1-11).
   const [memories, explicitSkills, autoSkills, reflectionSuggestions, enabledTools] = await Promise.all([
-    input.repositories.memories.findRelevant(scope, input.message),
+    input.repositories.memories.findRelevant(scope, input.message, input.signal),
     !hasAttachmentContext && explicitSkillIds.length > 0 && input.repositories.skills?.findByIds
       ? input.repositories.skills.findByIds(scope, explicitSkillIds)
       : Promise.resolve([] as SkillContext[]),

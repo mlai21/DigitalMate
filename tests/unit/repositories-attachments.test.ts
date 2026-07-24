@@ -77,6 +77,57 @@ function createTransactionalPool(query: ReturnType<typeof vi.fn>) {
   };
 }
 
+function createCommitAmbiguityPool(input: {
+  taskStatus?: "running" | "succeeded";
+  artifactStatuses?: Array<{ id: string; status: "pending" | "ready" }>;
+  verificationError?: Error;
+}) {
+  const transactionQuery = vi.fn(async (sql: unknown) => {
+    const text = String(sql);
+    if (text === "BEGIN") return { rows: [] };
+    if (text.includes("UPDATE task_artifacts")) {
+      return { rows: [{ id: ARTIFACT_1 }, { id: ARTIFACT_2 }] };
+    }
+    if (text.includes("UPDATE task_runs")) return { rows: [{ id: TASK_RUN_1 }] };
+    if (text === "COMMIT") throw new Error("connection_lost_after_commit");
+    throw new Error(`unexpected transaction query: ${text}`);
+  });
+  const verificationQuery = vi.fn(async (sql: unknown, params?: unknown[]) => {
+    void params;
+    if (input.verificationError) throw input.verificationError;
+    const text = String(sql);
+    if (text.includes("FROM task_runs")) {
+      return { rows: input.taskStatus ? [{ status: input.taskStatus }] : [] };
+    }
+    if (text.includes("FROM task_artifacts")) {
+      return { rows: input.artifactStatuses ?? [] };
+    }
+    throw new Error(`unexpected verification query: ${text}`);
+  });
+  const transactionRelease = vi.fn();
+  const verificationRelease = vi.fn();
+  const transactionClient = {
+    query: transactionQuery,
+    release: transactionRelease,
+  } as unknown as PoolClient;
+  const verificationClient = {
+    query: verificationQuery,
+    release: verificationRelease,
+  } as unknown as PoolClient;
+  const connect = vi
+    .fn<() => Promise<PoolClient>>()
+    .mockResolvedValueOnce(transactionClient)
+    .mockResolvedValueOnce(verificationClient);
+  return {
+    pool: { connect } as unknown as Pool,
+    connect,
+    transactionQuery,
+    transactionRelease,
+    verificationQuery,
+    verificationRelease,
+  };
+}
+
 describe("task completion repository", () => {
   it("commits artifact visibility and task success in one transaction", async () => {
     const query = vi.fn(async (sql: unknown) => {
@@ -171,6 +222,114 @@ describe("task completion repository", () => {
       "ROLLBACK",
     ]);
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("treats a lost COMMIT response as success when a fresh connection verifies the exact task and artifacts", async () => {
+    const setup = createCommitAmbiguityPool({
+      taskStatus: "succeeded",
+      artifactStatuses: [
+        { id: ARTIFACT_2, status: "ready" },
+        { id: ARTIFACT_1, status: "ready" },
+      ],
+    });
+    const repositories = createRepositories(setup.pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(setup.connect).toHaveBeenCalledTimes(2);
+    expect(setup.transactionRelease).toHaveBeenCalledWith(true);
+    expect(setup.verificationRelease).toHaveBeenCalledWith();
+    expect(setup.transactionQuery).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(setup.verificationQuery).toHaveBeenCalledTimes(2);
+    expect(setup.verificationQuery.mock.calls[0]?.[1]).toEqual([
+      TEST_SCOPE.userId,
+      TEST_SCOPE.agentId,
+      TASK_RUN_1,
+    ]);
+    expect(setup.verificationQuery.mock.calls[1]?.[1]).toEqual([
+      TEST_SCOPE.userId,
+      TEST_SCOPE.agentId,
+      TASK_RUN_1,
+      [ARTIFACT_1, ARTIFACT_2],
+    ]);
+  });
+
+  it("reports a cleanable failure when a fresh connection proves COMMIT was not applied", async () => {
+    const setup = createCommitAmbiguityPool({
+      taskStatus: "running",
+      artifactStatuses: [
+        { id: ARTIFACT_1, status: "pending" },
+        { id: ARTIFACT_2, status: "pending" },
+      ],
+    });
+    const repositories = createRepositories(setup.pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).rejects.toMatchObject({
+      code: "task_completion_not_committed",
+    });
+
+    expect(setup.transactionRelease).toHaveBeenCalledWith(true);
+    expect(setup.transactionQuery).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(setup.verificationRelease).toHaveBeenCalledWith();
+  });
+
+  it("reports a stable ambiguous error when COMMIT verification is unavailable", async () => {
+    const setup = createCommitAmbiguityPool({
+      verificationError: new Error("database_unavailable"),
+    });
+    const repositories = createRepositories(setup.pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).rejects.toMatchObject({
+      code: "task_completion_ambiguous",
+    });
+
+    expect(setup.transactionRelease).toHaveBeenCalledWith(true);
+    expect(setup.verificationRelease).toHaveBeenCalledWith(true);
+  });
+
+  it("reports a stable ambiguous error for a mixed or partial post-COMMIT state", async () => {
+    const setup = createCommitAmbiguityPool({
+      taskStatus: "succeeded",
+      artifactStatuses: [
+        { id: ARTIFACT_1, status: "ready" },
+        { id: ARTIFACT_2, status: "pending" },
+      ],
+    });
+    const repositories = createRepositories(setup.pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).rejects.toMatchObject({
+      code: "task_completion_ambiguous",
+    });
+
+    expect(setup.verificationRelease).toHaveBeenCalledWith();
   });
 
   it("creates runs as running and only fails a still-running task", async () => {
@@ -996,6 +1155,135 @@ describe("message attachment PostgreSQL concurrency", () => {
     const releaseSecond = await secondLock;
     expect(secondAcquired).toBe(true);
     await releaseSecond();
+  });
+
+  it("rejects an already-aborted turn-lock acquisition without checking out a client", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const turnLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const repositories = createRepositories(databasePool, turnLockPool);
+    const abortController = new AbortController();
+    abortController.abort(new Error("client_cancelled"));
+
+    try {
+      await expect(repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser("50000000-0000-4000-8000-000000000018"),
+        "52000000-0000-4000-8000-000000000018",
+        abortController.signal,
+      )).rejects.toThrow("client_cancelled");
+      expect(turnLockPool.totalCount).toBe(0);
+      expect(turnLockPool.waitingCount).toBe(0);
+
+      const release = await repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser("50000000-0000-4000-8000-000000000018"),
+        "52000000-0000-4000-8000-000000000019",
+      );
+      await release();
+    } finally {
+      await turnLockPool.end();
+    }
+  });
+
+  it("cancels a turn-lock waiter queued at pool.connect and reuses the pool", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const turnLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const repositories = createRepositories(databasePool, turnLockPool);
+    const ownerTurnId = "52000000-0000-4000-8000-000000000020";
+    let releaseOwner: (() => Promise<void>) | undefined;
+
+    try {
+      releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser("50000000-0000-4000-8000-000000000020"),
+        ownerTurnId,
+      );
+      const abortController = new AbortController();
+      const waiting = repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser("50000000-0000-4000-8000-000000000021"),
+        "52000000-0000-4000-8000-000000000021",
+        abortController.signal,
+      );
+      await vi.waitFor(() => expect(turnLockPool.waitingCount).toBe(1));
+      abortController.abort(new Error("client_cancelled"));
+
+      await expect(Promise.race([
+        waiting.then(() => "acquired", (error: unknown) => error instanceof Error ? error.message : "rejected"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-waiting"), 100)),
+      ])).resolves.toBe("client_cancelled");
+
+      await releaseOwner();
+      releaseOwner = undefined;
+      await vi.waitFor(() => expect(turnLockPool.waitingCount).toBe(0));
+      const releaseFresh = await repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser("50000000-0000-4000-8000-000000000021"),
+        "52000000-0000-4000-8000-000000000022",
+      );
+      await releaseFresh();
+    } finally {
+      await releaseOwner?.();
+      await turnLockPool.end();
+    }
+  });
+
+  it.each([
+    ["client_cancelled"],
+    ["chat_foreground_timeout"],
+  ])("aborts a blocking turn-lock query on %s and lets clear proceed", async (reason) => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const ownerTurnPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const waiterTurnPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const waiterUserDataPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const clearUserDataPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const ownerRepositories = createRepositories(databasePool, ownerTurnPool);
+    const waiterRepositories = createRepositories(databasePool, waiterTurnPool, waiterUserDataPool);
+    const clearRepositories = createRepositories(databasePool, clearUserDataPool, clearUserDataPool);
+    const userId = reason === "client_cancelled"
+      ? "50000000-0000-4000-8000-000000000023"
+      : "50000000-0000-4000-8000-000000000024";
+    const clientTurnId = reason === "client_cancelled"
+      ? "52000000-0000-4000-8000-000000000023"
+      : "52000000-0000-4000-8000-000000000024";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+    let releaseOwner: (() => Promise<void>) | undefined;
+    let sharedLease: Awaited<ReturnType<typeof waiterRepositories.userDataMutations.acquireSharedLease>> | undefined;
+
+    try {
+      releaseOwner = await ownerRepositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser(userId),
+        clientTurnId,
+      );
+      const fence = await waiterRepositories.userDataMutations.beginRequest(userId);
+      sharedLease = await waiterRepositories.userDataMutations.acquireSharedLease(fence);
+      const abortController = new AbortController();
+      const waiting = waiterRepositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser(userId),
+        clientTurnId,
+        abortController.signal,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      abortController.abort(new Error(reason));
+
+      await expect(Promise.race([
+        waiting.then(() => "acquired", (error: unknown) => error instanceof Error ? error.message : "rejected"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-waiting"), 100)),
+      ])).resolves.toBe(reason);
+      await sharedLease.release();
+      sharedLease = undefined;
+
+      const clearLease = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
+      await clearLease.release();
+      await vi.waitFor(() => expect(waiterTurnPool.totalCount).toBe(0));
+      const releaseFresh = await waiterRepositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser(userId),
+        `${clientTurnId.slice(0, -1)}9`,
+      );
+      await releaseFresh();
+    } finally {
+      await sharedLease?.release();
+      await releaseOwner?.();
+      await ownerTurnPool.end();
+      await waiterTurnPool.end();
+      await waiterUserDataPool.end();
+      await clearUserDataPool.end();
+    }
   });
 
   it("allows shared user-data leases concurrently across independent repository processes", async () => {

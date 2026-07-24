@@ -101,7 +101,11 @@ const mocks = vi.hoisted(() => {
     createdAt: Date;
   } | null>>(async () => null);
   const acquireClientTurnExecutionLock = vi.fn<
-    (_scope: typeof agentScope, _clientTurnId: string) => Promise<() => Promise<void>>
+    (
+      _scope: typeof agentScope,
+      _clientTurnId: string,
+      _signal?: AbortSignal,
+    ) => Promise<() => Promise<void>>
   >(async () => vi.fn<() => Promise<void>>(async () => undefined));
   const claimClientTurnExecution = vi.fn(async () => true);
   const proactiveTaskCreate = vi.fn(async () => undefined);
@@ -842,6 +846,76 @@ describe("chat route", () => {
       expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
     });
     expect(abortedAfterCancel).toBe(true);
+  });
+
+  it("aborts a turn-lock waiter on reader cancellation and releases foreground resources", async () => {
+    let lockSignal: AbortSignal | undefined;
+    mocks.acquireClientTurnExecutionLock.mockImplementationOnce(
+      async (_scope, _clientTurnId, signal) => {
+        lockSignal = signal;
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    );
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "等待 turn lock" })),
+    }));
+    await vi.waitFor(() => {
+      expect(mocks.acquireClientTurnExecutionLock).toHaveBeenCalledTimes(1);
+    });
+    await response.body!.cancel("client_cancelled");
+
+    await vi.waitFor(() => {
+      expect(mocks.releaseUserConnection).toHaveBeenCalledTimes(1);
+      expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+    });
+    expect(lockSignal?.aborted).toBe(true);
+    expect(mocks.acquireClientTurnExecutionLock).toHaveBeenCalledWith(
+      mocks.agentScope,
+      DEFAULT_CLIENT_TURN_ID,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.claimClientTurnExecution).not.toHaveBeenCalled();
+  });
+
+  it("aborts a turn-lock waiter at the foreground timeout", async () => {
+    vi.useFakeTimers();
+    let lockSignal: AbortSignal | undefined;
+    mocks.acquireClientTurnExecutionLock.mockImplementationOnce(
+      async (_scope, _clientTurnId, signal) => {
+        lockSignal = signal;
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    );
+
+    try {
+      const response = await POST(new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(withClientTurn({ message: "turn lock 超时" })),
+      }));
+      const visibleBody = response.text();
+      await vi.waitFor(() => {
+        expect(mocks.acquireClientTurnExecutionLock).toHaveBeenCalledTimes(1);
+      });
+      await vi.advanceTimersByTimeAsync(120_000);
+      await visibleBody;
+
+      expect(lockSignal?.aborted).toBe(true);
+      expect(mocks.releaseUserConnection).toHaveBeenCalledTimes(1);
+      expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+      expect(mocks.claimClientTurnExecution).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops consuming agent chunks after enqueue fails on a cancelled reader", async () => {

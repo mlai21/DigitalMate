@@ -286,7 +286,7 @@ async function processMemoryMessages(
       signal,
     });
     signal.throwIfAborted();
-    await repositories.memories.createMany(scope, message.id, memories);
+    await repositories.memories.createMany(scope, message.id, memories, signal);
   }
   signal.throwIfAborted();
   await repositories.messages.markMemoryProcessed(scope, messages.map((message) => message.id));
