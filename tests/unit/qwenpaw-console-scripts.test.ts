@@ -1877,6 +1877,10 @@ describe("QwenPaw Console patch preparation", () => {
         requestSource,
         agentsPageSource,
         agentTableSource,
+        agentModalSource,
+        profileFormSource,
+        agentScopeSource,
+        zhLocaleSource,
         i18nSource,
         headerSource,
         updateContentSource,
@@ -1912,6 +1916,10 @@ describe("QwenPaw Console patch preparation", () => {
         readPrepared("src/api/request.ts"),
         readPrepared("src/pages/Settings/Agents/index.tsx"),
         readPrepared("src/pages/Settings/Agents/components/AgentTable.tsx"),
+        readPrepared("src/pages/Settings/Agents/components/AgentModal.tsx"),
+        readPrepared("src/pages/Settings/Agents/profileForm.ts"),
+        readPrepared("src/api/agentScope.ts"),
+        readPrepared("src/locales/zh.json"),
         readPrepared("src/i18n.ts"),
         readPrepared("src/layouts/Header.tsx"),
         readPrepared("src/layouts/constants.ts"),
@@ -2057,6 +2065,10 @@ describe("QwenPaw Console patch preparation", () => {
       );
       expect(requestSource).not.toContain('window.location.href = "/login"');
       expect.soft(authHeadersSource).toContain("buildMutationHeaders");
+      expect.soft(authHeadersSource).toContain("getValidatedDefaultAgent");
+      expect
+        .soft(authHeadersSource)
+        .toContain('headers["x-digitalmate-agent-id"] = selectedAgent');
       expect
         .soft(authHeadersSource)
         .toContain('new Set(["POST", "PUT", "PATCH", "DELETE"])');
@@ -2079,15 +2091,16 @@ describe("QwenPaw Console patch preparation", () => {
       expect(agentTableSource).toContain("disabled={deleteDisabled}");
       expect
         .soft(agentTableSource)
-        .toMatch(
-          /record\.id === "default"\s*\?\s*t\("agent\.defaultNotDeletable"\)\s*:\s*startupInProgress\s*\?\s*t\("agent\.status\.waitUntilStarted"\)\s*:\s*secondaryActionsDisabled\s*\?\s*t\("agent\.secondaryAgentUnsupported"\)/,
-        );
+        .toContain("isDefaultAgent(record)");
       expect
         .soft(agentTableTestSource)
         .toContain('screen.getByTitle("agent.defaultNotDeletable")');
       expect
         .soft(agentSelectorSource)
-        .toContain('.filter((agent) => agent.id === "default")');
+        .toContain("agent.is_default === true");
+      expect
+        .soft(agentSelectorSource)
+        .not.toContain('.filter((agent) => agent.id === "default")');
       expect
         .soft(agentSelectorTestSource)
         .toContain("does not show secondary agent");
@@ -2097,6 +2110,18 @@ describe("QwenPaw Console patch preparation", () => {
       expect
         .soft(agentTableTestSource)
         .toContain("does not reorder secondary agents");
+      expect.soft(agentScopeSource).toContain("validatedDefaultAgentId");
+      expect.soft(profileFormSource).toContain("buildAgentProfileUpdate");
+      expect.soft(profileFormSource).not.toContain("active_model");
+      expect.soft(profileFormSource).not.toContain("workspace_dir");
+      expect
+        .soft(agentModalSource)
+        .toContain('t("agent.searchAuthorizationNotice")');
+      expect.soft(agentModalSource).not.toContain("providerApi");
+      expect.soft(agentModalSource).not.toContain("skillApi");
+      expect.soft(zhLocaleSource).toContain("不会开启联网");
+      expect.soft(zhLocaleSource).toContain("不代表授予联网权限");
+      expect.soft(zhLocaleSource).toContain("普通聊天仍默认不联网");
       expect.soft(headerSource).not.toContain("fetch(PYPI_URL)");
       expect.soft(headerSource).not.toContain("qwenpaw.agentscope.io/docs/faq");
       expect

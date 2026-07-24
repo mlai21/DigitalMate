@@ -25,20 +25,53 @@ index ad4fbf8..e119d8b 100644
          setStatus(result.authenticated === true ? "ok" : "auth-required");
        } catch {
          if (!cancelled) setStatus("auth-required");
+diff --git a/src/api/agentScope.ts b/src/api/agentScope.ts
+new file mode 100644
+index 0000000..029aec5
+--- /dev/null
++++ b/src/api/agentScope.ts
+@@ -0,0 +1,20 @@
++const CANONICAL_UUID =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++
++let validatedDefaultAgentId: string | null = null;
++
++export function isCanonicalAgentId(value: unknown): value is string {
++  return typeof value === "string" && CANONICAL_UUID.test(value);
++}
++
++export function markValidatedDefaultAgent(agentId: string): void {
++  validatedDefaultAgentId = isCanonicalAgentId(agentId) ? agentId : null;
++}
++
++export function clearValidatedDefaultAgent(): void {
++  validatedDefaultAgentId = null;
++}
++
++export function getValidatedDefaultAgent(): string | null {
++  return validatedDefaultAgentId;
++}
 diff --git a/src/api/authHeaders.test.ts b/src/api/authHeaders.test.ts
 new file mode 100644
-index 0000000..fe85084
+index 0000000..a877f42
 --- /dev/null
 +++ b/src/api/authHeaders.test.ts
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,234 @@
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { buildAuthHeaders, buildMutationHeaders } from "./authHeaders";
 +import { setCsrfToken } from "./config";
++import {
++  clearValidatedDefaultAgent,
++  markValidatedDefaultAgent,
++} from "./agentScope";
++
++const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
 +
 +describe("auth headers", () => {
 +  beforeEach(() => {
 +    sessionStorage.clear();
 +    localStorage.clear();
++    clearValidatedDefaultAgent();
 +    sessionStorage.setItem(
 +      "qwenpaw-agent-storage",
 +      JSON.stringify({ state: { selectedAgent: "default" } }),
@@ -54,16 +87,29 @@ index 0000000..fe85084
 +    vi.useRealTimers();
 +  });
 +
-+  it("default helper carries the agent id without CSRF", () => {
-+    expect(buildAuthHeaders()).toEqual({ "X-Agent-Id": "default" });
++  it("does not send the legacy placeholder before the first agent list", () => {
++    expect(buildAuthHeaders()).toEqual({});
++  });
++
++  it("sends the real selected UUID through both compatibility headers", () => {
++    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
++    sessionStorage.setItem(
++      "qwenpaw-agent-storage",
++      JSON.stringify({
++        state: { selectedAgent: DEFAULT_AGENT_ID },
++      }),
++    );
++    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
++    expect(buildAuthHeaders()).toEqual({
++      "X-Agent-Id": DEFAULT_AGENT_ID,
++      "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
++    });
 +  });
 +
 +  it.each(["GET", "HEAD", "OPTIONS"])(
 +    "does not attach CSRF to %s",
 +    async (method) => {
-+      await expect(buildMutationHeaders(method)).resolves.toEqual({
-+        "X-Agent-Id": "default",
-+      });
++      await expect(buildMutationHeaders(method)).resolves.toEqual({});
 +    },
 +  );
 +
@@ -71,7 +117,6 @@ index 0000000..fe85084
 +    "attaches in-memory CSRF to %s",
 +    async (method) => {
 +      await expect(buildMutationHeaders(method)).resolves.toEqual({
-+        "X-Agent-Id": "default",
 +        "x-csrf-token": "csrf-value",
 +      });
 +    },
@@ -82,6 +127,13 @@ index 0000000..fe85084
 +    vi.setSystemTime(new Date("2026-07-24T00:00:00.000Z"));
 +    setCsrfToken("old-token", 1_753_315_200);
 +    vi.advanceTimersByTime(31 * 60 * 1_000);
++    sessionStorage.setItem(
++      "qwenpaw-agent-storage",
++      JSON.stringify({
++        state: { selectedAgent: DEFAULT_AGENT_ID },
++      }),
++    );
++    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
 +    global.fetch = vi.fn().mockResolvedValue(
 +      Response.json({
 +        authenticated: true,
@@ -90,9 +142,11 @@ index 0000000..fe85084
 +          Math.floor(Date.now() / 1_000) + 1_800,
 +      }),
 +    );
++    const baselineTimerCount = vi.getTimerCount();
 +
 +    await expect(buildMutationHeaders("POST")).resolves.toMatchObject({
 +      "x-csrf-token": "fresh-token",
++      "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
 +    });
 +    expect(fetch).toHaveBeenCalledTimes(1);
 +    expect(fetch).toHaveBeenCalledWith(
@@ -101,7 +155,7 @@ index 0000000..fe85084
 +    );
 +    expect(localStorage.length).toBe(0);
 +    expect(sessionStorage.getItem("csrf_token")).toBeNull();
-+    expect(vi.getTimerCount()).toBe(0);
++    expect(vi.getTimerCount()).toBe(baselineTimerCount);
 +  });
 +
 +  it("bounds a shared half-open refresh and resets it for the next caller", async () => {
@@ -238,10 +292,10 @@ index 0000000..fe85084
 +  });
 +});
 diff --git a/src/api/authHeaders.ts b/src/api/authHeaders.ts
-index 9786946..daa2447 100644
+index 9786946..6ee9d49 100644
 --- a/src/api/authHeaders.ts
 +++ b/src/api/authHeaders.ts
-@@ -1,12 +1,17 @@
+@@ -1,12 +1,21 @@
 -import { getApiToken } from "./config";
 +import {
 +  clearAuthToken,
@@ -249,6 +303,10 @@ index 9786946..daa2447 100644
 +  hasFreshCsrfToken,
 +  setCsrfToken,
 +} from "./config";
++import {
++  getValidatedDefaultAgent,
++  isCanonicalAgentId,
++} from "./agentScope";
 
 -/** Authorization + X-Agent-Id for API requests. Caller sets Content-Type when needed. */
 +const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -265,7 +323,21 @@ index 9786946..daa2447 100644
    try {
      // Read from sessionStorage first (per-tab agent), fall back to localStorage
      const agentStorage =
-@@ -24,3 +29,148 @@ export function buildAuthHeaders(): Record<string, string> {
+@@ -15,8 +24,12 @@ export function buildAuthHeaders(): Record<string, string> {
+     if (agentStorage) {
+       const parsed = JSON.parse(agentStorage);
+       const selectedAgent = parsed?.state?.selectedAgent;
+-      if (selectedAgent) {
++      if (
++        isCanonicalAgentId(selectedAgent) &&
++        selectedAgent === getValidatedDefaultAgent()
++      ) {
+         headers["X-Agent-Id"] = selectedAgent;
++        headers["x-digitalmate-agent-id"] = selectedAgent;
+       }
+     }
+   } catch (error) {
+@@ -24,3 +37,148 @@ export function buildAuthHeaders(): Record<string, string> {
    }
    return headers;
  }
@@ -793,6 +865,27 @@ index 20eed03..1de9f75 100644
        body: formData,
      });
      if (!response.ok) {
+diff --git a/src/api/modules/agents.ts b/src/api/modules/agents.ts
+index 20c37c4..da6235f 100644
+--- a/src/api/modules/agents.ts
++++ b/src/api/modules/agents.ts
+@@ -5,6 +5,7 @@ import type {
+   CreateAgentRequest,
+   AgentProfileRef,
+   ReorderAgentsResponse,
++  UpdateAgentProfileRequest,
+ } from "../types/agents";
+
+ // Multi-agent management API
+@@ -24,7 +25,7 @@ export const agentsApi = {
+     }),
+
+   // Update agent configuration
+-  updateAgent: (agentId: string, agent: AgentProfileConfig) =>
++  updateAgent: (agentId: string, agent: UpdateAgentProfileRequest) =>
+     request<AgentProfileConfig>(`/agents/${agentId}`, {
+       method: "PUT",
+       body: JSON.stringify(agent),
 diff --git a/src/api/modules/auth.test.ts b/src/api/modules/auth.test.ts
 index 5fad1d8..744c011 100644
 --- a/src/api/modules/auth.test.ts
@@ -1698,11 +1791,114 @@ index 7f4cb7d..1ac4fb5 100644
          const errorMessage = getErrorMessageFromBody(text, contentType);
 
          // Preserve raw body for parseErrorDetail() to extract structured fields
+diff --git a/src/api/types/agents.ts b/src/api/types/agents.ts
+index 9daaea6..42d5c96 100644
+--- a/src/api/types/agents.ts
++++ b/src/api/types/agents.ts
+@@ -18,6 +18,40 @@ export interface AgentSummary {
+   pinned?: boolean;
+   startup_status?: AgentStartupStatus;
+   active_model?: ModelSlotConfig | null;
++  is_default?: boolean;
++  revision?: number;
++}
++
++export interface AgentPersona {
++  name: string;
++  style: string;
++  emojiHabit: string;
++}
++
++export interface AgentBehaviorSettings {
++  proactivity: {
++    quietStart: string;
++    quietEnd: string;
++    minIntervalMinutes: number;
++    maxPerHour: number;
++    maxPerDay: number;
++  };
++  cadence: {
++    responseDelayMs: number;
++    segmentDelayMs: number;
++    maxSegments: number;
++  };
++  search: {
++    aggressiveness: "conservative" | "standard" | "off";
++  };
++}
++
++export interface AgentCapabilities {
++  multi_agent: boolean;
++  create: boolean;
++  import: boolean;
++  clone: boolean;
++  delete: boolean;
+ }
+
+ export interface AgentListResponse {
+@@ -32,18 +66,26 @@ export interface ReorderAgentsResponse {
+ export interface AgentProfileConfig {
+   id: string;
+   name: string;
++  display_name?: string;
+   description?: string;
+   workspace_dir?: string;
+-  approval_level?: string;
+   active_model?: ModelSlotConfig | null;
+-  channels?: unknown;
+-  mcp?: unknown;
+-  heartbeat?: unknown;
+-  running?: unknown;
+-  llm_routing?: unknown;
+-  system_prompt_files?: string[];
+-  tools?: unknown;
+-  security?: unknown;
++  enabled: boolean;
++  pinned: boolean;
++  startup_status: AgentStartupStatus;
++  is_default: boolean;
++  persona: AgentPersona;
++  settings: AgentBehaviorSettings;
++  revision: number;
++  capabilities: AgentCapabilities;
++}
++
++export interface UpdateAgentProfileRequest {
++  id: string;
++  name: string;
++  persona: AgentPersona;
++  settings: AgentBehaviorSettings;
++  revision: number;
+ }
+
+ export interface CreateAgentRequest {
 diff --git a/src/components/AgentSelector/AgentSelector.test.tsx b/src/components/AgentSelector/AgentSelector.test.tsx
-index 8684213..788b005 100644
+index 8684213..d6615d0 100644
 --- a/src/components/AgentSelector/AgentSelector.test.tsx
 +++ b/src/components/AgentSelector/AgentSelector.test.tsx
-@@ -102,78 +102,26 @@ describe("AgentSelector", () => {
+@@ -44,8 +44,9 @@ vi.mock("react-router-dom", async (importOriginal) => {
+
+ const agents = [
+   {
+-    id: "default",
+-    name: "Default",
++    id: "10000000-0000-4000-8000-000000000011",
++    name: "DigitalMate",
++    is_default: true,
+     enabled: true,
+     description: "",
+     workspace_dir: "",
+@@ -74,7 +75,8 @@ const agents = [
+
+ describe("AgentSelector", () => {
+   beforeEach(() => {
+-    mocks.storeState.selectedAgent = "default";
++    mocks.storeState.selectedAgent =
++      "10000000-0000-4000-8000-000000000011";
+     mocks.storeState.agents = agents;
+     mocks.refreshAgents.mockResolvedValue(undefined);
+     mocks.toggleAgentEnabled.mockResolvedValue({
+@@ -102,78 +104,37 @@ describe("AgentSelector", () => {
      expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
    });
 
@@ -1712,7 +1908,7 @@ index 8684213..788b005 100644
      renderWithProviders(<AgentSelector />);
 
      await user.click(screen.getByRole("combobox"));
-+    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
++    expect(screen.getAllByText("DigitalMate").length).toBeGreaterThan(0);
 +    expect(screen.queryByText("Agent One")).not.toBeInTheDocument();
      expect(screen.queryByText("Agent Two")).not.toBeInTheDocument();
 -
@@ -1741,8 +1937,10 @@ index 8684213..788b005 100644
 -    const nextAgents = [...agents, pinnedDisabledAgent];
 -    mocks.storeState.agents = nextAgents;
 -    const user = userEvent.setup();
--    renderWithProviders(<AgentSelector />);
--
++  it("resets a previously selected secondary agent to default", async () => {
++    mocks.storeState.selectedAgent = "agent-1";
+     renderWithProviders(<AgentSelector />);
+
 -    await user.click(screen.getByRole("combobox"));
 -    expect(screen.getByText("Pinned Disabled")).toBeInTheDocument();
 -    await user.click(screen.getByRole("button", { name: "agent.enableAgent" }));
@@ -1769,12 +1967,19 @@ index 8684213..788b005 100644
 -        }),
 -      ]),
 -    );
--  });
--
++    await waitFor(() => {
++      expect(mocks.setSelectedAgent).toHaveBeenCalledWith(
++        "10000000-0000-4000-8000-000000000011",
++      );
++    });
++    expect(mocks.toggleAgentEnabled).not.toHaveBeenCalled();
++    expect(mocks.setAgentPinned).not.toHaveBeenCalled();
+   });
+
 -  it("switches to default after disabling the selected agent", async () => {
-+  it("resets a previously selected secondary agent to default", async () => {
-     mocks.storeState.selectedAgent = "agent-1";
+-    mocks.storeState.selectedAgent = "agent-1";
 -    const user = userEvent.setup();
++  it("keeps the real default UUID selected", async () => {
      renderWithProviders(<AgentSelector />);
 -    await user.click(screen.getByRole("combobox"));
 -    await user.click(
@@ -1783,25 +1988,24 @@ index 8684213..788b005 100644
 
      await waitFor(() => {
 -      expect(mocks.toggleAgentEnabled).toHaveBeenCalledWith("agent-1", false);
-+      expect(mocks.setSelectedAgent).toHaveBeenCalledWith("default");
++      expect(mocks.refreshAgents).toHaveBeenCalledOnce();
      });
 -    expect(mocks.setSelectedAgent).toHaveBeenCalledWith("default");
-+    expect(mocks.toggleAgentEnabled).not.toHaveBeenCalled();
-+    expect(mocks.setAgentPinned).not.toHaveBeenCalled();
++    expect(mocks.setSelectedAgent).not.toHaveBeenCalled();
    });
  });
 diff --git a/src/components/AgentSelector/index.tsx b/src/components/AgentSelector/index.tsx
-index 4717f38..0fe4987 100644
+index 4717f38..b8b1dbd 100644
 --- a/src/components/AgentSelector/index.tsx
 +++ b/src/components/AgentSelector/index.tsx
-@@ -70,31 +70,38 @@ export default function AgentSelector({
+@@ -70,47 +70,48 @@ export default function AgentSelector({
      void loadAgents();
    }, [loadAgents]);
 
 -  const enabledAgents = useMemo(
 -    () => agents.filter((agent) => agent.enabled),
 +  const visibleAgents = useMemo(
-+    () => agents.filter((agent) => agent.id === "default"),
++    () => agents.filter((agent) => agent.is_default === true),
      [agents],
    );
 +  const enabledAgents = useMemo(
@@ -1813,15 +2017,16 @@ index 4717f38..0fe4987 100644
 -    [agents],
 +    () =>
 +      visibleAgents.filter(
-+        (agent) => agent.id === "default" || agent.pinned,
++        (agent) => agent.is_default === true || agent.pinned,
 +      ),
 +    [visibleAgents],
    );
    const regularEnabledAgents = useMemo(
      () =>
 -      agents.filter(
+-        (agent) => agent.enabled && agent.id !== "default" && !agent.pinned,
 +      visibleAgents.filter(
-         (agent) => agent.enabled && agent.id !== "default" && !agent.pinned,
++        (agent) => agent.enabled && agent.is_default !== true && !agent.pinned,
        ),
 -    [agents],
 +    [visibleAgents],
@@ -1829,8 +2034,9 @@ index 4717f38..0fe4987 100644
    const regularDisabledAgents = useMemo(
      () =>
 -      agents.filter(
+-        (agent) => !agent.enabled && agent.id !== "default" && !agent.pinned,
 +      visibleAgents.filter(
-         (agent) => !agent.enabled && agent.id !== "default" && !agent.pinned,
++        (agent) => !agent.enabled && agent.is_default !== true && !agent.pinned,
        ),
 -    [agents],
 +    [visibleAgents],
@@ -1842,9 +2048,12 @@ index 4717f38..0fe4987 100644
      if (!targetAgent?.enabled) return;
      setSelectedAgent(value);
      message.success(t("agent.switchSuccess"));
-@@ -103,14 +110,7 @@ export default function AgentSelector({
+   };
+
    useEffect(() => {
-     if (!agents.length || selectedAgent === "default") return;
+-    if (!agents.length || selectedAgent === "default") return;
++    const defaultAgent = agents.find((agent) => agent.is_default === true);
++    if (!defaultAgent || selectedAgent === defaultAgent.id) return;
 
 -    const currentAgent = agents.find((agent) => agent.id === selectedAgent);
 -    if (!currentAgent) {
@@ -1854,11 +2063,20 @@ index 4717f38..0fe4987 100644
 -      setSelectedAgent("default");
 -      message.warning(t("agent.currentAgentDisabled"));
 -    }
-+    setSelectedAgent("default");
++    setSelectedAgent(defaultAgent.id);
    }, [agents, message, selectedAgent, setSelectedAgent, t]);
 
    const stopSelectorAction = (event: MouseEvent<HTMLElement>) => {
-@@ -193,7 +193,9 @@ export default function AgentSelector({
+@@ -162,7 +163,7 @@ export default function AgentSelector({
+
+   const handlePinAgent = useCallback(
+     async (agent: AgentSummary) => {
+-      if (agent.id === "default" || pinningAgentId !== null) return;
++      if (agent.is_default === true || pinningAgentId !== null) return;
+       const nextPinned = !agent.pinned;
+       setPinningAgentId(agent.id);
+       setAgents(
+@@ -193,7 +194,9 @@ export default function AgentSelector({
      },
    );
 
@@ -1869,6 +2087,33 @@ index 4717f38..0fe4987 100644
 
    if (collapsed) {
      return (
+@@ -276,7 +279,7 @@ export default function AgentSelector({
+         .filter(Boolean)
+         .join(" ")}
+       title={
+-        agent.id === "default"
++        agent.is_default === true
+           ? t("agent.defaultPinned")
+           : agent.pinned
+           ? t("agent.longPressToUnpin")
+@@ -299,7 +302,7 @@ export default function AgentSelector({
+             <span className={styles.agentOptionNameText}>
+               {getAgentDisplayName(agent, t)}
+             </span>
+-            {(agent.id === "default" || agent.pinned) && (
++            {(agent.is_default === true || agent.pinned) && (
+               <Pin
+                 size={12}
+                 strokeWidth={2.2}
+@@ -321,7 +324,7 @@ export default function AgentSelector({
+             </div>
+           )}
+         </div>
+-        {agent.id !== "default" && renderToggleButton(agent, !agent.enabled)}
++        {agent.is_default !== true && renderToggleButton(agent, !agent.enabled)}
+       </div>
+       <div className={styles.agentOptionId}>{`ID: ${agent.id}`}</div>
+     </div>
 diff --git a/src/components/CodingModeToggle/index.tsx b/src/components/CodingModeToggle/index.tsx
 index af2ea58..921d2f7 100644
 --- a/src/components/CodingModeToggle/index.tsx
@@ -2208,18 +2453,57 @@ index e8f9fd1..dd0d4f7 100644
    { id: "core.sessions", path: "/sessions", component: SessionsPage },
    { id: "core.inbox", path: "/inbox", component: InboxPage },
 diff --git a/src/locales/en.json b/src/locales/en.json
-index b5f9dc4..57113bc 100644
+index b5f9dc4..8601b74 100644
 --- a/src/locales/en.json
 +++ b/src/locales/en.json
-@@ -474,6 +474,7 @@
+@@ -468,12 +468,14 @@
+     "parent": "Settings",
+     "agents": "Agents",
+     "management": "Agent Management",
+-    "pageDescription": "Create, configure, and manage multiple AI agents with custom workspaces and identities.",
++    "pageDescription": "Configure the identity and behavior of the default DigitalMate avatar.",
+     "name": "Name",
+     "id": "ID",
      "description": "Description",
      "workspace": "Workspace Path",
      "create": "Create Agent",
-+    "secondaryAgentUnsupported": "This release supports the default digital avatar only. Creating, cloning, and deleting additional avatars is not available yet.",
++    "secondaryAgentUnsupported": "Only one default digital avatar is supported. Creating, importing, cloning, deleting, or reordering avatars is not available yet.",
++    "singleAvatarNotice": "Only one default digital avatar is active. You can edit its name, persona, and behavior. The capability boundary for a second memory and avatar is retained, but creating, importing, cloning, deleting, or reordering is not available in this release.",
      "createTitle": "Create New Agent",
      "createSuccess": "Agent created successfully",
      "createFailed": "Failed to create agent",
-@@ -2711,6 +2712,8 @@
+@@ -501,6 +503,30 @@
+     "idPlaceholder": "e.g.: my-agent",
+     "nameRequired": "Please enter agent name",
+     "namePlaceholder": "e.g.: My Agent",
++    "profileSection": "Identity and persona",
++    "personaName": "Persona name",
++    "personaNameRequired": "Please enter a persona name",
++    "personaStyle": "Personality and speaking style",
++    "personaStyleRequired": "Please enter a personality and speaking style",
++    "emojiHabit": "Emoji habits",
++    "proactivitySection": "Proactivity",
++    "quietStart": "Quiet hours start",
++    "quietEnd": "Quiet hours end",
++    "clockFormat": "Use HH:mm format",
++    "minIntervalMinutes": "Minimum interval (minutes)",
++    "maxPerHour": "Maximum per hour",
++    "maxPerDay": "Maximum per day",
++    "cadenceSection": "Response cadence",
++    "responseDelayMs": "Response delay (ms)",
++    "segmentDelayMs": "Segment delay (ms)",
++    "maxSegments": "Maximum segments",
++    "searchPolicySection": "Search policy when network access is authorized",
++    "searchAuthorizationNotice": "This only adjusts search behavior after you have explicitly authorized network access. It does not enable or grant network access.",
++    "searchAggressiveness": "Search aggressiveness",
++    "searchAggressivenessHelp": "Ordinary chat remains offline by default. Authorization requires the network button, an explicit search instruction, or a confirmed persistent contract.",
++    "searchConservative": "Conservative",
++    "searchStandard": "Standard",
++    "searchOff": "Do not search",
+     "descriptionPlaceholder": "Briefly describe this agent's purpose...",
+     "workspaceHelp": "Leave empty to auto-generate in ~/.qwenpaw/workspaces/<id>",
+     "dragHandleTooltip": "Drag to reorder agents",
+@@ -2711,6 +2737,8 @@
    },
    "codingMode": {
      "title": "Coding Mode",
@@ -2229,18 +2513,57 @@ index b5f9dc4..57113bc 100644
      "experimentalDesc": "Coding Mode transforms QwenPaw into a lightweight Web IDE with a code editor, file tree, Git integration, and AI-powered coding assistance.",
      "experimentalNote": "This feature is experimental and still under active development. Some functionality may be limited or change in future updates.",
 diff --git a/src/locales/zh.json b/src/locales/zh.json
-index 98e9c36..591d7d5 100644
+index 98e9c36..9c84dfa 100644
 --- a/src/locales/zh.json
 +++ b/src/locales/zh.json
-@@ -257,6 +257,7 @@
+@@ -251,12 +251,14 @@
+     "parent": "设置",
+     "agents": "智能体",
+     "management": "智能体管理",
+-    "pageDescription": "创建、配置和管理多个 AI 智能体，支持自定义工作空间和身份。",
++    "pageDescription": "配置 DigitalMate 默认数字分身的人设与行为。",
+     "name": "名称",
+     "id": "ID",
      "description": "描述",
      "workspace": "工作区路径",
      "create": "创建智能体",
-+    "secondaryAgentUnsupported": "本期仅支持默认数字分身，新增、克隆与删除其他分身暂未开放。",
++    "secondaryAgentUnsupported": "当前只支持一个默认数字分身；新增、导入、克隆、删除及多分身排序暂未开放。",
++    "singleAvatarNotice": "当前只保留一个默认数字分身。你可以编辑它的姓名、人设和行为；第二套记忆与第二个数字分身的能力边界已保留，但本期不开放创建、导入、克隆、删除或排序。",
      "createTitle": "创建新智能体",
      "createSuccess": "智能体创建成功",
      "createFailed": "智能体创建失败",
-@@ -2730,6 +2731,8 @@
+@@ -284,6 +286,30 @@
+     "idPlaceholder": "例如：my-agent",
+     "nameRequired": "请输入智能体名称",
+     "namePlaceholder": "例如：我的智能体",
++    "profileSection": "身份与人设",
++    "personaName": "人设称呼",
++    "personaNameRequired": "请输入人设称呼",
++    "personaStyle": "性格与表达风格",
++    "personaStyleRequired": "请输入性格与表达风格",
++    "emojiHabit": "表情使用习惯",
++    "proactivitySection": "主动性",
++    "quietStart": "静默开始时间",
++    "quietEnd": "静默结束时间",
++    "clockFormat": "请使用 HH:mm 格式",
++    "minIntervalMinutes": "最短间隔（分钟）",
++    "maxPerHour": "每小时上限",
++    "maxPerDay": "每天上限",
++    "cadenceSection": "回复节奏",
++    "responseDelayMs": "回复延迟（毫秒）",
++    "segmentDelayMs": "分段间隔（毫秒）",
++    "maxSegments": "最多分段数",
++    "searchPolicySection": "已授权联网时的搜索策略",
++    "searchAuthorizationNotice": "此项只调整在你已明确授予联网权限时的搜索策略，不会开启联网，也不代表授予联网权限。",
++    "searchAggressiveness": "搜索积极度",
++    "searchAggressivenessHelp": "普通聊天仍默认不联网；只有输入框联网按钮、明确搜索指令或已确认的持久化合同才构成联网授权。",
++    "searchConservative": "保守",
++    "searchStandard": "标准",
++    "searchOff": "关闭搜索",
+     "descriptionPlaceholder": "简要描述这个智能体的用途...",
+     "workspaceHelp": "留空将自动生成在 ~/.qwenpaw/workspaces/<id> 目录",
+     "dragHandleTooltip": "拖拽调整智能体顺序",
+@@ -2730,6 +2756,8 @@
    },
    "codingMode": {
      "title": "编程模式",
@@ -2292,8 +2615,608 @@ index a89d424..c642f04 100644
            };
 
            const reconnectIdentity = sessionApi.getSessionIdentity();
+diff --git a/src/pages/Settings/Agents/components/AgentModal.test.tsx b/src/pages/Settings/Agents/components/AgentModal.test.tsx
+new file mode 100644
+index 0000000..cfa08b8
+--- /dev/null
++++ b/src/pages/Settings/Agents/components/AgentModal.test.tsx
+@@ -0,0 +1,64 @@
++import { Form } from "antd";
++import { screen } from "@testing-library/react";
++import { describe, expect, it, vi } from "vitest";
++import { renderWithProviders } from "@/test/common_setup";
++import type { AgentSummary } from "@/api/types/agents";
++import zh from "@/locales/zh.json";
++import { AgentModal } from "./AgentModal";
++
++vi.mock("react-i18next", () => ({
++  useTranslation: () => ({ t: (key: string) => key }),
++}));
++
++const defaultAgent: AgentSummary = {
++  id: "10000000-0000-4000-8000-000000000011",
++  name: "DigitalMate",
++  description: "",
++  workspace_dir: "",
++  enabled: true,
++  pinned: true,
++  is_default: true,
++};
++
++function TestModal() {
++  const [form] = Form.useForm();
++  return (
++    <AgentModal
++      open
++      editingAgent={defaultAgent}
++      form={form}
++      onSave={vi.fn().mockResolvedValue(undefined)}
++      onCancel={vi.fn()}
++    />
++  );
++}
++
++describe("AgentModal", () => {
++  it("edits only the approved profile and behavior fields", () => {
++    renderWithProviders(<TestModal />);
++
++    expect(
++      screen.getByText("agent.searchAuthorizationNotice"),
++    ).toBeInTheDocument();
++    expect(screen.getByLabelText("agent.name")).toBeInTheDocument();
++    expect(screen.getByLabelText("agent.personaName")).toBeInTheDocument();
++    expect(screen.getByLabelText("agent.personaStyle")).toBeInTheDocument();
++    expect(screen.getByLabelText("agent.emojiHabit")).toBeInTheDocument();
++    expect(
++      screen.queryByText("agent.workspace"),
++    ).not.toBeInTheDocument();
++    expect(screen.queryByText("agent.model")).not.toBeInTheDocument();
++    expect(screen.queryByText("agent.initialSkills")).not.toBeInTheDocument();
++  });
++
++  it("states that search policy does not grant network authorization", () => {
++    expect(zh.agent.searchPolicySection).toContain("已授权联网时");
++    expect(zh.agent.searchAuthorizationNotice).toContain("不会开启联网");
++    expect(zh.agent.searchAuthorizationNotice).toContain(
++      "不代表授予联网权限",
++    );
++    expect(zh.agent.searchAggressivenessHelp).toContain(
++      "普通聊天仍默认不联网",
++    );
++  });
++});
+diff --git a/src/pages/Settings/Agents/components/AgentModal.tsx b/src/pages/Settings/Agents/components/AgentModal.tsx
+index f24930b..c53bdc9 100644
+--- a/src/pages/Settings/Agents/components/AgentModal.tsx
++++ b/src/pages/Settings/Agents/components/AgentModal.tsx
+@@ -1,41 +1,26 @@
+-import { useEffect, useState, useMemo } from "react";
+ import {
+-  Modal,
++  Alert,
++  Col,
++  Divider,
+   Form,
+   Input,
+-  Button,
++  InputNumber,
++  Modal,
++  Row,
+   Select,
+-  Space,
+   Typography,
+-  Empty,
+-  Spin,
+ } from "antd";
+-import { CheckOutlined } from "@ant-design/icons";
+ import { useTranslation } from "react-i18next";
+ import type { AgentSummary } from "@/api/types/agents";
+-import type { ProviderInfo } from "@/api/types/provider";
+ import { getAgentDisplayName } from "@/utils/agentDisplayName";
+-import type { PoolSkillSpec } from "@/api/types/skill";
+-import { skillApi } from "@/api/modules/skill";
+-import { providerApi } from "@/api/modules/provider";
+-import { providerIcon } from "../../Models/components/providerIcon";
+-import styles from "../index.module.less";
+
+-const { Text } = Typography;
+-
+-interface EligibleProvider {
+-  id: string;
+-  name: string;
+-  models: Array<{ id: string; name: string }>;
+-}
++const { Title } = Typography;
++const CLOCK_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+ interface AgentModalProps {
+   open: boolean;
+   editingAgent: AgentSummary | null;
+   form: ReturnType<typeof Form.useForm>[0];
+-  selectedSkills: string[];
+-  onSelectedSkillsChange: (skills: string[]) => void;
+-  onInstalledSkillsLoaded: (skills: string[]) => void;
+   onSave: () => Promise<void>;
+   onCancel: () => void;
+ }
+@@ -44,317 +29,195 @@ export function AgentModal({
+   open,
+   editingAgent,
+   form,
+-  selectedSkills,
+-  onSelectedSkillsChange,
+-  onInstalledSkillsLoaded,
+   onSave,
+   onCancel,
+ }: AgentModalProps) {
+   const { t } = useTranslation();
+-  const [poolSkills, setPoolSkills] = useState<PoolSkillSpec[]>([]);
+-  const [installedSkills, setInstalledSkills] = useState<string[]>([]);
+-  const [loadingSkills, setLoadingSkills] = useState(false);
+-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+-  const [loadingProviders, setLoadingProviders] = useState(false);
+-
+-  const selectedProviderId = Form.useWatch("active_model_provider", form);
+-  const selectedModelId = Form.useWatch("active_model_model", form);
+-
+-  const eligibleProviders: EligibleProvider[] = useMemo(() => {
+-    return providers
+-      .filter((p) => {
+-        const hasModels =
+-          (p.models?.length ?? 0) + (p.extra_models?.length ?? 0) > 0;
+-        if (!hasModels) return false;
+-        if (p.require_api_key === false) return !!p.base_url;
+-        if (p.is_custom) return !!p.base_url;
+-        if (p.require_api_key ?? true) return !!p.api_key;
+-        return true;
+-      })
+-      .map((p) => ({
+-        id: p.id,
+-        name: p.name,
+-        models: [...(p.models ?? []), ...(p.extra_models ?? [])],
+-      }));
+-  }, [providers]);
+-
+-  const availableModels = useMemo(() => {
+-    if (!selectedProviderId) return [];
+-    const provider = eligibleProviders.find((p) => p.id === selectedProviderId);
+-    return provider?.models ?? [];
+-  }, [selectedProviderId, eligibleProviders]);
+-
+-  useEffect(() => {
+-    if (!open) return;
+-
+-    setLoadingProviders(true);
+-    providerApi
+-      .listProviders()
+-      .then((data) => {
+-        if (Array.isArray(data)) setProviders(data);
+-      })
+-      .catch((err) => console.error("Failed to load providers:", err))
+-      .finally(() => setLoadingProviders(false));
+-
+-    setLoadingSkills(true);
+-
+-    const fetchPool = skillApi.listSkillPoolSkills();
+-    const fetchInstalled = editingAgent
+-      ? skillApi.listSkills(editingAgent.id)
+-      : Promise.resolve([]);
+-
+-    Promise.all([fetchPool, fetchInstalled])
+-      .then(([pool, workspaceSkills]) => {
+-        const poolSkillNames = new Set(pool.map((skill) => skill.name));
+-        const installedSkills = workspaceSkills
+-          .filter((skill) => poolSkillNames.has(skill.name))
+-          .map((skill) => skill.name);
+-
+-        setPoolSkills(pool);
+-        setInstalledSkills(installedSkills);
+-        onInstalledSkillsLoaded(installedSkills);
+-        if (editingAgent) {
+-          onSelectedSkillsChange(installedSkills);
+-        } else {
+-          onSelectedSkillsChange([]);
+-        }
+-      })
+-      .finally(() => setLoadingSkills(false));
+-  }, [editingAgent, onInstalledSkillsLoaded, onSelectedSkillsChange, open]);
+-
+-  const handleProviderChange = (providerId: string) => {
+-    form.setFieldsValue({
+-      active_model_provider: providerId,
+-      active_model_model: undefined,
+-    });
+-  };
+-
+-  const handleClearModel = () => {
+-    form.setFieldsValue({
+-      active_model_provider: undefined,
+-      active_model_model: undefined,
+-    });
+-  };
+-
+-  const toggleSkill = (name: string) => {
+-    const isInstalled = editingAgent && installedSkills.includes(name);
+-    if (isInstalled) return;
+-
+-    if (selectedSkills.includes(name)) {
+-      onSelectedSkillsChange(selectedSkills.filter((s) => s !== name));
+-    } else {
+-      onSelectedSkillsChange([...selectedSkills, name]);
+-    }
+-  };
+-
+-  const handleSelectAll = () => {
+-    const allNames = poolSkills.map((s) => s.name);
+-    onSelectedSkillsChange(allNames);
+-  };
+-
+-  const handleSelectBuiltin = () => {
+-    const builtinNames = poolSkills
+-      .filter((s) => s.source === "builtin")
+-      .map((s) => s.name);
+-    onSelectedSkillsChange(
+-      Array.from(new Set([...installedSkills, ...builtinNames])),
+-    );
+-  };
+-
+-  const handleSelectNone = () => {
+-    onSelectedSkillsChange(editingAgent ? [...installedSkills] : []);
+-  };
+
+   return (
+     <Modal
+-      title={
+-        editingAgent
+-          ? t("agent.editTitle", {
+-              name: getAgentDisplayName(editingAgent, t),
+-            })
+-          : t("agent.createTitle")
+-      }
++      title={t("agent.editTitle", {
++        name: editingAgent
++          ? getAgentDisplayName(editingAgent, t)
++          : t("agent.defaultDisplayName"),
++      })}
+       open={open}
+       onOk={onSave}
+       onCancel={onCancel}
+-      width={640}
++      width={720}
+       okText={t("common.save")}
+       cancelText={t("common.cancel")}
++      destroyOnHidden
+     >
+       <Form form={form} layout="vertical" autoComplete="off">
+-        <Form.Item name="active_model_provider" hidden>
++        <Form.Item name="id" hidden>
+           <Input />
+         </Form.Item>
+-        <Form.Item name="active_model_model" hidden>
+-          <Input />
++        <Form.Item name="revision" hidden>
++          <InputNumber />
+         </Form.Item>
+
+-        {editingAgent && (
+-          <Form.Item name="id" label={t("agent.id")}>
+-            <Input disabled />
+-          </Form.Item>
+-        )}
+-        {!editingAgent && (
+-          <Form.Item
+-            name="id"
+-            label={t("agent.idLabel")}
+-            help={t("agent.idHelp")}
+-            rules={[
+-              {
+-                pattern: /^[a-zA-Z0-9][a-zA-Z0-9_-]*[a-zA-Z0-9]$/,
+-                message: t("agent.idPattern"),
+-              },
+-            ]}
+-          >
+-            <Input placeholder={t("agent.idPlaceholder")} />
+-          </Form.Item>
+-        )}
++        <Title level={5}>{t("agent.profileSection")}</Title>
+         <Form.Item
+           name="name"
+           label={t("agent.name")}
+-          rules={[{ required: true, message: t("agent.nameRequired") }]}
++          rules={[
++            { required: true, whitespace: true, message: t("agent.nameRequired") },
++            { max: 80 },
++          ]}
+         >
+-          <Input placeholder={t("agent.namePlaceholder")} />
++          <Input maxLength={80} />
+         </Form.Item>
+-        <Form.Item name="description" label={t("agent.description")}>
+-          <Input.TextArea
+-            placeholder={t("agent.descriptionPlaceholder")}
+-            rows={3}
+-          />
++        <Form.Item
++          name={["persona", "name"]}
++          label={t("agent.personaName")}
++          rules={[
++            {
++              required: true,
++              whitespace: true,
++              message: t("agent.personaNameRequired"),
++            },
++            { max: 80 },
++          ]}
++        >
++          <Input maxLength={80} />
+         </Form.Item>
+-        <Form.Item label={t("agent.model")} help={t("agent.modelHelp")}>
+-          <Space.Compact style={{ width: "100%" }}>
+-            <Select
+-              value={selectedProviderId || undefined}
+-              onChange={handleProviderChange}
+-              placeholder={t("agent.modelPlaceholder")}
+-              allowClear
+-              onClear={handleClearModel}
+-              loading={loadingProviders}
+-              style={{ width: "45%", gap: "8px" }}
+-              showSearch
+-              optionFilterProp="label"
+-              options={eligibleProviders.map((p) => ({
+-                value: p.id,
+-                label: p.name,
+-              }))}
+-              optionRender={({ value }) => {
+-                const p = eligibleProviders.find((ep) => ep.id === value);
+-                if (!p) return value;
+-                return (
+-                  <Space size={6}>
+-                    <img
+-                      src={providerIcon(p.id)}
+-                      alt=""
+-                      style={{ width: 16, height: 16 }}
+-                    />
+-                    <span>{p.name}</span>
+-                  </Space>
+-                );
+-              }}
+-              notFoundContent={
+-                loadingProviders ? (
+-                  <Spin size="small" />
+-                ) : (
+-                  t("agent.noConfiguredModels")
+-                )
+-              }
+-            />
+-            <Select
+-              value={selectedModelId || undefined}
+-              onChange={(modelId) =>
+-                form.setFieldsValue({ active_model_model: modelId })
+-              }
+-              placeholder={
+-                selectedProviderId
+-                  ? t("models.model")
+-                  : t("agent.modelPlaceholder")
+-              }
+-              disabled={!selectedProviderId}
+-              style={{ width: "55%" }}
+-              showSearch
+-              optionFilterProp="label"
+-              options={availableModels.map((m) => ({
+-                value: m.id,
+-                label: m.name || m.id,
+-              }))}
+-            />
+-          </Space.Compact>
++        <Form.Item
++          name={["persona", "style"]}
++          label={t("agent.personaStyle")}
++          rules={[
++            {
++              required: true,
++              whitespace: true,
++              message: t("agent.personaStyleRequired"),
++            },
++            { max: 4_000 },
++          ]}
++        >
++          <Input.TextArea rows={4} maxLength={4_000} showCount />
+         </Form.Item>
+         <Form.Item
+-          name="workspace_dir"
+-          label={t("agent.workspace")}
+-          help={!editingAgent ? t("agent.workspaceHelp") : undefined}
++          name={["persona", "emojiHabit"]}
++          label={t("agent.emojiHabit")}
++          rules={[{ max: 500 }]}
+         >
+-          <Input
+-            placeholder="~/.qwenpaw/workspaces/my-agent"
+-            disabled={!!editingAgent}
+-          />
++          <Input.TextArea rows={2} maxLength={500} showCount />
+         </Form.Item>
+-      </Form>
+
+-      <div style={{ marginTop: 4 }}>
+-        <div
+-          style={{
+-            display: "flex",
+-            justifyContent: "space-between",
+-            alignItems: "center",
+-            marginBottom: 8,
+-          }}
++        <Divider />
++        <Title level={5}>{t("agent.proactivitySection")}</Title>
++        <Row gutter={16}>
++          <Col span={12}>
++            <Form.Item
++              name={["settings", "proactivity", "quietStart"]}
++              label={t("agent.quietStart")}
++              rules={[
++                { required: true },
++                { pattern: CLOCK_PATTERN, message: t("agent.clockFormat") },
++              ]}
++            >
++              <Input placeholder="23:00" />
++            </Form.Item>
++          </Col>
++          <Col span={12}>
++            <Form.Item
++              name={["settings", "proactivity", "quietEnd"]}
++              label={t("agent.quietEnd")}
++              rules={[
++                { required: true },
++                { pattern: CLOCK_PATTERN, message: t("agent.clockFormat") },
++              ]}
++            >
++              <Input placeholder="08:00" />
++            </Form.Item>
++          </Col>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "proactivity", "minIntervalMinutes"]}
++              label={t("agent.minIntervalMinutes")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={1} max={1_440} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "proactivity", "maxPerHour"]}
++              label={t("agent.maxPerHour")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={1} max={10} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "proactivity", "maxPerDay"]}
++              label={t("agent.maxPerDay")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={1} max={20} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++        </Row>
++
++        <Divider />
++        <Title level={5}>{t("agent.cadenceSection")}</Title>
++        <Row gutter={16}>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "cadence", "responseDelayMs"]}
++              label={t("agent.responseDelayMs")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={0} max={2_000} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "cadence", "segmentDelayMs"]}
++              label={t("agent.segmentDelayMs")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={0} max={2_000} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++          <Col span={8}>
++            <Form.Item
++              name={["settings", "cadence", "maxSegments"]}
++              label={t("agent.maxSegments")}
++              rules={[{ required: true }]}
++            >
++              <InputNumber min={1} max={20} style={{ width: "100%" }} />
++            </Form.Item>
++          </Col>
++        </Row>
++
++        <Divider />
++        <Title level={5}>{t("agent.searchPolicySection")}</Title>
++        <Alert
++          type="info"
++          showIcon
++          message={t("agent.searchAuthorizationNotice")}
++          style={{ marginBottom: 16 }}
++        />
++        <Form.Item
++          name={["settings", "search", "aggressiveness"]}
++          label={t("agent.searchAggressiveness")}
++          help={t("agent.searchAggressivenessHelp")}
++          rules={[{ required: true }]}
+         >
+-          <Text type="secondary" style={{ fontSize: 13 }}>
+-            {editingAgent
+-              ? t("agent.addSkillsToAgent")
+-              : t("agent.initialSkills")}
+-          </Text>
+-          <Space size={4}>
+-            <Button size="small" type="primary" onClick={handleSelectAll}>
+-              {t("agent.selectAll")}
+-            </Button>
+-            <Button size="small" type="default" onClick={handleSelectBuiltin}>
+-              {t("agent.selectBuiltin")}
+-            </Button>
+-            <Button size="small" type="default" onClick={handleSelectNone}>
+-              {t("agent.selectNone")}
+-            </Button>
+-          </Space>
+-        </div>
+-
+-        {loadingSkills ? (
+-          <div style={{ textAlign: "center", padding: "16px 0" }}>
+-            <Spin size="small" />
+-          </div>
+-        ) : poolSkills.length === 0 ? (
+-          <Empty
+-            image={Empty.PRESENTED_IMAGE_SIMPLE}
+-            description={t("agent.noPoolSkills")}
++          <Select
++            options={[
++              {
++                value: "conservative",
++                label: t("agent.searchConservative"),
++              },
++              { value: "standard", label: t("agent.searchStandard") },
++              { value: "off", label: t("agent.searchOff") },
++            ]}
+           />
+-        ) : (
+-          <div className={styles.pickerGrid}>
+-            {poolSkills.map((skill) => {
+-              const selected = selectedSkills.includes(skill.name);
+-              const isInstalled =
+-                !!editingAgent && installedSkills.includes(skill.name);
+-              return (
+-                <div
+-                  key={skill.name}
+-                  className={`${styles.pickerCard} ${
+-                    selected ? styles.pickerCardSelected : ""
+-                  } ${isInstalled ? styles.pickerCardDisabled : ""}`}
+-                  onClick={() => toggleSkill(skill.name)}
+-                >
+-                  {selected && (
+-                    <span className={styles.pickerCheck}>
+-                      <CheckOutlined />
+-                    </span>
+-                  )}
+-                  <div className={styles.pickerCardTitle}>{skill.name}</div>
+-                </div>
+-              );
+-            })}
+-          </div>
+-        )}
+-      </div>
++        </Form.Item>
++      </Form>
+     </Modal>
+   );
+ }
 diff --git a/src/pages/Settings/Agents/components/AgentTable.test.tsx b/src/pages/Settings/Agents/components/AgentTable.test.tsx
-index 62c02e5..199a971 100644
+index 62c02e5..d5b9a43 100644
 --- a/src/pages/Settings/Agents/components/AgentTable.test.tsx
 +++ b/src/pages/Settings/Agents/components/AgentTable.test.tsx
 @@ -1,9 +1,28 @@
@@ -2326,7 +3249,15 @@ index 62c02e5..199a971 100644
  vi.mock("react-i18next", () => ({
    useTranslation: () => ({ t: (key: string) => key }),
  }));
-@@ -40,4 +59,80 @@ describe("AgentTable", () => {
+@@ -17,6 +36,7 @@ const agent = (id: string, pinned: boolean): AgentSummary => ({
+   pinned,
+   startup_status: "running",
+ });
++const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
+
+ describe("AgentTable", () => {
+   it("uses click-specific labels for pin actions", () => {
+@@ -40,4 +60,121 @@ describe("AgentTable", () => {
        screen.getByRole("button", { name: "agent.unpinAgent" }),
      ).toBeInTheDocument();
    });
@@ -2406,20 +3337,65 @@ index 62c02e5..199a971 100644
 +    });
 +    expect(onReorder).not.toHaveBeenCalled();
 +  });
++
++  it("allows editing the real default UUID while topology actions stay disabled", async () => {
++    const user = userEvent.setup();
++    const onEdit = vi.fn();
++    const defaultAgent = {
++      ...agent(DEFAULT_AGENT_ID, true),
++      name: "DigitalMate",
++      is_default: true,
++    };
++    renderWithProviders(
++      <AgentTable
++        agents={[defaultAgent]}
++        loading={false}
++        reordering={false}
++        onEdit={onEdit}
++        onDelete={vi.fn()}
++        onToggle={vi.fn()}
++        onPin={vi.fn()}
++        onReorder={vi.fn()}
++        secondaryAgentActionsDisabled
++      />,
++    );
++
++    const row = screen.getAllByText("DigitalMate")[0].closest("tr");
++    expect(row).not.toBeNull();
++    const edit = within(row as HTMLElement).getByRole("button", {
++      name: "agent.edit",
++    });
++    await user.click(edit);
++    expect(onEdit).toHaveBeenCalledWith(defaultAgent);
++    expect(
++      within(row as HTMLElement).getByTitle(
++        "agent.defaultNotDeletable",
++      ),
++    ).toBeDisabled();
++    expect(
++      within(row as HTMLElement).getByTitle(
++        "agent.defaultNotDisablable",
++      ),
++    ).toBeDisabled();
++  });
  });
 diff --git a/src/pages/Settings/Agents/components/AgentTable.tsx b/src/pages/Settings/Agents/components/AgentTable.tsx
-index 5bdc7fb..ed54b4f 100644
+index 5bdc7fb..64f6b69 100644
 --- a/src/pages/Settings/Agents/components/AgentTable.tsx
 +++ b/src/pages/Settings/Agents/components/AgentTable.tsx
-@@ -32,6 +32,7 @@ interface AgentTableProps {
+@@ -32,6 +32,11 @@ interface AgentTableProps {
    onToggle: (agentId: string, currentEnabled: boolean) => void;
    onPin: (agentId: string, currentPinned: boolean) => void;
    onReorder: (activeId: string, overId: string) => void;
 +  secondaryAgentActionsDisabled?: boolean;
++}
++
++function isDefaultAgent(agent: AgentSummary): boolean {
++  return agent.is_default === true || agent.id === "default";
  }
 
  export function AgentTable({
-@@ -43,6 +44,7 @@ export function AgentTable({
+@@ -43,6 +48,7 @@ export function AgentTable({
    onToggle,
    onPin,
    onReorder,
@@ -2427,7 +3403,7 @@ index 5bdc7fb..ed54b4f 100644
  }: AgentTableProps) {
    const { t } = useTranslation();
    const { isDark } = useTheme();
-@@ -63,6 +65,9 @@ export function AgentTable({
+@@ -63,6 +69,9 @@ export function AgentTable({
      : {};
 
    const handleDragEnd = (event: DragEndEvent) => {
@@ -2437,7 +3413,7 @@ index 5bdc7fb..ed54b4f 100644
      const { active, over } = event;
      if (!over || active.id === over.id) {
        return;
-@@ -81,7 +86,12 @@ export function AgentTable({
+@@ -81,7 +90,12 @@ export function AgentTable({
          <Tooltip title={t("agent.dragHandleTooltip")}>
            <span>
              <DragHandle
@@ -2445,75 +3421,95 @@ index 5bdc7fb..ed54b4f 100644
 +              disabled={
 +                reordering ||
 +                loading ||
-+                record.id === "default" ||
++                isDefaultAgent(record) ||
 +                secondaryAgentActionsDisabled
 +              }
              />
            </span>
          </Tooltip>
-@@ -162,10 +172,18 @@ export function AgentTable({
+@@ -107,7 +121,7 @@ export function AgentTable({
+           <span style={{ opacity: record.enabled ? 1 : 0.5 }}>
+             {getAgentDisplayName(record, t)}
+           </span>
+-          {(record.id === "default" || record.pinned) && (
++          {(isDefaultAgent(record) || record.pinned) && (
+             <Pin size={13} aria-label={t("agent.pinned")} />
+           )}
+         </Space>
+@@ -162,10 +176,18 @@ export function AgentTable({
          const startupInProgress =
            record.startup_status === "pending" ||
            record.startup_status === "starting";
 -        const toggleDisabled = record.id === "default" || startupInProgress;
 +        const secondaryActionsDisabled =
-+          secondaryAgentActionsDisabled && record.id !== "default";
++          secondaryAgentActionsDisabled && !isDefaultAgent(record);
 +        const toggleDisabled =
-+          record.id === "default" ||
++          isDefaultAgent(record) ||
 +          startupInProgress ||
 +          secondaryActionsDisabled;
 +        const deleteDisabled = toggleDisabled;
          const pinActionLabel =
-           record.id === "default"
+-          record.id === "default"
++          isDefaultAgent(record)
              ? t("agent.defaultPinned")
 +            : secondaryActionsDisabled
 +            ? t("agent.secondaryAgentUnsupported")
              : record.pinned
              ? t("agent.unpinAgent")
              : t("agent.pinAgent");
-@@ -185,8 +203,12 @@ export function AgentTable({
+@@ -178,27 +200,36 @@ export function AgentTable({
+                 size="middle"
+                 aria-label={pinActionLabel}
+                 icon={
+-                  record.id === "default" || record.pinned ? (
++                  isDefaultAgent(record) || record.pinned ? (
+                     <Pin size={14} />
+                   ) : (
+                     <PinOff size={14} />
                    )
                  }
                  onClick={() => onPin(record.id, Boolean(record.pinned))}
 -                disabled={record.id === "default"}
 -                style={record.id === "default" ? disabledStyle : iconStyle}
-+                disabled={record.id === "default" || secondaryActionsDisabled}
++                disabled={isDefaultAgent(record) || secondaryActionsDisabled}
 +                style={
-+                  record.id === "default" || secondaryActionsDisabled
++                  isDefaultAgent(record) || secondaryActionsDisabled
 +                    ? disabledStyle
 +                    : iconStyle
 +                }
                />
              </Tooltip>
              <Button
-@@ -194,11 +216,17 @@ export function AgentTable({
+               type="text"
                size="middle"
                icon={<EditOutlined />}
++              aria-label={t("agent.edit")}
                onClick={() => onEdit(record)}
 -              disabled={record.id === "default"}
 -              style={record.id === "default" ? disabledStyle : iconStyle}
-+              disabled={record.id === "default" || secondaryActionsDisabled}
++              disabled={secondaryActionsDisabled}
 +              style={
-+                record.id === "default" || secondaryActionsDisabled
++                secondaryActionsDisabled
 +                  ? disabledStyle
 +                  : iconStyle
 +              }
                title={
-                 record.id === "default"
-                   ? t("agent.defaultNotEditable")
-+                  : secondaryActionsDisabled
+-                record.id === "default"
+-                  ? t("agent.defaultNotEditable")
++                secondaryActionsDisabled
 +                  ? t("agent.secondaryAgentUnsupported")
                    : undefined
                }
              />
-@@ -223,12 +251,14 @@ export function AgentTable({
+@@ -223,12 +254,14 @@ export function AgentTable({
                  size="middle"
                  icon={record.enabled ? <EyeOff size={14} /> : <Eye size={14} />}
                  disabled={toggleDisabled}
 -                style={record.id === "default" ? disabledStyle : iconStyle}
 +                style={toggleDisabled ? disabledStyle : iconStyle}
                  title={
-                   record.id === "default"
+-                  record.id === "default"
++                  isDefaultAgent(record)
                      ? t("agent.defaultNotDisablable")
                      : startupInProgress
                      ? t("agent.status.waitUntilStarted")
@@ -2522,7 +3518,7 @@ index 5bdc7fb..ed54b4f 100644
                      : undefined
                  }
                />
-@@ -237,7 +267,7 @@ export function AgentTable({
+@@ -237,7 +270,7 @@ export function AgentTable({
                title={t("agent.deleteConfirm")}
                description={t("agent.deleteConfirmDesc")}
                onConfirm={() => onDelete(record.id)}
@@ -2531,15 +3527,17 @@ index 5bdc7fb..ed54b4f 100644
                okText={t("common.confirm")}
                cancelText={t("common.cancel")}
              >
-@@ -246,13 +276,15 @@ export function AgentTable({
+@@ -246,13 +279,15 @@ export function AgentTable({
                  size="middle"
                  danger
                  icon={<DeleteOutlined />}
 -                disabled={toggleDisabled}
+-                style={record.id === "default" ? disabledStyle : undefined}
 +                disabled={deleteDisabled}
-                 style={record.id === "default" ? disabledStyle : undefined}
++                style={isDefaultAgent(record) ? disabledStyle : undefined}
                  title={
-                   record.id === "default"
+-                  record.id === "default"
++                  isDefaultAgent(record)
                      ? t("agent.defaultNotDeletable")
                      : startupInProgress
                      ? t("agent.status.waitUntilStarted")
@@ -2549,35 +3547,177 @@ index 5bdc7fb..ed54b4f 100644
                  }
                />
 diff --git a/src/pages/Settings/Agents/index.tsx b/src/pages/Settings/Agents/index.tsx
-index 20bea0b..1c5818f 100644
+index 20bea0b..e7e8402 100644
 --- a/src/pages/Settings/Agents/index.tsx
 +++ b/src/pages/Settings/Agents/index.tsx
-@@ -1,5 +1,5 @@
- import { useState, useRef, useCallback } from "react";
+@@ -1,20 +1,25 @@
+-import { useState, useRef, useCallback } from "react";
 -import { Card, Button, Form } from "antd";
-+import { Card, Button, Form, Tooltip } from "antd";
++import { useState } from "react";
++import { Alert, Card, Button, Form, Tooltip } from "antd";
  import { useAppMessage } from "../../../hooks/useAppMessage";
  import { PlusOutlined } from "@ant-design/icons";
  import { useTranslation } from "react-i18next";
-@@ -13,6 +13,8 @@ import { PageHeader } from "@/components/PageHeader";
+ import { agentsApi } from "../../../api/modules/agents";
+-import { invalidateSkillCache, skillApi } from "../../../api/modules/skill";
+ import type { AgentSummary } from "../../../api/types/agents";
+ import { useAgentStore } from "../../../stores/agentStore";
+ import { useAgents } from "./useAgents";
+ import { AgentTable, AgentModal } from "./components";
+ import { PageHeader } from "@/components/PageHeader";
  import { reorderAgents } from "./reorder";
++import {
++  buildAgentProfileUpdate,
++  type AgentProfileFormValues,
++} from "./profileForm";
  import styles from "./index.module.less";
 
 +const SECONDARY_AGENT_CAPABILITY = "unsupported";
 +
  export default function AgentsPage() {
-   const { t, i18n } = useTranslation();
+-  const { t, i18n } = useTranslation();
++  const { t } = useTranslation();
    const {
-@@ -32,6 +34,8 @@ export default function AgentsPage() {
-   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
-   const installedSkillsRef = useRef<string[]>([]);
+     agents,
+     loading,
+@@ -29,35 +34,15 @@ export default function AgentsPage() {
+   const [editingAgent, setEditingAgent] = useState<AgentSummary | null>(null);
+   const [reordering, setReordering] = useState(false);
+   const [form] = Form.useForm();
+-  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+-  const installedSkillsRef = useRef<string[]>([]);
    const { message } = useAppMessage();
+-
+-  const handleCreate = () => {
+-    setEditingAgent(null);
+-    form.resetFields();
+-    form.setFieldsValue({
+-      workspace_dir: "",
+-      active_model_provider: undefined,
+-      active_model_model: undefined,
+-    });
+-    setSelectedSkills([]);
+-    installedSkillsRef.current = [];
+-    setModalVisible(true);
+-  };
 +  const secondaryAgentActionsDisabled =
 +    SECONDARY_AGENT_CAPABILITY === "unsupported";
 
-   const handleCreate = () => {
-     setEditingAgent(null);
-@@ -193,13 +197,18 @@ export default function AgentsPage() {
+   const handleEdit = async (agent: AgentSummary) => {
+     try {
+-      setSelectedSkills([]);
+-      installedSkillsRef.current = [];
+-      invalidateSkillCache({ agentId: agent.id });
+       const config = await agentsApi.getAgent(agent.id);
+       setEditingAgent(agent);
+-      form.setFieldsValue({
+-        ...config,
+-        active_model_provider: config.active_model?.provider_id || undefined,
+-        active_model_model: config.active_model?.model || undefined,
+-      });
++      form.setFieldsValue(config);
+       setModalVisible(true);
+     } catch (error) {
+       console.error("Failed to load agent config:", error);
+@@ -70,7 +55,10 @@ export default function AgentsPage() {
+       await deleteAgent(agentId);
+
+       if (selectedAgent === agentId) {
+-        setSelectedAgent("default");
++        const defaultAgent = agents.find((agent) => agent.is_default);
++        if (defaultAgent) {
++          setSelectedAgent(defaultAgent.id);
++        }
+         message.info(t("agent.switchedToDefault"));
+       }
+     } catch {
+@@ -84,7 +72,10 @@ export default function AgentsPage() {
+       await toggleAgent(agentId, newEnabled);
+
+       if (!newEnabled && selectedAgent === agentId) {
+-        setSelectedAgent("default");
++        const defaultAgent = agents.find((agent) => agent.is_default);
++        if (defaultAgent) {
++          setSelectedAgent(defaultAgent.id);
++        }
+         message.info(t("agent.switchedToDefault"));
+       }
+     } catch {
+@@ -100,66 +91,21 @@ export default function AgentsPage() {
+     }
+   };
+
+-  const handleInstalledSkillsLoaded = useCallback((skills: string[]) => {
+-    installedSkillsRef.current = skills;
+-  }, []);
+-
+   const handleSubmit = async () => {
+     try {
+-      const values = await form.validateFields();
+-      const workspaceRaw = values.workspace_dir;
+-      const workspace_dir =
+-        typeof workspaceRaw === "string"
+-          ? workspaceRaw.trim() || undefined
+-          : workspaceRaw;
+-
+-      const providerId = values.active_model_provider;
+-      const modelId = values.active_model_model;
+-      const active_model =
+-        providerId && modelId
+-          ? { provider_id: providerId, model: modelId }
+-          : null;
+-
+-      const { active_model_provider, active_model_model, ...rest } = values;
+-      const payload = { ...rest, workspace_dir, active_model };
+-
+-      if (editingAgent) {
+-        const previousInstalledSkills = installedSkillsRef.current;
+-        const newSkills = selectedSkills.filter(
+-          (skill) => !previousInstalledSkills.includes(skill),
+-        );
+-
+-        for (const skill of newSkills) {
+-          await skillApi.downloadSkillPoolSkill({
+-            skill_name: skill,
+-            targets: [{ workspace_id: editingAgent.id }],
+-          });
+-        }
+-        await agentsApi.updateAgent(editingAgent.id, payload);
+-        installedSkillsRef.current = [
+-          ...previousInstalledSkills,
+-          ...newSkills.filter(
+-            (skill) => !previousInstalledSkills.includes(skill),
+-          ),
+-        ];
+-        invalidateSkillCache({ agentId: editingAgent.id });
+-        message.success(t("agent.updateSuccess"));
+-      } else {
+-        const result = await agentsApi.createAgent({
+-          ...payload,
+-          language: i18n.language,
+-          skill_names: selectedSkills,
+-        });
+-        message.success(`${t("agent.createSuccess")} (ID: ${result.id})`);
++      if (!editingAgent) {
++        return;
+       }
++      const values =
++        (await form.validateFields()) as AgentProfileFormValues;
++      const payload = buildAgentProfileUpdate(values);
++      await agentsApi.updateAgent(editingAgent.id, payload);
++      message.success(t("agent.updateSuccess"));
+
+       setModalVisible(false);
+       await loadAgents();
+     } catch (error: any) {
+       console.error("Failed to save agent:", error);
+-      if (editingAgent) {
+-        invalidateSkillCache({ agentId: editingAgent.id });
+-      }
+       message.error(error.message || t("agent.saveFailed"));
+     }
+   };
+@@ -193,17 +139,28 @@ export default function AgentsPage() {
          current={t("agent.agents")}
          extra={
            <div className={styles.headerRight}>
@@ -2593,7 +3733,6 @@ index 20bea0b..1c5818f 100644
 +                <Button
 +                  type="primary"
 +                  icon={<PlusOutlined />}
-+                  onClick={handleCreate}
 +                  disabled={secondaryAgentActionsDisabled}
 +                >
 +                  {t("agent.create")}
@@ -2603,7 +3742,18 @@ index 20bea0b..1c5818f 100644
            </div>
          }
        />
-@@ -214,6 +223,7 @@ export default function AgentsPage() {
+
++      <Alert
++        type="info"
++        showIcon
++        message={t("agent.singleAvatarNotice")}
++        style={{ marginBottom: 16 }}
++      />
++
+       <Card className={styles.tableCard}>
+         <AgentTable
+           agents={agents}
+@@ -214,6 +171,7 @@ export default function AgentsPage() {
            onToggle={handleToggle}
            onPin={handlePin}
            onReorder={handleReorder}
@@ -2611,6 +3761,141 @@ index 20bea0b..1c5818f 100644
          />
        </Card>
 
+@@ -221,9 +179,6 @@ export default function AgentsPage() {
+         open={modalVisible}
+         editingAgent={editingAgent}
+         form={form}
+-        selectedSkills={selectedSkills}
+-        onSelectedSkillsChange={setSelectedSkills}
+-        onInstalledSkillsLoaded={handleInstalledSkillsLoaded}
+         onSave={handleSubmit}
+         onCancel={() => setModalVisible(false)}
+       />
+diff --git a/src/pages/Settings/Agents/profileForm.test.ts b/src/pages/Settings/Agents/profileForm.test.ts
+new file mode 100644
+index 0000000..47fed81
+--- /dev/null
++++ b/src/pages/Settings/Agents/profileForm.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, it } from "vitest";
++import { buildAgentProfileUpdate } from "./profileForm";
++
++describe("buildAgentProfileUpdate", () => {
++  it("only serializes the approved single-avatar profile fields", () => {
++    expect(
++      buildAgentProfileUpdate({
++        id: "10000000-0000-4000-8000-000000000011",
++        name: "  DigitalMate  ",
++        persona: {
++          name: "  小D  ",
++          style: "  真诚、简洁  ",
++          emojiHabit: "  偶尔使用 🙂  ",
++        },
++        settings: {
++          proactivity: {
++            quietStart: "23:00",
++            quietEnd: "08:00",
++            minIntervalMinutes: 30,
++            maxPerHour: 2,
++            maxPerDay: 6,
++          },
++          cadence: {
++            responseDelayMs: 300,
++            segmentDelayMs: 500,
++            maxSegments: 4,
++          },
++          search: {
++            aggressiveness: "conservative",
++          },
++        },
++        revision: 7,
++        active_model: { provider_id: "secret", model: "secret-model" },
++        tools: ["hidden"],
++        skills: ["hidden"],
++        workspace_dir: "/hidden",
++      }),
++    ).toEqual({
++      id: "10000000-0000-4000-8000-000000000011",
++      name: "DigitalMate",
++      persona: {
++        name: "小D",
++        style: "真诚、简洁",
++        emojiHabit: "偶尔使用 🙂",
++      },
++      settings: {
++        proactivity: {
++          quietStart: "23:00",
++          quietEnd: "08:00",
++          minIntervalMinutes: 30,
++          maxPerHour: 2,
++          maxPerDay: 6,
++        },
++        cadence: {
++          responseDelayMs: 300,
++          segmentDelayMs: 500,
++          maxSegments: 4,
++        },
++        search: {
++          aggressiveness: "conservative",
++        },
++      },
++      revision: 7,
++    });
++  });
++});
+diff --git a/src/pages/Settings/Agents/profileForm.ts b/src/pages/Settings/Agents/profileForm.ts
+new file mode 100644
+index 0000000..7c466d5
+--- /dev/null
++++ b/src/pages/Settings/Agents/profileForm.ts
+@@ -0,0 +1,47 @@
++import type {
++  AgentBehaviorSettings,
++  AgentPersona,
++  UpdateAgentProfileRequest,
++} from "@/api/types/agents";
++
++export interface AgentProfileFormValues {
++  id: string;
++  name: string;
++  persona: AgentPersona;
++  settings: AgentBehaviorSettings;
++  revision: number;
++  [key: string]: unknown;
++}
++
++export function buildAgentProfileUpdate(
++  values: AgentProfileFormValues,
++): UpdateAgentProfileRequest {
++  return {
++    id: values.id,
++    name: values.name.trim(),
++    persona: {
++      name: values.persona.name.trim(),
++      style: values.persona.style.trim(),
++      emojiHabit: values.persona.emojiHabit.trim(),
++    },
++    settings: {
++      proactivity: {
++        quietStart: values.settings.proactivity.quietStart,
++        quietEnd: values.settings.proactivity.quietEnd,
++        minIntervalMinutes:
++          values.settings.proactivity.minIntervalMinutes,
++        maxPerHour: values.settings.proactivity.maxPerHour,
++        maxPerDay: values.settings.proactivity.maxPerDay,
++      },
++      cadence: {
++        responseDelayMs: values.settings.cadence.responseDelayMs,
++        segmentDelayMs: values.settings.cadence.segmentDelayMs,
++        maxSegments: values.settings.cadence.maxSegments,
++      },
++      search: {
++        aggressiveness: values.settings.search.aggressiveness,
++      },
++    },
++    revision: values.revision,
++  };
++}
 diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
 index 5607a73..de360b3 100644
 --- a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
@@ -2721,6 +4006,151 @@ index b745352..6417cc9 100644
      if (!res.ok) {
        console.warn(`[PluginLoader] /api/plugins returned ${res.status}`);
        return { loaded: 0, failed: [] };
+diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
+index 8d5b9a3..331cf37 100644
+--- a/src/stores/agentStore.test.ts
++++ b/src/stores/agentStore.test.ts
+@@ -1,6 +1,8 @@
+ import { describe, it, expect, beforeEach, vi } from "vitest";
+ import { useAgentStore } from "./agentStore";
+ import type { AgentSummary } from "@/api/types/agents";
++import { buildAuthHeaders } from "@/api/authHeaders";
++import { clearValidatedDefaultAgent } from "@/api/agentScope";
+
+ const mocks = vi.hoisted(() => ({
+   listAgents: vi.fn(),
+@@ -14,10 +16,14 @@ vi.mock("../api/modules/agents", () => ({
+
+ const mockAgent = (id: string): AgentSummary =>
+   ({ id, name: `Agent ${id}` }) as AgentSummary;
++const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
+
+ describe("agentStore", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    clearValidatedDefaultAgent();
++    sessionStorage.clear();
++    localStorage.clear();
+     // Reset to initial state before each test
+     useAgentStore.setState({
+       selectedAgent: "default",
+@@ -80,6 +86,62 @@ describe("agentStore", () => {
+     expect(useAgentStore.getState().agents).toEqual([mockAgent("1")]);
+   });
+
++  it("replaces the bootstrap placeholder with the real default UUID", async () => {
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().agents).toEqual([defaultAgent]);
++    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
++  });
++
++  it("replaces a stale stored UUID with the only real default agent", async () => {
++    useAgentStore.setState({
++      selectedAgent: "20000000-0000-4000-8000-000000000011",
++    });
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
++  });
++
++  it("starts headerless, then scopes later requests to the listed default UUID", async () => {
++    const staleId = "20000000-0000-4000-8000-000000000011";
++    useAgentStore.setState({ selectedAgent: staleId, agents: [] });
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    let startupHeaders: Record<string, string> | undefined;
++    mocks.listAgents.mockImplementation(async () => {
++      startupHeaders = buildAuthHeaders();
++      return { agents: [defaultAgent] };
++    });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(startupHeaders).toEqual({});
++    expect(buildAuthHeaders()).toEqual({
++      "X-Agent-Id": DEFAULT_AGENT_ID,
++      "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
++    });
++  });
++
+   it("allows a new refresh after the previous request settles", async () => {
+     mocks.listAgents.mockResolvedValue({ agents: [] });
+
+diff --git a/src/stores/agentStore.ts b/src/stores/agentStore.ts
+index 8249f60..92624eb 100644
+--- a/src/stores/agentStore.ts
++++ b/src/stores/agentStore.ts
+@@ -2,6 +2,10 @@ import { create } from "zustand";
+ import { persist } from "zustand/middleware";
+ import type { AgentSummary } from "../api/types/agents";
+ import { agentsApi } from "../api/modules/agents";
++import {
++  clearValidatedDefaultAgent,
++  markValidatedDefaultAgent,
++} from "../api/agentScope";
+ import { menuRegistry } from "../plugins/registry/store";
+
+ /**
+@@ -83,6 +87,14 @@ export const useAgentStore = create<AgentStore>()(
+
+       setSelectedAgent: (agentId) => {
+         set({ selectedAgent: agentId });
++        const selected = get().agents.find(
++          (agent) => agent.id === agentId && agent.is_default === true,
++        );
++        if (selected) {
++          markValidatedDefaultAgent(selected.id);
++        } else {
++          clearValidatedDefaultAgent();
++        }
+         menuRegistry.refresh();
+         // Persist to localStorage so new tabs inherit this choice
+         try {
+@@ -100,6 +112,23 @@ export const useAgentStore = create<AgentStore>()(
+         }
+
+         agentRefreshPromise = agentsApi.listAgents().then((response) => {
++          const defaultAgent = response.agents.find(
++            (agent) => agent.is_default === true,
++          );
++          if (defaultAgent) {
++            markValidatedDefaultAgent(defaultAgent.id);
++            set({
++              agents: response.agents,
++              selectedAgent: defaultAgent.id,
++            });
++            try {
++              localStorage.setItem(LAST_USED_AGENT_KEY, defaultAgent.id);
++            } catch {
++              /* ignore */
++            }
++            return;
++          }
++          clearValidatedDefaultAgent();
+           set({ agents: response.agents });
+         });
+         try {
 diff --git a/src/utils/error.ts b/src/utils/error.ts
 index 5e19f38..1744a41 100644
 --- a/src/utils/error.ts

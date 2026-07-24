@@ -16,6 +16,19 @@ import {
   putUserTimezone,
 } from "@/server/admin/compat/handlers/preferences";
 import {
+  cloneAgent,
+  createUpdateAgentHandler,
+  createAgent,
+  deleteAgent,
+  getAgent,
+  importAgent,
+  listAgents,
+  pinAgent,
+  reorderAgents,
+  toggleAgent,
+  type AdminAgentProfileUpdater,
+} from "@/server/admin/compat/handlers/agents";
+import {
   AdminCompatError,
   type AdminCompatHandler,
 } from "@/server/admin/compat/types";
@@ -40,6 +53,7 @@ export type CoreAdminCompatDependencies = Readonly<{
   upstreamTag: string;
   upstreamCommit: string;
   compatApiRevision: string;
+  updateAgentProfile?: AdminAgentProfileUpdater;
 }>;
 
 export function createCoreAdminCompatRouter(
@@ -58,6 +72,32 @@ export function createCoreAdminCompatRouter(
   router.sessionGet("/auth/verify", authVerify);
   router.get("/root", root);
   router.get("/version", root);
+  router.get("/agents", listAgents);
+  router.get("/agents/:agentId", getAgent, {
+    agentHeader: "required",
+  });
+  router.put(
+    "/agents/:agentId",
+    createUpdateAgentHandler(dependencies.updateAgentProfile),
+    { agentHeader: "required" },
+  );
+  router.post("/agents", createAgent);
+  router.post("/agents/import", importAgent);
+  router.post("/agents/:agentId/clone", cloneAgent, {
+    agentHeader: "required",
+  });
+  router.delete("/agents/:agentId", deleteAgent, {
+    agentHeader: "required",
+  });
+  router.patch("/agents/:agentId/toggle", toggleAgent, {
+    agentHeader: "required",
+  });
+  router.patch("/agents/:agentId/pin", pinAgent, {
+    agentHeader: "required",
+  });
+  router.put("/agents/order", reorderAgents, {
+    agentHeader: "required",
+  });
 
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);

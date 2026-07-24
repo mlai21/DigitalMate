@@ -15,6 +15,9 @@ import {
 import { readTrustedOriginalRequestPath } from "@/server/admin/compat/original-uri";
 import type { AgentScope } from "@/server/agents/types";
 import { isStableCapabilityCode } from "@/server/capabilities";
+import {
+  AdminAgentProfileError,
+} from "@/server/admin/agent-profile";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
 const METHODS = [
@@ -43,6 +46,9 @@ const ADMIN_AUDIT_VALIDATION_CODES = new Set([
 ]);
 type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
+export type AdminCompatRouteOptions = Readonly<{
+  agentHeader?: "optional" | "required";
+}>;
 
 type PatternSegment =
   | Readonly<{ kind: "static"; value: string }>
@@ -54,6 +60,7 @@ type RouteDefinition = Readonly<{
   segments: readonly PatternSegment[];
   staticSegments: number;
   access: "scoped" | "session" | "status";
+  agentHeader: "optional" | "required";
   handler:
     | AdminCompatHandler
     | AdminCompatSessionHandler
@@ -79,8 +86,12 @@ export type AdminCompatRuntime = Readonly<{
 export class AdminCompatRouter {
   private readonly routes: RouteDefinition[] = [];
 
-  get(path: string, handler: AdminCompatHandler): void {
-    this.register("GET", path, "scoped", handler);
+  get(
+    path: string,
+    handler: AdminCompatHandler,
+    options?: AdminCompatRouteOptions,
+  ): void {
+    this.register("GET", path, "scoped", handler, options);
   }
 
   sessionGet(path: string, handler: AdminCompatSessionHandler): void {
@@ -91,20 +102,36 @@ export class AdminCompatRouter {
     this.register("GET", path, "status", handler);
   }
 
-  post(path: string, handler: AdminCompatHandler): void {
-    this.register("POST", path, "scoped", handler);
+  post(
+    path: string,
+    handler: AdminCompatHandler,
+    options?: AdminCompatRouteOptions,
+  ): void {
+    this.register("POST", path, "scoped", handler, options);
   }
 
-  put(path: string, handler: AdminCompatHandler): void {
-    this.register("PUT", path, "scoped", handler);
+  put(
+    path: string,
+    handler: AdminCompatHandler,
+    options?: AdminCompatRouteOptions,
+  ): void {
+    this.register("PUT", path, "scoped", handler, options);
   }
 
-  patch(path: string, handler: AdminCompatHandler): void {
-    this.register("PATCH", path, "scoped", handler);
+  patch(
+    path: string,
+    handler: AdminCompatHandler,
+    options?: AdminCompatRouteOptions,
+  ): void {
+    this.register("PATCH", path, "scoped", handler, options);
   }
 
-  delete(path: string, handler: AdminCompatHandler): void {
-    this.register("DELETE", path, "scoped", handler);
+  delete(
+    path: string,
+    handler: AdminCompatHandler,
+    options?: AdminCompatRouteOptions,
+  ): void {
+    this.register("DELETE", path, "scoped", handler, options);
   }
 
   async dispatch(
@@ -118,6 +145,10 @@ export class AdminCompatRouter {
         this.resolveRequestPathSegments(
           request,
           runtime.security.trustProxyHeaders,
+        );
+        validateAgentHeaderSyntax(
+          request,
+          statusRoute.agentHeader,
         );
         const result = await (
           statusRoute.handler as AdminCompatStatusHandler
@@ -150,6 +181,7 @@ export class AdminCompatRouter {
     path: string,
     access: RouteDefinition["access"],
     handler: RouteDefinition["handler"],
+    options?: AdminCompatRouteOptions,
   ): void {
     const segments = parsePattern(path);
     const staticSegments = segments.filter(
@@ -161,6 +193,7 @@ export class AdminCompatRouter {
       segments,
       staticSegments,
       access,
+      agentHeader: options?.agentHeader ?? "optional",
       handler,
     } satisfies RouteDefinition;
 
@@ -266,6 +299,10 @@ export class AdminCompatRouter {
       );
     }
     if (selected.route.access === "session") {
+      validateAgentHeaderSyntax(
+        request,
+        selected.route.agentHeader,
+      );
       return toResponse(
         await (
           selected.route.handler as AdminCompatSessionHandler
@@ -287,6 +324,11 @@ export class AdminCompatRouter {
         signal,
       );
       signal.throwIfAborted();
+      validateAgentHeader(
+        request,
+        scope,
+        selected.route.agentHeader,
+      );
       const result = await (
         selected.route.handler as AdminCompatHandler
       )({
@@ -328,6 +370,52 @@ export class AdminCompatRouter {
     }
     return pathSegments;
   }
+}
+
+export const digitalMateAgentIdHeader =
+  "x-digitalmate-agent-id";
+
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function validateAgentHeader(
+  request: Request,
+  scope: AgentScope,
+  policy: "optional" | "required",
+): void {
+  const agentId = validateAgentHeaderSyntax(request, policy);
+  if (agentId !== null && agentId !== scope.agentId) {
+    throw new AdminCompatError(
+      404,
+      "not_found",
+      "agent_not_found",
+    );
+  }
+}
+
+function validateAgentHeaderSyntax(
+  request: Request,
+  policy: "optional" | "required",
+): string | null {
+  const agentId = request.headers.get(digitalMateAgentIdHeader);
+  if (agentId === null) {
+    if (policy === "required") {
+      throw new AdminCompatError(
+        400,
+        "invalid_request",
+        "agent_header_required",
+      );
+    }
+    return null;
+  }
+  if (!CANONICAL_UUID_PATTERN.test(agentId)) {
+    throw new AdminCompatError(
+      400,
+      "invalid_request",
+      "invalid_agent_header",
+    );
+  }
+  return agentId;
 }
 
 export function parseAdminCompatPath(
@@ -502,6 +590,19 @@ function mapError(error: unknown): Response {
       error.status === 409 &&
       error.code === "config_revision_conflict"
     ) {
+      return errorResponse(
+        409,
+        "config_revision_conflict",
+        "revision_conflict",
+      );
+    }
+    return errorResponse(500, "internal_error", "internal_error");
+  }
+  if (error instanceof AdminAgentProfileError) {
+    if (error.status === 404 && error.code === "agent_not_found") {
+      return errorResponse(404, "not_found", "agent_not_found");
+    }
+    if (error.status === 409 && error.code === "revision_conflict") {
       return errorResponse(
         409,
         "config_revision_conflict",

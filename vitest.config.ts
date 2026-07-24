@@ -8,6 +8,9 @@ export default defineConfig({
     },
   },
   test: {
+    // Several suites start isolated embedded PostgreSQL instances. Bounding
+    // workers prevents host shared-memory exhaustion without skipping PG tests.
+    maxWorkers: 4,
     environment: "jsdom",
     env: {
       TZ: "Asia/Shanghai",
