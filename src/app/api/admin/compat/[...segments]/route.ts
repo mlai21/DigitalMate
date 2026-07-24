@@ -28,13 +28,13 @@ export function createAdminCompatRouteHandler(
         routeSegments: segments ?? [],
       });
     } catch {
-      return internalErrorResponse();
+      return internalErrorResponse(request.method);
     }
   };
 }
 
-function internalErrorResponse(): Response {
-  return Response.json(
+function internalErrorResponse(requestMethod: string): Response {
+  const response = Response.json(
     {
       error: {
         code: "internal_error",
@@ -49,6 +49,11 @@ function internalErrorResponse(): Response {
       },
     },
   );
+  if (requestMethod.toUpperCase() !== "HEAD") return response;
+  return new Response(null, {
+    status: response.status,
+    headers: response.headers,
+  });
 }
 
 const handle = createAdminCompatRouteHandler();
