@@ -22,9 +22,7 @@ type ArtifactRepositories = {
       temporaryStoragePath: string;
       metadata?: unknown;
     }): Promise<string>;
-    markReady(scope: AgentScope, artifactId: string): Promise<boolean>;
-    markPendingForCleanup(scope: AgentScope, artifactId: string): Promise<boolean>;
-    delete(scope: AgentScope, artifactId: string): Promise<boolean>;
+    deletePending(scope: AgentScope, artifactId: string): Promise<boolean>;
   };
 };
 
@@ -97,8 +95,6 @@ export async function publishTaskArtifact(input: {
       temporaryStoragePath,
       finalStoragePath: stored.storagePath,
     });
-    const markedReady = await input.repositories.taskArtifacts.markReady(input.scope, artifactId);
-    if (!markedReady) throw new Error("artifact_ready_transition_failed");
     return { artifactId, ...stored };
   } catch (error) {
     if (artifactId) {
@@ -125,17 +121,14 @@ export async function discardPublishedTaskArtifacts(input: {
 }): Promise<void> {
   const storage = input.storage ?? defaultStorage;
   for (const artifact of input.artifacts) {
-    const hidden = await input.repositories.taskArtifacts
-      .markPendingForCleanup(input.scope, artifact.artifactId)
-      .catch(() => false);
-    if (!hidden) continue;
-
     try {
       await storage.deleteFile(input.root, artifact.storagePath);
     } catch {
       continue;
     }
-    await input.repositories.taskArtifacts.delete(input.scope, artifact.artifactId).catch(() => undefined);
+    await input.repositories.taskArtifacts
+      .deletePending(input.scope, artifact.artifactId)
+      .catch(() => undefined);
   }
 }
 
@@ -153,6 +146,8 @@ async function compensateArtifactPublication(input: {
     input.storage.deleteFile(input.root, input.finalStoragePath),
   ]);
   if (cleanupResults.every((result) => result.status === "fulfilled")) {
-    await input.repositories.taskArtifacts.delete(input.scope, input.artifactId).catch(() => undefined);
+    await input.repositories.taskArtifacts
+      .deletePending(input.scope, input.artifactId)
+      .catch(() => undefined);
   }
 }

@@ -339,30 +339,44 @@ export function createRepositories(
 
   async function acquireSharedUserDataLease(
     fence: UserDataRequestFence,
+    options: { signal?: AbortSignal } = {},
   ): Promise<UserDataLease> {
     const lockKey = `user-data-quiescence:${fence.userId}`;
-    const client = await userDataLockPool.connect();
+    const client = await connectPoolClient(userDataLockPool, options.signal);
     let locked = false;
+    let destroyed = false;
+    const abortPendingQuery = () => {
+      if (destroyed) return;
+      destroyed = true;
+      client.release(true);
+    };
+    options.signal?.addEventListener("abort", abortPendingQuery, { once: true });
     try {
+      options.signal?.throwIfAborted();
       await client.query(
         "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
         [lockKey],
       );
+      options.signal?.throwIfAborted();
       locked = true;
       const current = await client.query<{ epoch: string }>(
         "SELECT epoch::text AS epoch FROM user_data_epochs WHERE user_id = $1",
         [fence.userId],
       );
+      options.signal?.throwIfAborted();
       if (current.rows[0]?.epoch !== fence.epoch) {
         throw new Error("user_data_epoch_changed");
       }
     } catch (error) {
-      if (locked) {
+      if (locked && !destroyed) {
         await releaseAdvisoryLease(client, lockKey, "shared").catch(() => undefined);
-      } else {
+      } else if (!destroyed) {
         client.release(true);
       }
+      options.signal?.throwIfAborted();
       throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", abortPendingQuery);
     }
     return createAdvisoryLease(client, lockKey, fence.userId, fence.epoch, "shared");
   }
@@ -2117,8 +2131,8 @@ export function createRepositories(
         metadata?: unknown;
       }): Promise<string> {
         const result = await pool.query(
-          `INSERT INTO task_runs (user_id, agent_id, conversation_id, kind, input_summary, metadata)
-           SELECT $1, $2, $3, $4, $5, $6
+          `INSERT INTO task_runs (user_id, agent_id, conversation_id, kind, status, input_summary, metadata)
+           SELECT $1, $2, $3, $4, 'running', $5, $6
            WHERE (
              $3::uuid IS NULL OR EXISTS (
                SELECT 1 FROM conversations
@@ -2131,47 +2145,63 @@ export function createRepositories(
         if (!result.rows[0]) throw new Error("conversation_not_found");
         return result.rows[0].id;
       },
-      async complete(scope: AgentScope, taskRunId: string, outputSummary: string): Promise<void> {
-        await pool.query(
-          `UPDATE task_runs SET status = 'succeeded', output_summary = $4, updated_at = now()
-           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
-          [scope.userId, scope.agentId, taskRunId, outputSummary],
-        );
+      async completeWithArtifacts(
+        scope: AgentScope,
+        taskRunId: string,
+        outputSummary: string,
+        artifactIds: string[],
+      ): Promise<void> {
+        const uniqueArtifactIds = [...new Set(artifactIds)];
+        if (uniqueArtifactIds.length !== artifactIds.length) {
+          throw new Error("task_artifact_transition_failed");
+        }
+
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          if (uniqueArtifactIds.length > 0) {
+            const artifacts = await client.query<{ id: string }>(
+              `UPDATE task_artifacts
+               SET status = 'ready', temporary_storage_path = NULL, updated_at = now()
+               WHERE user_id = $1
+                 AND agent_id = $2
+                 AND task_run_id = $3
+                 AND id = ANY($4::uuid[])
+                 AND status = 'pending'
+               RETURNING id`,
+              [scope.userId, scope.agentId, taskRunId, uniqueArtifactIds],
+            );
+            if (artifacts.rows.length !== uniqueArtifactIds.length) {
+              throw new Error("task_artifact_transition_failed");
+            }
+          }
+
+          const task = await client.query<{ id: string }>(
+            `UPDATE task_runs
+             SET status = 'succeeded', output_summary = $4, error = NULL, updated_at = now()
+             WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'running'
+             RETURNING id`,
+            [scope.userId, scope.agentId, taskRunId, outputSummary],
+          );
+          if (!task.rows[0]) throw new Error("task_completion_transition_failed");
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
       },
       async fail(scope: AgentScope, taskRunId: string, error: string): Promise<void> {
         await pool.query(
-          "UPDATE task_runs SET status = 'failed', error = $4, updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          `UPDATE task_runs
+           SET status = 'failed', error = $4, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'running'`,
           [scope.userId, scope.agentId, taskRunId, error],
         );
       },
     },
     taskArtifacts: {
-      async create(scope: AgentScope, input: {
-        taskRunId: string;
-        fileName: string;
-        mimeType: string;
-        storagePath: string;
-        metadata?: unknown;
-      }): Promise<string> {
-        const result = await pool.query(
-          `INSERT INTO task_artifacts (user_id, agent_id, task_run_id, file_name, mime_type, storage_path, status, metadata)
-           SELECT $1, $2, task_run.id, $4, $5, $6, 'ready', $7
-           FROM task_runs AS task_run
-           WHERE task_run.user_id = $1 AND task_run.agent_id = $2 AND task_run.id = $3
-           RETURNING id`,
-          [
-            scope.userId,
-            scope.agentId,
-            input.taskRunId,
-            input.fileName,
-            input.mimeType,
-            input.storagePath,
-            JSON.stringify(input.metadata ?? {}),
-          ],
-        );
-        if (!result.rows[0]) throw new Error("task_run_not_found");
-        return result.rows[0].id;
-      },
       async createPending(scope: AgentScope, input: {
         taskRunId: string;
         fileName: string;
@@ -2187,7 +2217,10 @@ export function createRepositories(
            )
            SELECT $1, $2, task_run.id, $4, $5, $6, $7, 'pending', $8
            FROM task_runs AS task_run
-           WHERE task_run.user_id = $1 AND task_run.agent_id = $2 AND task_run.id = $3
+           WHERE task_run.user_id = $1
+             AND task_run.agent_id = $2
+             AND task_run.id = $3
+             AND task_run.status = 'running'
            RETURNING id`,
           [
             scope.userId,
@@ -2203,29 +2236,11 @@ export function createRepositories(
         if (!result.rows[0]) throw new Error("task_run_not_found");
         return result.rows[0].id;
       },
-      async markReady(scope: AgentScope, artifactId: string): Promise<boolean> {
+      async deletePending(scope: AgentScope, artifactId: string): Promise<boolean> {
         const result = await pool.query(
-          `UPDATE task_artifacts
-           SET status = 'ready', temporary_storage_path = NULL, updated_at = now()
+          `DELETE FROM task_artifacts
            WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'pending'
            RETURNING id`,
-          [scope.userId, scope.agentId, artifactId],
-        );
-        return Boolean(result.rows[0]);
-      },
-      async markPendingForCleanup(scope: AgentScope, artifactId: string): Promise<boolean> {
-        const result = await pool.query(
-          `UPDATE task_artifacts
-           SET status = 'pending', temporary_storage_path = NULL, updated_at = now()
-           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'ready'
-           RETURNING id`,
-          [scope.userId, scope.agentId, artifactId],
-        );
-        return Boolean(result.rows[0]);
-      },
-      async delete(scope: AgentScope, artifactId: string): Promise<boolean> {
-        const result = await pool.query(
-          "DELETE FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 AND id = $3 RETURNING id",
           [scope.userId, scope.agentId, artifactId],
         );
         return Boolean(result.rows[0]);
@@ -2841,4 +2856,37 @@ async function releaseAdvisoryLease(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function connectPoolClient(pool: Pool, signal?: AbortSignal): Promise<PoolClient> {
+  signal?.throwIfAborted();
+  if (!signal) return pool.connect();
+
+  return new Promise<PoolClient>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void pool.connect().then(
+      (client) => {
+        if (settled) {
+          client.release();
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(client);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

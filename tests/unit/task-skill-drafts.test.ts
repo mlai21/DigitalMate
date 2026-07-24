@@ -4,7 +4,7 @@ import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
 describe("completeTaskWithSkillDraft", () => {
   it("marks a task complete and creates a pending skill draft", async () => {
     const repositories = {
-      taskRuns: { complete: vi.fn() },
+      taskRuns: { completeWithArtifacts: vi.fn() },
       skills: { create: vi.fn() },
     };
 
@@ -14,12 +14,14 @@ describe("completeTaskWithSkillDraft", () => {
       kind: "spreadsheet",
       inputSummary: "表格汇总：sales.xlsx",
       outputSummary: "表格汇总报告已生成。",
+      artifactIds: ["artifact-1", "artifact-2"],
     });
 
-    expect(repositories.taskRuns.complete).toHaveBeenCalledWith(
+    expect(repositories.taskRuns.completeWithArtifacts).toHaveBeenCalledWith(
       { userId: "user-1", agentId: "agent-1" },
       "task-1",
       "表格汇总报告已生成。",
+      ["artifact-1", "artifact-2"],
     );
     expect(repositories.skills.create).toHaveBeenCalledWith(
       "user-1",
@@ -33,7 +35,7 @@ describe("completeTaskWithSkillDraft", () => {
 
   it("does not fail a completed task when skill draft creation fails", async () => {
     const repositories = {
-      taskRuns: { complete: vi.fn() },
+      taskRuns: { completeWithArtifacts: vi.fn() },
       skills: { create: vi.fn(async () => Promise.reject(new Error("skill write failed"))) },
     };
 
@@ -44,13 +46,15 @@ describe("completeTaskWithSkillDraft", () => {
         kind: "sandbox",
         inputSummary: "沙箱执行：node task.js",
         outputSummary: "沙箱任务已执行，输出文件已生成。",
+        artifactIds: ["artifact-1"],
       }),
     ).resolves.toBeUndefined();
 
-    expect(repositories.taskRuns.complete).toHaveBeenCalledWith(
+    expect(repositories.taskRuns.completeWithArtifacts).toHaveBeenCalledWith(
       { userId: "user-1", agentId: "agent-1" },
       "task-1",
       "沙箱任务已执行，输出文件已生成。",
+      ["artifact-1"],
     );
   });
 });

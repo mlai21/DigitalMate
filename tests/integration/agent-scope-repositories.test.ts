@@ -251,31 +251,34 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       kind: "presentation",
       inputSummary: "B task",
     });
-    const artifactA = await repositories.taskArtifacts.create(scopeA, {
+    const artifactA = await repositories.taskArtifacts.createPending(scopeA, {
       taskRunId: taskA,
       fileName: "a.txt",
       mimeType: "text/plain",
       storagePath: `${USER_ID}/${taskA}/a.txt`,
+      temporaryStoragePath: `${USER_ID}/${taskA}/.a.txt.test.tmp`,
     });
-    const artifactB = await repositories.taskArtifacts.create(scopeB, {
+    const artifactB = await repositories.taskArtifacts.createPending(scopeB, {
       taskRunId: taskB,
       fileName: "b.txt",
       mimeType: "text/plain",
       storagePath: `${USER_ID}/${taskB}/b.txt`,
+      temporaryStoragePath: `${USER_ID}/${taskB}/.b.txt.test.tmp`,
     });
     await expect(repositories.taskArtifacts.get(scopeA, artifactB)).resolves.toBeNull();
-    await expect(repositories.taskArtifacts.create(scopeA, {
+    await expect(repositories.taskArtifacts.createPending(scopeA, {
       taskRunId: taskB,
       fileName: "cross.txt",
       mimeType: "text/plain",
       storagePath: "cross.txt",
+      temporaryStoragePath: ".cross.txt.test.tmp",
     })).rejects.toThrow("task_run_not_found");
-    await repositories.taskRuns.complete(scopeA, taskB, "cross-agent completion");
-    await repositories.taskRuns.complete(scopeB, taskB, "B complete");
-    await expect(repositories.taskArtifacts.get(scopeA, artifactA))
-      .resolves.toMatchObject({ agent_id: AGENT_A });
-    await expect(repositories.taskRuns.list(scopeB))
-      .resolves.toEqual([expect.objectContaining({ output_summary: "B complete" })]);
+    await expect(repositories.taskRuns.completeWithArtifacts(
+      scopeA,
+      taskB,
+      "cross-agent completion",
+      [artifactB],
+    )).rejects.toThrow("task_artifact_transition_failed");
 
     const pendingArtifact = await repositories.taskArtifacts.createPending(scopeA, {
       taskRunId: taskA,
@@ -287,13 +290,7 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
     await expect(repositories.taskArtifacts.list(scopeA))
       .resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ id: pendingArtifact })]));
-    await expect(repositories.taskArtifacts.markReady(scopeA, pendingArtifact)).resolves.toBe(true);
-    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact))
-      .resolves.toMatchObject({ id: pendingArtifact, status: "ready" });
-    await expect(repositories.taskArtifacts.markPendingForCleanup(scopeA, pendingArtifact))
-      .resolves.toBe(true);
-    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
-    await expect(repositories.taskArtifacts.delete(scopeA, pendingArtifact)).resolves.toBe(true);
+    await expect(repositories.taskArtifacts.deletePending(scopeA, pendingArtifact)).resolves.toBe(true);
     await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
     const expiredPending = await repositories.taskArtifacts.createPending(scopeA, {
       taskRunId: taskA,
@@ -308,6 +305,13 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     );
     await expect(repositories.taskArtifacts.listExpiredPending(scopeA, 24, 100))
       .resolves.toEqual([expect.objectContaining({ id: expiredPending, status: "pending" })]);
+    await expect(repositories.taskArtifacts.deletePending(scopeA, expiredPending)).resolves.toBe(true);
+    await repositories.taskRuns.completeWithArtifacts(scopeA, taskA, "A complete", [artifactA]);
+    await repositories.taskRuns.completeWithArtifacts(scopeB, taskB, "B complete", [artifactB]);
+    await expect(repositories.taskArtifacts.get(scopeA, artifactA))
+      .resolves.toMatchObject({ agent_id: AGENT_A, status: "ready" });
+    await expect(repositories.taskRuns.list(scopeB))
+      .resolves.toEqual([expect.objectContaining({ output_summary: "B complete" })]);
 
     await repositories.toolLogs.create({
       ...scopeA,

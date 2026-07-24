@@ -203,6 +203,28 @@ describe("processGoalLoops (M-B closed loop)", () => {
     expect(outcome.stopped).toBe(0);
   });
 
+  it("rethrows tick cancellation before fallback ledger or goal status writes", async () => {
+    const controller = new AbortController();
+    const goal = buildGoal({ noProgressRounds: 0 });
+    const harness = buildHarness({ goals: [goal] });
+    harness.executeStep.mockImplementationOnce(async () => {
+      controller.abort(new Error("agent_tick_timeout"));
+      throw controller.signal.reason;
+    });
+
+    await expect(processGoalLoops({
+      scope,
+      repositories: harness.repositories,
+      services: harness.services,
+      signal: controller.signal,
+    })).rejects.toThrow("agent_tick_timeout");
+
+    expect(harness.createStep).not.toHaveBeenCalled();
+    expect(harness.updateProgress).not.toHaveBeenCalled();
+    expect(harness.setStatus).not.toHaveBeenCalled();
+    expect(harness.releaseRunningStep).not.toHaveBeenCalled();
+  });
+
   it("skips goals whose running step is already claimed", async () => {
     const goal = buildGoal({});
     const harness = buildHarness({ goals: [goal], claimResult: false });

@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { acquireUserDataLease } from "@/server/admin/user-data-lease";
+import {
+  acquireUserDataLease,
+  type FencedUserDataLease,
+} from "@/server/admin/user-data-lease";
 import { generateConversationTitle } from "@/server/agent/conversation-title";
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
@@ -18,6 +21,7 @@ import {
   createRepositories,
   type DbMessageAttachment,
   type UserDataLease,
+  type UserDataRequestFence,
 } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { recordTurnReview } from "@/server/evolution/turn-review";
@@ -32,6 +36,9 @@ import {
 import type { AgentScope } from "@/server/agents/types";
 
 export const runtime = "nodejs";
+
+export const CHAT_FOREGROUND_TIMEOUT_MS = 120_000;
+export const CHAT_POST_TURN_TIMEOUT_MS = 15_000;
 
 const requestSchema = z
   .object({
@@ -56,10 +63,18 @@ export async function POST(request: Request) {
   }
 
   const repositories = createRepositories();
-  let userDataLease: UserDataLease;
+  const foreground = createBoundedAbortLifecycle({
+    sourceSignals: [request.signal],
+    timeoutMs: CHAT_FOREGROUND_TIMEOUT_MS,
+    timeoutCode: "chat_foreground_timeout",
+  });
+  let userDataLease: FencedUserDataLease;
   try {
-    userDataLease = await acquireUserDataLease(repositories, user.id);
+    userDataLease = await acquireUserDataLease(repositories, user.id, {
+      signal: foreground.signal,
+    });
   } catch (error) {
+    foreground.dispose();
     const code = error instanceof Error ? error.message : "user_data_lease_failed";
     return NextResponse.json(
       { error: code === "user_data_epoch_changed" ? code : "user_data_lease_failed" },
@@ -67,18 +82,20 @@ export async function POST(request: Request) {
     );
   }
 
-  return handleLeasedChatRequest(request, user, repositories, userDataLease);
+  return handleLeasedChatRequest(request, user, repositories, userDataLease, foreground);
 }
 
 async function handleLeasedChatRequest(
   request: Request,
   user: { id: string },
   repositories: ReturnType<typeof createRepositories>,
-  userDataLease: UserDataLease,
+  userDataLease: FencedUserDataLease,
+  foreground: AbortLifecycle,
 ): Promise<Response> {
   let leaseTransferredToStream = false;
   try {
   const body = requestSchema.safeParse(await request.json());
+  foreground.signal.throwIfAborted();
   if (!body.success) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
   }
@@ -280,242 +297,275 @@ async function handleLeasedChatRequest(
   let stream: ReadableStream<Uint8Array>;
   try {
     stream = new ReadableStream({
-    async start(controller) {
-      let assistantText = "";
-      let executionAccepted = false;
-      let releaseExecutionLock: (() => Promise<void>) | undefined;
-      let releaseUserConnection: (() => void) | undefined;
-      try {
-        releaseUserConnection = userConnectionDisconnector.registerUserConnection(user.id);
-      } catch {
-        safeEnqueue(controller, encoder, { type: "error", message: "个人数据正在清理，请稍后重试。" });
-        safeClose(controller);
-        await releaseChatUserDataLease(userDataLease);
-        return;
-      }
-      try {
-        releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(scope, clientTurnId);
-      } catch {
-        console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
-        safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
-        safeClose(controller);
-        releaseUserConnection();
-        await releaseChatUserDataLease(userDataLease);
-        return;
-      }
-      try {
+      async start(controller) {
+        let assistantText = "";
+        let executionAccepted = false;
+        let assistantPersisted = false;
+        let admissionStage: "connection" | "turn_lock" | "execution" = "connection";
+        let releaseExecutionLock: (() => Promise<void>) | undefined;
+        let releaseUserConnection: (() => void) | undefined;
+        let detachedPostTurn: DetachedPostTurnInput | undefined;
+
+        const emit = (payload: unknown): boolean => {
+          if (safeEnqueue(controller, encoder, payload)) return true;
+          foreground.abort(new Error("chat_client_disconnected"));
+          return false;
+        };
         const acceptExecution = () => {
           executionAccepted = true;
-          safeEnqueue(controller, encoder, {
+          emit({
             type: "accepted",
             conversationId,
             userMessageId: userMessage.id,
             clientTurnId,
           });
         };
-        const assistantAfterLock = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
-        if (assistantAfterLock) {
-          acceptExecution();
-          safeEnqueue(controller, encoder, { type: "chunk", content: assistantAfterLock.content });
-          safeEnqueue(controller, encoder, {
-            type: "done",
-            conversationId,
-            clientTurnId,
-            userMessageId: userMessage.id,
-            assistantMessageId: assistantAfterLock.id,
-          });
-          safeClose(controller);
-          return;
-        }
 
-        const executionClaimed = await repositories.messages.claimClientTurnExecution(scope, clientTurnId);
-        if (!executionClaimed) {
-          const interruptedText = "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
-          const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
-            conversationId,
-            clientTurnId,
-            content: interruptedText,
-          });
-          acceptExecution();
-          safeEnqueue(controller, encoder, { type: "chunk", content: interruptedTurn.message.content });
-          safeEnqueue(controller, encoder, {
-            type: "done",
-            conversationId,
-            clientTurnId,
-            userMessageId: userMessage.id,
-            assistantMessageId: interruptedTurn.message.id,
-            degraded: true,
-          });
-          safeClose(controller);
-          return;
-        }
+        try {
+          foreground.signal.throwIfAborted();
+          releaseUserConnection = userConnectionDisconnector.registerUserConnection(user.id);
+          admissionStage = "turn_lock";
+          releaseExecutionLock = await repositories.messages.acquireClientTurnExecutionLock(scope, clientTurnId);
+          admissionStage = "execution";
+          foreground.signal.throwIfAborted();
 
-        acceptExecution();
-        for await (const chunk of runAgent({
-          userId: user.id,
-          agentId: scope.agentId,
-          conversationId,
-          message: agentMessage,
-          attachments: currentLlmAttachments,
-          history,
-          attachmentToolGuard: currentAttachments.length > 0 || historicalAttachments.length > 0,
-          persona: settings.persona,
-          llm: client,
-          model,
-          repositories,
-          explicitSkillIds,
-          createSkillMode,
-          webSearchEnabled: body.data.searchEnabled === true,
-          searchGate,
-          search: {
-            run: async (query) => {
-              const results = await searchWeb(query);
-              return { results, summary: summarizeSearchResults(results) };
-            },
-          },
-          skillInstaller: {
-            install: (url) =>
-              installSkillsFromGitHub({
-                url,
-                userId: user.id,
-                repositories,
-                scanner: { llm: light.client, model: light.model },
-                token: env.githubToken,
-              }),
-          },
-        })) {
-          assistantText += chunk;
-          safeEnqueue(controller, encoder, { type: "chunk", content: chunk });
-        }
-
-        if (!assistantText.trim()) {
-          assistantText = "我这边刚才没顺利想出来，等一下我们再试一次。";
-          safeEnqueue(controller, encoder, { type: "chunk", content: assistantText });
-        }
-
-        const assistantTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
-          conversationId,
-          clientTurnId,
-          content: assistantText,
-        });
-        const assistantMessage = assistantTurn.message;
-        if (!assistantTurn.created && assistantMessage.content !== assistantText) {
-          safeEnqueue(controller, encoder, { type: "replace", content: assistantMessage.content });
-          assistantText = assistantMessage.content;
-        }
-
-        if (assistantTurn.created) try {
-          const reminder = parseReminder(body.data.message);
-          if (reminder) {
-            await repositories.proactiveTasks.create(scope, {
+          const assistantAfterLock = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
+          foreground.signal.throwIfAborted();
+          if (assistantAfterLock) {
+            assistantPersisted = true;
+            acceptExecution();
+            emit({ type: "chunk", content: assistantAfterLock.content });
+            emit({
+              type: "done",
               conversationId,
-              kind: "reminder",
-              content: reminder.content,
-              scheduledAt: reminder.scheduledAt,
-              metadata: { urgent: reminder.urgent },
+              clientTurnId,
+              userMessageId: userMessage.id,
+              assistantMessageId: assistantAfterLock.id,
             });
-          } else {
-            const followUp = parseFollowUp(body.data.message);
-            if (followUp) {
+            safeClose(controller);
+            return;
+          }
+
+          const executionClaimed = await repositories.messages.claimClientTurnExecution(scope, clientTurnId);
+          foreground.signal.throwIfAborted();
+          if (!executionClaimed) {
+            const interruptedText = "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
+            const interruptedTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
+              conversationId,
+              clientTurnId,
+              content: interruptedText,
+            });
+            assistantPersisted = true;
+            acceptExecution();
+            emit({ type: "chunk", content: interruptedTurn.message.content });
+            emit({
+              type: "done",
+              conversationId,
+              clientTurnId,
+              userMessageId: userMessage.id,
+              assistantMessageId: interruptedTurn.message.id,
+              degraded: true,
+            });
+            safeClose(controller);
+            return;
+          }
+
+          acceptExecution();
+          foreground.signal.throwIfAborted();
+          for await (const chunk of runAgent({
+            userId: user.id,
+            agentId: scope.agentId,
+            conversationId,
+            message: agentMessage,
+            attachments: currentLlmAttachments,
+            history,
+            attachmentToolGuard: currentAttachments.length > 0 || historicalAttachments.length > 0,
+            persona: settings.persona,
+            llm: client,
+            model,
+            repositories,
+            explicitSkillIds,
+            createSkillMode,
+            webSearchEnabled: body.data.searchEnabled === true,
+            searchGate,
+            signal: foreground.signal,
+            search: {
+              run: async (query, signal) => {
+                const results = await searchWeb(query, env, signal);
+                return { results, summary: summarizeSearchResults(results) };
+              },
+            },
+            skillInstaller: {
+              install: (url, signal) =>
+                installSkillsFromGitHub({
+                  url,
+                  userId: user.id,
+                  repositories,
+                  scanner: { llm: light.client, model: light.model },
+                  token: env.githubToken,
+                  signal,
+                }),
+            },
+          })) {
+            foreground.signal.throwIfAborted();
+            assistantText += chunk;
+            emit({ type: "chunk", content: chunk });
+          }
+
+          if (!assistantText.trim()) {
+            assistantText = "我这边刚才没顺利想出来，等一下我们再试一次。";
+            emit({ type: "chunk", content: assistantText });
+            foreground.signal.throwIfAborted();
+          }
+
+          const assistantTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
+            conversationId,
+            clientTurnId,
+            content: assistantText,
+          });
+          assistantPersisted = true;
+          const assistantMessage = assistantTurn.message;
+          if (!assistantTurn.created && assistantMessage.content !== assistantText) {
+            emit({ type: "replace", content: assistantMessage.content });
+            assistantText = assistantMessage.content;
+          }
+
+          foreground.signal.throwIfAborted();
+          if (assistantTurn.created) try {
+            const reminder = parseReminder(body.data.message);
+            if (reminder) {
               await repositories.proactiveTasks.create(scope, {
                 conversationId,
-                kind: "follow_up",
-                content: followUp.content,
-                scheduledAt: followUp.scheduledAt,
+                kind: "reminder",
+                content: reminder.content,
+                scheduledAt: reminder.scheduledAt,
+                metadata: { urgent: reminder.urgent },
               });
+            } else {
+              const followUp = parseFollowUp(body.data.message);
+              if (followUp) {
+                await repositories.proactiveTasks.create(scope, {
+                  conversationId,
+                  kind: "follow_up",
+                  content: followUp.content,
+                  scheduledAt: followUp.scheduledAt,
+                });
+              }
             }
+          } catch {
+            console.error("chat_proactive_task_failed", { code: "proactive_task_create_failed" });
           }
-        } catch {
-          console.error("chat_proactive_task_failed", { code: "proactive_task_create_failed" });
-        }
 
-        safeEnqueue(controller, encoder, {
-          type: "done",
-          conversationId,
-          clientTurnId,
-          userMessageId: userMessage.id,
-          assistantMessageId: assistantMessage.id,
-        });
-        safeClose(controller);
-
-        // The client has its complete response, but the same shared lease stays
-        // alive until all derived writes from this turn have settled.
-        if (assistantTurn.created) {
-          await runPostTurnTasks({
-            repositories,
-            scope,
-            conversationId,
-            conversationTitle: conversation.title,
-            userText: body.data.message,
-            assistantText,
-            llm: light.client,
-            model: light.model,
-          });
-        }
-      } catch (error) {
-        if (!executionAccepted) {
-          console.error("chat_turn_admission_failed", {
-            code: "turn_admission_failed",
-            errorType: error instanceof Error ? "Error" : "NonError",
-          });
-          safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
-          safeClose(controller);
-          return;
-        }
-        const fallback = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
-        const suffix = assistantText.trim() ? `\n\n${fallback}` : fallback;
-        const content = `${assistantText}${suffix}`;
-        console.error("chat_agent_failed", {
-          code: "agent_response_failed",
-          errorType: error instanceof Error ? "Error" : "NonError",
-        });
-        let fallbackTurn;
-        try {
-          fallbackTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
-            conversationId,
-            clientTurnId,
-            content,
-          });
-        } catch (fallbackError) {
-          console.error("chat_fallback_persist_failed", {
-            code: "fallback_persist_failed",
-            errorType: fallbackError instanceof Error ? "Error" : "NonError",
-          });
-          safeEnqueue(controller, encoder, {
+          foreground.signal.throwIfAborted();
+          emit({
             type: "done",
             conversationId,
             clientTurnId,
             userMessageId: userMessage.id,
+            assistantMessageId: assistantMessage.id,
+          });
+          foreground.signal.throwIfAborted();
+          safeClose(controller);
+
+          if (assistantTurn.created) {
+            detachedPostTurn = {
+              repositories,
+              fence: userDataLease.requestFence,
+              scope,
+              conversationId,
+              conversationTitle: conversation.title,
+              userText: body.data.message,
+              assistantText,
+              llm: light.client,
+              model: light.model,
+            };
+          }
+        } catch (error) {
+          if (!executionAccepted) {
+            if (admissionStage === "connection") {
+              emit({ type: "error", message: "个人数据正在清理，请稍后重试。" });
+            } else {
+              if (admissionStage === "turn_lock") {
+                console.error("chat_turn_lock_failed", { code: "turn_lock_acquire_failed" });
+              } else {
+                console.error("chat_turn_admission_failed", {
+                  code: "turn_admission_failed",
+                  errorType: error instanceof Error ? "Error" : "NonError",
+                });
+              }
+              emit({ type: "error", message: "消息暂时没有受理，请重试。" });
+            }
+            safeClose(controller);
+            return;
+          }
+
+          if (assistantPersisted) {
+            safeClose(controller);
+            return;
+          }
+
+          const fallback = "我这边刚才有点卡住了，但不是你的问题。我们可以稍后再试一次。";
+          const suffix = assistantText.trim() ? `\n\n${fallback}` : fallback;
+          const content = `${assistantText}${suffix}`;
+          console.error("chat_agent_failed", {
+            code: "agent_response_failed",
+            errorType: error instanceof Error ? "Error" : "NonError",
+          });
+          let fallbackTurn;
+          try {
+            fallbackTurn = await repositories.messages.createIdempotentAssistantTurn(scope, {
+              conversationId,
+              clientTurnId,
+              content,
+            });
+            assistantPersisted = true;
+          } catch (fallbackError) {
+            console.error("chat_fallback_persist_failed", {
+              code: "fallback_persist_failed",
+              errorType: fallbackError instanceof Error ? "Error" : "NonError",
+            });
+            emit({
+              type: "done",
+              conversationId,
+              clientTurnId,
+              userMessageId: userMessage.id,
+              degraded: true,
+            });
+            safeClose(controller);
+            return;
+          }
+          const fallbackMessage = fallbackTurn.message;
+          if (fallbackTurn.created) {
+            emit({ type: "chunk", content: suffix });
+          } else {
+            emit({ type: "replace", content: fallbackMessage.content });
+          }
+          emit({
+            type: "done",
+            conversationId,
+            clientTurnId,
+            userMessageId: userMessage.id,
+            assistantMessageId: fallbackMessage.id,
             degraded: true,
           });
           safeClose(controller);
-          return;
+        } finally {
+          if (releaseExecutionLock) {
+            await releaseExecutionLock().catch(() => {
+              console.error("chat_turn_lock_release_failed", { code: "turn_lock_release_failed" });
+            });
+          }
+          releaseUserConnection?.();
+          await releaseChatUserDataLease(userDataLease);
+          foreground.dispose();
+          if (detachedPostTurn) {
+            startDetachedPostTurn(detachedPostTurn);
+          }
         }
-        const fallbackMessage = fallbackTurn.message;
-        if (fallbackTurn.created) {
-          safeEnqueue(controller, encoder, { type: "chunk", content: suffix });
-        } else {
-          safeEnqueue(controller, encoder, { type: "replace", content: fallbackMessage.content });
-        }
-        safeEnqueue(controller, encoder, {
-          type: "done",
-          conversationId,
-          clientTurnId,
-          userMessageId: userMessage.id,
-          assistantMessageId: fallbackMessage.id,
-          degraded: true,
-        });
-        safeClose(controller);
-      } finally {
-        if (releaseExecutionLock) {
-          await releaseExecutionLock().catch(() => {
-            console.error("chat_turn_lock_release_failed", { code: "turn_lock_release_failed" });
-          });
-        }
-        releaseUserConnection?.();
-        await releaseChatUserDataLease(userDataLease);
-      }
-    },
+      },
+      cancel(reason) {
+        foreground.abort(toAbortReason(reason, "chat_client_disconnected"));
+      },
     });
   } catch (error) {
     leaseTransferredToStream = false;
@@ -532,6 +582,7 @@ async function handleLeasedChatRequest(
   } finally {
     if (!leaseTransferredToStream) {
       await releaseChatUserDataLease(userDataLease);
+      foreground.dispose();
     }
   }
 }
@@ -711,6 +762,110 @@ function hashClientTurnPayload(input: {
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
+type DetachedPostTurnInput = {
+  repositories: ReturnType<typeof createRepositories>;
+  fence: UserDataRequestFence;
+  scope: AgentScope;
+  conversationId: string;
+  conversationTitle: string;
+  userText: string;
+  assistantText: string;
+  llm: ReturnType<typeof getLlmClient>["client"];
+  model: string;
+};
+
+type AbortLifecycle = {
+  signal: AbortSignal;
+  abort(reason: unknown): void;
+  dispose(): void;
+};
+
+function createBoundedAbortLifecycle(input: {
+  sourceSignals: AbortSignal[];
+  timeoutMs: number;
+  timeoutCode: string;
+}): AbortLifecycle {
+  const controller = new AbortController();
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
+  let disposed = false;
+
+  const abort = (reason: unknown) => {
+    if (!controller.signal.aborted) {
+      controller.abort(toAbortReason(reason, input.timeoutCode));
+    }
+  };
+
+  for (const sourceSignal of input.sourceSignals) {
+    if (sourceSignal.aborted) {
+      abort(sourceSignal.reason);
+      break;
+    }
+    const listener = () => abort(sourceSignal.reason);
+    sourceSignal.addEventListener("abort", listener, { once: true });
+    listeners.push({ signal: sourceSignal, listener });
+  }
+
+  const timer = setTimeout(() => abort(new Error(input.timeoutCode)), input.timeoutMs);
+  timer.unref?.();
+
+  return {
+    signal: controller.signal,
+    abort,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(timer);
+      for (const { signal, listener } of listeners) {
+        signal.removeEventListener("abort", listener);
+      }
+    },
+  };
+}
+
+function toAbortReason(reason: unknown, fallbackCode: string): Error {
+  if (reason instanceof Error) return reason;
+  return new Error(typeof reason === "string" && reason ? reason : fallbackCode);
+}
+
+function startDetachedPostTurn(input: DetachedPostTurnInput): void {
+  const lifecycle = createBoundedAbortLifecycle({
+    sourceSignals: [],
+    timeoutMs: CHAT_POST_TURN_TIMEOUT_MS,
+    timeoutCode: "chat_post_turn_timeout",
+  });
+
+  void (async () => {
+    let lease: UserDataLease | undefined;
+    try {
+      lease = await input.repositories.userDataMutations.acquireSharedLease(input.fence, {
+        signal: lifecycle.signal,
+      });
+      lifecycle.signal.throwIfAborted();
+      await runPostTurnTasks({
+        ...input,
+        signal: lifecycle.signal,
+      });
+    } catch (error) {
+      if (
+        !lifecycle.signal.aborted
+        && (!(error instanceof Error) || error.message !== "user_data_epoch_changed")
+      ) {
+        console.error("chat_post_turn_failed", {
+          code: "post_turn_failed",
+          errorType: error instanceof Error ? "Error" : "NonError",
+        });
+      }
+    } finally {
+      if (lease) {
+        await releaseChatUserDataLease(lease);
+      }
+      lifecycle.dispose();
+    }
+  })().catch(() => {
+    lifecycle.dispose();
+  });
+}
+
 async function runPostTurnTasks(input: {
   repositories: ReturnType<typeof createRepositories>;
   scope: AgentScope;
@@ -720,25 +875,39 @@ async function runPostTurnTasks(input: {
   assistantText: string;
   llm: ReturnType<typeof getLlmClient>["client"];
   model: string;
+  signal: AbortSignal;
 }): Promise<void> {
+  input.signal.throwIfAborted();
   const isDefaultTitle = input.conversationTitle === "新的对话" || input.conversationTitle === "和 DigitalMate 的对话";
   if (isDefaultTitle) {
-    await generateConversationTitle({
+    try {
+      const title = await generateConversationTitle({
+        llm: input.llm,
+        model: input.model,
+        userText: input.userText,
+        assistantText: input.assistantText,
+        signal: input.signal,
+      });
+      input.signal.throwIfAborted();
+      await input.repositories.conversations.setTitleIfDefault(input.scope, input.conversationId, title);
+      input.signal.throwIfAborted();
+    } catch {
+      input.signal.throwIfAborted();
+    }
+  }
+
+  input.signal.throwIfAborted();
+  try {
+    await recordTurnReview(input.repositories, {
+      scope: input.scope,
+      conversationId: input.conversationId,
       llm: input.llm,
       model: input.model,
       userText: input.userText,
       assistantText: input.assistantText,
-    })
-      .then((title) => input.repositories.conversations.setTitleIfDefault(input.scope, input.conversationId, title))
-      .catch(() => undefined);
+      signal: input.signal,
+    });
+  } catch {
+    input.signal.throwIfAborted();
   }
-
-  await recordTurnReview(input.repositories, {
-    scope: input.scope,
-    conversationId: input.conversationId,
-    llm: input.llm,
-    model: input.model,
-    userText: input.userText,
-    assistantText: input.assistantText,
-  }).catch(() => undefined);
 }

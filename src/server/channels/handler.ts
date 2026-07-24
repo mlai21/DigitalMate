@@ -72,22 +72,33 @@ export async function handleChannelMessage(input: {
   repositories: ChannelRepositories;
   llm: LlmClient;
   model: string;
-  send(message: NormalizedChannelMessage, text: string): Promise<unknown> | unknown;
-  skillInstaller?: { install(url: string): Promise<SkillInstallOutcome> };
+  send(
+    message: NormalizedChannelMessage,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<unknown> | unknown;
+  skillInstaller?: {
+    install(url: string, signal?: AbortSignal): Promise<SkillInstallOutcome>;
+  };
   /** Light-model client used for the web_search hard gate (PRD 5.4). */
   lightLlm?: { client: LlmClient; model: string };
-  delay?(ms: number): Promise<unknown> | unknown;
+  delay?(ms: number, signal?: AbortSignal): Promise<unknown> | unknown;
+  signal?: AbortSignal;
   now?: Date;
 }): Promise<void> {
+  input.signal?.throwIfAborted();
   const now = input.now ?? new Date();
   const conversation = await input.repositories.channels.ensureConversation(input.scope, input.message);
+  input.signal?.throwIfAborted();
   await input.repositories.channels.createChannelMessage(input.scope, { conversationId: conversation.id, message: input.message });
+  input.signal?.throwIfAborted();
   await input.repositories.messages.create(input.scope, {
     conversationId: conversation.id,
     role: "user",
     content: input.message.text,
     memoryProcessed: input.message.chatType === "group",
   });
+  input.signal?.throwIfAborted();
   if (input.repositories.reflections) {
     await recordEventReflection(
       { reflections: input.repositories.reflections },
@@ -104,6 +115,7 @@ export async function handleChannelMessage(input: {
     ).catch(() => undefined);
   }
   await scheduleDirectChannelTask(input, conversation.id, now);
+  input.signal?.throwIfAborted();
 
   if (input.message.chatType === "group") {
     const recentWindowStart = new Date(now.getTime() - 2 * 60_000);
@@ -114,6 +126,7 @@ export async function handleChannelMessage(input: {
       input.repositories.channels.sentCounts(input.scope, input.message.channel, input.message.externalConversationId, now),
       input.repositories.channels.recentMessageCount(input.scope, input.message.channel, input.message.externalConversationId, recentWindowStart),
     ]);
+    input.signal?.throwIfAborted();
     const decision = shouldInterject({
       message: input.message,
       memories: memories.map((memory) => memory.content),
@@ -136,11 +149,13 @@ export async function handleChannelMessage(input: {
       shouldInterject: decision.shouldInterject,
       reason: decision.reason,
     });
+    input.signal?.throwIfAborted();
     if (!decision.shouldInterject) return;
   }
 
   const settings = await input.repositories.settings.get(input.scope);
   const history = await input.repositories.messages.recentHistory(input.scope, conversation.id);
+  input.signal?.throwIfAborted();
 
   // IM channels cannot render skill cards, so slash prefixes are the explicit
   // invocation path here: "/skill-name ..." and "/create-skill ..." (P1-11/12).
@@ -179,32 +194,42 @@ export async function handleChannelMessage(input: {
     explicitSkillIds,
     createSkillMode,
     searchGate,
+    signal: input.signal,
     search: {
-      run: async (query) => {
-        const results = await searchWeb(query);
+      run: async (query, signal) => {
+        const results = await searchWeb(query, undefined, signal);
         return { results, summary: summarizeSearchResults(results) };
       },
     },
     skillInstaller: input.skillInstaller,
   })) {
+    input.signal?.throwIfAborted();
     answer += chunk;
   }
+  input.signal?.throwIfAborted();
   if (!answer.trim()) return;
   await input.repositories.messages.create(input.scope, {
     conversationId: conversation.id,
     role: "assistant",
     content: answer,
   });
+  input.signal?.throwIfAborted();
   const cadence = normalizeCadence(settings.cadence);
   const segments = splitAssistantText(answer).slice(0, cadence.maxSegments);
   if (segments.length > 0 && cadence.responseDelayMs > 0) {
-    await (input.delay ?? sleep)(cadence.responseDelayMs);
+    await runDelay(input.delay, cadence.responseDelayMs, input.signal);
   }
   for (const [index, segment] of segments.entries()) {
+    input.signal?.throwIfAborted();
     if (index > 0 && cadence.segmentDelayMs > 0) {
-      await (input.delay ?? sleep)(cadence.segmentDelayMs);
+      await runDelay(input.delay, cadence.segmentDelayMs, input.signal);
     }
-    await input.send(input.message, segment);
+    if (input.signal) {
+      await input.send(input.message, segment, input.signal);
+    } else {
+      await input.send(input.message, segment);
+    }
+    input.signal?.throwIfAborted();
   }
 }
 
@@ -253,6 +278,36 @@ function normalizeCadence(value: unknown): { responseDelayMs: number; segmentDel
   };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function runDelay(
+  delay: ((ms: number, signal?: AbortSignal) => Promise<unknown> | unknown) | undefined,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<unknown> | unknown {
+  return delay
+    ? signal
+      ? delay(ms, signal)
+      : delay(ms)
+    : sleep(ms, signal);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, ms);
+    const abort = () => {
+      cleanup();
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+
+    function cleanup() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+    }
+
+    function finish() {
+      cleanup();
+      resolve();
+    }
+  });
 }

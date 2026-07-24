@@ -37,6 +37,33 @@ function buildRepositories(entries: ReturnType<typeof buildEntries>) {
 }
 
 describe("consolidateMemoryKind", () => {
+  it("rethrows cancellation instead of pruning after an aborted merge", async () => {
+    const controller = new AbortController();
+    const repositories = buildRepositories(buildEntries(6));
+    const llm: LlmClient = {
+      async *stream() {
+        yield { type: "text", text: "" };
+      },
+      async completeText(input) {
+        controller.abort(new Error("memory_consolidation_timeout"));
+        input.signal?.throwIfAborted();
+        return "";
+      },
+    };
+
+    await expect(consolidateMemoryKind({
+      repositories,
+      llm,
+      model: "light",
+      scope: { userId: "u1", agentId: "a1" },
+      kind: "profile",
+      cap: 4,
+      signal: controller.signal,
+    })).rejects.toThrow("memory_consolidation_timeout");
+    expect(repositories.memories.softDeleteMany).not.toHaveBeenCalled();
+    expect(repositories.memories.createMany).not.toHaveBeenCalled();
+  });
+
   it("does nothing while the layer is under its cap", async () => {
     const repositories = buildRepositories(buildEntries(3));
 

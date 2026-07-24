@@ -290,6 +290,76 @@ describe("OpenAiCompatClient", () => {
       "LLM request failed",
     );
   });
+
+  it("passes the caller signal to fetch and cancels a half-open SSE reader on abort", async () => {
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cancelReader = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"content":"首段"}}]}\n',
+        ));
+      },
+      cancel: cancelReader,
+    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(body, { headers: { "content-type": "text/event-stream" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const abortController = new AbortController();
+    const client = new OpenAiCompatClient({
+      url: "https://example.com/v1/chat/completions",
+      apiKey: "k",
+    });
+    const iterator = client.stream({
+      model: "m",
+      messages: [{ role: "user", content: "Hi" }],
+      signal: abortController.signal,
+    })[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: { type: "text", text: "首段" },
+    });
+    const pendingRead = iterator.next();
+    abortController.abort(new Error("client_cancelled"));
+
+    await expect(Promise.race([
+      pendingRead.then(
+        () => "resolved",
+        () => "aborted",
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("still-pending"), 50)),
+    ])).resolves.toBe("aborted");
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(abortController.signal);
+    expect(cancelReader).toHaveBeenCalledTimes(1);
+    try {
+      streamController?.close();
+    } catch {
+      // Abort cancellation may already have closed the mocked stream.
+    }
+  });
+
+  it("does not lock an SSE body when the signal is already aborted", async () => {
+    const body = new ReadableStream<Uint8Array>();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(body, { headers: { "content-type": "text/event-stream" } }),
+    ));
+    const abortController = new AbortController();
+    abortController.abort(new Error("client_cancelled"));
+    const client = new OpenAiCompatClient({
+      url: "https://example.com/v1/chat/completions",
+      apiKey: "k",
+    });
+
+    await expect(collect(client.stream({
+      model: "m",
+      messages: [{ role: "user", content: "Hi" }],
+      signal: abortController.signal,
+    }))).rejects.toThrow("client_cancelled");
+    expect(body.locked).toBe(false);
+  });
 });
 
 async function collect(stream: AsyncIterable<LlmStreamEvent>): Promise<LlmStreamEvent[]> {

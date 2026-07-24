@@ -37,13 +37,21 @@ type ProactiveDeliveryRepositories = {
 export async function processDueProactiveTasks(input: {
   scope: AgentScope;
   repositories: ProactiveDeliveryRepositories;
-  sendChannel?: (target: NormalizedChannelMessage, text: string) => Promise<unknown> | unknown;
+  sendChannel?: (
+    target: NormalizedChannelMessage,
+    text: string,
+    signal?: AbortSignal,
+  ) => Promise<unknown> | unknown;
+  signal?: AbortSignal;
   now?: Date;
 }): Promise<void> {
+  input.signal?.throwIfAborted();
   const now = input.now ?? new Date();
   const tasks = await input.repositories.proactiveTasks.due(input.scope, now);
+  input.signal?.throwIfAborted();
 
   for (const task of tasks) {
+    input.signal?.throwIfAborted();
     if (task.kind === "share" && !isAuthorizedShare(task)) {
       await input.repositories.proactiveTasks.markCancelled(input.scope, task.id);
       continue;
@@ -51,6 +59,7 @@ export async function processDueProactiveTasks(input: {
     const settings = await input.repositories.settings.get(input.scope);
     const sentToday = await input.repositories.proactiveTasks.countSentToday(input.scope, now);
     const unansweredCount = await input.repositories.proactiveTasks.unansweredStreak(input.scope);
+    input.signal?.throwIfAborted();
     if (task.kind !== "reminder" && unansweredCount >= 2) continue;
 
     const canSend = canSendProactiveMessage(now, {
@@ -68,15 +77,23 @@ export async function processDueProactiveTasks(input: {
       conversationId: task.conversationId,
       content,
     });
+    input.signal?.throwIfAborted();
 
     if (inserted) {
       const target = await input.repositories.channels.latestDirectTarget(input.scope);
       if (target && input.sendChannel) {
         try {
           for (const segment of splitAssistantText(content)) {
-            await input.sendChannel(target, segment);
+            input.signal?.throwIfAborted();
+            if (input.signal) {
+              await input.sendChannel(target, segment, input.signal);
+            } else {
+              await input.sendChannel(target, segment);
+            }
+            input.signal?.throwIfAborted();
           }
         } catch {
+          input.signal?.throwIfAborted();
           await input.repositories.proactiveTasks.markFailed(input.scope, task.id);
           continue;
         }

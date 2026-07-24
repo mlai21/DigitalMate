@@ -14,6 +14,27 @@ function completeLlm(reply: string): LlmClient {
 }
 
 describe("extractMemoriesWithLlm", () => {
+  it("rethrows cancellation instead of falling back and continuing memory writes", async () => {
+    const controller = new AbortController();
+    const llm: LlmClient = {
+      async *stream() {
+        yield { type: "text", text: "" };
+      },
+      async completeText(input) {
+        controller.abort(new Error("memory_extraction_timeout"));
+        input.signal?.throwIfAborted();
+        return "";
+      },
+    };
+
+    await expect(extractMemoriesWithLlm({
+      llm,
+      model: "light",
+      text: "我喜欢周末爬山",
+      signal: controller.signal,
+    })).rejects.toThrow("memory_extraction_timeout");
+  });
+
   it("parses structured memories from the light model output", async () => {
     const llm = completeLlm(
       '这是结果：[{"kind":"profile","content":"用户喜欢周末爬山","confidence":0.85},{"kind":"episodic","content":"用户下周五要交报销","confidence":0.7}]',

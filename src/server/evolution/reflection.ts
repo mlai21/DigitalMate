@@ -36,7 +36,9 @@ export async function generateReflectionWithLlm(input: {
   llm: LlmClient;
   model: string;
   digest: string;
+  signal?: AbortSignal;
 }): Promise<DailyReflectionResult | null> {
+  input.signal?.throwIfAborted();
   try {
     const raw = await input.llm.completeText({
       model: input.model,
@@ -44,7 +46,9 @@ export async function generateReflectionWithLlm(input: {
         { role: "system", content: llmReflectionPrompt },
         { role: "user", content: input.digest },
       ],
+      ...(input.signal ? { signal: input.signal } : {}),
     });
+    input.signal?.throwIfAborted();
     const jsonText = extractJsonObject(raw);
     if (!jsonText) return null;
     const parsed = JSON.parse(jsonText) as Partial<Record<keyof ReflectionRecord, unknown>> & { skill?: unknown };
@@ -57,6 +61,7 @@ export async function generateReflectionWithLlm(input: {
     if (record.positives.length + record.negatives.length + record.suggestions.length === 0) return null;
     return record;
   } catch {
+    input.signal?.throwIfAborted();
     return null;
   }
 }

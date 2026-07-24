@@ -20,6 +20,7 @@ type GoalLoopDeps = {
   scope: AgentScope;
   repositories: ReturnType<typeof createRepositories>;
   services: GoalRoundServices;
+  signal?: AbortSignal;
   now?: Date;
 };
 
@@ -40,11 +41,20 @@ const DEFAULT_MAX_NO_PROGRESS_ROUNDS = 3;
  * State transitions only ever go through reduceGoalStatus; LLM verdicts are
  * inputs, never the transition itself.
  */
-export async function processGoalLoops({ scope, repositories, services, now = new Date() }: GoalLoopDeps): Promise<GoalLoopOutcome> {
+export async function processGoalLoops({
+  scope,
+  repositories,
+  services,
+  signal,
+  now = new Date(),
+}: GoalLoopDeps): Promise<GoalLoopOutcome> {
+  signal?.throwIfAborted();
   const outcome: GoalLoopOutcome = { pickedUp: 0, rounds: 0, succeeded: 0, stopped: 0, skipped: 0 };
   const dueGoals = await repositories.goals.listDue(scope, now);
+  signal?.throwIfAborted();
 
   for (const goal of dueGoals) {
+    signal?.throwIfAborted();
     let status: GoalStatus = goal.status;
 
     if (status === "confirmed") {
@@ -63,7 +73,7 @@ export async function processGoalLoops({ scope, repositories, services, now = ne
       continue;
     }
 
-    await runGoalRound({ scope, repositories, services, goal, now, outcome });
+    await runGoalRound({ scope, repositories, services, goal, now, outcome, signal });
   }
 
   return outcome;
@@ -76,8 +86,10 @@ async function runGoalRound(context: {
   goal: DbGoal;
   now: Date;
   outcome: GoalLoopOutcome;
+  signal?: AbortSignal;
 }): Promise<void> {
-  const { scope, repositories, services, goal, now, outcome } = context;
+  const { scope, repositories, services, goal, now, outcome, signal } = context;
+  signal?.throwIfAborted();
   const startedAt = Date.now();
   const priorSteps = await repositories.goalSteps.listByGoal(scope, goal.id);
   const round = (priorSteps[priorSteps.length - 1]?.round ?? 0) + 1;
@@ -104,10 +116,12 @@ async function runGoalRound(context: {
   try {
     // 2-3. Execute one round on the execution plane.
     const candidate = await services.executeStep(goal, priorSteps);
+    signal?.throwIfAborted();
 
     // 4. Independent verification (separate call, checklist + evidence only).
     const priorEvidence = collectEvidence(priorSteps);
     const verify = await services.verifyStep(goal, candidate, priorEvidence);
+    signal?.throwIfAborted();
 
     // 5. Commit: ledger row, aggregates, then the state machine decision.
     const verifyForLedger = {
@@ -166,6 +180,7 @@ async function runGoalRound(context: {
 
     await repositories.goals.releaseRunningStep(scope, goal.id, nextRunAtByCadence(goal, now));
   } catch (error) {
+    signal?.throwIfAborted();
     // Execution/verification failure: leave a ledger row, count it as a
     // no-progress round, and let the next round retry. Backoff lands in M-D.
     const message = error instanceof Error ? error.message : String(error);

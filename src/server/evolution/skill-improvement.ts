@@ -66,7 +66,9 @@ export async function proposeSkillRevisionWithLlm(input: {
   model: string;
   skill: { name: string; trigger: string; content: string };
   usageContext: string;
+  signal?: AbortSignal;
 }): Promise<SkillRevisionProposal | null> {
+  input.signal?.throwIfAborted();
   try {
     const raw = await input.llm.completeText({
       model: input.model,
@@ -83,7 +85,9 @@ export async function proposeSkillRevisionWithLlm(input: {
           ].join("\n"),
         },
       ],
+      ...(input.signal ? { signal: input.signal } : {}),
     });
+    input.signal?.throwIfAborted();
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
     if (start === -1 || end === -1 || end < start) return null;
@@ -98,6 +102,7 @@ export async function proposeSkillRevisionWithLlm(input: {
     if (!parseSkillMd(content)) return null;
     return { proposedContent: content, reason: parsed.reason.slice(0, 300) };
   } catch {
+    input.signal?.throwIfAborted();
     return null;
   }
 }
@@ -113,24 +118,38 @@ export async function processSkillImprovement(input: {
   model: string;
   scope: AgentScope;
   threshold?: number;
+  signal?: AbortSignal;
 }): Promise<{ proposed: number }> {
+  input.signal?.throwIfAborted();
   const skills = await input.repositories.skills.listEnabledForAgent(input.scope);
+  input.signal?.throwIfAborted();
   let proposed = 0;
 
   for (const skill of skills) {
+    input.signal?.throwIfAborted();
     const hasPending = await input.repositories.skillRevisions.hasPendingForSkill(skill.id);
+    input.signal?.throwIfAborted();
     if (hasPending) continue;
 
     const latestRevision = await input.repositories.skillRevisions.latestForSkill(skill.id);
     const usage = await input.repositories.skillUsageLogs.countSince(input.scope, skill.id, latestRevision?.createdAt ?? null);
+    input.signal?.throwIfAborted();
     if (!shouldProposeRevision({ usageSinceLastRevision: usage, hasPendingRevision: hasPending, threshold: input.threshold })) {
       continue;
     }
 
     const usageContext = await buildUsageContext(input.repositories, input.scope, skill.id);
+    input.signal?.throwIfAborted();
     if (!usageContext) continue;
 
-    const proposal = await proposeSkillRevisionWithLlm({ llm: input.llm, model: input.model, skill, usageContext });
+    const proposal = await proposeSkillRevisionWithLlm({
+      llm: input.llm,
+      model: input.model,
+      skill,
+      usageContext,
+      signal: input.signal,
+    });
+    input.signal?.throwIfAborted();
     if (!proposal) continue;
 
     await input.repositories.skillRevisions.create({
@@ -139,6 +158,7 @@ export async function processSkillImprovement(input: {
       proposedContent: proposal.proposedContent,
       reason: proposal.reason,
     });
+    input.signal?.throwIfAborted();
     proposed += 1;
   }
 

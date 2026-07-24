@@ -72,6 +72,7 @@ async function processPresentationTask(
       kind: "presentation",
       inputSummary,
       outputSummary: "PPT 文件已生成。",
+      artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

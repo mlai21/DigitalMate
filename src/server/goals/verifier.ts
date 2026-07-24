@@ -30,6 +30,7 @@ export type VerifyGoalStepInput = {
   priorEvidence: GoalEvidenceItem[];
   llm: LlmClient;
   model: string;
+  signal?: AbortSignal;
 };
 
 /**
@@ -40,6 +41,7 @@ export type VerifyGoalStepInput = {
  * references can never count as met.
  */
 export async function verifyGoalStep(input: VerifyGoalStepInput): Promise<GoalVerifyResult> {
+  input.signal?.throwIfAborted();
   const prompt = buildVerifyPrompt(input);
   const raw = await input.llm.completeText({
     messages: [
@@ -47,7 +49,9 @@ export async function verifyGoalStep(input: VerifyGoalStepInput): Promise<GoalVe
       { role: "user", content: prompt.user },
     ],
     model: input.model,
+    ...(input.signal ? { signal: input.signal } : {}),
   });
+  input.signal?.throwIfAborted();
   const tokensUsed = estimateTokenCount(prompt.system) + estimateTokenCount(prompt.user) + estimateTokenCount(raw);
   return hardenVerifyResult(input, parseVerifyResponse(raw), tokensUsed);
 }

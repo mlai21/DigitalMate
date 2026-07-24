@@ -38,6 +38,42 @@ const allowSearchGate = {
 };
 
 describe("runAgent", () => {
+  it("passes AbortSignal to the model and stops between streamed events without usage writes", async () => {
+    const abortController = new AbortController();
+    const seenInputs: LlmStreamInput[] = [];
+    const usageCreate = vi.fn();
+    const llm: LlmClient = {
+      async *stream(input) {
+        seenInputs.push(input);
+        yield { type: "text", text: "第一段" };
+        abortController.abort(new Error("client_cancelled"));
+        yield { type: "text", text: "不应继续" };
+      },
+      async completeText() {
+        return "";
+      },
+    };
+
+    await expect(async () => {
+      for await (const chunk of runAgent({
+        userId: "user-1",
+        agentId: "agent-1",
+        conversationId: "conversation-1",
+        message: "取消",
+        history: [],
+        persona: { name: "DigitalMate", style: "温暖、克制" },
+        llm,
+        model: "mock-main",
+        repositories: { ...baseRepositories(), llmUsage: { create: usageCreate } },
+        search: { run: vi.fn() },
+        signal: abortController.signal,
+      })) void chunk;
+    }).rejects.toThrow("client_cancelled");
+
+    expect(seenInputs[0]?.signal).toBe(abortController.signal);
+    expect(usageCreate).not.toHaveBeenCalled();
+  });
+
   it("loads private images as base64 and documents only from extracted database text", async () => {
     const read = vi.fn(async () => Buffer.from("private-image"));
     const attachments: DbMessageAttachment[] = [

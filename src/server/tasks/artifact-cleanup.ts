@@ -17,7 +17,7 @@ type ArtifactCleanupRepositories = {
       hours: number,
       limit: number,
     ): Promise<PendingArtifactRow[]>;
-    delete(scope: AgentScope, artifactId: string): Promise<boolean>;
+    deletePending(scope: AgentScope, artifactId: string): Promise<boolean>;
   };
 };
 
@@ -47,7 +47,7 @@ export async function cleanupStaleTaskArtifacts(input: {
       continue;
     }
     try {
-      if (await input.repositories.taskArtifacts.delete(input.scope, artifact.id)) {
+      if (await input.repositories.taskArtifacts.deletePending(input.scope, artifact.id)) {
         deleted += 1;
       } else {
         failed += 1;

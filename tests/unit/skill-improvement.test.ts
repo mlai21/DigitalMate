@@ -62,6 +62,28 @@ describe("shouldProposeRevision", () => {
 });
 
 describe("proposeSkillRevisionWithLlm", () => {
+  it("rethrows cancellation instead of treating it as no revision needed", async () => {
+    const controller = new AbortController();
+    const llm: LlmClient = {
+      async *stream() {
+        yield { type: "text", text: "" };
+      },
+      async completeText(input) {
+        controller.abort(new Error("skill_improvement_timeout"));
+        input.signal?.throwIfAborted();
+        return "";
+      },
+    };
+
+    await expect(proposeSkillRevisionWithLlm({
+      llm,
+      model: "light",
+      skill: baseSkill,
+      usageContext: "…",
+      signal: controller.signal,
+    })).rejects.toThrow("skill_improvement_timeout");
+  });
+
   it("returns a proposal when the model suggests a valid update", async () => {
     const proposal = await proposeSkillRevisionWithLlm({
       llm: completeLlm(JSON.stringify({ needsUpdate: true, reason: "实际使用中用户每次都要求标注风险", content: updatedSkillMd })),

@@ -20,6 +20,7 @@ export class OpenAiCompatClient implements LlmClient {
   async *stream(input: LlmStreamInput): AsyncIterable<LlmStreamEvent> {
     const response = await fetch(this.config.url, {
       method: "POST",
+      signal: input.signal,
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${this.config.apiKey}`,
@@ -44,7 +45,7 @@ export class OpenAiCompatClient implements LlmClient {
 
     const pendingToolCalls = new Map<number, { id: string; name: string; argumentChunks: string[] }>();
 
-    for await (const line of readSseLines(response.body)) {
+    for await (const line of readSseLines(response.body, input.signal)) {
       if (!line.startsWith("data: ")) continue;
       const data = line.slice(6).trim();
       if (!data || data === "[DONE]") continue;
@@ -85,7 +86,11 @@ export class OpenAiCompatClient implements LlmClient {
     }
   }
 
-  async completeText(input: { messages: LlmMessage[]; model: string }): Promise<string> {
+  async completeText(input: {
+    messages: LlmMessage[];
+    model: string;
+    signal?: AbortSignal;
+  }): Promise<string> {
     return collectStreamText(this.stream(input));
   }
 }
@@ -138,17 +143,37 @@ function toOpenAiMessage(message: LlmMessage) {
   return { role: message.role, content: message.content };
 }
 
-async function* readSseLines(stream: ReadableStream<Uint8Array>): AsyncIterable<string> {
+async function* readSseLines(
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncIterable<string> {
+  signal?.throwIfAborted();
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? "";
-    for (const line of lines) yield line;
+  let cancellation: Promise<void> | undefined;
+  const cancelReader = () => {
+    cancellation ??= reader.cancel(signal?.reason).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        signal?.throwIfAborted();
+        yield line;
+      }
+    }
+    signal?.throwIfAborted();
+    if (buffer) yield buffer;
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    await cancellation;
+    reader.releaseLock();
   }
-  if (buffer) yield buffer;
 }

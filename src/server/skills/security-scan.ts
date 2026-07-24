@@ -106,15 +106,22 @@ const llmScanPrompt = [
 
 export async function scanSkillContent(
   content: string,
-  options?: { llm?: LlmClient; model?: string },
+  options?: { llm?: LlmClient; model?: string; signal?: AbortSignal },
 ): Promise<ScanReport> {
+  options?.signal?.throwIfAborted();
   const findings = scanSkillContentWithRules(content);
   let llmResult: ScanReport["llm"] = null;
 
   if (options?.llm && options.model) {
-    llmResult = await scanWithLlm(options.llm, options.model, content).catch(() => null);
+    try {
+      llmResult = await scanWithLlm(options.llm, options.model, content, options.signal);
+    } catch {
+      options.signal?.throwIfAborted();
+      llmResult = null;
+    }
   }
 
+  options?.signal?.throwIfAborted();
   const ruleVerdict = findings.some((finding) => finding.severity === "danger")
     ? "danger"
     : findings.length > 0
@@ -125,13 +132,19 @@ export async function scanSkillContent(
   return { verdict, findings, llm: llmResult, scannedAt: new Date().toISOString() };
 }
 
-async function scanWithLlm(llm: LlmClient, model: string, content: string): Promise<ScanReport["llm"]> {
+async function scanWithLlm(
+  llm: LlmClient,
+  model: string,
+  content: string,
+  signal?: AbortSignal,
+): Promise<ScanReport["llm"]> {
   const raw = await llm.completeText({
     model,
     messages: [
       { role: "system", content: llmScanPrompt },
       { role: "user", content: content.slice(0, 8000) },
     ],
+    ...(signal ? { signal } : {}),
   });
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");

@@ -73,13 +73,20 @@ export type RunAgentInput = AgentScope & {
     };
   };
   search: {
-    run(query: string): Promise<{ summary: string; results: Array<{ title: string; url: string; snippet: string }> }>;
+    run(
+      query: string,
+      signal?: AbortSignal,
+    ): Promise<{ summary: string; results: Array<{ title: string; url: string; snippet: string }> }>;
   };
   toolExecutor?: {
-    run(tool: EnabledToolContext, input: string): Promise<RegisteredToolExecutionResult>;
+    run(
+      tool: EnabledToolContext,
+      input: string,
+      signal?: AbortSignal,
+    ): Promise<RegisteredToolExecutionResult>;
   };
   skillInstaller?: {
-    install(url: string): Promise<SkillInstallOutcome>;
+    install(url: string, signal?: AbortSignal): Promise<SkillInstallOutcome>;
   };
   /** Skills explicitly picked by the user (slash panel card or /skill-name); loaded unconditionally. */
   explicitSkillIds?: string[];
@@ -92,6 +99,7 @@ export type RunAgentInput = AgentScope & {
   /** Keeps every tool closed while a recent DB message still owns an attachment, even if its payload was cropped. */
   attachmentToolGuard?: boolean;
   purpose?: LlmPurpose;
+  signal?: AbortSignal;
 };
 
 const maxToolIterations = 4;
@@ -158,6 +166,7 @@ const createSkillTool: LlmTool = {
 };
 
 export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
+  throwIfAborted(input.signal);
   const scope = { userId: input.userId, agentId: input.agentId };
   const hasAttachmentContext =
     input.attachmentToolGuard === true
@@ -178,10 +187,12 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     input.repositories.reflections?.findAppliedSuggestions(scope) ?? Promise.resolve([]),
     input.repositories.toolRegistrations?.listEnabled(scope) ?? Promise.resolve([]),
   ]);
+  throwIfAborted(input.signal);
   const conversationSummary = await input.repositories.conversationSummaries?.latest(
     { userId: input.userId, agentId: input.agentId },
     input.conversationId,
   );
+  throwIfAborted(input.signal);
 
   if (!hasAttachmentContext && input.repositories.skills?.recordUsage) {
     const explicitIds = explicitSkills.map((skill) => skill.id).filter((id): id is string => Boolean(id));
@@ -195,6 +206,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
           "explicit",
         ),
       ).catch(() => undefined);
+      throwIfAborted(input.signal);
     }
     if (autoIds.length > 0) {
       await Promise.resolve(
@@ -205,6 +217,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
           "auto",
         ),
       ).catch(() => undefined);
+      throwIfAborted(input.signal);
     }
   }
 
@@ -232,8 +245,18 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   let outputTokens = 0;
   const searchEvidence = new Set<string>();
   const collectModelTurn = async (messages: LlmMessage[], turnTools: LlmTool[]) => {
+    throwIfAborted(input.signal);
     inputTokens += estimateMessagesTokenUsage(messages);
-    const turn = await collectTurn(input.llm.stream({ messages, model: input.model, tools: turnTools }));
+    const turn = await collectTurn(
+      input.llm.stream({
+        messages,
+        model: input.model,
+        tools: turnTools,
+        signal: input.signal,
+      }),
+      input.signal,
+    );
+    throwIfAborted(input.signal);
     outputTokens += estimateTokenCount(turn.text);
     outputTokens += turn.toolCalls.reduce(
       (sum, toolCall) => sum + estimateTokenCount(toolCall.arguments),
@@ -243,6 +266,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   };
 
   if (hasAttachmentContext) {
+    throwIfAborted(input.signal);
     const firstTurn = await collectModelTurn(activeMessages, []);
     let visible = "";
     if (firstTurn.toolCalls.length === 0) {
@@ -257,6 +281,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     const safeVisible = visible || attachmentReplyFallback;
     yield safeVisible;
   } else for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
+    throwIfAborted(input.signal);
     const { text, toolCalls } = await collectModelTurn(activeMessages, tools);
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
@@ -269,12 +294,15 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
 
     const toolMessages: LlmMessage[] = [];
     for (const toolCall of toolCalls) {
+      throwIfAborted(input.signal);
       const result = await executeToolCall({ input, toolCall, enabledTools, searchEvidence });
+      throwIfAborted(input.signal);
       toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }
     activeMessages = [...activeMessages, { role: "assistant", content: text, toolCalls }, ...toolMessages];
   }
 
+  throwIfAborted(input.signal);
   await input.repositories.llmUsage?.create({
     userId: input.userId,
     agentId: input.agentId,
@@ -285,6 +313,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     outputTokens,
     totalTokens: inputTokens + outputTokens,
   });
+  throwIfAborted(input.signal);
 }
 
 function addAttachmentCorrection(messages: LlmMessage[]): LlmMessage[] {
@@ -319,13 +348,18 @@ function buildTools(
   ];
 }
 
-async function collectTurn(stream: AsyncIterable<{ type: "text"; text: string } | { type: "tool_call"; toolCall: LlmToolCall }>) {
+async function collectTurn(
+  stream: AsyncIterable<{ type: "text"; text: string } | { type: "tool_call"; toolCall: LlmToolCall }>,
+  signal?: AbortSignal,
+) {
   const chunks: string[] = [];
   const toolCalls: LlmToolCall[] = [];
   for await (const event of stream) {
+    throwIfAborted(signal);
     if (event.type === "text") chunks.push(event.text);
     else toolCalls.push(event.toolCall);
   }
+  throwIfAborted(signal);
   return { text: chunks.join(""), toolCalls };
 }
 
@@ -336,6 +370,7 @@ async function executeToolCall(context: {
   searchEvidence: Set<string>;
 }): Promise<string> {
   const { input, toolCall } = context;
+  throwIfAborted(input.signal);
   const startedAt = Date.now();
   const args = safeParseArguments(toolCall.arguments);
 
@@ -353,6 +388,7 @@ async function executeToolCall(context: {
         durationMs: Date.now() - startedAt,
         error: "Missing search query",
       });
+      throwIfAborted(input.signal);
       return "没有拿到有效的搜索词，本次没有搜索。如果确实需要联网信息，请带上明确的 query 重新调用；否则直接回答。";
     }
     if (!input.searchGate) {
@@ -367,9 +403,11 @@ async function executeToolCall(context: {
         durationMs: Date.now() - startedAt,
         error: "Missing search gate",
       });
+      throwIfAborted(input.signal);
       return "本轮没有可验证的联网授权。请直接基于已有知识和记忆自然回答，不要再尝试搜索，也不要向用户提及搜索被拦截。";
     }
     const decision = await input.searchGate.evaluate(query);
+    throwIfAborted(input.signal);
     // Both allow and deny decisions are logged for admin auditing (PRD 5.4).
     await input.repositories.toolLogs.create({
       userId: input.userId,
@@ -381,11 +419,15 @@ async function executeToolCall(context: {
       status: "success",
       durationMs: Date.now() - startedAt,
     });
+    throwIfAborted(input.signal);
     if (!decision.allowed) {
       return "本轮没有获得联网授权。请直接基于已有知识和记忆自然回答，不要再尝试搜索，也不要向用户提及搜索被拦截。";
     }
     try {
-      const result = await input.search.run(query);
+      const result = input.signal
+        ? await input.search.run(query, input.signal)
+        : await input.search.run(query);
+      throwIfAborted(input.signal);
       collectSearchEvidence(context.searchEvidence, result);
       await input.repositories.toolLogs.create({
         userId: input.userId,
@@ -397,8 +439,10 @@ async function executeToolCall(context: {
         status: "success",
         durationMs: Date.now() - startedAt,
       });
+      throwIfAborted(input.signal);
       return `以下是内部搜索结果（仅作为你回答的依据，不要原样罗列条目、标题或链接，只把结论自然融入回答）：\n${result.summary}`;
     } catch (error) {
+      throwIfAborted(input.signal);
       const message = error instanceof Error ? error.message : String(error);
       await input.repositories.toolLogs.create({
         userId: input.userId,
@@ -411,6 +455,7 @@ async function executeToolCall(context: {
         durationMs: Date.now() - startedAt,
         error: message,
       });
+      throwIfAborted(input.signal);
       return "搜索暂时不可用，请基于已有知识谨慎回答，并说明信息可能不是最新的。";
     }
   }
@@ -441,11 +486,19 @@ async function executeToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: "Tool is not enabled",
     });
+    throwIfAborted(input.signal);
     return "工具未启用或不存在。";
   }
 
   try {
-    const result = await (input.toolExecutor?.run(tool, toolInput) ?? executeRegisteredTool(tool, toolInput));
+    const result = await (
+      input.toolExecutor
+        ? input.signal
+          ? input.toolExecutor.run(tool, toolInput, input.signal)
+          : input.toolExecutor.run(tool, toolInput)
+        : executeRegisteredTool(tool, toolInput)
+    );
+    throwIfAborted(input.signal);
     await input.repositories.toolLogs.create({
       userId: input.userId,
       agentId: input.agentId,
@@ -456,8 +509,10 @@ async function executeToolCall(context: {
       status: "success",
       durationMs: Date.now() - startedAt,
     });
+    throwIfAborted(input.signal);
     return result.output;
   } catch (error) {
+    throwIfAborted(input.signal);
     const message = error instanceof Error ? error.message : String(error);
     await input.repositories.toolLogs.create({
       userId: input.userId,
@@ -470,6 +525,7 @@ async function executeToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: message,
     });
+    throwIfAborted(input.signal);
     return `工具执行失败：${message}`;
   }
 }
@@ -518,6 +574,7 @@ async function saveSkillFromToolCall(context: {
   startedAt: number;
 }): Promise<string> {
   const { input, args, startedAt } = context;
+  throwIfAborted(input.signal);
   const name = typeof args.name === "string" ? args.name.trim() : "";
   const description = typeof args.description === "string" ? args.description.trim() : "";
   const steps = Array.isArray(args.steps) ? args.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0) : [];
@@ -539,20 +596,24 @@ async function saveSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: "Invalid skill draft input",
     });
+    throwIfAborted(input.signal);
     return "Skill 草稿信息不完整（需要名称、适用场景和至少 2 个步骤），本次未保存。";
   }
 
   try {
     const draft = createSkillDraft({ name, trigger: description, steps, notes, source: "agent" });
     await input.repositories.skills.create(input.userId, draft);
+    throwIfAborted(input.signal);
     await input.repositories.toolLogs.create({
       ...logBase,
       outputSummary: `已创建 Skill 草稿「${name}」，等待用户在后台确认`,
       status: "success",
       durationMs: Date.now() - startedAt,
     });
+    throwIfAborted(input.signal);
     return `Skill 草稿「${name}」已保存，状态为待确认；用户在后台确认后才会启用。请用自然的语气告诉用户你已经把这套做法记下来了，等 TA 在后台确认后就会生效，不要展示草稿的内部格式。`;
   } catch (error) {
+    throwIfAborted(input.signal);
     const message = error instanceof Error ? error.message : String(error);
     await input.repositories.toolLogs.create({
       ...logBase,
@@ -561,6 +622,7 @@ async function saveSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: message,
     });
+    throwIfAborted(input.signal);
     return "Skill 草稿保存失败，请稍后再试；先正常回复用户即可。";
   }
 }
@@ -571,6 +633,7 @@ async function createSkillFromToolCall(context: {
   startedAt: number;
 }): Promise<string> {
   const { input, args, startedAt } = context;
+  throwIfAborted(input.signal);
   const name = typeof args.name === "string" ? args.name.trim() : "";
   const description = typeof args.description === "string" ? args.description.trim() : "";
   const steps = Array.isArray(args.steps)
@@ -596,6 +659,7 @@ async function createSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: "Invalid skill input",
     });
+    throwIfAborted(input.signal);
     return "Skill 信息不完整（需要名称、适用场景和至少 2 个步骤），本次未创建。请继续向用户补齐缺失的信息。";
   }
 
@@ -604,14 +668,17 @@ async function createSkillFromToolCall(context: {
     // so the skill is enabled directly instead of entering the pending queue.
     const draft = createSkillDraft({ name, trigger: description, steps, notes, source: "manual", status: "enabled" });
     await input.repositories.skills.create(input.userId, draft);
+    throwIfAborted(input.signal);
     await input.repositories.toolLogs.create({
       ...logBase,
       outputSummary: `已创建并启用 Skill「${name}」（对话内确认）`,
       status: "success",
       durationMs: Date.now() - startedAt,
     });
+    throwIfAborted(input.signal);
     return `Skill「${name}」已创建并启用，立即生效，之后同类任务会按它执行。请用自然的语气告诉用户已经建好，不要展示内部格式。`;
   } catch (error) {
+    throwIfAborted(input.signal);
     const message = error instanceof Error ? error.message : String(error);
     await input.repositories.toolLogs.create({
       ...logBase,
@@ -620,6 +687,7 @@ async function createSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: message,
     });
+    throwIfAborted(input.signal);
     return "Skill 创建失败，请稍后再试；先自然地告知用户即可。";
   }
 }
@@ -630,6 +698,7 @@ async function installSkillFromToolCall(context: {
   startedAt: number;
 }): Promise<string> {
   const { input, args, startedAt } = context;
+  throwIfAborted(input.signal);
   const url =
     typeof args.url === "string" && args.url.trim() ? args.url.trim() : extractGitHubUrl(input.message) ?? "";
 
@@ -649,11 +718,15 @@ async function installSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: "Missing url or installer",
     });
+    throwIfAborted(input.signal);
     return "没有拿到有效的 GitHub 链接，请向用户确认链接后重试。";
   }
 
   try {
-    const outcome = await input.skillInstaller.install(url);
+    const outcome = input.signal
+      ? await input.skillInstaller.install(url, input.signal)
+      : await input.skillInstaller.install(url);
+    throwIfAborted(input.signal);
     const summary = summarizeInstallOutcome(outcome);
     await input.repositories.toolLogs.create({
       ...logBase,
@@ -661,8 +734,10 @@ async function installSkillFromToolCall(context: {
       status: "success",
       durationMs: Date.now() - startedAt,
     });
+    throwIfAborted(input.signal);
     return buildInstallToolResult(outcome);
   } catch (error) {
+    throwIfAborted(input.signal);
     const message = error instanceof Error ? error.message : String(error);
     await input.repositories.toolLogs.create({
       ...logBase,
@@ -671,6 +746,7 @@ async function installSkillFromToolCall(context: {
       durationMs: Date.now() - startedAt,
       error: message,
     });
+    throwIfAborted(input.signal);
     return `Skill 安装失败：${message}。请把失败原因用自然的语气告诉用户，不要暴露内部细节。`;
   }
 }
@@ -724,6 +800,10 @@ function safeParseArguments(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  signal?.throwIfAborted();
 }
 
 export function buildMessages(input: {

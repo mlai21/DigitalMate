@@ -14,18 +14,22 @@ export async function generateConversationTitle(input: {
   model: string;
   userText: string;
   assistantText: string;
+  signal?: AbortSignal;
 }): Promise<string> {
   try {
     const raw = await input.llm.completeText({
       model: input.model,
+      signal: input.signal,
       messages: [
         { role: "system", content: titlePrompt },
         { role: "user", content: `用户：${input.userText.slice(0, 800)}\n助手：${input.assistantText.slice(0, 800)}` },
       ],
     });
+    input.signal?.throwIfAborted();
     const title = raw.replace(/["'“”‘’。.\n\r]+/g, " ").trim();
     if (title.length >= 2 && title.length <= 40) return title;
   } catch {
+    input.signal?.throwIfAborted();
     // fall through to the truncated fallback
   }
   return fallbackConversationTitle(input.userText);

@@ -29,7 +29,7 @@ vi.mock("@/server/db/repositories", () => ({
     },
     taskRuns: {
       create: vi.fn(async () => "task-1"),
-      complete: mocks.taskRunComplete,
+      completeWithArtifacts: mocks.taskRunComplete,
       fail: mocks.taskRunFail,
     },
     taskArtifacts: {},

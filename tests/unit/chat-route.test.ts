@@ -100,7 +100,9 @@ const mocks = vi.hoisted(() => {
     content: string;
     createdAt: Date;
   } | null>>(async () => null);
-  const acquireClientTurnExecutionLock = vi.fn(async () => vi.fn(async () => undefined));
+  const acquireClientTurnExecutionLock = vi.fn<
+    (_scope: typeof agentScope, _clientTurnId: string) => Promise<() => Promise<void>>
+  >(async () => vi.fn<() => Promise<void>>(async () => undefined));
   const claimClientTurnExecution = vi.fn(async () => true);
   const proactiveTaskCreate = vi.fn(async () => undefined);
   const getAttachmentForUser = vi.fn<
@@ -114,14 +116,23 @@ const mocks = vi.hoisted(() => {
   const listMessagesAfter = vi.fn(async () => [] as HistoryRow[]);
   const readAttachment = vi.fn(async () => Buffer.from("private-image"));
   const generateConversationTitle = vi.fn(async () => "新的标题");
-  const recordTurnReview = vi.fn<() => Promise<void>>(async () => undefined);
-  const releaseUserDataLease = vi.fn(async () => undefined);
+  const recordTurnReview = vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined);
+  const releaseUserDataLease = vi.fn<() => Promise<void>>(async () => undefined);
+  const releaseClientTurnLock = vi.fn<() => Promise<void>>(async () => undefined);
+  const releaseUserConnection = vi.fn();
+  const registerUserConnection = vi.fn(() => releaseUserConnection);
   const beginUserDataRequest = vi.fn(async (userId: string) => ({ userId, epoch: "1" }));
-  const acquireSharedUserDataLease = vi.fn(async (fence: { userId: string; epoch: string }) => ({
-    ...fence,
-    mode: "shared" as const,
-    release: releaseUserDataLease,
-  }));
+  const acquireSharedUserDataLease = vi.fn(async (
+    fence: { userId: string; epoch: string },
+    _options?: { signal?: AbortSignal },
+  ) => {
+    void _options;
+    return {
+      ...fence,
+      mode: "shared" as const,
+      release: releaseUserDataLease,
+    };
+  });
 
   return {
     agentScope,
@@ -146,6 +157,9 @@ const mocks = vi.hoisted(() => {
     generateConversationTitle,
     recordTurnReview,
     releaseUserDataLease,
+    releaseClientTurnLock,
+    releaseUserConnection,
+    registerUserConnection,
     beginUserDataRequest,
     acquireSharedUserDataLease,
     createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
@@ -201,7 +215,8 @@ const mocks = vi.hoisted(() => {
       },
       model: "mock-main",
     })),
-    runAgent: vi.fn(async function* () {
+    runAgent: vi.fn(async function* (input: { signal?: AbortSignal }) {
+      void input;
       yield "收到。";
     }),
   };
@@ -224,6 +239,12 @@ vi.mock("@/server/db/repositories", () => ({
 
 vi.mock("@/server/evolution/event-reflection", () => ({
   recordEventReflection: mocks.recordEventReflection,
+}));
+
+vi.mock("@/server/admin/user-connections", () => ({
+  userConnectionDisconnector: {
+    registerUserConnection: mocks.registerUserConnection,
+  },
 }));
 
 vi.mock("@/server/llm/router", () => ({
@@ -272,6 +293,9 @@ describe("chat route", () => {
     mocks.listMessages.mockReset().mockResolvedValue([]);
     mocks.listMessagesAfter.mockReset().mockResolvedValue([]);
     mocks.releaseUserDataLease.mockReset().mockResolvedValue(undefined);
+    mocks.releaseClientTurnLock.mockReset().mockResolvedValue(undefined);
+    mocks.releaseUserConnection.mockReset();
+    mocks.registerUserConnection.mockReset().mockImplementation(() => mocks.releaseUserConnection);
     mocks.beginUserDataRequest.mockReset().mockImplementation(async (userId) => ({ userId, epoch: "1" }));
     mocks.acquireSharedUserDataLease.mockReset().mockImplementation(async (fence) => ({
       ...fence,
@@ -296,7 +320,7 @@ describe("chat route", () => {
       created: true,
     }));
     mocks.findByClientTurn.mockReset().mockResolvedValue(null);
-    mocks.acquireClientTurnExecutionLock.mockReset().mockImplementation(async () => vi.fn(async () => undefined));
+    mocks.acquireClientTurnExecutionLock.mockReset().mockImplementation(async () => mocks.releaseClientTurnLock);
     mocks.claimClientTurnExecution.mockReset().mockResolvedValue(true);
     mocks.proactiveTaskCreate.mockReset().mockResolvedValue(undefined);
     mocks.getLlmClient.mockReturnValue({
@@ -673,8 +697,51 @@ describe("chat route", () => {
     expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
   });
 
-  it("closes the visible stream before post-turn work settles but keeps the shared lease", async () => {
+  it("aborts a shared-lease waiter when the request is cancelled", async () => {
+    let leaseSignal: AbortSignal | undefined;
+    mocks.acquireSharedUserDataLease.mockImplementationOnce(async (_fence, options) => {
+      leaseSignal = options?.signal;
+      if (!leaseSignal) throw new Error("missing_signal");
+      await new Promise<void>((_resolve, reject) => {
+        leaseSignal?.addEventListener("abort", () => reject(leaseSignal?.reason), { once: true });
+      });
+      throw new Error("unreachable");
+    });
+    const requestController = new AbortController();
+    const responsePromise = POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "等待共享锁" })),
+      signal: requestController.signal,
+    }));
+
+    await vi.waitFor(() => {
+      expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledTimes(1);
+    });
+    requestController.abort(new Error("client_cancelled"));
+
+    await expect(responsePromise).resolves.toMatchObject({ status: 503 });
+    expect(leaseSignal?.aborted).toBe(true);
+    expect(mocks.releaseUserDataLease).not.toHaveBeenCalled();
+  });
+
+  it("closes the visible stream and releases foreground resources before detached post-turn settles", async () => {
     let finishPostTurn: (() => void) | undefined;
+    const releaseForegroundLease = vi.fn(async () => undefined);
+    const releasePostTurnLease = vi.fn(async () => undefined);
+    mocks.acquireSharedUserDataLease
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        epoch: "1",
+        mode: "shared",
+        release: releaseForegroundLease,
+      })
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        epoch: "1",
+        mode: "shared",
+        release: releasePostTurnLease,
+      });
     mocks.recordTurnReview.mockImplementationOnce(
       () => new Promise<void>((resolve) => {
         finishPostTurn = resolve;
@@ -692,13 +759,233 @@ describe("chat route", () => {
       visibleBody.then(() => "closed"),
       new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 50)),
     ])).resolves.toBe("closed");
-    expect(mocks.recordTurnReview).toHaveBeenCalledTimes(1);
-    expect(mocks.releaseUserDataLease).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledTimes(2);
+      expect(mocks.recordTurnReview).toHaveBeenCalledTimes(1);
+    });
+    expect(mocks.acquireSharedUserDataLease).toHaveBeenNthCalledWith(
+      2,
+      { userId: "user-1", epoch: "1" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(releaseForegroundLease).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseClientTurnLock).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserConnection).toHaveBeenCalledTimes(1);
+    expect(releasePostTurnLease).not.toHaveBeenCalled();
 
     finishPostTurn?.();
     await vi.waitFor(() => {
+      expect(releasePostTurnLease).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("skips all post-turn work when clear advances the original request fence first", async () => {
+    const releaseForegroundLease = vi.fn(async () => undefined);
+    mocks.acquireSharedUserDataLease
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        epoch: "7",
+        mode: "shared",
+        release: releaseForegroundLease,
+      })
+      .mockRejectedValueOnce(new Error("user_data_epoch_changed"));
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "清空后不要复盘" })),
+    }));
+    await response.text();
+
+    await vi.waitFor(() => {
+      expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledTimes(2);
+    });
+    expect(mocks.beginUserDataRequest).toHaveBeenCalledTimes(1);
+    expect(mocks.acquireSharedUserDataLease).toHaveBeenNthCalledWith(
+      2,
+      { userId: "user-1", epoch: "7" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(mocks.generateConversationTitle).not.toHaveBeenCalled();
+    expect(mocks.recordTurnReview).not.toHaveBeenCalled();
+    expect(releaseForegroundLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a half-open foreground stream on reader cancellation and releases all resources", async () => {
+    let resumeAgent: (() => void) | undefined;
+    let foregroundSignal: AbortSignal | undefined;
+    mocks.runAgent.mockImplementationOnce(async function* (input: { signal?: AbortSignal }) {
+      foregroundSignal = input.signal;
+      await new Promise<void>((resolve) => {
+        resumeAgent = resolve;
+      });
+      yield "取消后不应继续";
+    });
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "取消半开流" })),
+    }));
+    const reader = response.body!.getReader();
+    await reader.read();
+    await vi.waitFor(() => {
+      expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    });
+    await reader.cancel("client_cancelled");
+    const abortedAfterCancel = foregroundSignal?.aborted === true;
+    resumeAgent?.();
+
+    await vi.waitFor(() => {
+      expect(mocks.releaseClientTurnLock).toHaveBeenCalledTimes(1);
+      expect(mocks.releaseUserConnection).toHaveBeenCalledTimes(1);
       expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
     });
+    expect(abortedAfterCancel).toBe(true);
+  });
+
+  it("stops consuming agent chunks after enqueue fails on a cancelled reader", async () => {
+    let continueAgent: (() => void) | undefined;
+    let produced = 0;
+    let foregroundSignal: AbortSignal | undefined;
+    mocks.runAgent.mockImplementationOnce(async function* (input: { signal?: AbortSignal }) {
+      foregroundSignal = input.signal;
+      produced += 1;
+      yield "第一段";
+      await new Promise<void>((resolve) => {
+        continueAgent = resolve;
+      });
+      produced += 1;
+      yield "第二段";
+      produced += 1;
+      yield "第三段";
+    });
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "中途取消" })),
+    }));
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel("client_cancelled");
+    continueAgent?.();
+    await vi.waitFor(() => {
+      expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+    });
+
+    expect(foregroundSignal?.aborted).toBe(true);
+    expect(produced).toBe(2);
+  });
+
+  it("aborts a half-open foreground stream at the bounded timeout", async () => {
+    vi.useFakeTimers();
+    let finishAgent: (() => void) | undefined;
+    let foregroundSignal: AbortSignal | undefined;
+    mocks.runAgent.mockImplementationOnce(async function* (input: { signal?: AbortSignal }) {
+      foregroundSignal = input.signal;
+      await new Promise<void>((resolve) => {
+        finishAgent = resolve;
+        input.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      input.signal?.throwIfAborted();
+      yield "不应出现";
+    });
+
+    try {
+      const response = await POST(new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(withClientTurn({ message: "等待超时" })),
+      }));
+      const visibleBody = response.text();
+      await vi.waitFor(() => {
+        expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+      });
+      await vi.advanceTimersByTimeAsync(120_000);
+      const abortedAfterTimeout = foregroundSignal?.aborted === true;
+      finishAgent?.();
+      await visibleBody;
+      await vi.waitFor(() => {
+        expect(mocks.releaseClientTurnLock).toHaveBeenCalledTimes(1);
+        expect(mocks.releaseUserConnection).toHaveBeenCalledTimes(1);
+        expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+      });
+      expect(abortedAfterTimeout).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets clear wait for a detached post-turn lease, then aborts and releases it at timeout", async () => {
+    vi.useFakeTimers();
+    const releaseForegroundLease = vi.fn(async () => undefined);
+    let postTurnLeaseHeld = false;
+    let releaseClear: (() => void) | undefined;
+    const releasePostTurnLease = vi.fn(async () => {
+      postTurnLeaseHeld = false;
+      releaseClear?.();
+    });
+    mocks.acquireSharedUserDataLease
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        epoch: "9",
+        mode: "shared",
+        release: releaseForegroundLease,
+      })
+      .mockImplementationOnce(async () => {
+        postTurnLeaseHeld = true;
+        return {
+          userId: "user-1",
+          epoch: "9",
+          mode: "shared" as const,
+          release: releasePostTurnLease,
+        };
+      });
+    let finishReview: (() => void) | undefined;
+    let postTurnSignal: AbortSignal | undefined;
+    mocks.recordTurnReview.mockImplementationOnce(async (...args: unknown[]) => {
+      const input = args[1] as { signal?: AbortSignal };
+      postTurnSignal = input.signal;
+      await new Promise<void>((resolve) => {
+        finishReview = resolve;
+        input.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      input.signal?.throwIfAborted();
+    });
+
+    try {
+      const response = await POST(new Request("http://localhost/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(withClientTurn({ message: "复盘先拿锁" })),
+      }));
+      await response.text();
+      await vi.waitFor(() => {
+        expect(postTurnLeaseHeld).toBe(true);
+        expect(mocks.recordTurnReview).toHaveBeenCalledTimes(1);
+      });
+      let clearCompleted = false;
+      const clearPromise = new Promise<void>((resolve) => {
+        releaseClear = resolve;
+      }).then(() => {
+        clearCompleted = true;
+      });
+      await Promise.resolve();
+      expect(clearCompleted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      const abortedAfterTimeout = postTurnSignal?.aborted === true;
+      finishReview?.();
+      await clearPromise;
+
+      expect(abortedAfterTimeout).toBe(true);
+      expect(releasePostTurnLease).toHaveBeenCalledTimes(1);
+      expect(clearCompleted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("replays an existing assistant without running the agent again", async () => {

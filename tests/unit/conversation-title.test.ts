@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fallbackConversationTitle, generateConversationTitle } from "@/server/agent/conversation-title";
 import type { LlmClient } from "@/server/llm/types";
 
@@ -43,6 +43,31 @@ describe("generateConversationTitle", () => {
     });
 
     expect(title).toBe("这是一条特别长的用户消息，用来验证降级截…");
+  });
+
+  it("forwards AbortSignal to completeText and never converts cancellation into a fallback title", async () => {
+    const abortController = new AbortController();
+    const completeText = vi.fn(async (input: { signal?: AbortSignal }) => {
+      expect(input.signal).toBe(abortController.signal);
+      input.signal?.throwIfAborted();
+      return "不应生成";
+    });
+    const llm: LlmClient = {
+      async *stream() {
+        return;
+      },
+      completeText,
+    };
+    abortController.abort(new Error("post_turn_timeout"));
+
+    await expect(generateConversationTitle({
+      llm,
+      model: "light",
+      userText: "超时后不要写标题",
+      assistantText: "已回复",
+      signal: abortController.signal,
+    })).rejects.toThrow("post_turn_timeout");
+    expect(completeText).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -32,7 +32,9 @@ export async function extractMemoriesWithLlm(input: {
   llm: LlmClient;
   model: string;
   text: string;
+  signal?: AbortSignal;
 }): Promise<ExtractedMemory[]> {
+  input.signal?.throwIfAborted();
   try {
     const raw = await input.llm.completeText({
       model: input.model,
@@ -40,7 +42,9 @@ export async function extractMemoriesWithLlm(input: {
         { role: "system", content: extractionPrompt },
         { role: "user", content: input.text },
       ],
+      ...(input.signal ? { signal: input.signal } : {}),
     });
+    input.signal?.throwIfAborted();
     const jsonText = extractJsonArray(raw);
     if (!jsonText) return extractRuleBasedMemories(input.text);
     const parsed = extractionSchema.parse(JSON.parse(jsonText));
@@ -48,6 +52,7 @@ export async function extractMemoriesWithLlm(input: {
       .map((memory) => ({ ...memory, content: redactSensitiveMemory(memory.content) }))
       .filter((memory): memory is ExtractedMemory => Boolean(memory.content));
   } catch {
+    input.signal?.throwIfAborted();
     return extractRuleBasedMemories(input.text);
   }
 }

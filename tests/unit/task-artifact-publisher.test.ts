@@ -11,7 +11,7 @@ const stored = {
   storagePath: "user-1/task-1/report.md",
 };
 
-function createHarness(failure?: "locator" | "temporary-write" | "rename" | "ready") {
+function createHarness(failure?: "locator" | "temporary-write" | "rename") {
   const order: string[] = [];
   const repositories = {
     taskArtifacts: {
@@ -20,16 +20,7 @@ function createHarness(failure?: "locator" | "temporary-write" | "rename" | "rea
         if (failure === "locator") throw new Error("locator_failed");
         return "artifact-1";
       }),
-      markReady: vi.fn(async () => {
-        order.push("ready");
-        if (failure === "ready") throw new Error("ready_failed");
-        return true;
-      }),
-      markPendingForCleanup: vi.fn(async () => {
-        order.push("hide");
-        return true;
-      }),
-      delete: vi.fn(async () => {
+      deletePending: vi.fn(async () => {
         order.push("delete-row");
         return true;
       }),
@@ -54,7 +45,7 @@ function createHarness(failure?: "locator" | "temporary-write" | "rename" | "rea
 }
 
 describe("task artifact publisher", () => {
-  it("publishes pending locator through a unique temporary file and atomic rename before ready", async () => {
+  it("publishes a file while keeping its locator pending until task completion", async () => {
     const harness = createHarness();
 
     await expect(publishTaskArtifact({
@@ -70,7 +61,7 @@ describe("task artifact publisher", () => {
       storage: harness.storage,
     })).resolves.toMatchObject({ artifactId: "artifact-1", ...stored });
 
-    expect(harness.order).toEqual(["pending", "temporary-write", "rename", "ready"]);
+    expect(harness.order).toEqual(["pending", "temporary-write", "rename"]);
     expect(harness.storage.writeTemporary).toHaveBeenCalledWith({
       root: "/private/artifacts",
       storagePath: `${stored.storagePath}.unique.tmp`,
@@ -91,11 +82,6 @@ describe("task artifact publisher", () => {
       "delete-row",
     ]],
     ["rename", [
-      `delete-file:${stored.storagePath}.unique.tmp`,
-      `delete-file:${stored.storagePath}`,
-      "delete-row",
-    ]],
-    ["ready", [
       `delete-file:${stored.storagePath}.unique.tmp`,
       `delete-file:${stored.storagePath}`,
       "delete-row",
@@ -137,7 +123,7 @@ describe("task artifact publisher", () => {
     })).rejects.toThrow("temporary_write_failed");
 
     expect(harness.storage.deleteFile).toHaveBeenCalledTimes(2);
-    expect(harness.repositories.taskArtifacts.delete).not.toHaveBeenCalled();
+    expect(harness.repositories.taskArtifacts.deletePending).not.toHaveBeenCalled();
   });
 
   it("removes every already-published file and locator when task completion fails", async () => {
@@ -159,11 +145,10 @@ describe("task artifact publisher", () => {
     });
 
     expect(harness.storage.deleteFile).toHaveBeenCalledTimes(2);
-    expect(harness.repositories.taskArtifacts.markPendingForCleanup).toHaveBeenCalledTimes(2);
-    expect(harness.repositories.taskArtifacts.delete).toHaveBeenCalledTimes(2);
+    expect(harness.repositories.taskArtifacts.deletePending).toHaveBeenCalledTimes(2);
   });
 
-  it("hides a ready artifact and keeps its locator retryable when file cleanup fails", async () => {
+  it("keeps a pending locator retryable when file cleanup fails", async () => {
     const harness = createHarness();
     harness.storage.deleteFile.mockRejectedValueOnce(new Error("delete_failed"));
 
@@ -175,10 +160,6 @@ describe("task artifact publisher", () => {
       storage: harness.storage,
     });
 
-    expect(harness.repositories.taskArtifacts.markPendingForCleanup).toHaveBeenCalledWith(
-      scope,
-      "artifact-1",
-    );
-    expect(harness.repositories.taskArtifacts.delete).not.toHaveBeenCalled();
+    expect(harness.repositories.taskArtifacts.deletePending).not.toHaveBeenCalled();
   });
 });

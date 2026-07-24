@@ -96,4 +96,43 @@ describe("recordTurnReview", () => {
     expect(reflections.create).not.toHaveBeenCalled();
     expect(skills.create).not.toHaveBeenCalled();
   });
+
+  it("forwards AbortSignal and performs no writes when cancellation arrives after model output", async () => {
+    const abortController = new AbortController();
+    const reflections = { create: vi.fn() };
+    const skills = { create: vi.fn() };
+    const completeText = vi.fn(async (input: { signal?: AbortSignal }) => {
+      expect(input.signal).toBe(abortController.signal);
+      abortController.abort(new Error("post_turn_timeout"));
+      return JSON.stringify({
+        worthRecording: true,
+        positives: [],
+        negatives: [],
+        suggestions: ["不应写入"],
+        skill: null,
+      });
+    });
+    const llm: LlmClient = {
+      async *stream() {
+        return;
+      },
+      completeText,
+    };
+
+    await expect(recordTurnReview(
+      { reflections, skills },
+      {
+        scope: { userId: "u1", agentId: "a1" },
+        conversationId: "c1",
+        llm,
+        model: "light",
+        userText: "取消",
+        assistantText: "已回复",
+        signal: abortController.signal,
+      },
+    )).rejects.toThrow("post_turn_timeout");
+
+    expect(reflections.create).not.toHaveBeenCalled();
+    expect(skills.create).not.toHaveBeenCalled();
+  });
 });

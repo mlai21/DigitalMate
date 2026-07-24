@@ -14,6 +14,27 @@ function completeLlm(reply: string): LlmClient {
 }
 
 describe("generateReflectionWithLlm", () => {
+  it("rethrows cancellation instead of writing a degraded reflection fallback", async () => {
+    const controller = new AbortController();
+    const llm: LlmClient = {
+      async *stream() {
+        yield { type: "text", text: "" };
+      },
+      async completeText(input) {
+        controller.abort(new Error("reflection_timeout"));
+        input.signal?.throwIfAborted();
+        return "";
+      },
+    };
+
+    await expect(generateReflectionWithLlm({
+      llm,
+      model: "light",
+      digest: "...",
+      signal: controller.signal,
+    })).rejects.toThrow("reflection_timeout");
+  });
+
   it("parses a structured reflection from the model output", async () => {
     const llm = completeLlm(
       '{"positives":["回应节奏自然"],"negatives":["有一次误解了用户意图"],"suggestions":["先复述再给结论"]}',

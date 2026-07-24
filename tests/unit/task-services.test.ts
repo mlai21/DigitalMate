@@ -31,7 +31,7 @@ vi.mock("@/server/db/repositories", () => ({
     },
     taskRuns: {
       create: routeMocks.taskRunsCreate,
-      complete: routeMocks.taskRunsComplete,
+      completeWithArtifacts: routeMocks.taskRunsComplete,
       fail: vi.fn(async () => undefined),
     },
     taskArtifacts: {

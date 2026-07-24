@@ -45,15 +45,18 @@ export async function reviewTurnWithLlm(input: {
   model: string;
   userText: string;
   assistantText: string;
+  signal?: AbortSignal;
 }): Promise<TurnReviewResult | null> {
   try {
     const raw = await input.llm.completeText({
       model: input.model,
+      signal: input.signal,
       messages: [
         { role: "system", content: reviewPrompt },
         { role: "user", content: `用户：${input.userText.slice(0, 2000)}\n\n助手：${input.assistantText.slice(0, 2000)}` },
       ],
     });
+    input.signal?.throwIfAborted();
     const jsonText = extractJsonObject(raw);
     if (!jsonText) return null;
     const parsed = reviewSchema.parse(JSON.parse(jsonText));
@@ -69,6 +72,7 @@ export async function reviewTurnWithLlm(input: {
         : null,
     };
   } catch {
+    input.signal?.throwIfAborted();
     return null;
   }
 }
@@ -91,9 +95,11 @@ export async function recordTurnReview(
     model: string;
     userText: string;
     assistantText: string;
+    signal?: AbortSignal;
   },
 ): Promise<TurnReviewResult | null> {
   const result = await reviewTurnWithLlm(input);
+  input.signal?.throwIfAborted();
   if (!result) return null;
 
   if (result.reflection) {
@@ -101,9 +107,11 @@ export async function recordTurnReview(
       reflection: result.reflection,
       sourceWindow: { event: "turn_review", conversationId: input.conversationId },
     });
+    input.signal?.throwIfAborted();
   }
   if (result.skillDraft) {
     await repositories.skills.create(input.scope.userId, result.skillDraft);
+    input.signal?.throwIfAborted();
   }
   return result;
 }

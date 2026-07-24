@@ -79,4 +79,54 @@ describe("user data lease wrapper", () => {
     expect(createRepositories).toHaveBeenCalledTimes(1);
     expect(harness.release).toHaveBeenCalledTimes(1);
   });
+
+  it("aborts bounded work, waits for it to exit, then releases the shared lease", async () => {
+    vi.useFakeTimers();
+    const harness = createLeaseHarness();
+    let workSignal: AbortSignal | undefined;
+    let exited = false;
+    const order: string[] = [];
+    harness.release.mockImplementationOnce(async () => {
+      order.push("lease-released");
+    });
+    try {
+      const operation = withUserDataLease(
+        harness.repositories,
+        "user-1",
+        async (_lease, signal) => {
+          workSignal = signal;
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 1_000);
+            signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              resolve();
+            }, { once: true });
+          });
+          try {
+            signal?.throwIfAborted();
+            exited = true;
+          } finally {
+            order.push("work-exited");
+          }
+        },
+        { timeoutMs: 25, timeoutCode: "user_data_work_timeout" },
+      );
+      const settled = operation.then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(25);
+      expect(workSignal?.aborted).toBe(true);
+      const error = await settled;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("user_data_work_timeout");
+      expect(exited).toBe(false);
+      expect(harness.release).toHaveBeenCalledTimes(1);
+      expect(order).toEqual(["work-exited", "lease-released"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

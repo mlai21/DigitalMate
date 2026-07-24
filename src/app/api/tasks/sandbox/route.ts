@@ -76,6 +76,7 @@ async function processSandboxTask(
       kind: "sandbox",
       inputSummary,
       outputSummary: "沙箱任务已执行，输出文件已生成。",
+      artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

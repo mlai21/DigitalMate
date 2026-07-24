@@ -64,6 +64,7 @@ async function processSpreadsheetTask(
       kind: "spreadsheet",
       inputSummary,
       outputSummary: "表格汇总报告和图表已生成。",
+      artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

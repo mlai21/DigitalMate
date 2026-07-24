@@ -14,7 +14,7 @@ function createHarness() {
     repositories: {
       taskArtifacts: {
         listExpiredPending: vi.fn(async () => [pending]),
-        delete: vi.fn(async () => true),
+        deletePending: vi.fn(async () => true),
       },
     },
     deleteFile: vi.fn(async () => undefined),
@@ -43,7 +43,7 @@ describe("stale task artifact cleanup", () => {
       "/private/artifacts",
       harness.pending.storage_path,
     );
-    expect(harness.repositories.taskArtifacts.delete).toHaveBeenCalledWith(scope, harness.pending.id);
+    expect(harness.repositories.taskArtifacts.deletePending).toHaveBeenCalledWith(scope, harness.pending.id);
   });
 
   it("keeps the pending locator retryable when physical cleanup fails", async () => {
@@ -58,6 +58,6 @@ describe("stale task artifact cleanup", () => {
     })).resolves.toEqual({ claimed: 1, deleted: 0, failed: 1 });
 
     expect(harness.deleteFile).toHaveBeenCalledTimes(2);
-    expect(harness.repositories.taskArtifacts.delete).not.toHaveBeenCalled();
+    expect(harness.repositories.taskArtifacts.deletePending).not.toHaveBeenCalled();
   });
 });

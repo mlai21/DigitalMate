@@ -20,6 +20,9 @@ const MESSAGE_1 = "20000000-0000-4000-8000-000000000001";
 const OLD_MESSAGE = "20000000-0000-4000-8000-000000000002";
 const ATTACHMENT_1 = "30000000-0000-4000-8000-000000000001";
 const ATTACHMENT_2 = "30000000-0000-4000-8000-000000000002";
+const TASK_RUN_1 = "70000000-0000-4000-8000-000000000001";
+const ARTIFACT_1 = "71000000-0000-4000-8000-000000000001";
+const ARTIFACT_2 = "71000000-0000-4000-8000-000000000002";
 
 function scopeForUser(userId: string) {
   return { userId, agentId: `6${userId[0]}${userId.slice(2)}` };
@@ -73,6 +76,117 @@ function createTransactionalPool(query: ReturnType<typeof vi.fn>) {
     release,
   };
 }
+
+describe("task completion repository", () => {
+  it("commits artifact visibility and task success in one transaction", async () => {
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text === "BEGIN" || text === "COMMIT") return { rows: [] };
+      if (text.includes("UPDATE task_artifacts")) {
+        return { rows: [{ id: ARTIFACT_1 }, { id: ARTIFACT_2 }] };
+      }
+      if (text.includes("UPDATE task_runs")) return { rows: [{ id: TASK_RUN_1 }] };
+      throw new Error(`unexpected query: ${text}`);
+    });
+    const { pool, connect, release } = createTransactionalPool(query);
+    const repositories = createRepositories(pool);
+
+    await repositories.taskRuns.completeWithArtifacts(
+      TEST_SCOPE,
+      TASK_RUN_1,
+      "任务完成",
+      [ARTIFACT_1, ARTIFACT_2],
+    );
+
+    expect(connect).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+    expect(query.mock.calls.map(([sql]) => String(sql))).toEqual([
+      "BEGIN",
+      expect.stringContaining("UPDATE task_artifacts"),
+      expect.stringContaining("UPDATE task_runs"),
+      "COMMIT",
+    ]);
+    const artifactSql = String(query.mock.calls[1]?.[0]);
+    expect(artifactSql).toContain("status = 'pending'");
+    expect(artifactSql).toContain("task_run_id = $3");
+    expect(artifactSql).toContain("id = ANY($4::uuid[])");
+    const taskSql = String(query.mock.calls[2]?.[0]);
+    expect(taskSql).toContain("status = 'running'");
+    expect(taskSql).toContain("SET status = 'succeeded'");
+  });
+
+  it("rolls back both transitions when any requested artifact is missing", async () => {
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text === "BEGIN" || text === "ROLLBACK") return { rows: [] };
+      if (text.includes("UPDATE task_artifacts")) return { rows: [{ id: ARTIFACT_1 }] };
+      throw new Error(`unexpected query: ${text}`);
+    });
+    const { pool, release } = createTransactionalPool(query);
+    const repositories = createRepositories(pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).rejects.toThrow("task_artifact_transition_failed");
+
+    expect(query.mock.calls.map(([sql]) => String(sql))).toEqual([
+      "BEGIN",
+      expect.stringContaining("UPDATE task_artifacts"),
+      "ROLLBACK",
+    ]);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("rolls back ready artifacts when the task is no longer running", async () => {
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text === "BEGIN" || text === "ROLLBACK") return { rows: [] };
+      if (text.includes("UPDATE task_artifacts")) {
+        return { rows: [{ id: ARTIFACT_1 }, { id: ARTIFACT_2 }] };
+      }
+      if (text.includes("UPDATE task_runs")) return { rows: [] };
+      throw new Error(`unexpected query: ${text}`);
+    });
+    const { pool, release } = createTransactionalPool(query);
+    const repositories = createRepositories(pool);
+
+    await expect(
+      repositories.taskRuns.completeWithArtifacts(
+        TEST_SCOPE,
+        TASK_RUN_1,
+        "任务完成",
+        [ARTIFACT_1, ARTIFACT_2],
+      ),
+    ).rejects.toThrow("task_completion_transition_failed");
+
+    expect(query.mock.calls.map(([sql]) => String(sql))).toEqual([
+      "BEGIN",
+      expect.stringContaining("UPDATE task_artifacts"),
+      expect.stringContaining("UPDATE task_runs"),
+      "ROLLBACK",
+    ]);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("creates runs as running and only fails a still-running task", async () => {
+    const query = vi.fn(async () => ({ rows: [{ id: TASK_RUN_1 }] }));
+    const repositories = createRepositories(createPool(query));
+
+    await repositories.taskRuns.create(TEST_SCOPE, {
+      kind: "sandbox",
+      inputSummary: "执行任务",
+    });
+    await repositories.taskRuns.fail(TEST_SCOPE, TASK_RUN_1, "失败");
+
+    expect(String((query.mock.calls as unknown[][])[0]?.[0])).toContain("'running'");
+    expect(String((query.mock.calls as unknown[][])[1]?.[0])).toContain("status = 'running'");
+  });
+});
 
 describe("message attachments repository", () => {
   it("creates a pending attachment draft before private storage publication", async () => {
@@ -1015,6 +1129,44 @@ describe("message attachment PostgreSQL concurrency", () => {
     await expect(
       repositories.userDataMutations.acquireSharedLease(staleFence),
     ).rejects.toThrow("user_data_epoch_changed");
+  });
+
+  it("aborts a shared advisory-lock waiter and releases its dedicated pool client", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const clearLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const waiterLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const clearRepositories = createRepositories(databasePool, clearLockPool, clearLockPool);
+    const waiterRepositories = createRepositories(databasePool, waiterLockPool, waiterLockPool);
+    const userId = "50000000-0000-4000-8000-000000000017";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+    const staleFence = await waiterRepositories.userDataMutations.beginRequest(userId);
+    const exclusive = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
+    const abortController = new AbortController();
+    const waiting = waiterRepositories.userDataMutations.acquireSharedLease(
+      staleFence,
+      { signal: abortController.signal },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    abortController.abort(new Error("post_turn_timeout"));
+    const state = await Promise.race([
+      waiting.then(
+        () => "acquired",
+        (error: unknown) => error instanceof Error ? error.message : "rejected",
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("still-waiting"), 100)),
+    ]);
+
+    await exclusive.release();
+    await waiting.catch(() => undefined);
+    try {
+      expect(state).toBe("post_turn_timeout");
+      const freshFence = await waiterRepositories.userDataMutations.beginRequest(userId);
+      const freshLease = await waiterRepositories.userDataMutations.acquireSharedLease(freshFence);
+      await freshLease.release();
+    } finally {
+      await clearLockPool.end();
+      await waiterLockPool.end();
+    }
   });
 
   it("releases a real shared lease after an operation error so clear can proceed", async () => {

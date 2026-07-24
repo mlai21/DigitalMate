@@ -40,11 +40,18 @@ export async function installSkillsFromGitHub(input: {
   scanner?: { llm: LlmClient; model: string };
   token?: string;
   fetchFn?: FetchLike;
+  signal?: AbortSignal;
 }): Promise<SkillInstallOutcome> {
+  input.signal?.throwIfAborted();
   const parsed = parseGitHubUrl(input.url);
   if (!parsed) throw new Error("不是有效的 GitHub 链接。");
 
-  const discovered = await discoverSkillsFromGitHub({ url: input.url, token: input.token, fetchFn: input.fetchFn });
+  const discovered = await discoverSkillsFromGitHub({
+    url: input.url,
+    token: input.token,
+    fetchFn: input.fetchFn,
+    signal: input.signal,
+  });
   if (discovered.length === 0) {
     return { installed: [], blocked: [], others: [] };
   }
@@ -58,10 +65,16 @@ export async function installSkillsFromGitHub(input: {
   };
 
   for (const skill of primary.slice(0, MAX_AUTO_INSTALL)) {
+    input.signal?.throwIfAborted();
     const report = await scanSkillContent(
       skill.raw,
-      input.scanner ? { llm: input.scanner.llm, model: input.scanner.model } : undefined,
+      input.scanner
+        ? { llm: input.scanner.llm, model: input.scanner.model, signal: input.signal }
+        : input.signal
+          ? { signal: input.signal }
+          : undefined,
     );
+    input.signal?.throwIfAborted();
     if (report.verdict === "danger") {
       outcome.blocked.push({
         name: skill.document.name,
@@ -73,6 +86,7 @@ export async function installSkillsFromGitHub(input: {
     // Explicit chat request = user confirmation, so safe skills go live
     // immediately; warnings still require review in the admin console.
     const status = report.verdict === "safe" ? "enabled" : "pending";
+    input.signal?.throwIfAborted();
     await input.repositories.skills.create(input.userId, {
       name: skill.document.name,
       trigger: skill.document.description,

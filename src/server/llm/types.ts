@@ -50,11 +50,16 @@ export type LlmStreamInput = {
   messages: LlmMessage[];
   model: string;
   tools?: LlmTool[];
+  signal?: AbortSignal;
 };
 
 export type LlmClient = {
   stream(input: LlmStreamInput): AsyncIterable<LlmStreamEvent>;
-  completeText(input: { messages: LlmMessage[]; model: string }): Promise<string>;
+  completeText(input: {
+    messages: LlmMessage[];
+    model: string;
+    signal?: AbortSignal;
+  }): Promise<string>;
 };
 
 export async function collectStreamText(stream: AsyncIterable<LlmStreamEvent>): Promise<string> {

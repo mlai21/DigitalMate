@@ -19,7 +19,10 @@ export type DiscoveredSkill = {
   document: SkillDocument;
 };
 
-export type FetchLike = (url: string, init?: { headers?: Record<string, string> }) => Promise<{
+export type FetchLike = (url: string, init?: {
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+}) => Promise<{
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
@@ -65,7 +68,9 @@ export async function discoverSkillsFromGitHub(input: {
   url: string;
   token?: string;
   fetchFn?: FetchLike;
+  signal?: AbortSignal;
 }): Promise<DiscoveredSkill[]> {
+  input.signal?.throwIfAborted();
   const parsed = parseGitHubUrl(input.url);
   if (!parsed) throw new Error("不是有效的 GitHub 链接（支持仓库、目录或 SKILL.md 文件链接）。");
   const fetchFn: FetchLike = input.fetchFn ?? (fetch as unknown as FetchLike);
@@ -73,17 +78,18 @@ export async function discoverSkillsFromGitHub(input: {
 
   if (parsed.kind === "blob") {
     if (!isSkillMdPath(parsed.path)) throw new Error("文件链接必须指向 SKILL.md 文件。");
-    const skill = await fetchSkillFile(fetchFn, headers, parsed, parsed.path, parsed.ref ?? "HEAD");
+    const skill = await fetchSkillFile(fetchFn, headers, parsed, parsed.path, parsed.ref ?? "HEAD", input.signal);
     return skill ? [skill] : [];
   }
 
-  const ref = parsed.ref ?? (await fetchDefaultBranch(fetchFn, headers, parsed));
-  const paths = await listSkillMdPaths(fetchFn, headers, parsed, ref);
+  const ref = parsed.ref ?? (await fetchDefaultBranch(fetchFn, headers, parsed, input.signal));
+  const paths = await listSkillMdPaths(fetchFn, headers, parsed, ref, input.signal);
   const scoped = parsed.path ? paths.filter((path) => path === parsed.path || path.startsWith(`${parsed.path}/`)) : paths;
 
   const skills: DiscoveredSkill[] = [];
   for (const path of scoped.slice(0, MAX_SKILL_FILES)) {
-    const skill = await fetchSkillFile(fetchFn, headers, parsed, path, ref);
+    input.signal?.throwIfAborted();
+    const skill = await fetchSkillFile(fetchFn, headers, parsed, path, ref, input.signal);
     if (skill) skills.push(skill);
   }
   return skills;
@@ -102,8 +108,16 @@ function isSkillMdPath(path: string): boolean {
   return /(^|\/)skill\.md$/i.test(path);
 }
 
-async function fetchDefaultBranch(fetchFn: FetchLike, headers: Record<string, string>, parsed: ParsedGitHubUrl): Promise<string> {
-  const response = await fetchFn(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}`, { headers });
+async function fetchDefaultBranch(
+  fetchFn: FetchLike,
+  headers: Record<string, string>,
+  parsed: ParsedGitHubUrl,
+  signal?: AbortSignal,
+): Promise<string> {
+  const response = await fetchFn(
+    `https://api.github.com/repos/${parsed.owner}/${parsed.repo}`,
+    { headers, ...(signal ? { signal } : {}) },
+  );
   if (!response.ok) throw new Error(`无法访问 GitHub 仓库（HTTP ${response.status}），请确认链接和权限。`);
   const data = (await response.json()) as { default_branch?: string };
   return data.default_branch ?? "main";
@@ -114,10 +128,11 @@ async function listSkillMdPaths(
   headers: Record<string, string>,
   parsed: ParsedGitHubUrl,
   ref: string,
+  signal?: AbortSignal,
 ): Promise<string[]> {
   const response = await fetchFn(
     `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
-    { headers },
+    { headers, ...(signal ? { signal } : {}) },
   );
   if (!response.ok) throw new Error(`无法读取仓库文件列表（HTTP ${response.status}）。`);
   const data = (await response.json()) as { tree?: Array<{ path?: string; type?: string }> };
@@ -132,12 +147,16 @@ async function fetchSkillFile(
   parsed: ParsedGitHubUrl,
   path: string,
   ref: string,
+  signal?: AbortSignal,
 ): Promise<DiscoveredSkill | null> {
   const rawUrl = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${encodeURIComponent(ref)}/${path
     .split("/")
     .map(encodeURIComponent)
     .join("/")}`;
-  const response = await fetchFn(rawUrl, { headers: { "user-agent": "DigitalMate" } });
+  const response = await fetchFn(rawUrl, {
+    headers: { "user-agent": "DigitalMate" },
+    ...(signal ? { signal } : {}),
+  });
   if (!response.ok) return null;
   const raw = (await response.text()).slice(0, MAX_SKILL_BYTES);
   const document = parseSkillMd(raw);

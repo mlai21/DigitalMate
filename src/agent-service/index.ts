@@ -28,6 +28,7 @@ import { assertAuthorizedModelRoutes } from "@/server/agents/service";
 
 const intervalMs = 15_000;
 const skillImprovementIntervalMs = 24 * 60 * 60 * 1000;
+export const AGENT_TICK_TIMEOUT_MS = 120_000;
 const lastSkillImprovementAt = new Map<string, number>();
 
 async function main() {
@@ -61,11 +62,7 @@ async function main() {
   const shutdown = new AbortController();
   const runActiveAgentTick = createActiveAgentTickRunner({
     listActiveAgents: () => repositories.agents.listActive(),
-    execute: (scope) => withUserDataLease(
-      repositories,
-      scope.userId,
-      () => processAgentTick(repositories, scope),
-    ),
+    execute: (scope) => runAgentTickUnderLease(repositories, scope),
     onError: (error, scope) => {
       console.error("agent_tick_failed", {
         userId: scope.userId,
@@ -101,25 +98,58 @@ async function main() {
   }
 }
 
+export async function runAgentTickUnderLease(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
+  await withUserDataLease(
+    repositories,
+    scope.userId,
+    (_lease, signal) => processAgentTick(repositories, scope, signal),
+    {
+      signal: options.signal,
+      timeoutMs: options.timeoutMs ?? AGENT_TICK_TIMEOUT_MS,
+      timeoutCode: "agent_tick_timeout",
+    },
+  );
+}
+
 async function processAgentTick(
   repositories: ReturnType<typeof createRepositories>,
   scope: AgentScope,
+  signal: AbortSignal,
 ) {
+  signal.throwIfAborted();
   const env = readEnv();
   await processDueProactiveTasks({
     scope,
     repositories,
-    sendChannel: (target, text) => sendChannelMessage(env, target, text),
+    signal,
+    sendChannel: (target, text, sendSignal) =>
+      sendChannelMessage(env, target, text, sendSignal),
   });
-  await processMemoryMessages(repositories, scope);
-  await processMemoryConsolidation(repositories, scope);
-  await processConversationCompaction(repositories, scope);
-  await processDailyReflection(repositories, scope);
-  await processSkillImprovementJob(repositories, scope);
-  await processGoalLoopsJob(repositories, scope);
+  signal.throwIfAborted();
+  await processMemoryMessages(repositories, scope, signal);
+  signal.throwIfAborted();
+  await processMemoryConsolidation(repositories, scope, signal);
+  signal.throwIfAborted();
+  await processConversationCompaction(repositories, scope, signal);
+  signal.throwIfAborted();
+  await processDailyReflection(repositories, scope, signal);
+  signal.throwIfAborted();
+  await processSkillImprovementJob(repositories, scope, signal);
+  signal.throwIfAborted();
+  await processGoalLoopsJob(repositories, scope, signal);
+  signal.throwIfAborted();
 }
 
-async function processGoalLoopsJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processGoalLoopsJob(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
   await assertAuthorizedModelRoutes(
@@ -141,9 +171,10 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
           recentSteps,
           llm: main.client,
           model: main.model,
+          signal,
           search: {
-            run: async (query) => {
-              const results = await searchWeb(query);
+            run: async (query, searchSignal) => {
+              const results = await searchWeb(query, env, searchSignal);
               return { summary: summarizeSearchResults(results) };
             },
           },
@@ -165,7 +196,14 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
         return candidate;
       },
       verifyStep: async (goal, candidate, priorEvidence) => {
-        const verify = await verifyGoalStep({ goal, candidate, priorEvidence, llm: light.client, model: light.model });
+        const verify = await verifyGoalStep({
+          goal,
+          candidate,
+          priorEvidence,
+          llm: light.client,
+          model: light.model,
+          signal,
+        });
         await repositories.llmUsage
           .create({
             userId: goal.userId,
@@ -181,7 +219,11 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
         return verify;
       },
     },
-  }).catch(() => null);
+    signal,
+  }).catch(() => {
+    signal.throwIfAborted();
+    return null;
+  });
 
   if (outcome && (outcome.pickedUp > 0 || outcome.rounds > 0)) {
     console.log(
@@ -190,7 +232,12 @@ async function processGoalLoopsJob(repositories: ReturnType<typeof createReposit
   }
 }
 
-async function processSkillImprovementJob(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processSkillImprovementJob(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   // At most once a day: revision proposals ride the same slow cadence as the
   // daily reflection instead of the 15s tick.
   if (Date.now() - (lastSkillImprovementAt.get(scope.agentId) ?? 0) < skillImprovementIntervalMs) return;
@@ -206,13 +253,22 @@ async function processSkillImprovementJob(repositories: ReturnType<typeof create
     llm: client,
     model,
     scope,
-  }).catch(() => null);
+    signal,
+  }).catch(() => {
+    signal.throwIfAborted();
+    return null;
+  });
   if (outcome && outcome.proposed > 0) {
     console.log(`Skill improvement: proposed ${outcome.proposed} pending revision(s).`);
   }
 }
 
-async function processMemoryMessages(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processMemoryMessages(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   const messages = await repositories.messages.unprocessedForMemory(scope);
   if (messages.length === 0) return;
 
@@ -222,13 +278,26 @@ async function processMemoryMessages(repositories: ReturnType<typeof createRepos
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
 
   for (const message of messages) {
-    const memories = await extractMemoriesWithLlm({ llm: client, model, text: message.content });
+    signal.throwIfAborted();
+    const memories = await extractMemoriesWithLlm({
+      llm: client,
+      model,
+      text: message.content,
+      signal,
+    });
+    signal.throwIfAborted();
     await repositories.memories.createMany(scope, message.id, memories);
   }
+  signal.throwIfAborted();
   await repositories.messages.markMemoryProcessed(scope, messages.map((message) => message.id));
 }
 
-async function processMemoryConsolidation(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processMemoryConsolidation(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   const env = readEnv();
   const settings = await repositories.settings.get(scope);
   await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
@@ -241,7 +310,11 @@ async function processMemoryConsolidation(repositories: ReturnType<typeof create
       model,
       scope,
       kind,
-    }).catch(() => null);
+      signal,
+    }).catch(() => {
+      signal.throwIfAborted();
+      return null;
+    });
     if (outcome) {
       console.log(
         `Memory consolidation (${outcome.kind}): ${outcome.strategy}, removed ${outcome.removedCount}, merged into ${outcome.mergedCount}.`,
@@ -250,9 +323,15 @@ async function processMemoryConsolidation(repositories: ReturnType<typeof create
   }
 }
 
-async function processConversationCompaction(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processConversationCompaction(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   const conversations = await repositories.conversations.list(scope);
   for (const conversation of conversations) {
+    signal.throwIfAborted();
     const existing = await repositories.conversationSummaries.latest(scope, conversation.id);
     if (existing) continue;
 
@@ -268,7 +347,12 @@ async function processConversationCompaction(repositories: ReturnType<typeof cre
   }
 }
 
-async function processDailyReflection(repositories: ReturnType<typeof createRepositories>, scope: AgentScope) {
+async function processDailyReflection(
+  repositories: ReturnType<typeof createRepositories>,
+  scope: AgentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
   const latest = await repositories.reflections.latestBySourceEvent(scope, "daily");
   if (!shouldRunDailyReflection(new Date(), latest)) return;
   const conversations = await repositories.conversations.list(scope);
@@ -285,7 +369,13 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
   const settings = await repositories.settings.get(scope);
   await assertAuthorizedModelRoutes(scope, ["light"], settings.modelRouting, repositories.agents);
   const { client, model } = getLlmClient("light", env, settings.modelRouting);
-  const generated = await generateReflectionWithLlm({ llm: client, model, digest });
+  const generated = await generateReflectionWithLlm({
+    llm: client,
+    model,
+    digest,
+    signal,
+  });
+  signal.throwIfAborted();
   const reflection =
     generated ??
     normalizeReflection("做得好：保持了稳定陪伴。需要改进：反思模型暂不可用，本次为降级记录。建议：检查 light 模型配置。");
@@ -293,6 +383,7 @@ async function processDailyReflection(repositories: ReturnType<typeof createRepo
     reflection: { positives: reflection.positives, negatives: reflection.negatives, suggestions: reflection.suggestions },
     sourceWindow: { event: "daily", conversationId: conversation.id, messageCount: messages.length },
   });
+  signal.throwIfAborted();
 
   // Daily reflection may surface a recurring task pattern worth crystallizing
   // into a new skill draft (pending user approval, like every other draft).

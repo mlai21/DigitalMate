@@ -27,6 +27,46 @@ const directMessage: NormalizedChannelMessage = {
 const scope = { userId: "user-1", agentId: "agent-1" };
 
 describe("handleChannelMessage", () => {
+  it("aborts a half-open channel model stream without assistant writes or sends", async () => {
+    const controller = new AbortController();
+    let providerSignal: AbortSignal | undefined;
+    const send = vi.fn();
+    const createMessage = vi.fn();
+    const llm: LlmClient = {
+      async *stream(input) {
+        providerSignal = input.signal;
+        await new Promise<void>((resolve) => {
+          controller.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        input.signal?.throwIfAborted();
+      },
+      async completeText() {
+        return "";
+      },
+    };
+
+    const operation = handleChannelMessage({
+      message: directMessage,
+      scope,
+      repositories: fakeRepositories({ createMessage }),
+      llm,
+      model: "mock-main",
+      send,
+      signal: controller.signal,
+      now: new Date("2026-07-05T10:00:00+08:00"),
+    });
+    await vi.waitFor(() => {
+      expect(providerSignal).toBeDefined();
+    });
+    controller.abort(new Error("channel_timeout"));
+
+    await expect(operation).rejects.toThrow("channel_timeout");
+    expect(providerSignal?.aborted).toBe(true);
+    expect(createMessage.mock.calls.filter(([, input]) =>
+      (input as { role?: string }).role === "assistant")).toHaveLength(0);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("answers direct channel messages with the shared agent", async () => {
     const send = vi.fn();
     const createChannelMessage = vi.fn((input: unknown) => {

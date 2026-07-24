@@ -20,11 +20,16 @@ type IqsSearchResponse = {
   message?: string;
 };
 
-export async function searchWeb(query: string, env: AppEnv = readEnv()): Promise<WebSearchResult[]> {
+export async function searchWeb(
+  query: string,
+  env: AppEnv = readEnv(),
+  signal?: AbortSignal,
+): Promise<WebSearchResult[]> {
+  signal?.throwIfAborted();
   if (env.searchProvider === "iqs") {
-    return searchWithIqs(query, env);
+    return searchWithIqs(query, env, signal);
   }
-  return searchWithDuckDuckGo(query);
+  return searchWithDuckDuckGo(query, signal);
 }
 
 // IQS may fall back to full-page mainText; cap snippets so a whole search-results
@@ -54,7 +59,11 @@ export function mapIqsPageItems(items: IqsPageItem[]): WebSearchResult[] {
     .filter((item): item is WebSearchResult => item !== null);
 }
 
-async function searchWithIqs(query: string, env: AppEnv): Promise<WebSearchResult[]> {
+async function searchWithIqs(
+  query: string,
+  env: AppEnv,
+  signal?: AbortSignal,
+): Promise<WebSearchResult[]> {
   if (!env.aliyunIqsApiKey) {
     throw new Error("ALIYUN_IQS_API_KEY is required when SEARCH_PROVIDER=iqs");
   }
@@ -78,6 +87,7 @@ async function searchWithIqs(query: string, env: AppEnv): Promise<WebSearchResul
         numResults: 5,
       },
     }),
+    ...(signal ? { signal } : {}),
   });
 
   if (!response.ok) {
@@ -89,12 +99,13 @@ async function searchWithIqs(query: string, env: AppEnv): Promise<WebSearchResul
   return mapIqsPageItems(payload.pageItems ?? []);
 }
 
-async function searchWithDuckDuckGo(query: string): Promise<WebSearchResult[]> {
+async function searchWithDuckDuckGo(query: string, signal?: AbortSignal): Promise<WebSearchResult[]> {
   const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   const response = await fetch(url, {
     headers: {
       "user-agent": "DigitalMate/0.1 (+https://localhost)",
     },
+    ...(signal ? { signal } : {}),
   });
 
   if (!response.ok) {

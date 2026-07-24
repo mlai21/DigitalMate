@@ -26,9 +26,10 @@ export type ExecuteGoalStepInput = {
   recentSteps: DbGoalStep[];
   llm: LlmClient;
   model: string;
-  search: { run(query: string): Promise<{ summary: string }> };
+  search: { run(query: string, signal?: AbortSignal): Promise<{ summary: string }> };
   memories: { findRelevant(scope: AgentScope, query: string): Promise<RankableMemory[]> };
   toolLogs: { create(input: ToolLogInput): Promise<unknown> | unknown };
+  signal?: AbortSignal;
   now?: Date;
 };
 
@@ -61,13 +62,24 @@ const memorySearchTool: LlmTool = {
  * advances goal state itself — that is the orchestrator's job.
  */
 export async function executeGoalStep(input: ExecuteGoalStepInput): Promise<GoalStepCandidate> {
+  input.signal?.throwIfAborted();
   const tools = buildWhitelistedTools(input.goal);
   let messages = buildStepMessages(input);
   let outputTokens = 0;
 
   let finalText = "";
   for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
-    const { text, toolCalls } = await collectTurn(input.llm.stream({ messages, model: input.model, tools }));
+    input.signal?.throwIfAborted();
+    const { text, toolCalls } = await collectTurn(
+      input.llm.stream({
+        messages,
+        model: input.model,
+        tools,
+        ...(input.signal ? { signal: input.signal } : {}),
+      }),
+      input.signal,
+    );
+    input.signal?.throwIfAborted();
     outputTokens += estimateTokenCount(text);
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
@@ -77,12 +89,15 @@ export async function executeGoalStep(input: ExecuteGoalStepInput): Promise<Goal
 
     const toolMessages: LlmMessage[] = [];
     for (const toolCall of toolCalls) {
+      input.signal?.throwIfAborted();
       const result = await executeGoalToolCall(input, toolCall);
+      input.signal?.throwIfAborted();
       toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }
     messages = [...messages, { role: "assistant", content: text, toolCalls }, ...toolMessages];
   }
 
+  input.signal?.throwIfAborted();
   const tokensUsed = estimateMessagesTokenUsage(messages) + outputTokens;
   return { ...parseCandidate(finalText), tokensUsed };
 }
@@ -173,7 +188,10 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
 
   if (toolCall.name === "web_search") {
     try {
-      const result = await input.search.run(query);
+      const result = input.signal
+        ? await input.search.run(query, input.signal)
+        : await input.search.run(query);
+      input.signal?.throwIfAborted();
       await input.toolLogs.create({
         ...logBase,
         outputSummary: result.summary.slice(0, 500),
@@ -182,6 +200,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
       });
       return `搜索结果：\n${result.summary}`;
     } catch (error) {
+      input.signal?.throwIfAborted();
       const message = error instanceof Error ? error.message : String(error);
       await input.toolLogs.create({
         ...logBase,
@@ -200,6 +219,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
         { userId: input.goal.userId, agentId: input.goal.agentId },
         query,
       );
+      input.signal?.throwIfAborted();
       const summary =
         memories.length > 0 ? memories.map((memory) => `- ${memory.content}`).join("\n") : "没有找到相关记忆。";
       await input.toolLogs.create({
@@ -210,6 +230,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
       });
       return `相关记忆：\n${summary}`;
     } catch (error) {
+      input.signal?.throwIfAborted();
       const message = error instanceof Error ? error.message : String(error);
       await input.toolLogs.create({
         ...logBase,
@@ -271,13 +292,18 @@ export function extractJsonObject(text: string): Record<string, unknown> | null 
   }
 }
 
-async function collectTurn(stream: AsyncIterable<{ type: "text"; text: string } | { type: "tool_call"; toolCall: LlmToolCall }>) {
+async function collectTurn(
+  stream: AsyncIterable<{ type: "text"; text: string } | { type: "tool_call"; toolCall: LlmToolCall }>,
+  signal?: AbortSignal,
+) {
   const chunks: string[] = [];
   const toolCalls: LlmToolCall[] = [];
   for await (const event of stream) {
+    signal?.throwIfAborted();
     if (event.type === "text") chunks.push(event.text);
     else toolCalls.push(event.toolCall);
   }
+  signal?.throwIfAborted();
   return { text: chunks.join(""), toolCalls };
 }
 

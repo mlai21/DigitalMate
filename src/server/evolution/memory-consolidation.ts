@@ -67,19 +67,24 @@ export async function consolidateMemoryKind(input: {
   scope: AgentScope;
   kind: MemoryKind;
   cap?: number;
+  signal?: AbortSignal;
 }): Promise<ConsolidationOutcome | null> {
+  input.signal?.throwIfAborted();
   const cap = input.cap ?? MEMORY_CAPACITY_LIMITS[input.kind];
   if (!cap) return null;
 
   const entries = await input.repositories.memories.listActiveByKind(input.scope, input.kind);
+  input.signal?.throwIfAborted();
   if (entries.length <= cap) return null;
 
-  const merged = await mergeWithLlm(input.llm, input.model, entries, cap);
+  const merged = await mergeWithLlm(input.llm, input.model, entries, cap, input.signal);
+  input.signal?.throwIfAborted();
   if (merged) {
     await input.repositories.memories.softDeleteMany(
       input.scope,
       entries.map((entry) => entry.id),
     );
+    input.signal?.throwIfAborted();
     await input.repositories.memories.createMany(
       input.scope,
       null,
@@ -111,7 +116,9 @@ async function mergeWithLlm(
   model: string,
   entries: MemoryEntryForConsolidation[],
   cap: number,
+  signal?: AbortSignal,
 ): Promise<Array<{ content: string; confidence: number }> | null> {
+  signal?.throwIfAborted();
   try {
     const raw = await llm.completeText({
       model,
@@ -122,13 +129,16 @@ async function mergeWithLlm(
           content: entries.map((entry) => `- (置信度 ${entry.confidence.toFixed(2)}) ${entry.content}`).join("\n"),
         },
       ],
+      ...(signal ? { signal } : {}),
     });
+    signal?.throwIfAborted();
     const jsonText = extractJsonArray(raw);
     if (!jsonText) return null;
     const parsed = mergeSchema.parse(JSON.parse(jsonText));
     if (parsed.length > cap) return parsed.slice(0, cap);
     return parsed;
   } catch {
+    signal?.throwIfAborted();
     return null;
   }
 }

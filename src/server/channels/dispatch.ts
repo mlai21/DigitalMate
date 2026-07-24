@@ -30,7 +30,7 @@ export function scheduleChannelMessageHandling(input: {
 async function processChannelMessage(input: { env: AppEnv; message: NormalizedChannelMessage }): Promise<void> {
   const repositories = createRepositories();
   const user = await repositories.users.ensureDefault();
-  await withUserDataLease(repositories, user.id, async () => {
+  await withUserDataLease(repositories, user.id, async (_lease, signal) => {
     const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
     const settings = await repositories.settings.get(scope);
     await assertAuthorizedModelRoutes(
@@ -49,15 +49,18 @@ async function processChannelMessage(input: { env: AppEnv; message: NormalizedCh
       llm: client,
       model,
       lightLlm: { client: light.client, model: light.model },
-      send: (normalized, text) => sendChannelMessage(input.env, normalized, text),
+      signal,
+      send: (normalized, text, sendSignal) =>
+        sendChannelMessage(input.env, normalized, text, sendSignal),
       skillInstaller: {
-        install: (url) =>
+        install: (url, installSignal) =>
           installSkillsFromGitHub({
             url,
             userId: user.id,
             repositories,
             scanner: { llm: light.client, model: light.model },
             token: input.env.githubToken,
+            signal: installSignal,
           }),
       },
     });
