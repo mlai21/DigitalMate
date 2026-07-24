@@ -1506,7 +1506,7 @@ index ce104e5..661a6c0 100644
      });
 
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..15f15f1 100644
+index ce94f9a..de70478 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
 @@ -1,19 +1,23 @@
@@ -1597,7 +1597,7 @@ index ce94f9a..15f15f1 100644
    });
 
    it("throws error with status code for non-401 errors", async () => {
-@@ -136,14 +164,64 @@ describe("request", () => {
+@@ -136,14 +164,136 @@ describe("request", () => {
      await expect(request("/models")).rejects.toThrow("server exploded");
    });
 
@@ -1616,6 +1616,78 @@ index ce94f9a..15f15f1 100644
 +      kind: "transport",
 +      retryable: true,
 +    });
++  });
++
++  it.each([
++    ["JSON", "application/json", "json"],
++    ["text", "text/plain", "text"],
++  ] as const)(
++    "classifies a successful %s body read TypeError as retryable transport",
++    async (_label, contentType, reader) => {
++      global.fetch = vi.fn().mockResolvedValue({
++        ok: true,
++        status: 200,
++        statusText: "OK",
++        headers: { get: () => contentType },
++        json:
++          reader === "json"
++            ? vi.fn().mockRejectedValue(new TypeError("stream reset"))
++            : vi.fn(),
++        text:
++          reader === "text"
++            ? vi.fn().mockRejectedValue(new TypeError("stream reset"))
++            : vi.fn(),
++      } as unknown as Response);
++
++      const error = await request("/models").catch(
++        (caught: unknown) => caught,
++      );
++
++      expect(error).toMatchObject({
++        name: "RetryableRequestError",
++        kind: "transport",
++        retryable: true,
++      });
++      expect(fetch).toHaveBeenCalledTimes(1);
++    },
++  );
++
++  it("does not classify malformed completed JSON as retryable", async () => {
++    const syntaxError = new SyntaxError("Unexpected token");
++    global.fetch = vi.fn().mockResolvedValue({
++      ok: true,
++      status: 200,
++      statusText: "OK",
++      headers: { get: () => "application/json" },
++      json: vi.fn().mockRejectedValue(syntaxError),
++      text: vi.fn(),
++    } as unknown as Response);
++
++    const error = await request("/models").catch(
++      (caught: unknown) => caught,
++    );
++
++    expect(error).toBe(syntaxError);
++    expect(error).not.toMatchObject({ retryable: true });
++    expect(fetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not classify a non-2xx error body read failure as retryable", async () => {
++    global.fetch = vi.fn().mockResolvedValue({
++      ok: false,
++      status: 500,
++      statusText: "Internal Server Error",
++      headers: { get: () => "application/json" },
++      text: vi.fn().mockRejectedValue(new TypeError("stream reset")),
++    } as unknown as Response);
++
++    const error = await request("/models", {
++      method: "PUT",
++      body: "{}",
++    }).catch((caught: unknown) => caught);
++
++    expect(error).not.toMatchObject({ retryable: true });
++    expect(fetch).toHaveBeenCalledTimes(1);
 +  });
 +
 +  it("preserves the stable DigitalMate error envelope without raw JSON", async () => {
@@ -1665,7 +1737,7 @@ index ce94f9a..15f15f1 100644
    });
 
    it("request URL is correctly built by getApiUrl", async () => {
-@@ -208,6 +286,28 @@ describe("request", () => {
+@@ -208,6 +358,28 @@ describe("request", () => {
      vi.useRealTimers();
    });
 
@@ -1694,7 +1766,7 @@ index ce94f9a..15f15f1 100644
    it("completes successfully before timeout", async () => {
      vi.useFakeTimers();
      mockFetch(200, { data: "ok" });
-@@ -271,6 +371,9 @@ describe("request", () => {
+@@ -271,6 +443,9 @@ describe("request", () => {
    it("succeeds on retry after initial timeout", async () => {
      vi.useFakeTimers();
      let attemptCount = 0;
@@ -1704,7 +1776,7 @@ index ce94f9a..15f15f1 100644
 
      global.fetch = vi.fn().mockImplementation((_url, options) => {
        attemptCount++;
-@@ -299,10 +402,13 @@ describe("request", () => {
+@@ -299,10 +474,13 @@ describe("request", () => {
      });
 
      const requestPromise = request("/flaky-endpoint", {
@@ -1718,7 +1790,7 @@ index ce94f9a..15f15f1 100644
 
      // First attempt timeout
      vi.advanceTimersByTime(1000);
-@@ -311,6 +417,8 @@ describe("request", () => {
+@@ -311,6 +489,8 @@ describe("request", () => {
      const result = await requestPromise;
      expect(result).toEqual({ data: "success" });
      expect(attemptCount).toBe(2);
@@ -1727,7 +1799,7 @@ index ce94f9a..15f15f1 100644
 
      vi.useRealTimers();
    });
-@@ -332,6 +440,48 @@ describe("request", () => {
+@@ -332,6 +512,48 @@ describe("request", () => {
      expect(fetch).not.toHaveBeenCalled();
    });
 
@@ -1777,7 +1849,7 @@ index ce94f9a..15f15f1 100644
      let attemptCount = 0;
 
 diff --git a/src/api/request.ts b/src/api/request.ts
-index 7f4cb7d..81e53dc 100644
+index 7f4cb7d..5d2961f 100644
 --- a/src/api/request.ts
 +++ b/src/api/request.ts
 @@ -1,5 +1,70 @@
@@ -1951,11 +2023,12 @@ index 7f4cb7d..81e53dc 100644
 
    let lastError: Error | null = null;
 
-@@ -112,24 +234,46 @@ export async function request<T = unknown>(
+@@ -112,24 +234,47 @@ export async function request<T = unknown>(
        }
      }
 
 +    let responseReceived = false;
++    let readingSuccessfulBody = false;
      try {
        const response = await fetch(url, {
          ...fetchOptions,
@@ -1999,7 +2072,19 @@ index 7f4cb7d..81e53dc 100644
          const errorMessage = getErrorMessageFromBody(text, contentType);
 
          // Preserve raw body for parseErrorDetail() to extract structured fields
-@@ -162,15 +306,15 @@ export async function request<T = unknown>(
+@@ -146,9 +291,11 @@ export async function request<T = unknown>(
+
+       const contentType = response.headers.get("content-type") || "";
+       if (!contentType.includes("application/json")) {
++        readingSuccessfulBody = true;
+         return (await response.text()) as unknown as T;
+       }
+
++      readingSuccessfulBody = true;
+       return (await response.json()) as T;
+     } catch (error) {
+       if (
+@@ -162,15 +309,18 @@ export async function request<T = unknown>(
 
        if (error instanceof DOMException && error.name === "AbortError") {
          // Timeout-triggered abort
@@ -2013,7 +2098,10 @@ index 7f4cb7d..81e53dc 100644
            await new Promise((resolve) => setTimeout(resolve, retryDelay));
            continue;
          }
-+      } else if (!responseReceived && error instanceof TypeError) {
++      } else if (
++        error instanceof TypeError &&
++        (!responseReceived || readingSuccessfulBody)
++      ) {
 +        throw new RetryableRequestError("transport");
        } else {
          // Non-timeout errors should not retry
@@ -2912,10 +3000,10 @@ index 0000000..52d1f01
 +});
 diff --git a/src/pages/Control/Channels/channelSecurity.test.ts b/src/pages/Control/Channels/channelSecurity.test.ts
 new file mode 100644
-index 0000000..5015dd9
+index 0000000..565ea88
 --- /dev/null
 +++ b/src/pages/Control/Channels/channelSecurity.test.ts
-@@ -0,0 +1,752 @@
+@@ -0,0 +1,811 @@
 +import { describe, expect, it, vi } from "vitest";
 +import { readFileSync } from "node:fs";
 +import path from "node:path";
@@ -3221,6 +3309,65 @@ index 0000000..5015dd9
 +      expect(save).toHaveBeenCalledTimes(2);
 +    },
 +  );
++
++  it("retries a body-read transport failure once with identical serialized payload and operation id", async () => {
++    const payload = {
++      operation_id: OPERATION_ID,
++      revision: 0,
++      bot_prefix: "draft",
++      clear_secret: [],
++    };
++    const serializedBodies: string[] = [];
++    const save = vi.fn(async (stablePayload: ChannelUpdatePayload) => {
++      serializedBodies.push(JSON.stringify(stablePayload));
++      if (serializedBodies.length === 1) {
++        throw new RetryableRequestError("transport");
++      }
++      return { revision: 1 };
++    });
++
++    await expect(saveChannelWithRetry(save, payload)).resolves.toEqual({
++      revision: 1,
++    });
++    expect(serializedBodies).toEqual([
++      JSON.stringify(payload),
++      JSON.stringify(payload),
++    ]);
++    expect(
++      serializedBodies.every((body) => body.includes(OPERATION_ID)),
++    ).toBe(true);
++  });
++
++  it("stops after the one body-read transport retry also fails", async () => {
++    const secondFailure = new RetryableRequestError("transport");
++    const save = vi
++      .fn()
++      .mockRejectedValueOnce(new RetryableRequestError("transport"))
++      .mockRejectedValueOnce(secondFailure);
++
++    await expect(
++      saveChannelWithRetry(save, {
++        operation_id: OPERATION_ID,
++        revision: 0,
++        clear_secret: [],
++      }),
++    ).rejects.toBe(secondFailure);
++    expect(save).toHaveBeenCalledTimes(2);
++  });
++
++  it("does not retry a completed response body SyntaxError", async () => {
++    const syntaxError = new SyntaxError("Unexpected token");
++    const save = vi.fn().mockRejectedValue(syntaxError);
++
++    await expect(
++      saveChannelWithRetry(save, {
++        operation_id: OPERATION_ID,
++        revision: 0,
++        clear_secret: [],
++      }),
++    ).rejects.toBe(syntaxError);
++    expect(save).toHaveBeenCalledTimes(1);
++  });
 +
 +  it("does not retry an authoritative HTTP error", async () => {
 +    const error = new Error("409");
@@ -4109,11 +4256,15 @@ index c0bc4b1..4bba206 100644
      >
        {/* Top section: Icon and Status */}
 diff --git a/src/pages/Control/Channels/components/ChannelDrawer.tsx b/src/pages/Control/Channels/components/ChannelDrawer.tsx
-index db43570..695a48c 100644
+index db43570..41610db 100644
 --- a/src/pages/Control/Channels/components/ChannelDrawer.tsx
 +++ b/src/pages/Control/Channels/components/ChannelDrawer.tsx
-@@ -11,14 +11,29 @@ import { useAppMessage } from "../../../../hooks/useAppMessage";
- import { Alert, ConfigProvider } from "antd";
+@@ -8,17 +8,32 @@ import {
+   Select,
+ } from "@agentscope-ai/design";
+ import { useAppMessage } from "../../../../hooks/useAppMessage";
+-import { Alert, ConfigProvider } from "antd";
++import { Alert, ConfigProvider, Spin } from "antd";
  import { LinkOutlined } from "@ant-design/icons";
  import { useTranslation } from "react-i18next";
 -import { useEffect } from "react";
@@ -4144,7 +4295,23 @@ index db43570..695a48c 100644
 
  const CHANNELS_WITH_ACCESS_CONTROL: ChannelKey[] = [
    "telegram",
-@@ -166,23 +181,55 @@ export function ChannelDrawer({
+@@ -142,6 +157,7 @@ interface ChannelDrawerProps {
+   activeLabel: string;
+   form: FormInstance<Record<string, unknown>>;
+   saving: boolean;
++  detailLoading: boolean;
+   initialValues: Record<string, unknown> | undefined;
+   isBuiltin: boolean;
+   channelSchema?: ChannelSchema;
+@@ -155,6 +171,7 @@ export function ChannelDrawer({
+   activeLabel,
+   form,
+   saving,
++  detailLoading,
+   initialValues,
+   isBuiltin,
+   channelSchema,
+@@ -166,23 +183,55 @@ export function ChannelDrawer({
    const currentAgent = agents.find((a) => a.id === selectedAgent);
    const defaultMediaDir = currentAgent?.workspace_dir
      ? `${currentAgent.workspace_dir}/media`
@@ -4206,7 +4373,7 @@ index db43570..695a48c 100644
 
    // ── Access control fields (shared across multiple channels) ──────────────
 
-@@ -240,7 +287,12 @@ export function ChannelDrawer({
+@@ -240,7 +289,12 @@ export function ChannelDrawer({
              <Form.Item
                name="auth_method"
                label="Auth Method"
@@ -4220,7 +4387,7 @@ index db43570..695a48c 100644
              >
                <Select
                  options={[
-@@ -254,7 +306,9 @@ export function ChannelDrawer({
+@@ -254,7 +308,9 @@ export function ChannelDrawer({
                label="Access Token"
                rules={[
                  {
@@ -4231,7 +4398,7 @@ index db43570..695a48c 100644
                    message: "Please enter access token",
                  },
                ]}
-@@ -267,7 +321,9 @@ export function ChannelDrawer({
+@@ -267,7 +323,9 @@ export function ChannelDrawer({
                label="Password"
                rules={[
                  {
@@ -4242,7 +4409,7 @@ index db43570..695a48c 100644
                    message: "Please enter password",
                  },
                ]}
-@@ -338,7 +394,7 @@ export function ChannelDrawer({
+@@ -338,7 +396,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
@@ -4251,7 +4418,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="Discord bot token" />
              </Form.Item>
-@@ -346,7 +402,7 @@ export function ChannelDrawer({
+@@ -346,7 +404,7 @@ export function ChannelDrawer({
                <Input placeholder="http://127.0.0.1:18118" />
              </Form.Item>
              <Form.Item name="http_proxy_auth" label="HTTP Proxy Auth">
@@ -4260,7 +4427,7 @@ index db43570..695a48c 100644
              </Form.Item>
              <Form.Item
                name="accept_bot_messages"
-@@ -407,7 +463,7 @@ export function ChannelDrawer({
+@@ -407,7 +465,7 @@ export function ChannelDrawer({
              <Form.Item
                name="client_secret"
                label="Client Secret"
@@ -4269,7 +4436,7 @@ index db43570..695a48c 100644
              >
                <Input.Password />
              </Form.Item>
-@@ -559,15 +615,15 @@ export function ChannelDrawer({
+@@ -559,15 +617,15 @@ export function ChannelDrawer({
              <Form.Item
                name="app_secret"
                label="App Secret"
@@ -4288,7 +4455,7 @@ index db43570..695a48c 100644
              </Form.Item>
              <Form.Item name="media_dir" label={t("channels.wechatMediaDir")}>
                <Input placeholder={defaultMediaDir} />
-@@ -631,7 +687,7 @@ export function ChannelDrawer({
+@@ -631,7 +689,7 @@ export function ChannelDrawer({
              <Form.Item
                name="client_secret"
                label="Client Secret"
@@ -4297,7 +4464,7 @@ index db43570..695a48c 100644
              >
                <Input.Password />
              </Form.Item>
-@@ -654,7 +710,7 @@ export function ChannelDrawer({
+@@ -654,7 +712,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
@@ -4306,7 +4473,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="Telegram bot token from BotFather" />
              </Form.Item>
-@@ -683,7 +739,7 @@ export function ChannelDrawer({
+@@ -683,7 +741,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
@@ -4315,7 +4482,7 @@ index db43570..695a48c 100644
                tooltip={t("channels.slackBotTokenTooltip")}
              >
                <Input.Password placeholder="xoxb-..." />
-@@ -691,7 +747,7 @@ export function ChannelDrawer({
+@@ -691,7 +749,7 @@ export function ChannelDrawer({
              <Form.Item
                name="app_token"
                label="App Token"
@@ -4324,7 +4491,7 @@ index db43570..695a48c 100644
                tooltip={t("channels.slackAppTokenTooltip")}
              >
                <Input.Password placeholder="xapp-..." />
-@@ -802,7 +858,7 @@ export function ChannelDrawer({
+@@ -802,7 +860,7 @@ export function ChannelDrawer({
                <Input placeholder="Path to client certificate file" />
              </Form.Item>
              <Form.Item name="tls_keyfile" label="TLS Keyfile">
@@ -4333,7 +4500,7 @@ index db43570..695a48c 100644
              </Form.Item>
            </>
          );
-@@ -820,7 +876,7 @@ export function ChannelDrawer({
+@@ -820,7 +878,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
@@ -4342,7 +4509,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="Mattermost bot token" />
              </Form.Item>
-@@ -865,7 +921,11 @@ export function ChannelDrawer({
+@@ -865,7 +923,11 @@ export function ChannelDrawer({
              <Form.Item
                name="twilio_auth_token"
                label={t("channels.twilioAuthToken")}
@@ -4355,7 +4522,7 @@ index db43570..695a48c 100644
              >
                <Input.Password />
              </Form.Item>
-@@ -1009,6 +1069,24 @@ export function ChannelDrawer({
+@@ -1009,6 +1071,24 @@ export function ChannelDrawer({
              >
                <Input.TextArea rows={2} />
              </Form.Item>
@@ -4380,7 +4547,7 @@ index db43570..695a48c 100644
              <Form.Item
                noStyle
                shouldUpdate={(prev, cur) => prev.sip_mode !== cur.sip_mode}
-@@ -1020,21 +1098,39 @@ export function ChannelDrawer({
+@@ -1020,21 +1100,39 @@ export function ChannelDrawer({
                      <Form.Item
                        name="livekit_url"
                        label={t("channels.livekitUrl")}
@@ -4424,7 +4591,7 @@ index db43570..695a48c 100644
                      >
                        <Input.Password />
                      </Form.Item>
-@@ -1099,7 +1195,12 @@ export function ChannelDrawer({
+@@ -1099,7 +1197,12 @@ export function ChannelDrawer({
              <Form.Item
                name="secret"
                label="Secret"
@@ -4438,7 +4605,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="Secret from WeCom backend" />
              </Form.Item>
-@@ -1145,7 +1246,12 @@ export function ChannelDrawer({
+@@ -1145,7 +1248,12 @@ export function ChannelDrawer({
              <Form.Item
                name="sk"
                label="Secret Key (SK)"
@@ -4452,7 +4619,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="Secret Key from Huawei Developer Platform" />
              </Form.Item>
-@@ -1211,7 +1317,7 @@ export function ChannelDrawer({
+@@ -1211,7 +1319,7 @@ export function ChannelDrawer({
                label={t("channels.wechatBotTokenFile")}
                tooltip={t("channels.wechatBotTokenFileTooltip")}
              >
@@ -4461,7 +4628,7 @@ index db43570..695a48c 100644
              </Form.Item>
              <Form.Item name="media_dir" label={t("channels.wechatMediaDir")}>
                <Input placeholder={defaultMediaDir} />
-@@ -1288,7 +1394,12 @@ export function ChannelDrawer({
+@@ -1288,7 +1396,12 @@ export function ChannelDrawer({
              <Form.Item
                name="app_secret"
                label="App Secret"
@@ -4475,7 +4642,7 @@ index db43570..695a48c 100644
              >
                <Input.Password placeholder="App Secret from Yuanbao platform" />
              </Form.Item>
-@@ -1384,7 +1495,7 @@ export function ChannelDrawer({
+@@ -1384,7 +1497,7 @@ export function ChannelDrawer({
                field.placeholder,
                i18n.language,
              );
@@ -4484,7 +4651,41 @@ index db43570..695a48c 100644
                ? [{ required: true, message: `Please enter ${fieldLabel}` }]
                : undefined;
 
-@@ -1595,19 +1706,8 @@ export function ChannelDrawer({
+@@ -1574,7 +1687,12 @@ export function ChannelDrawer({
+   const drawerFooter = (
+     <div className={styles.formActions}>
+       <Button onClick={onClose}>{t("common.cancel")}</Button>
+-      <Button type="primary" loading={saving} onClick={() => form.submit()}>
++      <Button
++        type="primary"
++        loading={saving || detailLoading}
++        disabled={detailLoading}
++        onClick={() => form.submit()}
++      >
+         {t("common.save")}
+       </Button>
+     </div>
+@@ -1591,23 +1709,27 @@ export function ChannelDrawer({
+       footer={drawerFooter}
+       key={activeKey} // Force remount when switching channels
+     >
+-      {activeKey && (
++      {activeKey && detailLoading && (
++        <div
++          aria-busy="true"
++          style={{
++            minHeight: 160,
++            display: "flex",
++            alignItems: "center",
++            justifyContent: "center",
++            gap: 12,
++          }}
++        >
++          <Spin />
++          <span>正在加载渠道配置</span>
++        </div>
++      )}
++      {activeKey && !detailLoading && (
          <Form
            form={form}
            layout="vertical"
@@ -4506,7 +4707,7 @@ index db43570..695a48c 100644
          >
            <Form.Item
              name="enabled"
-@@ -1617,6 +1717,53 @@ export function ChannelDrawer({
+@@ -1617,6 +1739,53 @@ export function ChannelDrawer({
              <Switch />
            </Form.Item>
 
@@ -4560,7 +4761,7 @@ index db43570..695a48c 100644
            {activeKey !== "voice" && (
              <Form.Item name="bot_prefix" label="Bot Prefix">
                <Input placeholder="@bot" />
-@@ -1631,7 +1778,7 @@ export function ChannelDrawer({
+@@ -1631,7 +1800,7 @@ export function ChannelDrawer({
                  valuePropName="checked"
                  tooltip={t("channels.filterToolMessagesTooltip")}
                >
@@ -4569,7 +4770,7 @@ index db43570..695a48c 100644
                </Form.Item>
                <Form.Item
                  name="filter_thinking"
-@@ -1639,7 +1786,7 @@ export function ChannelDrawer({
+@@ -1639,7 +1808,7 @@ export function ChannelDrawer({
                  valuePropName="checked"
                  tooltip={t("channels.filterThinkingTooltip")}
                >
@@ -4596,7 +4797,7 @@ index b824513..3f87a97 100644
    display: grid;
    grid-template-columns: repeat(auto-fill, minmax(346px, 1fr));
 diff --git a/src/pages/Control/Channels/index.tsx b/src/pages/Control/Channels/index.tsx
-index 54f2acc..02e94b1 100644
+index 54f2acc..b0084cb 100644
 --- a/src/pages/Control/Channels/index.tsx
 +++ b/src/pages/Control/Channels/index.tsx
 @@ -1,4 +1,10 @@
@@ -4630,7 +4831,7 @@ index 54f2acc..02e94b1 100644
 
  type FilterType = "all" | "builtin" | "custom";
 
-@@ -29,7 +47,12 @@ function ChannelsPage() {
+@@ -29,17 +47,25 @@ function ChannelsPage() {
      channelSchemas,
      isBuiltin,
      loading,
@@ -4640,27 +4841,33 @@ index 54f2acc..02e94b1 100644
      fetchChannels,
 +    retrySchemas,
 +    fetchChannelConfig,
++    invalidateChannelDetail,
    } = useChannels();
    const [filter, setFilter] = useState<FilterType>("all");
    const [saving, setSaving] = useState(false);
-@@ -38,8 +61,8 @@ function ChannelsPage() {
++  const [detailLoading, setDetailLoading] = useState(false);
+   const [activeKey, setActiveKey] = useState<ChannelKey | null>(null);
+   const [drawerOpen, setDrawerOpen] = useState(false);
    const [aclDrawerOpen, setAclDrawerOpen] = useState(false);
    const [pendingDrawerOpen, setPendingDrawerOpen] = useState(false);
    const [pendingCount, setPendingCount] = useState(0);
 -  // eslint-disable-next-line @typescript-eslint/no-explicit-any
 -  const [form] = Form.useForm<any>();
 +  const submissionInFlight = useRef(false);
++  const detailReady = useRef(false);
 +  const [form] = Form.useForm<Record<string, unknown>>();
 
    const fetchPendingCount = useCallback(async () => {
      try {
-@@ -79,26 +102,43 @@ function ChannelsPage() {
+@@ -79,61 +105,115 @@ function ChannelsPage() {
    }, [channels, orderedKeys, filter, isBuiltin]);
 
    const handleCardClick = useCallback(
 -    (key: ChannelKey) => {
 +    async (key: ChannelKey) => {
 +      if (!ready || !channelSchemas[key]) return;
++      detailReady.current = false;
++      setDetailLoading(true);
        setActiveKey(key);
        setDrawerOpen(true);
 -      const channelConfig = channels[key] || { enabled: false, bot_prefix: "" };
@@ -4684,12 +4891,15 @@ index 54f2acc..02e94b1 100644
 +      try {
 +        channelConfig = await fetchChannelConfig(key);
 +      } catch {
++        detailReady.current = false;
++        setDetailLoading(false);
 +        setDrawerOpen(false);
 +        setActiveKey(null);
 +        message.error(t("channels.configFailed"));
 +        return;
 +      }
 +      if (!channelConfig) return;
++      form.resetFields();
 +      const formValues = normalizeChannelFormValues(
 +        channelConfig,
 +        schema,
@@ -4702,6 +4912,8 @@ index 54f2acc..02e94b1 100644
 +      form.setFieldsValue(
 +        formValues as Parameters<typeof form.setFieldsValue>[0],
 +      );
++      detailReady.current = true;
++      setDetailLoading(false);
      },
 -    [channels, form],
 +    [
@@ -4715,7 +4927,11 @@ index 54f2acc..02e94b1 100644
    );
 
    const handleDrawerClose = () => {
-@@ -107,33 +147,53 @@ function ChannelsPage() {
++    invalidateChannelDetail();
++    detailReady.current = false;
++    setDetailLoading(false);
+     setDrawerOpen(false);
+     setActiveKey(null);
    };
 
    const handleSubmit = async (values: Record<string, unknown>) => {
@@ -4729,7 +4945,14 @@ index 54f2acc..02e94b1 100644
 -      filter_tool_messages: !values.filter_tool_messages,
 -      filter_thinking: !values.filter_thinking,
 -    };
-+    if (!activeKey || submissionInFlight.current) return;
++    if (
++      !activeKey ||
++      detailLoading ||
++      !detailReady.current ||
++      submissionInFlight.current
++    ) {
++      return;
++    }
 +    const current = channels[activeKey] as ChannelConfigResponse | undefined;
 +    const schema = channelSchemas[activeKey];
 +    if (!current || !schema) return;
@@ -4757,7 +4980,8 @@ index 54f2acc..02e94b1 100644
        );
        await fetchChannels();
 
-       setDrawerOpen(false);
+-      setDrawerOpen(false);
++      handleDrawerClose();
        message.success(t("channels.configSaved"));
      } catch (error) {
 -      console.error("❌ Failed to update channel config:", error);
@@ -4786,7 +5010,7 @@ index 54f2acc..02e94b1 100644
        setSaving(false);
      }
    };
-@@ -192,6 +252,26 @@ function ChannelsPage() {
+@@ -192,6 +272,26 @@ function ChannelsPage() {
            </div>
          ) : (
            <>
@@ -4813,7 +5037,7 @@ index 54f2acc..02e94b1 100644
              {/* Enabled Channels Section */}
              <div className={styles.panelSection}>
                <div className={styles.panelTitle}>
-@@ -211,6 +291,7 @@ function ChannelsPage() {
+@@ -211,6 +311,7 @@ function ChannelsPage() {
                        config={config}
                        iconUrl={channelSchemas[key]?.icon}
                        onClick={() => handleCardClick(key)}
@@ -4821,7 +5045,7 @@ index 54f2acc..02e94b1 100644
                      />
                    ))}
                  </div>
-@@ -250,6 +331,7 @@ function ChannelsPage() {
+@@ -250,6 +351,7 @@ function ChannelsPage() {
                        channelKey={key}
                        iconUrl={channelSchemas[key]?.icon}
                        onClick={() => handleCardClick(key)}
@@ -4829,8 +5053,16 @@ index 54f2acc..02e94b1 100644
                      />
                    ))}
                  </div>
+@@ -264,6 +366,7 @@ function ChannelsPage() {
+         activeLabel={activeLabel}
+         form={form}
+         saving={saving}
++        detailLoading={detailLoading}
+         initialValues={activeKey ? channels[activeKey] : undefined}
+         isBuiltin={activeKey ? isBuiltin(activeKey) : true}
+         channelSchema={activeKey ? channelSchemas[activeKey] : undefined}
 diff --git a/src/pages/Control/Channels/useChannels.test.ts b/src/pages/Control/Channels/useChannels.test.ts
-index 6f5a746..91e2779 100644
+index 6f5a746..0b4efa0 100644
 --- a/src/pages/Control/Channels/useChannels.test.ts
 +++ b/src/pages/Control/Channels/useChannels.test.ts
 @@ -7,6 +7,8 @@ vi.mock("../../../api", () => ({
@@ -4873,7 +5105,7 @@ index 6f5a746..91e2779 100644
    });
 
    it("orderedKeys 中不在 builtinOrder 的 key 出现在末尾", async () => {
-@@ -160,4 +160,137 @@ describe("useChannels", () => {
+@@ -160,4 +160,160 @@ describe("useChannels", () => {
      expect(result.current.isBuiltin("dingtalk")).toBe(false);
      expect(result.current.isBuiltin("non-existent-key")).toBe(false);
    });
@@ -5000,6 +5232,29 @@ index 6f5a746..91e2779 100644
 +    });
 +    expect(result.current.channels.telegram).toBeUndefined();
 +  });
++
++  it("关闭详情后使在途响应失效且不写入渠道状态", async () => {
++    const telegram = deferred<Record<string, unknown>>();
++    (api.getChannelConfig as ReturnType<typeof vi.fn>).mockReturnValue(
++      telegram.promise,
++    );
++    const { result } = renderHook(() => useChannels());
++    await waitFor(() => {
++      expect(result.current.loading).toBe(false);
++    });
++
++    const pending = result.current.fetchChannelConfig("telegram");
++    const invalidateChannelDetail = Reflect.get(
++      result.current,
++      "invalidateChannelDetail",
++    );
++    expect(typeof invalidateChannelDetail).toBe("function");
++    invalidateChannelDetail();
++    telegram.resolve({ enabled: true, revision: 9 });
++
++    await expect(pending).resolves.toBeNull();
++    expect(result.current.channels.telegram).toBeUndefined();
++  });
  });
 +
 +function deferred<T>() {
@@ -5012,7 +5267,7 @@ index 6f5a746..91e2779 100644
 +  return { promise, resolve, reject };
 +}
 diff --git a/src/pages/Control/Channels/useChannels.ts b/src/pages/Control/Channels/useChannels.ts
-index 8266189..e7d5952 100644
+index 8266189..fc75efc 100644
 --- a/src/pages/Control/Channels/useChannels.ts
 +++ b/src/pages/Control/Channels/useChannels.ts
 @@ -1,8 +1,16 @@
@@ -5033,7 +5288,7 @@ index 8266189..e7d5952 100644
  export function useChannels() {
    const { selectedAgent } = useAgentStore();
    const [channels, setChannels] = useState<
-@@ -12,29 +20,81 @@ export function useChannels() {
+@@ -12,32 +20,88 @@ export function useChannels() {
    const [channelSchemas, setChannelSchemas] = useState<
      Record<string, ChannelSchema>
    >({});
@@ -5132,7 +5387,14 @@ index 8266189..e7d5952 100644
      }
    }, []);
 
-@@ -45,19 +105,23 @@ export function useChannels() {
++  const invalidateChannelDetail = useCallback(() => {
++    detailGeneration.current += 1;
++  }, []);
++
+   useEffect(() => {
+     fetchChannels();
+   }, [fetchChannels, selectedAgent]);
+@@ -45,19 +109,23 @@ export function useChannels() {
    // Built-in channels come first (in a fixed order), then custom channels
    const builtinOrder = useMemo(
      () => [
@@ -5163,7 +5425,7 @@ index 8266189..e7d5952 100644
      ],
      [],
    );
-@@ -65,7 +129,9 @@ export function useChannels() {
+@@ -65,7 +133,9 @@ export function useChannels() {
    const orderedKeys = useMemo(
      () => [
        ...builtinOrder.filter((k) => channelTypes.includes(k)),
@@ -5174,7 +5436,7 @@ index 8266189..e7d5952 100644
      ],
      [builtinOrder, channelTypes],
    );
-@@ -75,6 +141,10 @@ export function useChannels() {
+@@ -75,6 +145,10 @@ export function useChannels() {
      (key: string) => Boolean(channels[key]?.isBuiltin),
      [channels],
    );
@@ -5185,7 +5447,7 @@ index 8266189..e7d5952 100644
 
    return {
      channels,
-@@ -83,6 +153,11 @@ export function useChannels() {
+@@ -83,6 +157,12 @@ export function useChannels() {
      orderedKeys,
      isBuiltin,
      loading,
@@ -5195,6 +5457,7 @@ index 8266189..e7d5952 100644
      fetchChannels,
 +    retrySchemas,
 +    fetchChannelConfig,
++    invalidateChannelDetail,
    };
  }
 diff --git a/src/pages/Settings/Agents/components/AgentModal.test.tsx b/src/pages/Settings/Agents/components/AgentModal.test.tsx
