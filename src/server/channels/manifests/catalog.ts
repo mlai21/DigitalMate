@@ -99,6 +99,9 @@ const stringListSchema = z
     message: "不得包含重复项",
   })
   .default([]);
+const nullableStringListSchema = stringListSchema
+  .nullable()
+  .default(null);
 
 const field = (
   name: string,
@@ -222,6 +225,23 @@ const selectField = <TValues extends readonly [string, ...string[]]>(
 const listField = (name: string, label: string) =>
   field(name, label, "string-list", stringListSchema, []);
 
+const nullableListField = (name: string, label: string) =>
+  field(name, label, "string-list", nullableStringListSchema, null);
+
+const positiveNumberField = (
+  name: string,
+  label: string,
+  defaultValue: number,
+  maximum: number,
+) =>
+  field(
+    name,
+    label,
+    "number",
+    z.number().finite().positive().max(maximum).default(defaultValue),
+    defaultValue,
+  );
+
 const BASE_FIELDS: readonly FieldDefinition[] = [
   booleanField("enabled", "启用渠道", false),
   stringField("bot_prefix", "机器人前缀"),
@@ -304,7 +324,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups", "streaming"],
     platformFields: [
       stringField("client_id", "Client ID"),
-      secretField("client_secret", "Client Secret"),
+      secretField("client_secret", "Client Secret", false, true),
       selectField("message_type", "消息类型", ["markdown", "card"], "markdown"),
       selectField(
         "cron_message_type",
@@ -338,7 +358,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups", "streaming", "typing"],
     platformFields: [
       stringField("app_id", "App ID"),
-      secretField("app_secret", "App Secret"),
+      secretField("app_secret", "App Secret", false, true),
       secretField("encrypt_key", "Encrypt Key"),
       secretField("verification_token", "Verification Token"),
       nullableStringField("media_dir", "媒体目录"),
@@ -354,7 +374,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups"],
     platformFields: [
       stringField("app_id", "App ID"),
-      secretField("client_secret", "Client Secret"),
+      secretField("client_secret", "Client Secret", false, true),
       booleanField("markdown_enabled", "Markdown 消息", true),
       numberField("max_reconnect_attempts", "最大重连次数", 100, -1, 10_000),
       stringField("ack_message", "确认消息"),
@@ -387,7 +407,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups", "typing"],
     platformFields: [
       urlField("url", "服务器 URL"),
-      secretField("bot_token", "Bot Token"),
+      secretField("bot_token", "Bot Token", false, true),
       nullableStringField("media_dir", "媒体目录"),
       field(
         "show_typing",
@@ -482,7 +502,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     prerequisites: ["Twilio 账号"],
     platformFields: [
       stringField("twilio_account_sid", "Twilio Account SID"),
-      secretField("twilio_auth_token", "Twilio Auth Token"),
+      secretField("twilio_auth_token", "Twilio Auth Token", false, true),
       stringField("phone_number", "电话号码"),
       stringField("phone_number_sid", "电话号码 SID"),
       stringField("tts_provider", "TTS 服务", "google"),
@@ -518,7 +538,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
       stringField("stt_provider", "STT 服务", "aliyun"),
       stringField("language", "语言", "zh-CN"),
       stringField("welcome_greeting", "欢迎语", "你好，我是DigitalMate"),
-      numberField("call_timeout", "呼叫超时（秒）", 120, 1, 3_600),
+      positiveNumberField("call_timeout", "呼叫超时（秒）", 120, 3_600),
       urlField("livekit_url", "LiveKit URL"),
       secretField("livekit_api_key", "LiveKit API Key"),
       secretField("livekit_api_secret", "LiveKit API Secret"),
@@ -547,7 +567,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups", "streaming"],
     platformFields: [
       stringField("bot_id", "Bot ID"),
-      secretField("secret", "Secret"),
+      secretField("secret", "Secret", false, true),
       nullableStringField("media_dir", "媒体目录"),
       stringField("welcome_text", "欢迎语"),
       booleanField("share_session_in_group", "群聊共享会话", true),
@@ -562,7 +582,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: [],
     platformFields: [
       stringField("ak", "Access Key"),
-      secretField("sk", "Secret Key"),
+      secretField("sk", "Secret Key", false, true),
       stringField("agent_id", "Agent ID"),
       numberField("task_timeout_ms", "任务超时（毫秒）", 3_600_000, 1_000, 86_400_000),
     ],
@@ -574,7 +594,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "typing"],
     platformFields: [
       stringField("app_id", "App ID"),
-      secretField("app_secret", "App Secret"),
+      secretField("app_secret", "App Secret", false, true),
       stringField("api_domain", "API 域名", "bot.yuanbao.tencent.com"),
       nullableStringField("media_dir", "媒体目录"),
       booleanField("accept_bot_messages", "接收机器人消息", false),
@@ -619,11 +639,16 @@ const buildManifest = <TType extends ChannelType>(
 ): ChannelManifest<TType> => {
   const definition = DEFINITIONS[type];
   const definitions = [
-    ...BASE_FIELDS.map((baseField) =>
-      type === "slack" && baseField.name === "require_mention"
-        ? booleanField("require_mention", "群聊需要 @", true)
-        : baseField
-    ),
+    ...BASE_FIELDS.map((baseField) => {
+      if (type !== "slack") return baseField;
+      if (baseField.name === "allow_from") {
+        return nullableListField("allow_from", "允许来源");
+      }
+      if (baseField.name === "require_mention") {
+        return booleanField("require_mention", "群聊需要 @", true);
+      }
+      return baseField;
+    }),
     ...definition.platformFields,
   ];
   const shape = Object.fromEntries(

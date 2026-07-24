@@ -767,9 +767,70 @@ function sanitizeDetails(
       sanitized.current_revision = currentRevision;
     }
   }
+  if (errorCode === "invalid_request") {
+    const issues = sanitizeValidationIssues(details.issues);
+    if (issues) sanitized.issues = issues;
+  }
   return Object.keys(sanitized).length > 0
     ? sanitized
     : undefined;
+}
+
+const SAFE_VALIDATION_ISSUE_CODES = new Set([
+  "custom",
+  "invalid_format",
+  "invalid_type",
+  "invalid_value",
+  "too_big",
+  "too_small",
+  "unrecognized_keys",
+]);
+
+function sanitizeValidationIssues(
+  value: unknown,
+): Array<{ code: string; path: string[] }> | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    return undefined;
+  }
+  const sanitized: Array<{ code: string; path: string[] }> = [];
+  for (const issue of value) {
+    if (
+      typeof issue !== "object" ||
+      issue === null ||
+      Array.isArray(issue)
+    ) {
+      return undefined;
+    }
+    const code = Reflect.get(issue, "code");
+    const path = Reflect.get(issue, "path");
+    if (
+      typeof code !== "string" ||
+      !SAFE_VALIDATION_ISSUE_CODES.has(code) ||
+      !Array.isArray(path) ||
+      path.length === 0 ||
+      path.length > 16 ||
+      !path.every(
+        (segment) =>
+          (
+            typeof segment === "string" &&
+            segment.length > 0 &&
+            segment.length <= 512
+          ) ||
+          (
+            typeof segment === "number" &&
+            Number.isSafeInteger(segment) &&
+            segment >= 0
+          ),
+      )
+    ) {
+      return undefined;
+    }
+    sanitized.push({
+      code,
+      path: path.map(String),
+    });
+  }
+  return sanitized;
 }
 
 function errorResponse(

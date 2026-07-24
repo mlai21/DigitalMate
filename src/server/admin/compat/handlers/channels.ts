@@ -206,7 +206,16 @@ function parseChannelWrite(
     clearFields.size !== envelope.clear_secret.length ||
     envelope.clear_secret.some((name) => !secretFields.has(name))
   ) {
-    throw invalidSecretChange();
+    const invalidField =
+      envelope.clear_secret.find(
+        (name, index) =>
+          envelope.clear_secret.indexOf(name) !== index ||
+          !secretFields.has(name),
+      ) ?? "unknown";
+    throw invalidSecretChange(
+      ["clear_secret", invalidField],
+      "invalid_value",
+    );
   }
 
   const configInput = { ...raw };
@@ -220,8 +229,14 @@ function parseChannelWrite(
     if (candidate === undefined || candidate === "") {
       continue;
     }
-    if (typeof candidate !== "string" || clearFields.has(fieldName)) {
-      throw invalidSecretChange();
+    if (typeof candidate !== "string") {
+      throw invalidSecretChange([fieldName], "invalid_type");
+    }
+    if (clearFields.has(fieldName)) {
+      throw invalidSecretChange(
+        ["clear_secret", fieldName],
+        "invalid_value",
+      );
     }
     secretChanges.push({
       fieldName,
@@ -231,7 +246,10 @@ function parseChannelWrite(
   }
   for (const fieldName of clearFields) {
     if (Object.hasOwn(raw, fieldName)) {
-      throw invalidSecretChange();
+      throw invalidSecretChange(
+        ["clear_secret", fieldName],
+        "invalid_value",
+      );
     }
     secretChanges.push({ fieldName, operation: "delete" });
   }
@@ -319,11 +337,17 @@ function assertSafeObject(value: unknown): asserts value is Record<string, unkno
   }
 }
 
-function invalidSecretChange(): AdminCompatError {
+function invalidSecretChange(
+  path: readonly string[],
+  code: "invalid_type" | "invalid_value",
+): AdminCompatError {
   return new AdminCompatError(
     400,
     "invalid_request",
     "invalid_secret_change",
+    {
+      issues: [{ code, path }],
+    },
   );
 }
 

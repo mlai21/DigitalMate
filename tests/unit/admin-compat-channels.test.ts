@@ -120,7 +120,104 @@ describe("admin compatibility channel contract", () => {
     );
 
     expect(await types.json()).toEqual(CHANNEL_TYPES);
-    expect(Object.keys(await schemas.json())).toEqual(CHANNEL_TYPES);
+    const schemaBody = (await schemas.json()) as Record<
+      string,
+      {
+        config_fields: Array<{
+          name: string;
+          default: unknown;
+        }>;
+      }
+    >;
+    expect(Object.keys(schemaBody)).toEqual(CHANNEL_TYPES);
+    expect(
+      schemaBody.slack.config_fields.find(
+        (field) => field.name === "allow_from",
+      )?.default,
+    ).toBeNull();
+  });
+
+  it("accepts a finite decimal SIP call_timeout through the API contract", async () => {
+    const update = vi.fn<AdminChannelConfigWriter>(async (input) => ({
+      type: input.type,
+      enabled: input.enabled,
+      revision: input.expectedRevision + 1,
+      config: input.config,
+      secrets: {},
+      health: { status: "disabled", detail: {} },
+    }));
+    const router = createCoreAdminCompatRouter(
+      dependencies({ updateChannelConfig: update }),
+    );
+    const response = await router.dispatch(
+      await request("/config/channels/sip", {
+        method: "PUT",
+        body: {
+          operation_id: OPERATION_ID,
+          revision: 0,
+          call_timeout: 12.5,
+        },
+      }),
+      runtime(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({ call_timeout: 12.5 }),
+      }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("returns safe issue paths for URL, number, and nested Matrix fields", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const attempts = [
+      {
+        type: "telegram",
+        body: { base_url: "not-a-url" },
+        path: ["base_url"],
+      },
+      {
+        type: "sip",
+        body: { sip_port: 70_000 },
+        path: ["sip_port"],
+      },
+      {
+        type: "matrix",
+        body: {
+          groups: {
+            "!room:example.com": {
+              requireMention: true,
+              nested: "must-not-appear",
+            },
+          },
+        },
+        path: ["groups", "!room:example.com"],
+      },
+    ] as const;
+
+    for (const attempt of attempts) {
+      const response = await router.dispatch(
+        await request(`/config/channels/${attempt.type}`, {
+          method: "PUT",
+          body: {
+            operation_id: OPERATION_ID,
+            revision: 0,
+            ...attempt.body,
+          },
+        }),
+        runtime(),
+      );
+      const serialized = JSON.stringify(await response.json());
+      expect(response.status).toBe(400);
+      expect(serialized).toContain(
+        `"path":[${attempt.path
+          .map((part) => JSON.stringify(part))
+          .join(",")}`,
+      );
+      expect(serialized).not.toContain("must-not-appear");
+    }
   });
 
   it("requires the canonical default-agent header on every channel route", async () => {
@@ -253,6 +350,18 @@ describe("admin compatibility channel contract", () => {
     const router = createCoreAdminCompatRouter(
       dependencies({ updateChannelConfig: update }),
     );
+    const invalidSecretType = await router.dispatch(
+      await request("/config/channels/telegram", {
+        method: "PUT",
+        body: {
+          operation_id: OPERATION_ID,
+          revision: 1,
+          bot_token: { configured: true },
+          clear_secret: [],
+        },
+      }),
+      runtime(),
+    );
     const cleared = await router.dispatch(
       await request("/config/channels/telegram", {
         method: "PUT",
@@ -287,6 +396,31 @@ describe("admin compatibility channel contract", () => {
       expect.any(AbortSignal),
     );
     expect(conflicting.status).toBe(400);
+    await expect(conflicting.json()).resolves.toMatchObject({
+      error: {
+        details: {
+          issues: [
+            {
+              code: "invalid_value",
+              path: ["clear_secret", "bot_token"],
+            },
+          ],
+        },
+      },
+    });
+    expect(invalidSecretType.status).toBe(400);
+    await expect(invalidSecretType.json()).resolves.toMatchObject({
+      error: {
+        details: {
+          issues: [
+            {
+              code: "invalid_type",
+              path: ["bot_token"],
+            },
+          ],
+        },
+      },
+    });
   });
 
   it("rejects unknown, nested secret and prototype-like keys without value reflection", async () => {

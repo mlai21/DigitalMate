@@ -315,6 +315,112 @@ describe("admin channel configuration service", () => {
     }
   });
 
+  it("atomically switches Matrix credentials and audits only configured state", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    const scope = { userId: USER_ID, agentId: AGENT_ID };
+    const baseConfig = {
+      bot_prefix: "",
+      filter_tool_messages: true,
+      filter_thinking: true,
+    };
+    const password = await service.update({
+      scope,
+      type: "matrix",
+      operationId: OPERATION_ID,
+      expectedRevision: 0,
+      enabled: false,
+      config: baseConfig,
+      secretChanges: [
+        {
+          fieldName: "password",
+          operation: "set",
+          value: "matrix-password",
+        },
+      ],
+    });
+    expect(password.secrets).toMatchObject({
+      access_token: { configured: false },
+      password: { configured: true },
+    });
+
+    const token = await service.update({
+      scope,
+      type: "matrix",
+      operationId: OTHER_OPERATION_ID,
+      expectedRevision: 1,
+      enabled: false,
+      config: baseConfig,
+      secretChanges: [
+        {
+          fieldName: "access_token",
+          operation: "set",
+          value: "matrix-token",
+        },
+        { fieldName: "password", operation: "delete" },
+      ],
+    });
+    expect(token.secrets).toMatchObject({
+      access_token: { configured: true },
+      password: { configured: false },
+    });
+
+    const passwordAgain = await service.update({
+      scope,
+      type: "matrix",
+      operationId: "30000000-0000-4000-8000-000000000033",
+      expectedRevision: 2,
+      enabled: false,
+      config: baseConfig,
+      secretChanges: [
+        {
+          fieldName: "password",
+          operation: "set",
+          value: "matrix-password-again",
+        },
+        { fieldName: "access_token", operation: "delete" },
+      ],
+    });
+    expect(passwordAgain.secrets).toMatchObject({
+      access_token: { configured: false },
+      password: { configured: true },
+    });
+
+    const stored = await primary.query<{ field_name: string }>(
+      `SELECT field_name
+       FROM channel_secrets
+       ORDER BY field_name`,
+    );
+    expect(stored.rows).toEqual([{ field_name: "password" }]);
+    const audits = await primary.query<{
+      before_summary: Record<string, unknown>;
+      after_summary: Record<string, unknown>;
+    }>(
+      `SELECT before_summary, after_summary
+       FROM admin_audit_logs
+       ORDER BY created_at`,
+    );
+    expect(audits.rows).toHaveLength(3);
+    expect(audits.rows[1].after_summary).toMatchObject({
+      secrets: {
+        access_token: { configured: true },
+        password: { configured: false },
+      },
+    });
+    expect(audits.rows[2].after_summary).toMatchObject({
+      secrets: {
+        access_token: { configured: false },
+        password: { configured: true },
+      },
+    });
+    expect(JSON.stringify(audits.rows)).not.toContain("matrix-token");
+    expect(JSON.stringify(audits.rows)).not.toContain("matrix-password");
+    expect((await service.read(scope)).matrix.secrets).toMatchObject({
+      access_token: { configured: false },
+      password: { configured: true },
+    });
+  });
+
   it("aborts an advisory-lock wait promptly and remains reusable", async () => {
     if (key.status !== "ready") throw new Error("test_key_not_ready");
     const blocker = await secondary.connect();

@@ -2800,13 +2800,21 @@ index 0000000..52d1f01
 +});
 diff --git a/src/pages/Control/Channels/channelSecurity.test.ts b/src/pages/Control/Channels/channelSecurity.test.ts
 new file mode 100644
-index 0000000..0a7fb76
+index 0000000..f06b76b
 --- /dev/null
 +++ b/src/pages/Control/Channels/channelSecurity.test.ts
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,679 @@
 +import { describe, expect, it, vi } from "vitest";
++import { readFileSync } from "node:fs";
++import path from "node:path";
 +
 +import type { ChannelSchema } from "../../../api/modules/channel";
++import { ApiError } from "../../../api/request";
++import type {
++  ChannelConfigResponse,
++  ChannelUpdatePayload,
++} from "../../../api/types/channel";
++import * as channelSecurity from "./channelSecurity";
 +import {
 +  buildChannelSavePayload,
 +  normalizeChannelFormValues,
@@ -2814,6 +2822,33 @@ index 0000000..0a7fb76
 +} from "./channelSecurity";
 +
 +const OPERATION_ID = "30000000-0000-4000-8000-000000000031";
++const SECRET_FIELDS_BY_CHANNEL = {
++  imessage: [],
++  discord: ["bot_token", "http_proxy_auth"],
++  dingtalk: ["client_secret"],
++  feishu: ["app_secret", "encrypt_key", "verification_token"],
++  qq: ["client_secret"],
++  telegram: ["bot_token", "http_proxy_auth"],
++  mattermost: ["bot_token"],
++  mqtt: ["password", "tls_keyfile"],
++  matrix: ["access_token", "password"],
++  slack: ["bot_token", "app_token"],
++  voice: ["twilio_auth_token"],
++  sip: [
++    "sip_password",
++    "dashscope_api_key",
++    "livekit_api_key",
++    "livekit_api_secret",
++  ],
++  wecom: ["secret"],
++  xiaoyi: ["sk"],
++  yuanbao: ["app_secret"],
++  wechat: ["bot_token", "bot_token_file"],
++  onebot: ["access_token"],
++} as const;
++const SECRET_FIELDS = [
++  ...new Set(Object.values(SECRET_FIELDS_BY_CHANNEL).flat()),
++];
 +const schema = {
 +  label: "Telegram",
 +  description: "Telegram",
@@ -2849,6 +2884,124 @@ index 0000000..0a7fb76
 +} satisfies ChannelSchema;
 +
 +describe("channel secret form contract", () => {
++  it("reads every secret configured state by its own manifest field name", () => {
++    const helper = requiredHelper<
++      (config: ChannelConfigResponse, fieldName: string) => boolean
++    >("isChannelSecretConfigured");
++
++    expect(Object.keys(SECRET_FIELDS_BY_CHANNEL)).toHaveLength(17);
++    for (const [channelType, fieldNames] of Object.entries(
++      SECRET_FIELDS_BY_CHANNEL,
++    )) {
++      for (const fieldName of fieldNames) {
++        const config = configWithSecrets({
++          [fieldName]: {
++            configured: true,
++            lastRotatedAt: "2026-07-25T00:00:00.000Z",
++          },
++        });
++        expect(
++          helper(config, fieldName),
++          `${channelType}.${fieldName}`,
++        ).toBe(true);
++        expect(
++          helper(config, `${fieldName}_other`),
++          `${channelType}.${fieldName}`,
++        ).toBe(false);
++      }
++    }
++  });
++
++  it.each([
++    ["client_secret", "app_secret"],
++    ["app_secret", "bot_token"],
++    ["client_secret", "app_token"],
++    ["bot_token", "twilio_auth_token"],
++  ])(
++    "does not substitute configured state for %s from %s",
++    (fieldName, wrongFieldName) => {
++      const helper = requiredHelper<
++        (config: ChannelConfigResponse, fieldName: string) => boolean
++      >("isChannelSecretConfigured");
++      const config = configWithSecrets({
++        [fieldName]: { configured: true, lastRotatedAt: null },
++        [wrongFieldName]: { configured: false, lastRotatedAt: null },
++      });
++
++      expect(helper(config, fieldName)).toBe(true);
++    },
++  );
++
++  it("requires an empty required secret only when its own status is unconfigured", () => {
++    const helper = requiredHelper<
++      (
++        config: ChannelConfigResponse,
++        schema: ChannelSchema,
++        fieldName: string,
++      ) => boolean
++    >("isChannelSecretRequired");
++    const requiredSchema = secretSchema("client_secret", true);
++
++    expect(
++      helper(
++        configWithSecrets({
++          client_secret: { configured: false, lastRotatedAt: null },
++        }),
++        requiredSchema,
++        "client_secret",
++      ),
++    ).toBe(true);
++    expect(
++      helper(
++        configWithSecrets({
++          client_secret: { configured: true, lastRotatedAt: null },
++        }),
++        requiredSchema,
++        "client_secret",
++      ),
++    ).toBe(false);
++  });
++
++  it("retains every configured empty secret when no clear was requested", () => {
++    const allSecretsSchema = {
++      label: "All secrets",
++      description: "All secrets",
++      plugin_id: null,
++      config_fields: SECRET_FIELDS.map((name) => ({
++        name,
++        label: name,
++        type: "password" as const,
++        required: true,
++        default: "",
++      })),
++    } satisfies ChannelSchema;
++    const current = configWithSecrets(
++      Object.fromEntries(
++        SECRET_FIELDS.map((name) => [
++          name,
++          { configured: true, lastRotatedAt: null },
++        ]),
++      ),
++    );
++    const values = Object.fromEntries(
++      SECRET_FIELDS.flatMap((name) => [
++        [name, ""],
++        [`clear_secret_${name}`, false],
++      ]),
++    );
++    const payload = buildChannelSavePayload(
++      current,
++      values,
++      allSecretsSchema,
++      OPERATION_ID,
++    );
++
++    expect(payload.clear_secret).toEqual([]);
++    for (const fieldName of SECRET_FIELDS) {
++      expect(payload).not.toHaveProperty(fieldName);
++    }
++  });
++
 +  it("never refills a configured secret status as a form value", () => {
 +    expect(
 +      normalizeChannelFormValues(
@@ -2941,15 +3094,405 @@ index 0000000..0a7fb76
 +    expect(save).toHaveBeenCalledTimes(1);
 +  });
 +});
++
++describe("Matrix credential switching", () => {
++  const matrixSchema = {
++    label: "Matrix",
++    description: "Matrix",
++    plugin_id: null,
++    config_fields: [
++      {
++        name: "access_token",
++        label: "Access Token",
++        type: "password",
++        required: true,
++        default: "",
++      },
++      {
++        name: "password",
++        label: "Password",
++        type: "password",
++        required: true,
++        default: "",
++      },
++      {
++        name: "encryption",
++        label: "Encryption",
++        type: "switch",
++        default: false,
++      },
++    ],
++  } satisfies ChannelSchema;
++  const buildMatrixPayload = buildChannelSavePayload as (
++    current: ChannelConfigResponse,
++    values: Record<string, unknown>,
++    schema: ChannelSchema,
++    operationId: string,
++    channelType: string,
++  ) => ChannelUpdatePayload;
++
++  it("switches password to token by explicitly clearing password", () => {
++    const payload = buildMatrixPayload(
++      configWithSecrets({
++        access_token: { configured: false, lastRotatedAt: null },
++        password: { configured: true, lastRotatedAt: null },
++      }),
++      {
++        auth_method: "token",
++        access_token: "next-token",
++        password: "",
++      },
++      matrixSchema,
++      OPERATION_ID,
++      "matrix",
++    );
++
++    expect(payload).toMatchObject({
++      access_token: "next-token",
++      clear_secret: ["password"],
++    });
++    expect(payload).not.toHaveProperty("auth_method");
++    expect(payload).not.toHaveProperty("password");
++  });
++
++  it("switches token to password by explicitly clearing access token", () => {
++    const payload = buildMatrixPayload(
++      configWithSecrets({
++        access_token: { configured: true, lastRotatedAt: null },
++        password: { configured: false, lastRotatedAt: null },
++      }),
++      {
++        auth_method: "password",
++        access_token: "",
++        password: "next-password",
++      },
++      matrixSchema,
++      OPERATION_ID,
++      "matrix",
++    );
++
++    expect(payload).toMatchObject({
++      password: "next-password",
++      clear_secret: ["access_token"],
++    });
++    expect(payload).not.toHaveProperty("auth_method");
++    expect(payload).not.toHaveProperty("access_token");
++  });
++
++  it("keeps the configured active credential on empty input while clearing the inactive one", () => {
++    const payload = buildMatrixPayload(
++      configWithSecrets({
++        access_token: { configured: true, lastRotatedAt: null },
++        password: { configured: true, lastRotatedAt: null },
++      }),
++      {
++        auth_method: "token",
++        access_token: "",
++        password: "",
++      },
++      matrixSchema,
++      OPERATION_ID,
++      "matrix",
++    );
++
++    expect(payload.clear_secret).toEqual(["password"]);
++    expect(payload).not.toHaveProperty("access_token");
++    expect(payload).not.toHaveProperty("password");
++  });
++
++  it("derives stable modes and requires a choice for legacy dual credentials", () => {
++    const helper = requiredHelper<
++      (config: ChannelConfigResponse) => "token" | "password" | null
++    >("deriveMatrixAuthMethod");
++
++    expect(
++      helper(
++        configWithSecrets({
++          access_token: { configured: true, lastRotatedAt: null },
++          password: { configured: false, lastRotatedAt: null },
++        }),
++      ),
++    ).toBe("token");
++    expect(
++      helper(
++        configWithSecrets({
++          access_token: { configured: false, lastRotatedAt: null },
++          password: { configured: true, lastRotatedAt: null },
++        }),
++      ),
++    ).toBe("password");
++    expect(
++      helper(
++        configWithSecrets({
++          access_token: { configured: true, lastRotatedAt: null },
++          password: { configured: true, lastRotatedAt: null },
++        }),
++      ),
++    ).toBeNull();
++  });
++});
++
++describe("channel API validation mapping", () => {
++  const validationSchema = {
++    label: "Validation",
++    description: "Validation",
++    plugin_id: null,
++    config_fields: [
++      {
++        name: "base_url",
++        label: "API Base URL",
++        type: "text",
++        default: "",
++      },
++      {
++        name: "call_timeout",
++        label: "呼叫超时（秒）",
++        type: "number",
++        default: 120,
++      },
++      {
++        name: "groups",
++        label: "房间设置",
++        type: "text",
++        default: {},
++      },
++      {
++        name: "bot_token",
++        label: "Bot Token",
++        type: "password",
++        default: "",
++      },
++    ],
++  } satisfies ChannelSchema;
++
++  it.each([
++    [
++      ["base_url"],
++      "invalid_format",
++      { name: "base_url", errors: ["API Base URL格式不正确"] },
++    ],
++    [
++      ["call_timeout"],
++      "too_big",
++      { name: "call_timeout", errors: ["呼叫超时（秒）超出允许范围"] },
++    ],
++    [
++      ["config", "groups", "!room:example.com", "requireMention"],
++      "unrecognized_keys",
++      { name: "groups", errors: ["房间设置格式不正确"] },
++    ],
++    [
++      ["config", "bot_token"],
++      "invalid_type",
++      { name: "bot_token", errors: ["Bot Token格式不正确"] },
++    ],
++    [
++      ["clear_secret", "bot_token"],
++      "invalid_value",
++      {
++        name: "clear_secret_bot_token",
++        errors: ["Bot Token清除选项无效"],
++      },
++    ],
++  ])(
++    "maps safe issue path %j to its Ant Form field",
++    (path, code, expected) => {
++      const helper = requiredHelper<
++        (
++          error: unknown,
++          schema: ChannelSchema,
++        ) => Array<{ name: string; errors: string[] }> | null
++      >("mapChannelApiErrorToFormFields");
++      const error = new ApiError("validation_failed", {
++        status: 400,
++        code: "invalid_request",
++        details: { issues: [{ code, path }] },
++      });
++
++      expect(helper(error, validationSchema)).toEqual([expected]);
++    },
++  );
++
++  it("does not expose unknown or server error details as field errors", () => {
++    const helper = requiredHelper<
++      (
++        error: unknown,
++        schema: ChannelSchema,
++      ) => Array<{ name: string; errors: string[] }> | null
++    >("mapChannelApiErrorToFormFields");
++    const raw = "postgres://secret@db/internal";
++    const error = new ApiError("internal_error", {
++      status: 500,
++      code: "internal_error",
++      details: { issues: [{ code: raw, path: ["base_url"] }] },
++    });
++
++    expect(helper(error, validationSchema)).toBeNull();
++    expect(JSON.stringify(helper(error, validationSchema))).not.toContain(raw);
++  });
++
++  it("sets field errors instead of showing a toast for safe validation issues", () => {
++    const helper = requiredHelper<
++      (
++        error: unknown,
++        schema: ChannelSchema,
++        setFields: (
++          fields: Array<{ name: string; errors: string[] }>,
++        ) => void,
++        showGenericError: () => void,
++      ) => boolean
++    >("handleChannelSaveError");
++    const setFields = vi.fn();
++    const showGenericError = vi.fn();
++    const error = new ApiError("validation_failed", {
++      status: 400,
++      code: "invalid_request",
++      details: {
++        issues: [{ code: "invalid_format", path: ["base_url"] }],
++      },
++    });
++
++    expect(
++      helper(error, validationSchema, setFields, showGenericError),
++    ).toBe(true);
++    expect(setFields).toHaveBeenCalledWith([
++      {
++        name: "base_url",
++        errors: ["API Base URL格式不正确"],
++      },
++    ]);
++    expect(showGenericError).not.toHaveBeenCalled();
++
++    expect(
++      helper(
++        new ApiError("internal_error", {
++          status: 500,
++          code: "internal_error",
++        }),
++        validationSchema,
++        setFields,
++        showGenericError,
++      ),
++    ).toBe(false);
++    expect(showGenericError).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe("nullable list and decimal number form contract", () => {
++  it("renders Slack null allow_from as empty without changing its untouched payload", () => {
++    const slackSchema = {
++      label: "Slack",
++      description: "Slack",
++      plugin_id: null,
++      config_fields: [
++        {
++          name: "allow_from",
++          label: "Allow From",
++          type: "text",
++          default: null,
++        },
++      ],
++    } satisfies ChannelSchema;
++    const current = configWithSecrets({ allow_from: null });
++    const values = normalizeChannelFormValues(current, slackSchema);
++
++    expect(values.allow_from).toEqual([]);
++    expect(
++      buildChannelSavePayload(
++        current,
++        values,
++        slackSchema,
++        OPERATION_ID,
++      ).allow_from,
++    ).toBeNull();
++  });
++
++  it("sends a finite decimal SIP timeout and exposes a decimal UI step", () => {
++    const sipSchema = {
++      label: "SIP",
++      description: "SIP",
++      plugin_id: null,
++      config_fields: [
++        {
++          name: "call_timeout",
++          label: "Call Timeout",
++          type: "number",
++          default: 120,
++        },
++      ],
++    } satisfies ChannelSchema;
++    expect(
++      buildChannelSavePayload(
++        configWithSecrets({ call_timeout: 120 }),
++        { call_timeout: 12.5 },
++        sipSchema,
++        OPERATION_ID,
++      ).call_timeout,
++    ).toBe(12.5);
++
++    const source = readFileSync(
++      path.resolve(
++        process.cwd(),
++        "src/pages/Control/Channels/components/ChannelDrawer.tsx",
++      ),
++      "utf8",
++    );
++    expect(source).toMatch(
++      /name="call_timeout"[\s\S]{0,500}<InputNumber[\s\S]{0,200}step=\{0\.1\}/,
++    );
++  });
++});
++
++function configWithSecrets(
++  fields: Record<string, unknown>,
++): ChannelConfigResponse {
++  return {
++    enabled: false,
++    revision: 1,
++    isBuiltin: true,
++    health: { status: "disabled", detail: {} },
++    ...fields,
++  };
++}
++
++function secretSchema(
++  fieldName: string,
++  required: boolean,
++): ChannelSchema {
++  return {
++    label: "Secret",
++    description: "Secret",
++    plugin_id: null,
++    config_fields: [
++      {
++        name: fieldName,
++        label: fieldName,
++        type: "password",
++        required,
++        default: "",
++      },
++    ],
++  };
++}
++
++function requiredHelper<T>(name: string): T {
++  const candidate = Reflect.get(channelSecurity, name);
++  expect(
++    typeof candidate,
++    `channelSecurity.${name} must be implemented`,
++  ).toBe("function");
++  return candidate as T;
++}
 diff --git a/src/pages/Control/Channels/channelSecurity.ts b/src/pages/Control/Channels/channelSecurity.ts
 new file mode 100644
-index 0000000..7ff5fb9
+index 0000000..caf6a84
 --- /dev/null
 +++ b/src/pages/Control/Channels/channelSecurity.ts
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,328 @@
 +import type {
 +  ChannelSchema,
 +} from "../../../api/modules/channel";
++import { ApiError } from "../../../api/request";
 +import type {
 +  ChannelConfigResponse,
 +  ChannelUpdatePayload,
@@ -2982,6 +3525,45 @@ index 0000000..7ff5fb9
 +  );
 +}
 +
++export function isChannelSecretConfigured(
++  config: Readonly<Record<string, unknown>> | undefined,
++  fieldName: string,
++): boolean {
++  const status = config?.[fieldName];
++  return isSecretStatus(status) && status.configured;
++}
++
++export function isChannelSecretRequired(
++  config: Readonly<Record<string, unknown>> | undefined,
++  schema: ChannelSchema | undefined,
++  fieldName: string,
++  requiredOverride?: boolean,
++): boolean {
++  const field = schema?.config_fields.find(
++    (candidate) =>
++      candidate.name === fieldName &&
++      candidate.type === "password",
++  );
++  const required = requiredOverride ?? field?.required === true;
++  return required && !isChannelSecretConfigured(config, fieldName);
++}
++
++export function deriveMatrixAuthMethod(
++  config: Readonly<Record<string, unknown>>,
++): "token" | "password" | null {
++  const tokenConfigured = isChannelSecretConfigured(
++    config,
++    "access_token",
++  );
++  const passwordConfigured = isChannelSecretConfigured(
++    config,
++    "password",
++  );
++  if (tokenConfigured && passwordConfigured) return null;
++  if (passwordConfigured) return "password";
++  return "token";
++}
++
 +export function normalizeChannelFormValues(
 +  config: ChannelConfigResponse,
 +  schema: ChannelSchema,
@@ -2995,7 +3577,8 @@ index 0000000..7ff5fb9
 +    }
 +    const value = config[field.name];
 +    if (!RESPONSE_ONLY_FIELDS.has(field.name) && value !== undefined) {
-+      result[field.name] = value;
++      result[field.name] =
++        field.name === "allow_from" && value === null ? [] : value;
 +    }
 +  }
 +  result.filter_tool_messages = true;
@@ -3008,6 +3591,7 @@ index 0000000..7ff5fb9
 +  values: Record<string, unknown>,
 +  schema: ChannelSchema,
 +  operationId: string,
++  channelType?: string,
 +): ChannelUpdatePayload {
 +  const payload: ChannelUpdatePayload = {
 +    operation_id: operationId,
@@ -3015,9 +3599,26 @@ index 0000000..7ff5fb9
 +      typeof current.revision === "number" ? current.revision : 0,
 +    clear_secret: [],
 +  };
++  const matrixAuthMethod =
++    channelType === "matrix" &&
++    (
++      values.auth_method === "token" ||
++      values.auth_method === "password"
++    )
++      ? values.auth_method
++      : null;
++  const inactiveMatrixSecret =
++    matrixAuthMethod === "token"
++      ? "password"
++      : matrixAuthMethod === "password"
++        ? "access_token"
++        : null;
 +
 +  for (const field of schema.config_fields) {
 +    if (field.type === "password") {
++      if (field.name === inactiveMatrixSecret) {
++        continue;
++      }
 +      const nextValue = values[field.name];
 +      if (typeof nextValue === "string" && nextValue.length > 0) {
 +        payload[field.name] = nextValue;
@@ -3036,13 +3637,147 @@ index 0000000..7ff5fb9
 +      payload[field.name] = currentValue;
 +    }
 +    const nextValue = values[field.name];
-+    if (isPublicFieldValue(nextValue)) {
++    if (
++      field.name === "allow_from" &&
++      currentValue === null &&
++      Array.isArray(nextValue) &&
++      nextValue.length === 0
++    ) {
++      payload[field.name] = null;
++    } else if (isPublicFieldValue(nextValue)) {
 +      payload[field.name] = nextValue;
 +    }
++  }
++  if (
++    inactiveMatrixSecret &&
++    !payload.clear_secret.includes(inactiveMatrixSecret)
++  ) {
++    payload.clear_secret.push(inactiveMatrixSecret);
++  }
++  if (matrixAuthMethod === "token") {
++    payload.encryption = false;
 +  }
 +  payload.filter_tool_messages = true;
 +  payload.filter_thinking = true;
 +  return payload;
++}
++
++type ChannelFormFieldError = {
++  name: string;
++  errors: string[];
++};
++
++export function mapChannelApiErrorToFormFields(
++  error: unknown,
++  schema: ChannelSchema,
++): ChannelFormFieldError[] | null {
++  if (
++    !(error instanceof ApiError) ||
++    error.status !== 400 ||
++    error.code !== "invalid_request" ||
++    typeof error.details !== "object" ||
++    error.details === null ||
++    Array.isArray(error.details)
++  ) {
++    return null;
++  }
++  const issues = Reflect.get(error.details, "issues");
++  if (!Array.isArray(issues) || issues.length === 0 || issues.length > 64) {
++    return null;
++  }
++  const fieldByName = new Map(
++    schema.config_fields.map((field) => [field.name, field]),
++  );
++  const mapped = new Map<string, ChannelFormFieldError>();
++  for (const issue of issues) {
++    if (
++      typeof issue !== "object" ||
++      issue === null ||
++      Array.isArray(issue)
++    ) {
++      continue;
++    }
++    const path = Reflect.get(issue, "path");
++    const code = Reflect.get(issue, "code");
++    if (
++      !Array.isArray(path) ||
++      path.length === 0 ||
++      path.length > 16 ||
++      typeof code !== "string"
++    ) {
++      continue;
++    }
++    const resolved = resolveIssueFieldName(path, fieldByName);
++    if (!resolved || mapped.has(resolved.name)) continue;
++    const field = fieldByName.get(resolved.fieldName);
++    if (!field) continue;
++    const label =
++      typeof field.label === "string" && field.label.length > 0
++        ? field.label
++        : field.name;
++    const message = resolved.clearSecret
++      ? `${label}清除选项无效`
++      : code === "too_big" || code === "too_small"
++        ? `${label}超出允许范围`
++        : `${label}格式不正确`;
++    mapped.set(resolved.name, {
++      name: resolved.name,
++      errors: [message],
++    });
++  }
++  return mapped.size > 0 ? [...mapped.values()] : null;
++}
++
++export function handleChannelSaveError(
++  error: unknown,
++  schema: ChannelSchema,
++  setFields: (fields: ChannelFormFieldError[]) => void,
++  showGenericError: () => void,
++): boolean {
++  const fieldErrors = mapChannelApiErrorToFormFields(error, schema);
++  if (fieldErrors) {
++    setFields(fieldErrors);
++    return true;
++  }
++  showGenericError();
++  return false;
++}
++
++function resolveIssueFieldName(
++  path: unknown[],
++  fieldByName: ReadonlyMap<string, unknown>,
++):
++  | {
++      name: string;
++      fieldName: string;
++      clearSecret: boolean;
++    }
++  | null {
++  const safePath = path.map((segment) =>
++    typeof segment === "number" ? String(segment) : segment
++  );
++  if (!safePath.every((segment) => typeof segment === "string")) {
++    return null;
++  }
++  const clearIndex = safePath.indexOf("clear_secret");
++  if (clearIndex >= 0) {
++    const fieldName = safePath
++      .slice(clearIndex + 1)
++      .find((segment) => fieldByName.has(segment));
++    return fieldName
++      ? {
++          name: `clear_secret_${fieldName}`,
++          fieldName,
++          clearSecret: true,
++        }
++      : null;
++  }
++  const fieldName = safePath.find((segment) =>
++    fieldByName.has(segment)
++  );
++  return fieldName
++    ? { name: fieldName, fieldName, clearSecret: false }
++    : null;
 +}
 +
 +function isPublicFieldValue(
@@ -3083,10 +3818,10 @@ index 0000000..7ff5fb9
 +  }
 +}
 diff --git a/src/pages/Control/Channels/components/ChannelDrawer.tsx b/src/pages/Control/Channels/components/ChannelDrawer.tsx
-index db43570..cfbdd3b 100644
+index db43570..695a48c 100644
 --- a/src/pages/Control/Channels/components/ChannelDrawer.tsx
 +++ b/src/pages/Control/Channels/components/ChannelDrawer.tsx
-@@ -11,14 +11,27 @@ import { useAppMessage } from "../../../../hooks/useAppMessage";
+@@ -11,14 +11,29 @@ import { useAppMessage } from "../../../../hooks/useAppMessage";
  import { Alert, ConfigProvider } from "antd";
  import { LinkOutlined } from "@ant-design/icons";
  import { useTranslation } from "react-i18next";
@@ -3105,7 +3840,9 @@ index db43570..cfbdd3b 100644
 +import type { ChannelConfigResponse } from "../../../../api/types/channel";
 +import {
 +  channelQrCodeEnabled,
-+  isSecretStatus,
++  deriveMatrixAuthMethod,
++  isChannelSecretConfigured,
++  isChannelSecretRequired,
 +  normalizeChannelFormValues,
 +} from "../channelSecurity";
 +
@@ -3116,7 +3853,7 @@ index db43570..cfbdd3b 100644
 
  const CHANNELS_WITH_ACCESS_CONTROL: ChannelKey[] = [
    "telegram",
-@@ -166,20 +179,40 @@ export function ChannelDrawer({
+@@ -166,23 +181,55 @@ export function ChannelDrawer({
    const currentAgent = agents.find((a) => a.id === selectedAgent);
    const defaultMediaDir = currentAgent?.workspace_dir
      ? `${currentAgent.workspace_dir}/media`
@@ -3145,10 +3882,22 @@ index db43570..cfbdd3b 100644
 +        : initialValues,
 +    [channelSchema, initialValues],
 +  );
-+  const secretConfigured = (fieldName: string) => {
-+    const status = initialValues?.[fieldName];
-+    return isSecretStatus(status) && status.configured;
-+  };
++  const secretConfigured = (fieldName: string) =>
++    isChannelSecretConfigured(initialValues, fieldName);
++  const secretRequired = (
++    fieldName: string,
++    requiredOverride?: boolean,
++  ) =>
++    isChannelSecretRequired(
++      initialValues,
++      channelSchema,
++      fieldName,
++      requiredOverride,
++    );
++  const initialMatrixAuthMethod =
++    activeKey === "matrix" && initialValues
++      ? deriveMatrixAuthMethod(initialValues)
++      : null;
 
    // Parent calls form.setFieldsValue() before the Form mounts, which wins over
    // initialValues. Re-apply auth_method after open so the dropdown is correct.
@@ -3156,42 +3905,62 @@ index db43570..cfbdd3b 100644
      if (!open || activeKey !== "matrix") return;
 -    const pw = initialValues?.password;
 -    if (typeof pw === "string" && pw.trim().length > 0) {
-+    if (secretConfigured("password")) {
-       form.setFieldsValue({ auth_method: "password" });
-     }
-   }, [open, activeKey, initialValues, form]);
-@@ -254,7 +287,9 @@ export function ChannelDrawer({
+-      form.setFieldsValue({ auth_method: "password" });
+-    }
+-  }, [open, activeKey, initialValues, form]);
++    form.setFieldsValue({
++      auth_method: initialMatrixAuthMethod ?? undefined,
++    });
++  }, [open, activeKey, initialMatrixAuthMethod, form]);
+
+   // ── Access control fields (shared across multiple channels) ──────────────
+
+@@ -240,7 +287,12 @@ export function ChannelDrawer({
+             <Form.Item
+               name="auth_method"
+               label="Auth Method"
+-              initialValue="token"
++              rules={[
++                {
++                  required: true,
++                  message: "请选择 Matrix 认证方式",
++                },
++              ]}
+             >
+               <Select
+                 options={[
+@@ -254,7 +306,9 @@ export function ChannelDrawer({
                label="Access Token"
                rules={[
                  {
 -                  required: !isMatrixPasswordAuth,
 +                  required:
 +                    !isMatrixPasswordAuth &&
-+                    !secretConfigured("access_token"),
++                    secretRequired("access_token", true),
                    message: "Please enter access token",
                  },
                ]}
-@@ -267,7 +302,9 @@ export function ChannelDrawer({
+@@ -267,7 +321,9 @@ export function ChannelDrawer({
                label="Password"
                rules={[
                  {
 -                  required: isMatrixPasswordAuth,
 +                  required:
 +                    isMatrixPasswordAuth &&
-+                    !secretConfigured("password"),
++                    secretRequired("password", true),
                    message: "Please enter password",
                  },
                ]}
-@@ -338,7 +375,7 @@ export function ChannelDrawer({
+@@ -338,7 +394,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("bot_token") }]}
++              rules={[{ required: secretRequired("bot_token") }]}
              >
                <Input.Password placeholder="Discord bot token" />
              </Form.Item>
-@@ -346,7 +383,7 @@ export function ChannelDrawer({
+@@ -346,7 +402,7 @@ export function ChannelDrawer({
                <Input placeholder="http://127.0.0.1:18118" />
              </Form.Item>
              <Form.Item name="http_proxy_auth" label="HTTP Proxy Auth">
@@ -3200,37 +3969,21 @@ index db43570..cfbdd3b 100644
              </Form.Item>
              <Form.Item
                name="accept_bot_messages"
-@@ -400,14 +437,14 @@ export function ChannelDrawer({
-             <Form.Item
-               name="client_id"
-               label="Client ID"
--              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("client_secret") }]}
-             >
-               <Input placeholder="dingxxxxx" />
-             </Form.Item>
+@@ -407,7 +463,7 @@ export function ChannelDrawer({
              <Form.Item
                name="client_secret"
                label="Client Secret"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("app_secret") }]}
++              rules={[{ required: secretRequired("client_secret") }]}
              >
                <Input.Password />
              </Form.Item>
-@@ -552,22 +589,22 @@ export function ChannelDrawer({
-             <Form.Item
-               name="app_id"
-               label="App ID"
--              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("client_secret") }]}
-             >
-               <Input placeholder="cli_xxx" />
-             </Form.Item>
+@@ -559,15 +615,15 @@ export function ChannelDrawer({
              <Form.Item
                name="app_secret"
                label="App Secret"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("bot_token") }]}
++              rules={[{ required: secretRequired("app_secret") }]}
              >
                <Input.Password placeholder="App Secret" />
              </Form.Item>
@@ -3244,42 +3997,43 @@ index db43570..cfbdd3b 100644
              </Form.Item>
              <Form.Item name="media_dir" label={t("channels.wechatMediaDir")}>
                <Input placeholder={defaultMediaDir} />
-@@ -624,14 +661,14 @@ export function ChannelDrawer({
-             <Form.Item
-               name="app_id"
-               label="App ID"
--              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("bot_token") }]}
-             >
-               <Input />
-             </Form.Item>
+@@ -631,7 +687,7 @@ export function ChannelDrawer({
              <Form.Item
                name="client_secret"
                label="Client Secret"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("app_token") }]}
++              rules={[{ required: secretRequired("client_secret") }]}
              >
                <Input.Password />
              </Form.Item>
-@@ -654,7 +691,7 @@ export function ChannelDrawer({
+@@ -654,7 +710,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("bot_token") }]}
++              rules={[{ required: secretRequired("bot_token") }]}
              >
                <Input.Password placeholder="Telegram bot token from BotFather" />
              </Form.Item>
-@@ -683,7 +720,7 @@ export function ChannelDrawer({
+@@ -683,7 +739,7 @@ export function ChannelDrawer({
              <Form.Item
                name="bot_token"
                label="Bot Token"
 -              rules={[{ required: true }]}
-+              rules={[{ required: !secretConfigured("twilio_auth_token") }]}
++              rules={[{ required: secretRequired("bot_token") }]}
                tooltip={t("channels.slackBotTokenTooltip")}
              >
                <Input.Password placeholder="xoxb-..." />
-@@ -802,7 +839,7 @@ export function ChannelDrawer({
+@@ -691,7 +747,7 @@ export function ChannelDrawer({
+             <Form.Item
+               name="app_token"
+               label="App Token"
+-              rules={[{ required: true }]}
++              rules={[{ required: secretRequired("app_token") }]}
+               tooltip={t("channels.slackAppTokenTooltip")}
+             >
+               <Input.Password placeholder="xapp-..." />
+@@ -802,7 +858,7 @@ export function ChannelDrawer({
                <Input placeholder="Path to client certificate file" />
              </Form.Item>
              <Form.Item name="tls_keyfile" label="TLS Keyfile">
@@ -3288,15 +4042,61 @@ index db43570..cfbdd3b 100644
              </Form.Item>
            </>
          );
-@@ -1020,16 +1057,26 @@ export function ChannelDrawer({
+@@ -820,7 +876,7 @@ export function ChannelDrawer({
+             <Form.Item
+               name="bot_token"
+               label="Bot Token"
+-              rules={[{ required: true }]}
++              rules={[{ required: secretRequired("bot_token") }]}
+             >
+               <Input.Password placeholder="Mattermost bot token" />
+             </Form.Item>
+@@ -865,7 +921,11 @@ export function ChannelDrawer({
+             <Form.Item
+               name="twilio_auth_token"
+               label={t("channels.twilioAuthToken")}
+-              rules={[{ required: true }]}
++              rules={[
++                {
++                  required: secretRequired("twilio_auth_token"),
++                },
++              ]}
+             >
+               <Input.Password />
+             </Form.Item>
+@@ -1009,6 +1069,24 @@ export function ChannelDrawer({
+             >
+               <Input.TextArea rows={2} />
+             </Form.Item>
++            <Form.Item
++              name="call_timeout"
++              label="Call Timeout (seconds)"
++              rules={[
++                {
++                  type: "number",
++                  min: Number.EPSILON,
++                  max: 3600,
++                },
++              ]}
++            >
++              <InputNumber
++                min={0.1}
++                max={3600}
++                step={0.1}
++                style={{ width: "100%" }}
++              />
++            </Form.Item>
+             <Form.Item
+               noStyle
+               shouldUpdate={(prev, cur) => prev.sip_mode !== cur.sip_mode}
+@@ -1020,21 +1098,39 @@ export function ChannelDrawer({
                      <Form.Item
                        name="livekit_url"
                        label={t("channels.livekitUrl")}
 -                      rules={[{ required: true }]}
 +                      rules={[
 +                        {
-+                          required:
-+                            !secretConfigured("livekit_api_secret"),
++                          required: true,
 +                        },
 +                      ]}
                      >
@@ -3308,8 +4108,10 @@ index db43570..cfbdd3b 100644
 -                      rules={[{ required: true }]}
 +                      rules={[
 +                        {
-+                          required:
-+                            !secretConfigured("livekit_api_key"),
++                          required: secretRequired(
++                            "livekit_api_key",
++                            true,
++                          ),
 +                        },
 +                      ]}
                      >
@@ -3318,35 +4120,48 @@ index db43570..cfbdd3b 100644
                      </Form.Item>
                      <Form.Item
                        name="livekit_api_secret"
-@@ -1099,7 +1146,12 @@ export function ChannelDrawer({
+                       label={t("channels.livekitApiSecret")}
+-                      rules={[{ required: true }]}
++                      rules={[
++                        {
++                          required: secretRequired(
++                            "livekit_api_secret",
++                            true,
++                          ),
++                        },
++                      ]}
+                     >
+                       <Input.Password />
+                     </Form.Item>
+@@ -1099,7 +1195,12 @@ export function ChannelDrawer({
              <Form.Item
                name="secret"
                label="Secret"
 -              rules={[{ required: true, message: "Please input Secret" }]}
 +              rules={[
 +                {
-+                  required: !secretConfigured("secret"),
++                  required: secretRequired("secret"),
 +                  message: "Please input Secret",
 +                },
 +              ]}
              >
                <Input.Password placeholder="Secret from WeCom backend" />
              </Form.Item>
-@@ -1145,7 +1197,12 @@ export function ChannelDrawer({
+@@ -1145,7 +1246,12 @@ export function ChannelDrawer({
              <Form.Item
                name="sk"
                label="Secret Key (SK)"
 -              rules={[{ required: true, message: "Please input Secret Key" }]}
 +              rules={[
 +                {
-+                  required: !secretConfigured("sk"),
++                  required: secretRequired("sk"),
 +                  message: "Please input Secret Key",
 +                },
 +              ]}
              >
                <Input.Password placeholder="Secret Key from Huawei Developer Platform" />
              </Form.Item>
-@@ -1211,7 +1268,7 @@ export function ChannelDrawer({
+@@ -1211,7 +1317,7 @@ export function ChannelDrawer({
                label={t("channels.wechatBotTokenFile")}
                tooltip={t("channels.wechatBotTokenFileTooltip")}
              >
@@ -3355,39 +4170,52 @@ index db43570..cfbdd3b 100644
              </Form.Item>
              <Form.Item name="media_dir" label={t("channels.wechatMediaDir")}>
                <Input placeholder={defaultMediaDir} />
-@@ -1288,7 +1345,12 @@ export function ChannelDrawer({
+@@ -1288,7 +1394,12 @@ export function ChannelDrawer({
              <Form.Item
                name="app_secret"
                label="App Secret"
 -              rules={[{ required: true, message: "Please input App Secret" }]}
 +              rules={[
 +                {
-+                  required: !secretConfigured("app_secret"),
++                  required: secretRequired("app_secret"),
 +                  message: "Please input App Secret",
 +                },
 +              ]}
              >
                <Input.Password placeholder="App Secret from Yuanbao platform" />
              </Form.Item>
-@@ -1384,7 +1446,7 @@ export function ChannelDrawer({
+@@ -1384,7 +1495,7 @@ export function ChannelDrawer({
                field.placeholder,
                i18n.language,
              );
 -            const rules = field.required
-+            const rules = field.required && !secretConfigured(field.name)
++            const rules = secretRequired(field.name)
                ? [{ required: true, message: `Please enter ${fieldLabel}` }]
                : undefined;
 
-@@ -1595,7 +1657,7 @@ export function ChannelDrawer({
+@@ -1595,19 +1706,8 @@ export function ChannelDrawer({
          <Form
            form={form}
            layout="vertical"
 -          initialValues={initialValues}
+-          onFinish={(values: Record<string, unknown>) => {
+-            if (activeKey !== "matrix") {
+-              onSubmit(values);
+-              return;
+-            }
+-            const { auth_method, ...rest } = values;
+-            if (auth_method === "password") {
+-              onSubmit({ ...rest, access_token: "" });
+-            } else {
+-              onSubmit({ ...rest, password: "", encryption: false });
+-            }
+-          }}
 +          initialValues={safeInitialValues}
-           onFinish={(values: Record<string, unknown>) => {
-             if (activeKey !== "matrix") {
-               onSubmit(values);
-@@ -1617,6 +1679,40 @@ export function ChannelDrawer({
++          onFinish={onSubmit}
+         >
+           <Form.Item
+             name="enabled"
+@@ -1617,6 +1717,53 @@ export function ChannelDrawer({
              <Switch />
            </Form.Item>
 
@@ -3425,10 +4253,23 @@ index db43570..cfbdd3b 100644
 +            </ConfigProvider>
 +          )}
 +
++          {activeKey === "matrix" &&
++            initialMatrixAuthMethod === null && (
++              <ConfigProvider prefixCls="ant">
++                <Alert
++                  type="warning"
++                  showIcon
++                  message="检测到 Token 与密码同时存在"
++                  description="请选择本次保留的认证方式；保存后会安全删除另一套凭据。"
++                  style={{ marginBottom: 16 }}
++                />
++              </ConfigProvider>
++            )}
++
            {activeKey !== "voice" && (
              <Form.Item name="bot_prefix" label="Bot Prefix">
                <Input placeholder="@bot" />
-@@ -1631,7 +1727,7 @@ export function ChannelDrawer({
+@@ -1631,7 +1778,7 @@ export function ChannelDrawer({
                  valuePropName="checked"
                  tooltip={t("channels.filterToolMessagesTooltip")}
                >
@@ -3437,7 +4278,7 @@ index db43570..cfbdd3b 100644
                </Form.Item>
                <Form.Item
                  name="filter_thinking"
-@@ -1639,7 +1735,7 @@ export function ChannelDrawer({
+@@ -1639,7 +1786,7 @@ export function ChannelDrawer({
                  valuePropName="checked"
                  tooltip={t("channels.filterThinkingTooltip")}
                >
@@ -3447,10 +4288,10 @@ index db43570..cfbdd3b 100644
              </>
            )}
 diff --git a/src/pages/Control/Channels/index.tsx b/src/pages/Control/Channels/index.tsx
-index 54f2acc..83dd0d3 100644
+index 54f2acc..2f11406 100644
 --- a/src/pages/Control/Channels/index.tsx
 +++ b/src/pages/Control/Channels/index.tsx
-@@ -17,6 +17,16 @@ import {
+@@ -17,6 +17,17 @@ import {
  import { PageHeader } from "@/components/PageHeader";
  import { useAppMessage } from "../../../hooks/useAppMessage";
  import styles from "./index.module.less";
@@ -3460,14 +4301,15 @@ index 54f2acc..83dd0d3 100644
 +} from "../../../api/types/channel";
 +import {
 +  buildChannelSavePayload,
-+  isSecretStatus,
++  deriveMatrixAuthMethod,
++  handleChannelSaveError,
 +  normalizeChannelFormValues,
 +  saveChannelWithRetry,
 +} from "./channelSecurity";
 
  type FilterType = "all" | "builtin" | "custom";
 
-@@ -38,8 +48,7 @@ function ChannelsPage() {
+@@ -38,8 +49,7 @@ function ChannelsPage() {
    const [aclDrawerOpen, setAclDrawerOpen] = useState(false);
    const [pendingDrawerOpen, setPendingDrawerOpen] = useState(false);
    const [pendingCount, setPendingCount] = useState(0);
@@ -3477,7 +4319,7 @@ index 54f2acc..83dd0d3 100644
 
    const fetchPendingCount = useCallback(async () => {
      try {
-@@ -83,22 +92,24 @@ function ChannelsPage() {
+@@ -83,22 +93,22 @@ function ChannelsPage() {
        setActiveKey(key);
        setDrawerOpen(true);
        const channelConfig = channels[key] || { enabled: false, bot_prefix: "" };
@@ -3502,14 +4344,12 @@ index 54f2acc..83dd0d3 100644
 +        schema,
 +      );
 +      if (key === "matrix") {
-+        const password = channelConfig.password;
-+        formValues.auth_method =
-+          isSecretStatus(password) && password.configured
-+            ? "password"
-+            : "token";
++        formValues.auth_method = deriveMatrixAuthMethod(
++          channelConfig as ChannelConfigResponse,
++        );
 +      }
 +      form.setFieldsValue(
-+        formValues as Record<string, {} | undefined>,
++        formValues as Parameters<typeof form.setFieldsValue>[0],
 +      );
      },
 -    [channels, form],
@@ -3517,7 +4357,7 @@ index 54f2acc..83dd0d3 100644
    );
 
    const handleDrawerClose = () => {
-@@ -108,23 +119,23 @@ function ChannelsPage() {
+@@ -108,31 +118,36 @@ function ChannelsPage() {
 
    const handleSubmit = async (values: Record<string, unknown>) => {
      if (!activeKey) return;
@@ -3539,6 +4379,7 @@ index 54f2acc..83dd0d3 100644
 +      values,
 +      schema,
 +      operationId,
++      activeKey,
 +    );
 
      setSaving(true);
@@ -3555,6 +4396,20 @@ index 54f2acc..83dd0d3 100644
        );
        await fetchChannels();
 
+       setDrawerOpen(false);
+       message.success(t("channels.configSaved"));
+     } catch (error) {
+-      console.error("❌ Failed to update channel config:", error);
+-      message.error(t("channels.configFailed"));
++      handleChannelSaveError(
++        error,
++        schema,
++        (fieldErrors) => form.setFields(fieldErrors),
++        () => message.error(t("channels.configFailed")),
++      );
+     } finally {
+       setSaving(false);
+     }
 diff --git a/src/pages/Control/Channels/useChannels.test.ts b/src/pages/Control/Channels/useChannels.test.ts
 index 6f5a746..3ec96cb 100644
 --- a/src/pages/Control/Channels/useChannels.test.ts
