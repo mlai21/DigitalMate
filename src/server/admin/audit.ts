@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
+import { containsSecretExposure } from "@/server/admin/secret-content";
 import {
   connectPoolClient,
   guardPoolClientWithAbort,
@@ -19,9 +20,6 @@ const MAX_LIFECYCLE_TIMEOUT_MS = COMPATIBILITY_TIMEOUT_MS - 1;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
 const TRANSACTION_LOCK_TIMEOUT_MS = 10_000;
 const TRANSACTION_STATEMENT_TIMEOUT_MS = 110_000;
-// Long secrets are distinctive enough to block when embedded in another
-// public string; short values require an exact match to avoid false positives.
-const SECRET_SUBSTRING_MIN_UTF8_BYTES = 8;
 
 export type ChannelSecretChange =
   | Readonly<{
@@ -173,8 +171,8 @@ export function createChannelConnectionAuditService(
         if (
           containsSecretExposure(
             prepared.config,
-            prepared.auditConfigFields,
             beforeSecrets.plaintextValues,
+            prepared.auditConfigFields,
           )
         ) {
           throw new AdminAuditError(400, "secret_in_public_config");
@@ -521,8 +519,8 @@ function prepareUpdate(
   if (
     containsSecretExposure(
       config,
-      auditConfigFields,
       secretValues,
+      auditConfigFields,
     )
   ) {
     throw new AdminAuditError(400, "secret_in_public_config");
@@ -634,46 +632,6 @@ function pickConfig(
       .filter((field) => Object.hasOwn(config, field))
       .map((field) => [field, config[field]]),
   );
-}
-
-function containsSecretExposure(
-  config: JsonObject,
-  auditConfigFields: readonly string[],
-  secretValues: readonly string[],
-): boolean {
-  const secrets = secretValues.map((value) => ({
-    value,
-    embeddedMatch:
-      Buffer.byteLength(value, "utf8") >=
-      SECRET_SUBSTRING_MIN_UTF8_BYTES,
-  }));
-  if (secrets.length === 0) return false;
-  const matches = (candidate: string) =>
-    secrets.some((secret) =>
-      secret.embeddedMatch
-        ? candidate.includes(secret.value)
-        : candidate === secret.value
-    );
-  if (auditConfigFields.some(matches)) return true;
-
-  const pending: unknown[] = [config];
-  while (pending.length > 0) {
-    const value = pending.pop();
-    if (typeof value === "string") {
-      if (matches(value)) return true;
-      continue;
-    }
-    if (Array.isArray(value)) {
-      pending.push(...value);
-      continue;
-    }
-    if (typeof value !== "object" || value === null) continue;
-    for (const [key, nested] of Object.entries(value)) {
-      if (matches(key)) return true;
-      pending.push(nested);
-    }
-  }
-  return false;
 }
 
 function applyConfiguredChanges(

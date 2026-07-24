@@ -1506,7 +1506,7 @@ index ce104e5..661a6c0 100644
      });
 
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..2a45a5e 100644
+index ce94f9a..15f15f1 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
 @@ -1,19 +1,23 @@
@@ -1597,11 +1597,27 @@ index ce94f9a..2a45a5e 100644
    });
 
    it("throws error with status code for non-401 errors", async () => {
-@@ -136,14 +164,48 @@ describe("request", () => {
+@@ -136,14 +164,64 @@ describe("request", () => {
      await expect(request("/models")).rejects.toThrow("server exploded");
    });
 
 -  it("injects Authorization header when token is present", async () => {
++  it("classifies fetch TypeError as an explicit retryable transport error", async () => {
++    global.fetch = vi
++      .fn()
++      .mockRejectedValue(new TypeError("Failed to fetch internal host"));
++
++    const error = await request("/models").catch(
++      (caught: unknown) => caught,
++    );
++
++    expect(error).toMatchObject({
++      name: "RetryableRequestError",
++      kind: "transport",
++      retryable: true,
++    });
++  });
++
 +  it("preserves the stable DigitalMate error envelope without raw JSON", async () => {
 +    mockFetch(409, {
 +      error: {
@@ -1649,7 +1665,36 @@ index ce94f9a..2a45a5e 100644
    });
 
    it("request URL is correctly built by getApiUrl", async () => {
-@@ -271,6 +333,9 @@ describe("request", () => {
+@@ -208,6 +286,28 @@ describe("request", () => {
+     vi.useRealTimers();
+   });
+
++  it("classifies timeout as an explicit retryable timeout error", async () => {
++    vi.useFakeTimers();
++    global.fetch = vi.fn().mockImplementation((_url, options) => {
++      return new Promise((_resolve, reject) => {
++        options?.signal?.addEventListener("abort", () => {
++          reject(new DOMException("aborted", "AbortError"));
++        });
++      });
++    });
++
++    const pending = request("/slow-endpoint", { timeout: 1000 });
++    vi.advanceTimersByTime(1000);
++    const error = await pending.catch((caught: unknown) => caught);
++
++    expect(error).toMatchObject({
++      name: "RetryableRequestError",
++      kind: "timeout",
++      retryable: true,
++    });
++    vi.useRealTimers();
++  });
++
+   it("completes successfully before timeout", async () => {
+     vi.useFakeTimers();
+     mockFetch(200, { data: "ok" });
+@@ -271,6 +371,9 @@ describe("request", () => {
    it("succeeds on retry after initial timeout", async () => {
      vi.useFakeTimers();
      let attemptCount = 0;
@@ -1659,7 +1704,7 @@ index ce94f9a..2a45a5e 100644
 
      global.fetch = vi.fn().mockImplementation((_url, options) => {
        attemptCount++;
-@@ -299,10 +364,13 @@ describe("request", () => {
+@@ -299,10 +402,13 @@ describe("request", () => {
      });
 
      const requestPromise = request("/flaky-endpoint", {
@@ -1673,7 +1718,7 @@ index ce94f9a..2a45a5e 100644
 
      // First attempt timeout
      vi.advanceTimersByTime(1000);
-@@ -311,6 +379,8 @@ describe("request", () => {
+@@ -311,6 +417,8 @@ describe("request", () => {
      const result = await requestPromise;
      expect(result).toEqual({ data: "success" });
      expect(attemptCount).toBe(2);
@@ -1682,7 +1727,7 @@ index ce94f9a..2a45a5e 100644
 
      vi.useRealTimers();
    });
-@@ -332,6 +402,48 @@ describe("request", () => {
+@@ -332,6 +440,48 @@ describe("request", () => {
      expect(fetch).not.toHaveBeenCalled();
    });
 
@@ -1732,10 +1777,10 @@ index ce94f9a..2a45a5e 100644
      let attemptCount = 0;
 
 diff --git a/src/api/request.ts b/src/api/request.ts
-index 7f4cb7d..1ac4fb5 100644
+index 7f4cb7d..81e53dc 100644
 --- a/src/api/request.ts
 +++ b/src/api/request.ts
-@@ -1,5 +1,35 @@
+@@ -1,5 +1,70 @@
  import { getApiUrl, clearAuthToken } from "./config";
 -import { buildAuthHeaders } from "./authHeaders";
 +import {
@@ -1764,6 +1809,41 @@ index 7f4cb7d..1ac4fb5 100644
 +  }
 +}
 +
++export type RetryableRequestErrorKind = "transport" | "timeout";
++
++export class RetryableRequestError extends Error {
++  readonly kind: RetryableRequestErrorKind;
++  readonly retryable = true as const;
++
++  constructor(kind: RetryableRequestErrorKind) {
++    super(
++      kind === "timeout"
++        ? "Request timeout"
++        : "Network request failed",
++    );
++    this.name = "RetryableRequestError";
++    this.kind = kind;
++  }
++}
++
++export function isRetryableRequestError(
++  error: unknown,
++): error is RetryableRequestError {
++  return (
++    error instanceof RetryableRequestError ||
++    (
++      typeof error === "object" &&
++      error !== null &&
++      Reflect.get(error, "name") === "RetryableRequestError" &&
++      Reflect.get(error, "retryable") === true &&
++      (
++        Reflect.get(error, "kind") === "transport" ||
++        Reflect.get(error, "kind") === "timeout"
++      )
++    )
++  );
++}
++
 +type StableCompatError = Readonly<{
 +  code: string;
 +  message: string;
@@ -1772,7 +1852,7 @@ index 7f4cb7d..1ac4fb5 100644
 
  function getErrorMessageFromBody(
    text: string,
-@@ -29,6 +59,16 @@ function getErrorMessageFromBody(
+@@ -29,6 +94,16 @@ function getErrorMessageFromBody(
      if (typeof payload.error === "string" && payload.error) {
        return payload.error;
      }
@@ -1789,7 +1869,7 @@ index 7f4cb7d..1ac4fb5 100644
    } catch {
      return text;
    }
-@@ -36,7 +76,46 @@ function getErrorMessageFromBody(
+@@ -36,7 +111,46 @@ function getErrorMessageFromBody(
    return text;
  }
 
@@ -1837,7 +1917,7 @@ index 7f4cb7d..1ac4fb5 100644
    // Normalize extra to a Headers instance for consistent handling
    const headers = extra instanceof Headers ? extra : new Headers(extra);
 
-@@ -48,12 +127,6 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
+@@ -48,12 +162,6 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
      }
    }
 
@@ -1850,7 +1930,7 @@ index 7f4cb7d..1ac4fb5 100644
    return headers;
  }
 
-@@ -89,6 +162,20 @@ export async function request<T = unknown>(
+@@ -89,6 +197,20 @@ export async function request<T = unknown>(
    if (callerSignal?.aborted) {
      throw new DOMException("The operation was aborted", "AbortError");
    }
@@ -1871,7 +1951,20 @@ index 7f4cb7d..1ac4fb5 100644
 
    let lastError: Error | null = null;
 
-@@ -123,13 +210,33 @@ export async function request<T = unknown>(
+@@ -112,24 +234,46 @@ export async function request<T = unknown>(
+       }
+     }
+
++    let responseReceived = false;
+     try {
+       const response = await fetch(url, {
+         ...fetchOptions,
+         headers,
+         signal: controller.signal,
+       });
++      responseReceived = true;
+
+       if (!response.ok) {
          if (response.status === 401) {
            clearAuthToken();
            if (window.location.pathname !== "/login") {
@@ -1906,6 +1999,25 @@ index 7f4cb7d..1ac4fb5 100644
          const errorMessage = getErrorMessageFromBody(text, contentType);
 
          // Preserve raw body for parseErrorDetail() to extract structured fields
+@@ -162,15 +306,15 @@ export async function request<T = unknown>(
+
+       if (error instanceof DOMException && error.name === "AbortError") {
+         // Timeout-triggered abort
+-        lastError = new Error(
+-          `Request timeout after ${timeout}ms: ${method} ${path}`,
+-        );
++        lastError = new RetryableRequestError("timeout");
+
+         // Retry if we have attempts remaining
+         if (attempt < retries) {
+           await new Promise((resolve) => setTimeout(resolve, retryDelay));
+           continue;
+         }
++      } else if (!responseReceived && error instanceof TypeError) {
++        throw new RetryableRequestError("transport");
+       } else {
+         // Non-timeout errors should not retry
+         throw error;
 diff --git a/src/api/types/agents.ts b/src/api/types/agents.ts
 index 9daaea6..56e9df5 100644
 --- a/src/api/types/agents.ts
@@ -2800,16 +2912,19 @@ index 0000000..52d1f01
 +});
 diff --git a/src/pages/Control/Channels/channelSecurity.test.ts b/src/pages/Control/Channels/channelSecurity.test.ts
 new file mode 100644
-index 0000000..f06b76b
+index 0000000..5015dd9
 --- /dev/null
 +++ b/src/pages/Control/Channels/channelSecurity.test.ts
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,752 @@
 +import { describe, expect, it, vi } from "vitest";
 +import { readFileSync } from "node:fs";
 +import path from "node:path";
 +
 +import type { ChannelSchema } from "../../../api/modules/channel";
-+import { ApiError } from "../../../api/request";
++import {
++  ApiError,
++  RetryableRequestError,
++} from "../../../api/request";
 +import type {
 +  ChannelConfigResponse,
 +  ChannelUpdatePayload,
@@ -3064,7 +3179,7 @@ index 0000000..f06b76b
 +  it("reuses one operation id for the single bounded retry", async () => {
 +    const save = vi
 +      .fn()
-+      .mockRejectedValueOnce(new TypeError("network"))
++      .mockRejectedValueOnce(new RetryableRequestError("transport"))
 +      .mockResolvedValueOnce({ revision: 1 });
 +    const payload = {
 +      operation_id: OPERATION_ID,
@@ -3080,6 +3195,33 @@ index 0000000..f06b76b
 +    expect(save).toHaveBeenCalledTimes(2);
 +  });
 +
++  it.each(["transport", "timeout"] as const)(
++    "retries one explicit retryable %s error with the exact same payload",
++    async (kind) => {
++      const retryable = Object.assign(new Error(kind), {
++        name: "RetryableRequestError",
++        kind,
++        retryable: true as const,
++      });
++      const save = vi
++        .fn()
++        .mockRejectedValueOnce(retryable)
++        .mockResolvedValueOnce({ revision: 1 });
++      const payload = {
++        operation_id: OPERATION_ID,
++        revision: 0,
++        clear_secret: [],
++      };
++
++      await expect(saveChannelWithRetry(save, payload)).resolves.toEqual({
++        revision: 1,
++      });
++      expect(save).toHaveBeenNthCalledWith(1, payload);
++      expect(save).toHaveBeenNthCalledWith(2, payload);
++      expect(save).toHaveBeenCalledTimes(2);
++    },
++  );
++
 +  it("does not retry an authoritative HTTP error", async () => {
 +    const error = new Error("409");
 +    const save = vi.fn().mockRejectedValue(error);
@@ -3092,6 +3234,49 @@ index 0000000..f06b76b
 +      }),
 +    ).rejects.toBe(error);
 +    expect(save).toHaveBeenCalledTimes(1);
++  });
++
++  it("refreshes exactly once on revision conflict without mutating form input", async () => {
++    const helper = requiredHelper<
++      <T>(
++        error: unknown,
++        refresh: () => Promise<T>,
++      ) => Promise<T | null>
++    >("refreshChannelAfterRevisionConflict");
++    const draft = { bot_prefix: "尚未保存的输入" };
++    const refresh = vi.fn().mockResolvedValue({
++      revision: 3,
++      bot_prefix: "server",
++    });
++    const conflict = new ApiError("revision_conflict", {
++      status: 409,
++      code: "config_revision_conflict",
++    });
++
++    await expect(helper(conflict, refresh)).resolves.toEqual({
++      revision: 3,
++      bot_prefix: "server",
++    });
++    expect(refresh).toHaveBeenCalledTimes(1);
++    expect(draft).toEqual({ bot_prefix: "尚未保存的输入" });
++  });
++
++  it("does not loop when the one conflict refresh fails", async () => {
++    const helper = requiredHelper<
++      <T>(
++        error: unknown,
++        refresh: () => Promise<T>,
++      ) => Promise<T | null>
++    >("refreshChannelAfterRevisionConflict");
++    const refreshFailure = new Error("refresh unavailable");
++    const refresh = vi.fn().mockRejectedValue(refreshFailure);
++    const conflict = new ApiError("revision_conflict", {
++      status: 409,
++      code: "config_revision_conflict",
++    });
++
++    await expect(helper(conflict, refresh)).rejects.toBe(refreshFailure);
++    expect(refresh).toHaveBeenCalledTimes(1);
 +  });
 +});
 +
@@ -3485,14 +3670,17 @@ index 0000000..f06b76b
 +}
 diff --git a/src/pages/Control/Channels/channelSecurity.ts b/src/pages/Control/Channels/channelSecurity.ts
 new file mode 100644
-index 0000000..caf6a84
+index 0000000..8bcefd6
 --- /dev/null
 +++ b/src/pages/Control/Channels/channelSecurity.ts
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,345 @@
 +import type {
 +  ChannelSchema,
 +} from "../../../api/modules/channel";
-+import { ApiError } from "../../../api/request";
++import {
++  ApiError,
++  isRetryableRequestError,
++} from "../../../api/request";
 +import type {
 +  ChannelConfigResponse,
 +  ChannelUpdatePayload,
@@ -3813,10 +4001,113 @@ index 0000000..caf6a84
 +  try {
 +    return await save(payload);
 +  } catch (error) {
-+    if (!(error instanceof TypeError)) throw error;
++    if (!isRetryableRequestError(error)) throw error;
 +    return save(payload);
 +  }
 +}
++
++export async function refreshChannelAfterRevisionConflict<T>(
++  error: unknown,
++  refresh: () => Promise<T>,
++): Promise<T | null> {
++  if (
++    !(error instanceof ApiError) ||
++    error.status !== 409 ||
++    error.code !== "config_revision_conflict"
++  ) {
++    return null;
++  }
++  return refresh();
++}
+diff --git a/src/pages/Control/Channels/components/ChannelAvailableItem.tsx b/src/pages/Control/Channels/components/ChannelAvailableItem.tsx
+index 764a1f2..ccd8341 100644
+--- a/src/pages/Control/Channels/components/ChannelAvailableItem.tsx
++++ b/src/pages/Control/Channels/components/ChannelAvailableItem.tsx
+@@ -8,12 +8,14 @@ interface ChannelAvailableItemProps {
+   channelKey: ChannelKey;
+   onClick: () => void;
+   iconUrl?: string;
++  disabled?: boolean;
+ }
+
+ export const ChannelAvailableItem = React.memo(function ChannelAvailableItem({
+   channelKey,
+   onClick,
+   iconUrl,
++  disabled = false,
+ }: ChannelAvailableItemProps) {
+   const { t } = useTranslation();
+   const label = getChannelLabel(channelKey, t);
+@@ -21,17 +23,22 @@ export const ChannelAvailableItem = React.memo(function ChannelAvailableItem({
+   const handleKeyDown = (event: React.KeyboardEvent) => {
+     if (event.key === "Enter" || event.key === " ") {
+       event.preventDefault();
+-      onClick();
++      if (!disabled) onClick();
+     }
+   };
+
+   return (
+     <div
+-      className={styles.availableItem}
+-      onClick={onClick}
++      className={`${styles.availableItem} ${
++        disabled ? styles.channelItemDisabled : ""
++      }`}
++      onClick={() => {
++        if (!disabled) onClick();
++      }}
+       onKeyDown={handleKeyDown}
+       role="button"
+-      tabIndex={0}
++      tabIndex={disabled ? -1 : 0}
++      aria-disabled={disabled}
+     >
+       <ChannelIcon channelKey={channelKey} size={24} iconUrl={iconUrl} />
+       <span className={styles.availableItemName}>{label}</span>
+diff --git a/src/pages/Control/Channels/components/ChannelCard.tsx b/src/pages/Control/Channels/components/ChannelCard.tsx
+index c0bc4b1..4bba206 100644
+--- a/src/pages/Control/Channels/components/ChannelCard.tsx
++++ b/src/pages/Control/Channels/components/ChannelCard.tsx
+@@ -10,6 +10,7 @@ interface ChannelCardProps {
+   config: Record<string, unknown>;
+   onClick: () => void;
+   iconUrl?: string;
++  disabled?: boolean;
+ }
+
+ export const ChannelCard = React.memo(function ChannelCard({
+@@ -17,6 +18,7 @@ export const ChannelCard = React.memo(function ChannelCard({
+   config,
+   onClick,
+   iconUrl,
++  disabled = false,
+ }: ChannelCardProps) {
+   const { t } = useTranslation();
+   const [isHover, setIsHover] = useState(false);
+@@ -39,11 +41,18 @@ export const ChannelCard = React.memo(function ChannelCard({
+
+   return (
+     <Card
+-      hoverable
+-      onClick={onClick}
+-      onMouseEnter={() => setIsHover(true)}
++      hoverable={!disabled}
++      onClick={() => {
++        if (!disabled) onClick();
++      }}
++      onMouseEnter={() => {
++        if (!disabled) setIsHover(true);
++      }}
+       onMouseLeave={() => setIsHover(false)}
+-      className={getCardClassNames()}
++      className={`${getCardClassNames()} ${
++        disabled ? styles.channelItemDisabled : ""
++      }`}
++      aria-disabled={disabled}
+       bodyStyle={{ padding: 24 }}
+     >
+       {/* Top section: Icon and Status */}
 diff --git a/src/pages/Control/Channels/components/ChannelDrawer.tsx b/src/pages/Control/Channels/components/ChannelDrawer.tsx
 index db43570..695a48c 100644
 --- a/src/pages/Control/Channels/components/ChannelDrawer.tsx
@@ -4287,11 +4578,40 @@ index db43570..695a48c 100644
                </Form.Item>
              </>
            )}
+diff --git a/src/pages/Control/Channels/index.module.less b/src/pages/Control/Channels/index.module.less
+index b824513..3f87a97 100644
+--- a/src/pages/Control/Channels/index.module.less
++++ b/src/pages/Control/Channels/index.module.less
+@@ -98,6 +98,12 @@
+   color: #999;
+ }
+
++.channelItemDisabled {
++  cursor: not-allowed;
++  opacity: 0.55;
++  pointer-events: none;
++}
++
+ .channelsGrid {
+   display: grid;
+   grid-template-columns: repeat(auto-fill, minmax(346px, 1fr));
 diff --git a/src/pages/Control/Channels/index.tsx b/src/pages/Control/Channels/index.tsx
-index 54f2acc..2f11406 100644
+index 54f2acc..02e94b1 100644
 --- a/src/pages/Control/Channels/index.tsx
 +++ b/src/pages/Control/Channels/index.tsx
-@@ -17,6 +17,17 @@ import {
+@@ -1,4 +1,10 @@
+-import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  useCallback,
++  useEffect,
++  useMemo,
++  useRef,
++  useState,
++} from "react";
+ import { Form } from "@agentscope-ai/design";
+ import { Badge, Button, Space } from "antd";
+ import { SafetyOutlined, AuditOutlined } from "@ant-design/icons";
+@@ -17,6 +23,18 @@ import {
  import { PageHeader } from "@/components/PageHeader";
  import { useAppMessage } from "../../../hooks/useAppMessage";
  import styles from "./index.module.less";
@@ -4304,25 +4624,46 @@ index 54f2acc..2f11406 100644
 +  deriveMatrixAuthMethod,
 +  handleChannelSaveError,
 +  normalizeChannelFormValues,
++  refreshChannelAfterRevisionConflict,
 +  saveChannelWithRetry,
 +} from "./channelSecurity";
 
  type FilterType = "all" | "builtin" | "custom";
 
-@@ -38,8 +49,7 @@ function ChannelsPage() {
+@@ -29,7 +47,12 @@ function ChannelsPage() {
+     channelSchemas,
+     isBuiltin,
+     loading,
++    ready,
++    coreStatus,
++    schemaStatus,
+     fetchChannels,
++    retrySchemas,
++    fetchChannelConfig,
+   } = useChannels();
+   const [filter, setFilter] = useState<FilterType>("all");
+   const [saving, setSaving] = useState(false);
+@@ -38,8 +61,8 @@ function ChannelsPage() {
    const [aclDrawerOpen, setAclDrawerOpen] = useState(false);
    const [pendingDrawerOpen, setPendingDrawerOpen] = useState(false);
    const [pendingCount, setPendingCount] = useState(0);
 -  // eslint-disable-next-line @typescript-eslint/no-explicit-any
 -  const [form] = Form.useForm<any>();
++  const submissionInFlight = useRef(false);
 +  const [form] = Form.useForm<Record<string, unknown>>();
 
    const fetchPendingCount = useCallback(async () => {
      try {
-@@ -83,22 +93,22 @@ function ChannelsPage() {
+@@ -79,26 +102,43 @@ function ChannelsPage() {
+   }, [channels, orderedKeys, filter, isBuiltin]);
+
+   const handleCardClick = useCallback(
+-    (key: ChannelKey) => {
++    async (key: ChannelKey) => {
++      if (!ready || !channelSchemas[key]) return;
        setActiveKey(key);
        setDrawerOpen(true);
-       const channelConfig = channels[key] || { enabled: false, bot_prefix: "" };
+-      const channelConfig = channels[key] || { enabled: false, bot_prefix: "" };
 -      // Migrate legacy allowlist policy to new access control fields
 -      const accessControlDm =
 -        channelConfig.access_control_dm ||
@@ -4339,13 +4680,23 @@ index 54f2acc..2f11406 100644
 -      });
 +      const schema = channelSchemas[key];
 +      if (!schema) return;
++      let channelConfig: ChannelConfigResponse | null;
++      try {
++        channelConfig = await fetchChannelConfig(key);
++      } catch {
++        setDrawerOpen(false);
++        setActiveKey(null);
++        message.error(t("channels.configFailed"));
++        return;
++      }
++      if (!channelConfig) return;
 +      const formValues = normalizeChannelFormValues(
-+        channelConfig as ChannelConfigResponse,
++        channelConfig,
 +        schema,
 +      );
 +      if (key === "matrix") {
 +        formValues.auth_method = deriveMatrixAuthMethod(
-+          channelConfig as ChannelConfigResponse,
++          channelConfig,
 +        );
 +      }
 +      form.setFieldsValue(
@@ -4353,14 +4704,22 @@ index 54f2acc..2f11406 100644
 +      );
      },
 -    [channels, form],
-+    [channelSchemas, channels, form],
++    [
++      channelSchemas,
++      fetchChannelConfig,
++      form,
++      message,
++      ready,
++      t,
++    ],
    );
 
    const handleDrawerClose = () => {
-@@ -108,31 +118,36 @@ function ChannelsPage() {
+@@ -107,33 +147,53 @@ function ChannelsPage() {
+   };
 
    const handleSubmit = async (values: Record<string, unknown>) => {
-     if (!activeKey) return;
+-    if (!activeKey) return;
 -
 -    // eslint-disable-next-line @typescript-eslint/no-unused-vars
 -    const { isBuiltin: _isBuiltin, ...savedConfig } = channels[activeKey] || {};
@@ -4370,6 +4729,7 @@ index 54f2acc..2f11406 100644
 -      filter_tool_messages: !values.filter_tool_messages,
 -      filter_thinking: !values.filter_thinking,
 -    };
++    if (!activeKey || submissionInFlight.current) return;
 +    const current = channels[activeKey] as ChannelConfigResponse | undefined;
 +    const schema = channelSchemas[activeKey];
 +    if (!current || !schema) return;
@@ -4382,6 +4742,7 @@ index 54f2acc..2f11406 100644
 +      activeKey,
 +    );
 
++    submissionInFlight.current = true;
      setSaving(true);
      try {
 -      await api.updateChannelConfig(
@@ -4401,6 +4762,19 @@ index 54f2acc..2f11406 100644
      } catch (error) {
 -      console.error("❌ Failed to update channel config:", error);
 -      message.error(t("channels.configFailed"));
++      try {
++        const refreshed = await refreshChannelAfterRevisionConflict(
++          error,
++          () => fetchChannelConfig(activeKey),
++        );
++        if (refreshed) {
++          message.warning("配置已更新，请确认后重试");
++          return;
++        }
++      } catch {
++        message.error(t("channels.configFailed"));
++        return;
++      }
 +      handleChannelSaveError(
 +        error,
 +        schema,
@@ -4408,13 +4782,76 @@ index 54f2acc..2f11406 100644
 +        () => message.error(t("channels.configFailed")),
 +      );
      } finally {
++      submissionInFlight.current = false;
        setSaving(false);
      }
+   };
+@@ -192,6 +252,26 @@ function ChannelsPage() {
+           </div>
+         ) : (
+           <>
++            {!ready && (
++              <div className={styles.loading} role="alert">
++                <span className={styles.loadingText}>
++                  {schemaStatus === "error"
++                    ? "渠道配置架构加载失败"
++                    : "渠道配置加载失败"}
++                </span>
++                <Button
++                  onClick={() => {
++                    if (schemaStatus === "error") {
++                      void retrySchemas();
++                    } else if (coreStatus === "error") {
++                      void fetchChannels();
++                    }
++                  }}
++                >
++                  {t("common.retry")}
++                </Button>
++              </div>
++            )}
+             {/* Enabled Channels Section */}
+             <div className={styles.panelSection}>
+               <div className={styles.panelTitle}>
+@@ -211,6 +291,7 @@ function ChannelsPage() {
+                       config={config}
+                       iconUrl={channelSchemas[key]?.icon}
+                       onClick={() => handleCardClick(key)}
++                      disabled={!ready}
+                     />
+                   ))}
+                 </div>
+@@ -250,6 +331,7 @@ function ChannelsPage() {
+                       channelKey={key}
+                       iconUrl={channelSchemas[key]?.icon}
+                       onClick={() => handleCardClick(key)}
++                      disabled={!ready}
+                     />
+                   ))}
+                 </div>
 diff --git a/src/pages/Control/Channels/useChannels.test.ts b/src/pages/Control/Channels/useChannels.test.ts
-index 6f5a746..3ec96cb 100644
+index 6f5a746..91e2779 100644
 --- a/src/pages/Control/Channels/useChannels.test.ts
 +++ b/src/pages/Control/Channels/useChannels.test.ts
-@@ -61,7 +61,7 @@ describe("useChannels", () => {
+@@ -7,6 +7,8 @@ vi.mock("../../../api", () => ({
+   default: {
+     listChannels: vi.fn(),
+     listChannelTypes: vi.fn(),
++    listChannelSchemas: vi.fn(),
++    getChannelConfig: vi.fn(),
+   },
+ }));
+
+@@ -22,6 +24,8 @@ describe("useChannels", () => {
+     vi.clearAllMocks();
+     (api.listChannels as ReturnType<typeof vi.fn>).mockResolvedValue({});
+     (api.listChannelTypes as ReturnType<typeof vi.fn>).mockResolvedValue([]);
++    (api.listChannelSchemas as ReturnType<typeof vi.fn>).mockResolvedValue({});
++    (api.getChannelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({});
+   });
+
+   it("初始 loading=true，fetch 成功后 loading=false", async () => {
+@@ -61,7 +65,7 @@ describe("useChannels", () => {
      expect(result.current.channelTypes).toEqual(mockTypes);
    });
 
@@ -4423,7 +4860,7 @@ index 6f5a746..3ec96cb 100644
      (api.listChannels as ReturnType<typeof vi.fn>).mockResolvedValue({});
      (api.listChannelTypes as ReturnType<typeof vi.fn>).mockResolvedValue([
        "dingtalk",
-@@ -75,11 +75,7 @@ describe("useChannels", () => {
+@@ -75,11 +79,7 @@ describe("useChannels", () => {
        expect(result.current.loading).toBe(false);
      });
 
@@ -4436,11 +4873,266 @@ index 6f5a746..3ec96cb 100644
    });
 
    it("orderedKeys 中不在 builtinOrder 的 key 出现在末尾", async () => {
+@@ -160,4 +160,137 @@ describe("useChannels", () => {
+     expect(result.current.isBuiltin("dingtalk")).toBe(false);
+     expect(result.current.isBuiltin("non-existent-key")).toBe(false);
+   });
++
++  it("channels 和 types 先完成时仍等待 schemas，三者成功后才 ready", async () => {
++    const channels = deferred<Record<string, Record<string, unknown>>>();
++    const types = deferred<string[]>();
++    const schemas = deferred<Record<string, never>>();
++    (api.listChannels as ReturnType<typeof vi.fn>).mockReturnValue(
++      channels.promise,
++    );
++    (api.listChannelTypes as ReturnType<typeof vi.fn>).mockReturnValue(
++      types.promise,
++    );
++    (api.listChannelSchemas as ReturnType<typeof vi.fn>).mockReturnValue(
++      schemas.promise,
++    );
++
++    const { result } = renderHook(() => useChannels());
++    channels.resolve({ telegram: { enabled: false } });
++    types.resolve(["telegram"]);
++    await waitFor(() => {
++      expect(api.listChannelSchemas).toHaveBeenCalledTimes(1);
++    });
++
++    expect(Reflect.get(result.current, "ready")).toBe(false);
++    expect(Reflect.get(result.current, "schemaStatus")).toBe("loading");
++
++    schemas.resolve({});
++    await waitFor(() => {
++      expect(Reflect.get(result.current, "ready")).toBe(true);
++    });
++  });
++
++  it("schema 失败后保持不可编辑，并可显式重试到 ready", async () => {
++    (api.listChannelSchemas as ReturnType<typeof vi.fn>)
++      .mockRejectedValueOnce(new Error("schema unavailable"))
++      .mockResolvedValueOnce({});
++
++    const { result } = renderHook(() => useChannels());
++    await waitFor(() => {
++      expect(Reflect.get(result.current, "schemaStatus")).toBe("error");
++    });
++    expect(Reflect.get(result.current, "ready")).toBe(false);
++
++    const retrySchemas = Reflect.get(result.current, "retrySchemas");
++    expect(typeof retrySchemas).toBe("function");
++    retrySchemas();
++    await waitFor(() => {
++      expect(Reflect.get(result.current, "ready")).toBe(true);
++    });
++    expect(api.listChannelSchemas).toHaveBeenCalledTimes(2);
++  });
++
++  it("较早一次刷新晚到时不能覆盖较新刷新结果", async () => {
++    const firstChannels =
++      deferred<Record<string, Record<string, unknown>>>();
++    const firstTypes = deferred<string[]>();
++    const firstSchemas = deferred<Record<string, never>>();
++    const secondChannels =
++      deferred<Record<string, Record<string, unknown>>>();
++    const secondTypes = deferred<string[]>();
++    const secondSchemas = deferred<Record<string, never>>();
++    (api.listChannels as ReturnType<typeof vi.fn>)
++      .mockReturnValueOnce(firstChannels.promise)
++      .mockReturnValueOnce(secondChannels.promise);
++    (api.listChannelTypes as ReturnType<typeof vi.fn>)
++      .mockReturnValueOnce(firstTypes.promise)
++      .mockReturnValueOnce(secondTypes.promise);
++    (api.listChannelSchemas as ReturnType<typeof vi.fn>)
++      .mockReturnValueOnce(firstSchemas.promise)
++      .mockReturnValueOnce(secondSchemas.promise);
++
++    const { result } = renderHook(() => useChannels());
++    result.current.fetchChannels();
++
++    secondChannels.resolve({ discord: { enabled: true } });
++    secondTypes.resolve(["discord"]);
++    secondSchemas.resolve({});
++    await waitFor(() => {
++      expect(result.current.channelTypes).toEqual(["discord"]);
++    });
++
++    firstChannels.resolve({ telegram: { enabled: false } });
++    firstTypes.resolve(["telegram"]);
++    firstSchemas.resolve({});
++    await waitFor(() => {
++      expect(api.listChannelSchemas).toHaveBeenCalledTimes(2);
++    });
++    expect(result.current.channelTypes).toEqual(["discord"]);
++    expect(result.current.channels).toEqual({
++      discord: { enabled: true },
++    });
++  });
++
++  it("A→B 快速切换时 A 的迟到详情不能覆盖当前 B", async () => {
++    const telegram = deferred<Record<string, unknown>>();
++    const discord = deferred<Record<string, unknown>>();
++    (api.getChannelConfig as ReturnType<typeof vi.fn>)
++      .mockReturnValueOnce(telegram.promise)
++      .mockReturnValueOnce(discord.promise);
++    const { result } = renderHook(() => useChannels());
++    await waitFor(() => {
++      expect(result.current.loading).toBe(false);
++    });
++
++    const fetchChannelConfig = Reflect.get(
++      result.current,
++      "fetchChannelConfig",
++    );
++    expect(typeof fetchChannelConfig).toBe("function");
++    const telegramRequest = fetchChannelConfig("telegram");
++    const discordRequest = fetchChannelConfig("discord");
++    discord.resolve({ enabled: true, revision: 4 });
++    await expect(discordRequest).resolves.toMatchObject({
++      revision: 4,
++    });
++    telegram.resolve({ enabled: false, revision: 2 });
++    await expect(telegramRequest).resolves.toBeNull();
++    await waitFor(() => {
++      expect(result.current.channels.discord).toMatchObject({
++        revision: 4,
++      });
++    });
++    expect(result.current.channels.telegram).toBeUndefined();
++  });
+ });
++
++function deferred<T>() {
++  let resolve!: (value: T) => void;
++  let reject!: (error: unknown) => void;
++  const promise = new Promise<T>((onResolve, onReject) => {
++    resolve = onResolve;
++    reject = onReject;
++  });
++  return { promise, resolve, reject };
++}
 diff --git a/src/pages/Control/Channels/useChannels.ts b/src/pages/Control/Channels/useChannels.ts
-index 8266189..ec1e11b 100644
+index 8266189..e7d5952 100644
 --- a/src/pages/Control/Channels/useChannels.ts
 +++ b/src/pages/Control/Channels/useChannels.ts
-@@ -45,19 +45,23 @@ export function useChannels() {
+@@ -1,8 +1,16 @@
+-import { useState, useEffect, useCallback, useMemo } from "react";
++import {
++  useState,
++  useEffect,
++  useCallback,
++  useMemo,
++  useRef,
++} from "react";
+ import api from "../../../api";
+ import type { ChannelSchema } from "../../../api/modules/channel";
+ import { useAgentStore } from "../../../stores/agentStore";
+
++type LoadStatus = "loading" | "ready" | "error";
++
+ export function useChannels() {
+   const { selectedAgent } = useAgentStore();
+   const [channels, setChannels] = useState<
+@@ -12,29 +20,81 @@ export function useChannels() {
+   const [channelSchemas, setChannelSchemas] = useState<
+     Record<string, ChannelSchema>
+   >({});
+-  const [loading, setLoading] = useState(true);
++  const [coreStatus, setCoreStatus] = useState<LoadStatus>("loading");
++  const [schemaStatus, setSchemaStatus] =
++    useState<LoadStatus>("loading");
++  const refreshGeneration = useRef(0);
++  const schemaGeneration = useRef(0);
++  const detailGeneration = useRef(0);
+
+   const fetchChannels = useCallback(async () => {
+-    setLoading(true);
+-    try {
+-      const [data, types] = await Promise.all([
+-        api.listChannels(),
+-        api.listChannelTypes(),
+-      ]);
+-      if (data)
+-        setChannels(data as unknown as Record<string, Record<string, unknown>>);
+-      if (types) setChannelTypes(types);
+-    } catch (error) {
+-      console.error("❌ Failed to load channels:", error);
+-    } finally {
+-      setLoading(false);
++    const generation = ++refreshGeneration.current;
++    const currentSchemaGeneration = ++schemaGeneration.current;
++    detailGeneration.current += 1;
++    setCoreStatus("loading");
++    setSchemaStatus("loading");
++
++    const [coreResult, schemaResult] = await Promise.allSettled([
++      Promise.all([api.listChannels(), api.listChannelTypes()]),
++      api.listChannelSchemas(),
++    ]);
++    if (generation !== refreshGeneration.current) return;
++
++    if (coreResult.status === "fulfilled") {
++      const [data, types] = coreResult.value;
++      setChannels(
++        (data ?? {}) as unknown as Record<
++          string,
++          Record<string, unknown>
++        >,
++      );
++      setChannelTypes(types ?? []);
++      setCoreStatus("ready");
++    } else {
++      console.error("❌ Failed to load channels:", coreResult.reason);
++      setCoreStatus("error");
++    }
++    if (
++      currentSchemaGeneration !== schemaGeneration.current
++    ) {
++      return;
++    }
++    if (schemaResult.status === "fulfilled") {
++      setChannelSchemas(schemaResult.value ?? {});
++      setSchemaStatus("ready");
++    } else {
++      setSchemaStatus("error");
+     }
+-    // Fetch schemas separately so failures don't block core channel loading
++  }, []);
++
++  const retrySchemas = useCallback(async () => {
++    const generation = ++schemaGeneration.current;
++    setSchemaStatus("loading");
+     try {
+       const schemas = await api.listChannelSchemas();
+-      if (schemas) setChannelSchemas(schemas);
++      if (generation !== schemaGeneration.current) return;
++      setChannelSchemas(schemas ?? {});
++      setSchemaStatus("ready");
+     } catch {
+-      // Plugin system may not be available; non-critical
++      if (generation === schemaGeneration.current) {
++        setSchemaStatus("error");
++      }
++    }
++  }, []);
++
++  const fetchChannelConfig = useCallback(async (channelName: string) => {
++    const generation = ++detailGeneration.current;
++    try {
++      const config = await api.getChannelConfig(channelName);
++      if (generation !== detailGeneration.current) return null;
++      setChannels((current) => ({
++        ...current,
++        [channelName]: config as unknown as Record<string, unknown>,
++      }));
++      return config;
++    } catch (error) {
++      if (generation !== detailGeneration.current) return null;
++      throw error;
+     }
+   }, []);
+
+@@ -45,19 +105,23 @@ export function useChannels() {
    // Built-in channels come first (in a fixed order), then custom channels
    const builtinOrder = useMemo(
      () => [
@@ -4471,7 +5163,7 @@ index 8266189..ec1e11b 100644
      ],
      [],
    );
-@@ -65,7 +69,9 @@ export function useChannels() {
+@@ -65,7 +129,9 @@ export function useChannels() {
    const orderedKeys = useMemo(
      () => [
        ...builtinOrder.filter((k) => channelTypes.includes(k)),
@@ -4482,6 +5174,29 @@ index 8266189..ec1e11b 100644
      ],
      [builtinOrder, channelTypes],
    );
+@@ -75,6 +141,10 @@ export function useChannels() {
+     (key: string) => Boolean(channels[key]?.isBuiltin),
+     [channels],
+   );
++  const loading =
++    coreStatus === "loading" || schemaStatus === "loading";
++  const ready =
++    coreStatus === "ready" && schemaStatus === "ready";
+
+   return {
+     channels,
+@@ -83,6 +153,11 @@ export function useChannels() {
+     orderedKeys,
+     isBuiltin,
+     loading,
++    ready,
++    coreStatus,
++    schemaStatus,
+     fetchChannels,
++    retrySchemas,
++    fetchChannelConfig,
+   };
+ }
 diff --git a/src/pages/Settings/Agents/components/AgentModal.test.tsx b/src/pages/Settings/Agents/components/AgentModal.test.tsx
 new file mode 100644
 index 0000000..cfa08b8

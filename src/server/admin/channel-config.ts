@@ -7,6 +7,7 @@ import type {
   AdminChannelConfigWrite,
   AdminChannelSecretStatus,
 } from "@/server/admin/compat/handlers/channels";
+import { containsSecretExposure } from "@/server/admin/secret-content";
 import {
   CHANNEL_TYPES,
   getChannelManifest,
@@ -18,6 +19,7 @@ import {
   type AbortablePoolClientGuard,
 } from "@/server/db/abortable-client";
 import {
+  encryptedSecretFromStorage,
   validateSecretPlaintext,
   type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
@@ -50,6 +52,14 @@ type ConnectionRow = {
 type ConnectionSecretRow = ConnectionRow & {
   field_name: string | null;
   rotated_at: Date | string | null;
+};
+
+type StoredSecretRow = {
+  field_name: string;
+  ciphertext: Buffer;
+  nonce: Buffer;
+  auth_tag: Buffer;
+  key_version: number;
 };
 
 type PreparedWrite = AdminChannelConfigWrite & {
@@ -141,6 +151,13 @@ export function createAdminChannelConfigService(
 
         const active = await lockActiveConnections(client, prepared);
         if (active.length > 1) throw ambiguousConnection();
+        validateLockedRevision(prepared, active);
+        await validatePublicConfigSecrets(
+          client,
+          prepared,
+          active[0],
+          secretKey,
+        );
         let updated: ConnectionRow;
         let beforeSnapshot: AdminChannelConfigSnapshot;
         let action: "channel_connection.create" | "channel_connection.update";
@@ -284,6 +301,15 @@ export function createAdminChannelConfigService(
           const active = await lockActiveConnections(client, item);
           validateLockedRevision(item, active);
           locked.set(item.type, active);
+        }
+        for (const item of prepared) {
+          await validatePublicConfigSecrets(
+            client,
+            item,
+            locked.get(item.type)?.[0],
+            secretKey,
+          );
+          lifecycle.signal.throwIfAborted();
         }
 
         const snapshots = new Map<
@@ -612,6 +638,49 @@ async function lockActiveConnections(
     [input.scope.userId, input.scope.agentId, input.type],
   );
   return result.rows;
+}
+
+async function validatePublicConfigSecrets(
+  client: PoolClient,
+  input: PreparedWrite,
+  connection: ConnectionRow | undefined,
+  key: ChannelSecretsKey,
+): Promise<void> {
+  const plaintextValues = input.secretChanges.flatMap((change) =>
+    change.operation === "set" ? [change.value] : []
+  );
+  if (connection) {
+    const manifest = getChannelManifest(input.type);
+    const result = await client.query<StoredSecretRow>(
+      `SELECT field_name, ciphertext, nonce, auth_tag, key_version
+       FROM channel_secrets
+       WHERE connection_id = $1
+         AND field_name = ANY($2::text[])`,
+      [connection.id, manifest.secretFields],
+    );
+    for (const row of result.rows) {
+      const encrypted = encryptedSecretFromStorage({
+        ciphertext: row.ciphertext,
+        nonce: row.nonce,
+        authTag: row.auth_tag,
+        keyVersion: row.key_version,
+      });
+      plaintextValues.push(
+        key.decrypt(encrypted, {
+          userId: input.scope.userId,
+          agentId: input.scope.agentId,
+          connectionId: connection.id,
+          fieldName: row.field_name,
+        }),
+      );
+    }
+  }
+  if (containsSecretExposure(input.config, plaintextValues)) {
+    throw new AdminChannelConfigError(
+      400,
+      "secret_in_public_config",
+    );
+  }
 }
 
 async function insertConnection(

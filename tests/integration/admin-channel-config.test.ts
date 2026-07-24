@@ -192,6 +192,239 @@ describe("admin channel configuration service", () => {
     expect(JSON.stringify(audit.rows[0])).not.toContain(TOKEN);
   });
 
+  it.each([
+    [
+      "机器人前缀",
+      "telegram" as const,
+      {
+        bot_prefix: `Bearer ${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      "bot_token",
+    ],
+    [
+      "URL 查询参数",
+      "telegram" as const,
+      {
+        base_url: `https://api.telegram.test/?token=${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      "bot_token",
+    ],
+    [
+      "嵌套对象键",
+      "matrix" as const,
+      {
+        groups: {
+          [TOKEN]: { autoReply: true },
+        },
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      "access_token",
+    ],
+  ])(
+    "rejects a newly supplied secret repeated in public %s before any durable write",
+    async (_label, type, config, secretFieldName) => {
+      if (key.status !== "ready") throw new Error("test_key_not_ready");
+      const service = createAdminChannelConfigService(primary, key.key);
+
+      const error = await service.update({
+        scope: { userId: USER_ID, agentId: AGENT_ID },
+        type,
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        enabled: false,
+        config,
+        secretChanges: [
+          {
+            fieldName: secretFieldName,
+            operation: "set",
+            value: TOKEN,
+          },
+        ],
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        status: 400,
+        code: "secret_in_public_config",
+        message: "secret_in_public_config",
+      });
+      expect(JSON.stringify(error)).not.toContain(TOKEN);
+      await expect(readDurableChannelText(primary)).resolves.not.toContain(
+        TOKEN,
+      );
+      await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+        connections: "0",
+        secrets: "0",
+        audits: "0",
+      });
+    },
+  );
+
+  it("rejects a retained encrypted secret repeated in the next public config", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+
+    const error = await service.update({
+      ...createInput(OTHER_OPERATION_ID),
+      expectedRevision: 1,
+      config: {
+        bot_prefix: `token=${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    expect(JSON.stringify(error)).not.toContain(TOKEN);
+    const stored = await primary.query<{
+      revision: number;
+      config: Record<string, unknown>;
+    }>("SELECT revision, config FROM channel_connections");
+    expect(stored.rows).toMatchObject([
+      {
+        revision: 1,
+        config: {
+          bot_prefix: "",
+          filter_tool_messages: true,
+          filter_thinking: true,
+        },
+      },
+    ]);
+    await expect(readDurableChannelText(primary)).resolves.not.toContain(
+      TOKEN,
+    );
+    await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+      connections: "1",
+      secrets: "1",
+      audits: "1",
+    });
+  });
+
+  it("rejects a rotated secret repeated in public config before updating the row or audit", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+    const rotated = "rotated-integration-token";
+
+    const error = await service.update({
+      ...createInput(OTHER_OPERATION_ID),
+      expectedRevision: 1,
+      config: {
+        bot_prefix: `Bearer ${rotated}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [
+        {
+          fieldName: "bot_token",
+          operation: "set",
+          value: rotated,
+        },
+      ],
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    expect(JSON.stringify(error)).not.toContain(rotated);
+    await expect(readDurableChannelText(primary)).resolves.not.toContain(
+      rotated,
+    );
+    await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+      connections: "1",
+      secrets: "1",
+      audits: "1",
+    });
+  });
+
+  it("rejects moving an existing credential into public config while deleting it", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+
+    const error = await service.update({
+      ...createInput(OTHER_OPERATION_ID),
+      expectedRevision: 1,
+      config: {
+        bot_prefix: TOKEN,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [
+        { fieldName: "bot_token", operation: "delete" },
+      ],
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+      connections: "1",
+      secrets: "1",
+      audits: "1",
+    });
+  });
+
+  it("rejects a secret exposure in the second bulk item before the first item writes", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    const inputs = CHANNEL_TYPES.map((type, index) => ({
+      scope: { userId: USER_ID, agentId: AGENT_ID },
+      type,
+      operationId:
+        `30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      expectedRevision: 0,
+      enabled: false,
+      config:
+        type === "discord"
+          ? {
+              bot_prefix: `Bearer ${TOKEN}`,
+              filter_tool_messages: true,
+              filter_thinking: true,
+            }
+          : {},
+      secretChanges:
+        type === "discord"
+          ? [
+              {
+                fieldName: "bot_token",
+                operation: "set" as const,
+                value: TOKEN,
+              },
+            ]
+          : [],
+    }));
+
+    const error = await service.updateMany(inputs).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    expect(JSON.stringify(error)).not.toContain(TOKEN);
+    await expect(readDurableChannelText(primary)).resolves.not.toContain(
+      TOKEN,
+    );
+    await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+      connections: "0",
+      secrets: "0",
+      audits: "0",
+    });
+  });
+
   it("allows only one different operation to create the canonical connection", async () => {
     if (key.status !== "ready") throw new Error("test_key_not_ready");
     const first = createAdminChannelConfigService(primary, key.key);
@@ -791,6 +1024,37 @@ async function readStoredSecret(pool: Pool) {
   const row = result.rows[0];
   if (!row) throw new Error("stored_secret_not_found");
   return row;
+}
+
+async function readChannelWriteCounts(pool: Pool) {
+  const result = await pool.query<{
+    connections: string;
+    secrets: string;
+    audits: string;
+  }>(
+    `SELECT
+       (SELECT count(*) FROM channel_connections) AS connections,
+       (SELECT count(*) FROM channel_secrets) AS secrets,
+       (SELECT count(*) FROM admin_audit_logs) AS audits`,
+  );
+  return result.rows[0];
+}
+
+async function readDurableChannelText(pool: Pool): Promise<string> {
+  const result = await pool.query<{ text: string }>(
+    `SELECT concat_ws(
+       ' ',
+       COALESCE(
+         (SELECT json_agg(connection.*)::text FROM channel_connections connection),
+         ''
+       ),
+       COALESCE(
+         (SELECT json_agg(audit.*)::text FROM admin_audit_logs audit),
+         ''
+       )
+     ) AS text`,
+  );
+  return result.rows[0]?.text ?? "";
 }
 
 function commitOutcomeUnknownPool(pool: Pool): Pool {
