@@ -82,6 +82,127 @@ describe("channel audit public config validation", () => {
       expect(connect).not.toHaveBeenCalled();
     },
   );
+
+  it.each([
+    [
+      "URL query substring",
+      "query-secret-value",
+      { endpoint: "https://example.test/hook?token=query-secret-value" },
+      ["endpoint"],
+    ],
+    [
+      "Bearer substring",
+      "bearer-secret-value",
+      { authorization: "Bearer bearer-secret-value" },
+      ["authorization"],
+    ],
+    [
+      "JSON fragment substring",
+      "json-secret-value",
+      { payload: '{"token":"json-secret-value"}' },
+      ["payload"],
+    ],
+    [
+      "nested object key",
+      "secret_key",
+      { nested: { secret_key: "safe" } },
+      ["nested"],
+    ],
+    [
+      "audit field name",
+      "audit_field",
+      { endpoint: "safe" },
+      ["audit_field"],
+    ],
+    [
+      "eight-byte substring",
+      "12345678",
+      { endpoint: "prefix-12345678-suffix" },
+      ["endpoint"],
+    ],
+    [
+      "multi-byte eight-byte substring",
+      "密ab钥",
+      { endpoint: "前缀密ab钥后缀" },
+      ["endpoint"],
+    ],
+  ])(
+    "rejects a new secret found as a %s before connecting",
+    async (_label, secret, config, auditConfigFields) => {
+      if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+      const connect = vi.fn(() => {
+        throw new Error("pool_must_not_be_reached");
+      });
+      const service = createChannelConnectionAuditService(
+        { connect } as unknown as Pool,
+        KEY_STATE.key,
+      );
+
+      await expect(
+        service.update({
+          ...updateInput(secret, config),
+          auditConfigFields,
+        }),
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "secret_in_public_config",
+        message: "secret_in_public_config",
+      });
+      expect(connect).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      "seven-byte substring",
+      "1234567",
+      { endpoint: "prefix-1234567-suffix" },
+    ],
+    [
+      "six-byte multi-byte substring",
+      "密a钥",
+      { endpoint: "前缀密a钥后缀" },
+    ],
+  ])(
+    "allows an unrelated %s while retaining exact matching for short secrets",
+    async (_label, secret, config) => {
+      if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+      const connect = vi.fn(() => {
+        throw new Error("validation_passed");
+      });
+      const service = createChannelConnectionAuditService(
+        { connect } as unknown as Pool,
+        KEY_STATE.key,
+      );
+
+      await expect(
+        service.update(updateInput(secret, config)),
+      ).rejects.toThrow("validation_passed");
+      expect(connect).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["1234567", "密a钥"])(
+    "still rejects an exact short secret",
+    async (secret) => {
+      if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+      const connect = vi.fn(() => {
+        throw new Error("pool_must_not_be_reached");
+      });
+      const service = createChannelConnectionAuditService(
+        { connect } as unknown as Pool,
+        KEY_STATE.key,
+      );
+
+      await expect(
+        service.update(updateInput(secret, { endpoint: secret })),
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "secret_in_public_config",
+      });
+      expect(connect).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function updateInput(

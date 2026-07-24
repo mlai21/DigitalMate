@@ -2,11 +2,26 @@ import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
 import {
+  connectPoolClient,
+  guardPoolClientWithAbort,
+  type AbortablePoolClientGuard,
+} from "@/server/db/abortable-client";
+import {
+  encryptedSecretFromStorage,
   validateSecretPlaintext,
   type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
 
 type JsonObject = Record<string, unknown>;
+
+const COMPATIBILITY_TIMEOUT_MS = 120_000;
+const MAX_LIFECYCLE_TIMEOUT_MS = COMPATIBILITY_TIMEOUT_MS - 1;
+const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
+const TRANSACTION_LOCK_TIMEOUT_MS = 10_000;
+const TRANSACTION_STATEMENT_TIMEOUT_MS = 110_000;
+// Long secrets are distinctive enough to block when embedded in another
+// public string; short values require an exact match to avoid false positives.
+const SECRET_SUBSTRING_MIN_UTF8_BYTES = 8;
 
 export type ChannelSecretChange =
   | Readonly<{
@@ -41,6 +56,10 @@ export type ChannelConnectionConfigUpdateResult = Readonly<{
   revision: number;
 }>;
 
+export type ChannelConnectionAuditServiceOptions = Readonly<{
+  lifecycleTimeoutMs?: number;
+}>;
+
 type ChannelConnectionRow = {
   id: string;
   user_id: string;
@@ -70,6 +89,11 @@ type PreparedSecretChange =
       fieldName: string;
       operation: "delete";
     }>;
+
+type DeclaredSecretState = Readonly<{
+  configuredFields: ReadonlySet<string>;
+  plaintextValues: readonly string[];
+}>;
 
 export class AdminAuditError extends Error {
   readonly status: number;
@@ -101,16 +125,37 @@ export class AdminAuditError extends Error {
 export function createChannelConnectionAuditService(
   pool: Pool,
   secretKey: ChannelSecretsKey,
+  options: ChannelConnectionAuditServiceOptions = {},
 ) {
+  const lifecycleTimeoutMs = normalizeLifecycleTimeout(
+    options.lifecycleTimeoutMs,
+  );
   return {
     async update(
       input: ChannelConnectionConfigUpdate,
+      outerSignal?: AbortSignal,
     ): Promise<ChannelConnectionConfigUpdateResult> {
-      const prepared = prepareUpdate(input);
-      const client = await pool.connect();
+      const lifecycle = createBoundedLifecycle(
+        lifecycleTimeoutMs,
+        outerSignal,
+      );
+      let client: PoolClient | undefined;
+      let clientGuard: AbortablePoolClientGuard | undefined;
       try {
+        lifecycle.signal.throwIfAborted();
+        const prepared = prepareUpdate(input);
+        client = await connectPoolClient(pool, lifecycle.signal);
+        clientGuard = guardPoolClientWithAbort(
+          client,
+          lifecycle.signal,
+        );
+        lifecycle.signal.throwIfAborted();
         await client.query("BEGIN");
+        lifecycle.signal.throwIfAborted();
+        await setTransactionTimeouts(client);
+        lifecycle.signal.throwIfAborted();
         const before = await lockConnection(client, input);
+        lifecycle.signal.throwIfAborted();
         if (
           before === null ||
           before.revision !== input.expectedRevision
@@ -118,43 +163,81 @@ export function createChannelConnectionAuditService(
           throw revisionConflict();
         }
 
-        const beforeConfiguredSecrets = await readConfiguredSecretFields(
+        const beforeSecrets = await readDeclaredSecrets(
           client,
-          before.id,
+          before,
           prepared.secretFieldNames,
+          secretKey,
         );
+        lifecycle.signal.throwIfAborted();
+        if (
+          containsSecretExposure(
+            prepared.config,
+            prepared.auditConfigFields,
+            beforeSecrets.plaintextValues,
+          )
+        ) {
+          throw new AdminAuditError(400, "secret_in_public_config");
+        }
         const updated = await updateConnection(
           client,
           input,
           prepared.config,
         );
+        lifecycle.signal.throwIfAborted();
         if (updated === null) throw revisionConflict();
         await applySecretChanges(
           client,
           before,
           prepared.secretChanges,
           secretKey,
+          lifecycle.signal,
         );
         const afterConfiguredSecrets = applyConfiguredChanges(
-          beforeConfiguredSecrets,
+          beforeSecrets.configuredFields,
           prepared.secretChanges,
         );
         await insertSuccessAudit(client, input, prepared, {
           before,
           updated,
-          beforeConfiguredSecrets,
+          beforeConfiguredSecrets: beforeSecrets.configuredFields,
           afterConfiguredSecrets,
         });
+        lifecycle.signal.throwIfAborted();
         await client.query("COMMIT");
+        lifecycle.signal.throwIfAborted();
         return { revision: updated.revision };
       } catch (caught) {
-        await rollbackPreservingOriginalError(client);
+        if (client !== undefined && clientGuard?.destroyed !== true) {
+          await rollbackPreservingOriginalError(client);
+        }
+        if (
+          lifecycle.signal.aborted ||
+          isPostgresTimeoutError(caught)
+        ) {
+          throw updateFailed();
+        }
         throw caught;
       } finally {
-        client.release();
+        lifecycle.dispose();
+        clientGuard?.dispose();
+        if (client !== undefined && clientGuard?.destroyed !== true) {
+          client.release();
+        }
       }
     },
   };
+}
+
+async function setTransactionTimeouts(
+  client: PoolClient,
+): Promise<void> {
+  await client.query(
+    `SET LOCAL lock_timeout = '${TRANSACTION_LOCK_TIMEOUT_MS}ms'`,
+  );
+  await client.query(
+    `SET LOCAL statement_timeout = '${TRANSACTION_STATEMENT_TIMEOUT_MS}ms'`,
+  );
 }
 
 async function lockConnection(
@@ -207,20 +290,54 @@ async function updateConnection(
   return result.rows[0] ?? null;
 }
 
-async function readConfiguredSecretFields(
+async function readDeclaredSecrets(
   client: PoolClient,
-  connectionId: string,
+  connection: ChannelConnectionRow,
   secretFieldNames: readonly string[],
-): Promise<ReadonlySet<string>> {
-  if (secretFieldNames.length === 0) return new Set();
-  const result = await client.query<{ field_name: string }>(
-    `SELECT field_name
+  secretKey: ChannelSecretsKey,
+): Promise<DeclaredSecretState> {
+  if (secretFieldNames.length === 0) {
+    return {
+      configuredFields: new Set(),
+      plaintextValues: [],
+    };
+  }
+  // Task 7 manifests are the authority for the complete secret-field list.
+  // Never probe undeclared rows because that would weaken manifest isolation.
+  const result = await client.query<{
+    field_name: string;
+    ciphertext: Buffer;
+    nonce: Buffer;
+    auth_tag: Buffer;
+    key_version: number;
+  }>(
+    `SELECT field_name, ciphertext, nonce, auth_tag, key_version
      FROM channel_secrets
      WHERE connection_id = $1
        AND field_name = ANY($2::text[])`,
-    [connectionId, secretFieldNames],
+    [connection.id, secretFieldNames],
   );
-  return new Set(result.rows.map((row) => row.field_name));
+  return {
+    configuredFields: new Set(
+      result.rows.map((row) => row.field_name),
+    ),
+    plaintextValues: result.rows.map((row) =>
+      secretKey.decrypt(
+        encryptedSecretFromStorage({
+          ciphertext: row.ciphertext,
+          nonce: row.nonce,
+          authTag: row.auth_tag,
+          keyVersion: row.key_version,
+        }),
+        {
+          userId: connection.user_id,
+          agentId: connection.agent_id,
+          connectionId: connection.id,
+          fieldName: row.field_name,
+        },
+      )
+    ),
+  };
 }
 
 async function applySecretChanges(
@@ -228,6 +345,7 @@ async function applySecretChanges(
   connection: ChannelConnectionRow,
   changes: readonly PreparedSecretChange[],
   secretKey: ChannelSecretsKey,
+  signal: AbortSignal,
 ): Promise<void> {
   for (const change of changes) {
     if (change.operation === "delete") {
@@ -237,6 +355,7 @@ async function applySecretChanges(
            AND field_name = $2`,
         [connection.id, change.fieldName],
       );
+      signal.throwIfAborted();
       continue;
     }
     const encrypted = secretKey.encrypt(change.plaintext, {
@@ -267,6 +386,7 @@ async function applySecretChanges(
         storage.keyVersion,
       ],
     );
+    signal.throwIfAborted();
   }
 }
 
@@ -398,7 +518,13 @@ function prepareUpdate(
       };
     },
   );
-  if (containsExactStringValue(config, new Set(secretValues))) {
+  if (
+    containsSecretExposure(
+      config,
+      auditConfigFields,
+      secretValues,
+    )
+  ) {
     throw new AdminAuditError(400, "secret_in_public_config");
   }
   return {
@@ -510,20 +636,44 @@ function pickConfig(
   );
 }
 
-function containsExactStringValue(
-  value: unknown,
-  secretValues: ReadonlySet<string>,
+function containsSecretExposure(
+  config: JsonObject,
+  auditConfigFields: readonly string[],
+  secretValues: readonly string[],
 ): boolean {
-  if (typeof value === "string") return secretValues.has(value);
-  if (Array.isArray(value)) {
-    return value.some((item) =>
-      containsExactStringValue(item, secretValues)
+  const secrets = secretValues.map((value) => ({
+    value,
+    embeddedMatch:
+      Buffer.byteLength(value, "utf8") >=
+      SECRET_SUBSTRING_MIN_UTF8_BYTES,
+  }));
+  if (secrets.length === 0) return false;
+  const matches = (candidate: string) =>
+    secrets.some((secret) =>
+      secret.embeddedMatch
+        ? candidate.includes(secret.value)
+        : candidate === secret.value
     );
+  if (auditConfigFields.some(matches)) return true;
+
+  const pending: unknown[] = [config];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      if (matches(value)) return true;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      pending.push(...value);
+      continue;
+    }
+    if (typeof value !== "object" || value === null) continue;
+    for (const [key, nested] of Object.entries(value)) {
+      if (matches(key)) return true;
+      pending.push(nested);
+    }
   }
-  if (typeof value !== "object" || value === null) return false;
-  return Object.values(value).some((item) =>
-    containsExactStringValue(item, secretValues)
-  );
+  return false;
 }
 
 function applyConfiguredChanges(
@@ -542,6 +692,10 @@ function revisionConflict(): AdminAuditError {
   return new AdminAuditError(409, "config_revision_conflict");
 }
 
+function updateFailed(): AdminAuditError {
+  return new AdminAuditError(500, "channel_config_update_failed");
+}
+
 async function rollbackPreservingOriginalError(
   client: PoolClient,
 ): Promise<void> {
@@ -556,4 +710,49 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     value,
   );
+}
+
+function normalizeLifecycleTimeout(value: number | undefined): number {
+  if (
+    value === undefined ||
+    !Number.isFinite(value) ||
+    value <= 0
+  ) {
+    return DEFAULT_LIFECYCLE_TIMEOUT_MS;
+  }
+  return Math.min(
+    Math.max(1, Math.trunc(value)),
+    MAX_LIFECYCLE_TIMEOUT_MS,
+  );
+}
+
+function createBoundedLifecycle(
+  timeoutMs: number,
+  outerSignal?: AbortSignal,
+): Readonly<{
+  signal: AbortSignal;
+  dispose(): void;
+}> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (outerSignal?.aborted) {
+    abort();
+  } else {
+    outerSignal?.addEventListener("abort", abort, { once: true });
+  }
+  const timer = setTimeout(abort, timeoutMs);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timer);
+      outerSignal?.removeEventListener("abort", abort);
+    },
+  };
+}
+
+function isPostgresTimeoutError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "55P03" || code === "57014";
 }

@@ -281,6 +281,67 @@ describe("channel config revision, secret and audit transaction", () => {
     );
   });
 
+  it("aborts a real row-lock wait promptly and leaves the connection reusable", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const auditPool = new Pool({
+      connectionString: databaseUrl,
+      options: "-c statement_timeout=1000 -c lock_timeout=250",
+    });
+    const blocker = await secondaryPool.connect();
+    const controller = new AbortController();
+    const service = createChannelConnectionAuditService(
+      auditPool,
+      keyState.key,
+    );
+    let captured: unknown;
+    let elapsedMs = 0;
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        `SELECT id
+         FROM channel_connections
+         WHERE id = $1
+         FOR UPDATE`,
+        [CONNECTION_A],
+      );
+      const startedAt = Date.now();
+      const abortTimer = setTimeout(() => {
+        controller.abort(new Error(`sensitive-${TEST_SECRET}`));
+      }, 25);
+      try {
+        await service.update(
+          updateInput({ secret: TEST_SECRET }),
+          controller.signal,
+        );
+      } catch (error) {
+        captured = error;
+      } finally {
+        clearTimeout(abortTimer);
+        elapsedMs = Date.now() - startedAt;
+      }
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+    }
+
+    try {
+      expect(captured).toMatchObject({
+        status: 500,
+        code: "channel_config_update_failed",
+        message: "channel_config_update_failed",
+      });
+      expect(
+        `${String(captured)} ${inspect(captured)} ${JSON.stringify(captured)}`,
+      ).not.toContain(TEST_SECRET);
+      expect(elapsedMs).toBeLessThan(1_000);
+      await expect(
+        service.update(updateInput({ secret: TEST_SECRET })),
+      ).resolves.toEqual({ revision: 2 });
+    } finally {
+      await auditPool.end();
+    }
+  });
+
   it("upserts and explicitly deletes secrets while auditing configured state only", async () => {
     if (keyState.status !== "ready") throw new Error("test_key_not_ready");
     const service = createChannelConnectionAuditService(
@@ -616,6 +677,69 @@ describe("channel config revision, secret and audit transaction", () => {
     expect(stored.rows[0].config).toEqual({ endpoint: "safe" });
     expect(stored.rows[0].audit_text).not.toContain('"bot_token":"e"');
   });
+
+  it.each([
+    ["unmodified", []],
+    [
+      "deleted",
+      [{ fieldName: "bot_token", operation: "delete" as const }],
+    ],
+  ])(
+    "rejects an existing %s declared secret copied into public config without writes",
+    async (_label, secretChanges) => {
+      if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+      const service = createChannelConnectionAuditService(
+        primaryPool,
+        keyState.key,
+      );
+      await service.update(updateInput({ secret: TEST_SECRET }));
+      let captured: unknown;
+
+      try {
+        await service.update({
+          ...updateInput({
+            expectedRevision: 2,
+            secret: OTHER_SECRET,
+            config: {
+              endpoint:
+                `https://example.test/hook?token=${TEST_SECRET}`,
+            },
+          }),
+          secretChanges,
+        });
+      } catch (error) {
+        captured = error;
+      }
+
+      expect(captured).toMatchObject({
+        status: 400,
+        code: "secret_in_public_config",
+        message: "secret_in_public_config",
+      });
+      expect(
+        `${String(captured)} ${inspect(captured)} ${JSON.stringify(captured)}`,
+      ).not.toContain(TEST_SECRET);
+      const unchanged = await primaryPool.query<{
+        config: Record<string, unknown>;
+        revision: number;
+        audits: string;
+        secrets: string;
+      }>(
+        `SELECT config, revision,
+                (SELECT count(*) FROM admin_audit_logs) AS audits,
+                (SELECT count(*) FROM channel_secrets) AS secrets
+         FROM channel_connections
+         WHERE id = $1`,
+        [CONNECTION_A],
+      );
+      expect(unchanged.rows[0]).toEqual({
+        config: { endpoint: "new-a" },
+        revision: 2,
+        audits: "1",
+        secrets: "1",
+      });
+    },
+  );
 
   it("enforces scoped foreign keys and preserves audit history after agent deletion", async () => {
     await expect(
