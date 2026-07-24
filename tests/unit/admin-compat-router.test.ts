@@ -22,6 +22,7 @@ import {
   parseAdminCompatPath,
   type AdminCompatRuntime,
 } from "@/server/admin/compat/router";
+import { AdminAuditError } from "@/server/admin/audit";
 import {
   AdminCompatError,
   type AdminCompatResources,
@@ -31,6 +32,7 @@ import {
   type CoreAdminCompatDependencies,
 } from "@/server/admin/compat/register-core";
 import { createUserPreferencesRepository } from "@/server/settings/user-preferences";
+import { SecretEncryptionError } from "@/server/security/encrypted-secret";
 import {
   createAdminCompatRouteHandler,
   DELETE as CATCH_ALL_DELETE,
@@ -1028,6 +1030,165 @@ describe("admin compatibility exact router", () => {
       expect(serialized).not.toContain("internal_table");
       expect(serialized).not.toContain("stack");
     }
+  });
+
+  it.each([
+    "invalid_config_revision",
+    "invalid_secret_field",
+    "invalid_audit_config_field",
+    "secret_in_audit_config",
+    "secret_in_public_config",
+    "invalid_secret_change",
+    "invalid_channel_config",
+    "invalid_confirmation_source",
+  ])(
+    "maps the allowlisted audit validation %s to an exact public 400",
+    async (code) => {
+      const router = new AdminCompatRouter();
+      router.put("/audit-validation", async () => {
+        throw Object.assign(new AdminAuditError(400, code), {
+          details: { secret: "must-not-leak" },
+        });
+      });
+      const fixture = await authenticatedRouterRequest(
+        "PUT",
+        "/audit-validation",
+      );
+
+      const response = await router.dispatch(
+        fixture.request,
+        fixture.runtime,
+      );
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "invalid_request",
+          message: code,
+        },
+      });
+    },
+  );
+
+  it("maps only the exact audit revision conflict combination to the stable public 409", async () => {
+    const router = new AdminCompatRouter();
+    router.put("/audit-revision", async () => {
+      throw new AdminAuditError(409, "config_revision_conflict");
+    });
+    const fixture = await authenticatedRouterRequest(
+      "PUT",
+      "/audit-revision",
+    );
+
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "config_revision_conflict",
+        message: "revision_conflict",
+      },
+    });
+  });
+
+  it.each([
+    [400, "unknown_audit_error"],
+    [409, "invalid_secret_change"],
+    [418, "secret_in_public_config"],
+    [500, "channel_config_update_failed"],
+  ])(
+    "maps unsupported AdminAuditError combination %s/%s to a fixed 500",
+    async (status, code) => {
+      const router = new AdminCompatRouter();
+      router.put("/unsupported-audit", async () => {
+        throw new AdminAuditError(status, code);
+      });
+      const fixture = await authenticatedRouterRequest(
+        "PUT",
+        "/unsupported-audit",
+      );
+
+      const response = await router.dispatch(
+        fixture.request,
+        fixture.runtime,
+      );
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "internal_error",
+          message: "internal_error",
+        },
+      });
+    },
+  );
+
+  it.each([
+    {
+      label: "duck-typed validation",
+      error: Object.assign(new Error("secret_in_public_config"), {
+        status: 400,
+        code: "secret_in_public_config",
+      }),
+    },
+    {
+      label: "duck-typed audit revision",
+      error: Object.assign(new Error("config_revision_conflict"), {
+        status: 409,
+        code: "config_revision_conflict",
+      }),
+    },
+    {
+      label: "encryption error",
+      error: new SecretEncryptionError("invalid_secret_context"),
+    },
+  ])("does not expose a $label", async ({ error }) => {
+    const router = new AdminCompatRouter();
+    router.put("/untrusted-error", async () => {
+      throw error;
+    });
+    const fixture = await authenticatedRouterRequest(
+      "PUT",
+      "/untrusted-error",
+    );
+
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "internal_error",
+        message: "internal_error",
+      },
+    });
+  });
+
+  it("preserves the structural settings revision conflict bridge", async () => {
+    const router = new AdminCompatRouter();
+    router.put("/settings-revision", async () => {
+      throw Object.assign(new Error("revision_conflict"), {
+        status: 409,
+        code: "revision_conflict",
+      });
+    });
+    const fixture = await authenticatedRouterRequest(
+      "PUT",
+      "/settings-revision",
+    );
+
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "config_revision_conflict",
+        message: "revision_conflict",
+      },
+    });
   });
 
   it("only exposes allowlisted stable details and drops secret-shaped values even under safe keys", async () => {

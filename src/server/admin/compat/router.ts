@@ -1,4 +1,5 @@
 import { ZodError } from "zod";
+import { AdminAuditError } from "@/server/admin/audit";
 import {
   dispatchAdminSecurityBoundary,
   type AdminSecurityOptions,
@@ -29,6 +30,16 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const SAFE_HANDLER_RESPONSE_HEADERS = new Set([
   "content-language",
   "content-type",
+]);
+const ADMIN_AUDIT_VALIDATION_CODES = new Set([
+  "invalid_config_revision",
+  "invalid_secret_field",
+  "invalid_audit_config_field",
+  "secret_in_audit_config",
+  "secret_in_public_config",
+  "invalid_secret_change",
+  "invalid_channel_config",
+  "invalid_confirmation_source",
 ]);
 type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
@@ -480,6 +491,25 @@ function mapError(error: unknown): Response {
       sanitizeDetails(error.code, error.details),
     );
   }
+  if (error instanceof AdminAuditError) {
+    if (
+      error.status === 400 &&
+      ADMIN_AUDIT_VALIDATION_CODES.has(error.code)
+    ) {
+      return errorResponse(400, "invalid_request", error.code);
+    }
+    if (
+      error.status === 409 &&
+      error.code === "config_revision_conflict"
+    ) {
+      return errorResponse(
+        409,
+        "config_revision_conflict",
+        "revision_conflict",
+      );
+    }
+    return errorResponse(500, "internal_error", "internal_error");
+  }
   if (error instanceof ZodError) {
     return errorResponse(
       400,
@@ -515,10 +545,7 @@ function isRevisionConflict(
   error: unknown,
 ): error is { status: number; code: string } {
   if (!isErrorRecord(error) || error.status !== 409) return false;
-  return (
-    error.code === "revision_conflict" ||
-    error.code === "config_revision_conflict"
-  );
+  return error.code === "revision_conflict";
 }
 
 function isCapabilityDisabled(
