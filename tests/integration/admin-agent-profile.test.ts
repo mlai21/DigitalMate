@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import EmbeddedPostgres from "embedded-postgres";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import {
   afterAll,
   beforeAll,
@@ -16,6 +16,12 @@ import {
 } from "vitest";
 
 import { createAdminAgentProfileService } from "@/server/admin/agent-profile";
+import {
+  createCoreAdminCompatRouter,
+  type CoreAdminCompatDependencies,
+} from "@/server/admin/compat/register-core";
+import type { AdminCompatRuntime } from "@/server/admin/compat/router";
+import type { AdminCompatResources } from "@/server/admin/compat/types";
 import {
   trackEmbeddedPostgresPool,
   type EmbeddedPostgresLifecycle,
@@ -254,6 +260,156 @@ describe("admin default-agent profile transaction", () => {
     expect(stored.rows[0].revision).toBe(2);
   });
 
+  it.each([
+    ["/agents", false],
+    [`/agents/${AGENT_A}`, true],
+  ])(
+    "never returns an old name with new settings from GET %s",
+    async (path, requiresHeader) => {
+      const firstSnapshotRead = deferred<void>();
+      const updateCommitted = deferred<void>();
+      const profileService =
+        createAdminAgentProfileService(primaryPool);
+      const router = createCoreAdminCompatRouter(
+        agentRouterDependencies({
+          readAgentProfile: async (
+            scope: { userId: string; agentId: string },
+            signal?: AbortSignal,
+          ) => {
+            const snapshot = await profileService.read(
+              scope,
+              signal,
+            );
+            firstSnapshotRead.resolve();
+            await updateCommitted.promise;
+            return snapshot;
+          },
+        }),
+      );
+      const request = new Request(
+        `http://localhost/api/admin/compat${path}`,
+        requiresHeader
+          ? {
+              headers: {
+                "x-digitalmate-agent-id": AGENT_A,
+              },
+            }
+          : undefined,
+      );
+      const responsePromise = router.dispatch(
+        request,
+        agentRouterRuntime({
+          agents: {
+            getActive: async () => {
+              const result = await primaryPool.query<{
+                display_name: string;
+              }>(
+                `SELECT display_name
+                 FROM digital_agents
+                 WHERE user_id = $1 AND id = $2`,
+                [USER_A, AGENT_A],
+              );
+              firstSnapshotRead.resolve();
+              return {
+                id: AGENT_A,
+                userId: USER_A,
+                slug: "default-a",
+                displayName: result.rows[0]?.display_name ?? "",
+                persona: {},
+                status: "active",
+                isDefault: true,
+                inheritsUserResources: true,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              };
+            },
+          },
+          settings: {
+            get: async () => {
+              await firstSnapshotRead.promise;
+              await updateCommitted.promise;
+              const result = await primaryPool.query<{
+                persona: Record<string, unknown>;
+                proactivity: Record<string, unknown>;
+                cadence: Record<string, unknown>;
+                search: Record<string, unknown>;
+                revision: number;
+              }>(
+                `SELECT persona, proactivity, cadence, search, revision
+                 FROM agent_settings
+                 WHERE user_id = $1 AND agent_id = $2`,
+                [USER_A, AGENT_A],
+              );
+              const row = result.rows[0]!;
+              return {
+                ...row,
+                modelRouting: { main: "main", light: "light" },
+                modelRoutingOverride: {},
+              };
+            },
+          },
+        }),
+      );
+
+      await firstSnapshotRead.promise;
+      await createAdminAgentProfileService(primaryPool).update(
+        updateInput(),
+      );
+      updateCommitted.resolve();
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        agents?: Array<{
+          name: string;
+          persona?: { name?: string };
+          revision: number;
+        }>;
+        name?: string;
+        persona?: { name?: string };
+        revision?: number;
+      };
+      const profile = body.agents?.[0] ?? body;
+
+      if (requiresHeader) {
+        expect(profile).not.toMatchObject({
+          name: "Agent A",
+          persona: { name: "Mate" },
+          revision: 2,
+        });
+        expect([
+          {
+            name: "Agent A",
+            persona: { name: "Agent A" },
+            revision: 1,
+          },
+          {
+            name: "Mate",
+            persona: { name: "Mate" },
+            revision: 2,
+          },
+        ]).toContainEqual(
+          expect.objectContaining({
+            name: profile.name,
+            persona: { name: profile.persona?.name },
+            revision: profile.revision,
+          }),
+        );
+      } else {
+        expect(profile).not.toMatchObject({
+          name: "Agent A",
+          revision: 2,
+        });
+        expect([
+          { name: "Agent A", revision: 1 },
+          { name: "Mate", revision: 2 },
+        ]).toContainEqual({
+          name: profile.name,
+          revision: profile.revision,
+        });
+      }
+    },
+  );
+
   it("rolls back profile rows when the success audit cannot be inserted", async () => {
     await primaryPool.query(`
       CREATE FUNCTION fail_agent_audit_insert()
@@ -292,6 +448,51 @@ describe("admin default-agent profile transaction", () => {
       display_name: "Agent A",
       style: "old-style",
       revision: 1,
+    });
+  });
+
+  it("returns success when abort arrives after COMMIT has resolved", async () => {
+    const controller = new AbortController();
+    const wrapped = abortAfterCommitPool(primaryPool, controller);
+
+    await expect(
+      createAdminAgentProfileService(wrapped.pool).update(
+        updateInput(),
+        controller.signal,
+      ),
+    ).resolves.toEqual({ revision: 2 });
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(wrapped.releaseCalls()).toBe(1);
+    const committed = await primaryPool.query<{
+      display_name: string;
+      revision: number;
+      audit_count: string;
+    }>(
+      `SELECT digital_agents.display_name,
+              agent_settings.revision,
+              (
+                SELECT count(*)
+                FROM admin_audit_logs
+                WHERE user_id = $1
+                  AND agent_id = $2
+                  AND action = 'agent_profile.update'
+              ) AS audit_count
+       FROM digital_agents
+       JOIN agent_settings
+         ON agent_settings.user_id = digital_agents.user_id
+        AND agent_settings.agent_id = digital_agents.id
+       WHERE digital_agents.user_id = $1
+         AND digital_agents.id = $2`,
+      [USER_A, AGENT_A],
+    );
+    expect(committed.rows[0]).toEqual({
+      display_name: "Mate",
+      revision: 2,
+      audit_count: "1",
+    });
+    await expect(primaryPool.query("SELECT 1 AS ok")).resolves.toMatchObject({
+      rows: [{ ok: 1 }],
     });
   });
 
@@ -374,6 +575,103 @@ function updateInput(
       },
       search: { aggressiveness: "off" as const },
     },
+  };
+}
+
+function agentRouterDependencies(
+  overrides: Record<string, unknown> = {},
+): CoreAdminCompatDependencies {
+  return {
+    createAuthStatusResponse: async () =>
+      Response.json({ authenticated: true }),
+    digitalMateVersion: "0.1.0",
+    upstreamTag: "v2.0.0.post3",
+    upstreamCommit:
+      "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
+    compatApiRevision: "test",
+    ...overrides,
+  } as CoreAdminCompatDependencies;
+}
+
+function agentRouterRuntime(
+  resources: unknown,
+): AdminCompatRuntime {
+  return {
+    security: {
+      defaultUserId: USER_A,
+      appSecret: "test-app-secret-for-agent-profile",
+      appPasswordEnabled: false,
+      production: false,
+      trustProxyHeaders: false,
+      loadSessionGeneration: async () => 0,
+    },
+    withUserDataLease: async (_userId, work) =>
+      work(
+        resources as AdminCompatResources,
+        new AbortController().signal,
+      ),
+    resolveDefaultScope: async () => ({
+      userId: USER_A,
+      agentId: AGENT_A,
+    }),
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+function abortAfterCommitPool(
+  pool: Pool,
+  controller: AbortController,
+): {
+  pool: Pool;
+  releaseCalls(): number;
+} {
+  let releases = 0;
+  return {
+    pool: {
+      async connect() {
+        const client = await pool.connect();
+        return new Proxy(client, {
+          get(target, property, receiver) {
+            if (property === "query") {
+              return async (...args: unknown[]) => {
+                const result = await Reflect.apply(
+                  target.query,
+                  target,
+                  args,
+                );
+                if (
+                  typeof args[0] === "string" &&
+                  args[0].trim().toUpperCase() === "COMMIT"
+                ) {
+                  controller.abort(
+                    new Error("abort_after_commit_resolved"),
+                  );
+                }
+                return result;
+              };
+            }
+            if (property === "release") {
+              return (...args: unknown[]) => {
+                releases += 1;
+                return Reflect.apply(target.release, target, args);
+              };
+            }
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === "function"
+              ? value.bind(target)
+              : value;
+          },
+        }) as PoolClient;
+      },
+    } as Pool,
+    releaseCalls: () => releases,
   };
 }
 

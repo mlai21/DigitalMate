@@ -1,13 +1,12 @@
 import { z } from "zod";
 import { assertMultiAgentMutationAllowed } from "@/server/agents/features";
-import type { DigitalAgent } from "@/server/agents/types";
-import type { EffectiveAgentSettings } from "@/server/settings/agent-settings";
 import type { AdminCompatHandler } from "@/server/admin/compat/types";
 import { AdminCompatError } from "@/server/admin/compat/types";
 import { readAdminCompatJson } from "@/server/admin/compat/json";
 import { STABLE_CAPABILITY_CODES } from "@/server/capabilities";
 import {
   createAdminAgentProfileService,
+  type AdminAgentProfileSnapshot,
   type AdminAgentProfileUpdate,
   type AdminAgentProfileUpdateResult,
 } from "@/server/admin/agent-profile";
@@ -78,16 +77,34 @@ export type AdminAgentProfileUpdater = (
   signal?: AbortSignal,
 ) => Promise<AdminAgentProfileUpdateResult>;
 
-export const listAgents: AdminCompatHandler = async (context) => {
-  const profile = await readDefaultAgentProfile(context);
-  return { agents: [toAgentSummary(profile.agent, profile.settings)] };
-};
+export type AdminAgentProfileReader = (
+  scope: AdminAgentProfileUpdate["scope"],
+  signal?: AbortSignal,
+) => Promise<AdminAgentProfileSnapshot>;
 
-export const getAgent: AdminCompatHandler = async (context) => {
-  assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
-  const profile = await readDefaultAgentProfile(context);
-  return toAgentProfile(profile.agent, profile.settings);
-};
+export function createListAgentsHandler(
+  readProfile: AdminAgentProfileReader = (scope, signal) =>
+    createAdminAgentProfileService(getPool()).read(scope, signal),
+): AdminCompatHandler {
+  return async (context) => {
+    const profile = await readProfile(context.scope, context.signal);
+    return { agents: [toAgentSummary(profile)] };
+  };
+}
+
+export function createGetAgentHandler(
+  readProfile: AdminAgentProfileReader = (scope, signal) =>
+    createAdminAgentProfileService(getPool()).read(scope, signal),
+): AdminCompatHandler {
+  return async (context) => {
+    assertDefaultAgentPath(
+      context.params.agentId,
+      context.scope.agentId,
+    );
+    const profile = await readProfile(context.scope, context.signal);
+    return toAgentProfile(profile);
+  };
+}
 
 export function createUpdateAgentHandler(
   updateProfile: AdminAgentProfileUpdater = (input, signal) =>
@@ -139,19 +156,16 @@ export function createUpdateAgentHandler(
   };
 }
 
-export const createAgent: AdminCompatHandler = async ({ request }) => {
-  await readAdminCompatJson(request);
+export const createAgent: AdminCompatHandler = async () => {
   assertMultiAgentMutationAllowed("create");
 };
 
-export const importAgent: AdminCompatHandler = async ({ request }) => {
-  await readAdminCompatJson(request);
+export const importAgent: AdminCompatHandler = async () => {
   assertMultiAgentMutationAllowed("import");
 };
 
 export const cloneAgent: AdminCompatHandler = async (context) => {
   assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
-  await readAdminCompatJson(context.request);
   assertMultiAgentMutationAllowed("clone");
 };
 
@@ -202,52 +216,34 @@ export const reorderAgents: AdminCompatHandler = async (context) => {
   };
 };
 
-async function readDefaultAgentProfile(
-  context: Parameters<AdminCompatHandler>[0],
-): Promise<{
-  agent: DigitalAgent;
-  settings: EffectiveAgentSettings;
-}> {
-  const [agent, settings] = await Promise.all([
-    context.resources.agents.getActive(context.scope),
-    context.resources.settings.get(context.scope),
-  ]);
-  if (!agent || !agent.isDefault) {
-    throw new Error("default_agent_not_found");
-  }
-  return { agent, settings };
-}
-
 function toAgentSummary(
-  agent: DigitalAgent,
-  settings: EffectiveAgentSettings,
+  profile: AdminAgentProfileSnapshot,
 ) {
   return {
-    id: agent.id,
-    name: agent.displayName,
-    display_name: agent.displayName,
+    id: profile.id,
+    name: profile.displayName,
+    display_name: profile.displayName,
     description: DEFAULT_AGENT_DESCRIPTION,
     workspace_dir: "",
-    enabled: agent.status === "active",
+    enabled: true,
     pinned: true,
     startup_status: "running",
     active_model: null,
     is_default: true,
-    revision: settings.revision,
+    revision: profile.revision,
   };
 }
 
 function toAgentProfile(
-  agent: DigitalAgent,
-  settings: EffectiveAgentSettings,
+  profile: AdminAgentProfileSnapshot,
 ) {
   return {
-    ...toAgentSummary(agent, settings),
-    persona: settings.persona,
+    ...toAgentSummary(profile),
+    persona: profile.persona,
     settings: {
-      proactivity: settings.proactivity,
-      cadence: settings.cadence,
-      search: settings.search,
+      proactivity: profile.proactivity,
+      cadence: profile.cadence,
+      search: profile.search,
     },
     capabilities: {
       multi_agent: false,

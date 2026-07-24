@@ -17,15 +17,16 @@ import {
 } from "@/server/admin/compat/handlers/preferences";
 import {
   cloneAgent,
+  createGetAgentHandler,
+  createListAgentsHandler,
   createUpdateAgentHandler,
   createAgent,
   deleteAgent,
-  getAgent,
   importAgent,
-  listAgents,
   pinAgent,
   reorderAgents,
   toggleAgent,
+  type AdminAgentProfileReader,
   type AdminAgentProfileUpdater,
 } from "@/server/admin/compat/handlers/agents";
 import {
@@ -53,6 +54,7 @@ export type CoreAdminCompatDependencies = Readonly<{
   upstreamTag: string;
   upstreamCommit: string;
   compatApiRevision: string;
+  readAgentProfile?: AdminAgentProfileReader;
   updateAgentProfile?: AdminAgentProfileUpdater;
 }>;
 
@@ -72,10 +74,17 @@ export function createCoreAdminCompatRouter(
   router.sessionGet("/auth/verify", authVerify);
   router.get("/root", root);
   router.get("/version", root);
-  router.get("/agents", listAgents);
-  router.get("/agents/:agentId", getAgent, {
-    agentHeader: "required",
-  });
+  router.get(
+    "/agents",
+    createListAgentsHandler(dependencies.readAgentProfile),
+  );
+  router.get(
+    "/agents/:agentId",
+    createGetAgentHandler(dependencies.readAgentProfile),
+    {
+      agentHeader: "required",
+    },
+  );
   router.put(
     "/agents/:agentId",
     createUpdateAgentHandler(dependencies.updateAgentProfile),

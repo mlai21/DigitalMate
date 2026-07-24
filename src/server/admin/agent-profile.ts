@@ -1,11 +1,12 @@
 import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
-import type {
-  CadenceSettings,
-  PersonaSettings,
-  ProactivitySettings,
-  SearchSettings,
+import {
+  defaultSettings,
+  type CadenceSettings,
+  type PersonaSettings,
+  type ProactivitySettings,
+  type SearchSettings,
 } from "@/server/settings/defaults";
 import {
   connectPoolClient,
@@ -29,6 +30,16 @@ export type AdminAgentProfileUpdateResult = Readonly<{
   revision: number;
 }>;
 
+export type AdminAgentProfileSnapshot = Readonly<{
+  id: string;
+  displayName: string;
+  persona: PersonaSettings;
+  proactivity: ProactivitySettings;
+  cadence: CadenceSettings;
+  search: SearchSettings;
+  revision: number;
+}>;
+
 export type AdminAgentProfileServiceOptions = Readonly<{
   lifecycleTimeoutMs?: number;
 }>;
@@ -41,6 +52,16 @@ type LockedProfile = {
   cadence: Record<string, unknown>;
   search: Record<string, unknown>;
   model_routing_override: Record<string, unknown>;
+  revision: number;
+};
+
+type ProfileSnapshotRow = {
+  id: string;
+  display_name: string;
+  persona: unknown;
+  proactivity: unknown;
+  cadence: unknown;
+  search: unknown;
   revision: number;
 };
 
@@ -67,6 +88,58 @@ export function createAdminAgentProfileService(
     options.lifecycleTimeoutMs,
   );
   return {
+    async read(
+      scope: AgentScope,
+      outerSignal?: AbortSignal,
+    ): Promise<AdminAgentProfileSnapshot> {
+      const lifecycle = createBoundedLifecycle(
+        lifecycleTimeoutMs,
+        outerSignal,
+      );
+      let client: PoolClient | undefined;
+      let guard: AbortablePoolClientGuard | undefined;
+      try {
+        lifecycle.signal.throwIfAborted();
+        client = await connectPoolClient(pool, lifecycle.signal);
+        guard = guardPoolClientWithAbort(client, lifecycle.signal);
+        lifecycle.signal.throwIfAborted();
+        await client.query("BEGIN");
+        await setTransactionTimeouts(client, lifecycleTimeoutMs);
+        await ensureDefaultProfileSettings(client, scope);
+        lifecycle.signal.throwIfAborted();
+        const snapshot = await readDefaultProfileSnapshot(
+          client,
+          scope,
+        );
+        if (!snapshot) {
+          throw new AdminAgentProfileError(404, "agent_not_found");
+        }
+        lifecycle.signal.throwIfAborted();
+        await client.query("COMMIT");
+        return snapshot;
+      } catch (error) {
+        if (client && guard?.destroyed !== true) {
+          await client.query("ROLLBACK").catch(() => undefined);
+        }
+        if (
+          lifecycle.signal.aborted ||
+          isPostgresTimeoutError(error)
+        ) {
+          throw new AdminAgentProfileError(
+            500,
+            "agent_profile_read_failed",
+          );
+        }
+        throw error;
+      } finally {
+        lifecycle.dispose();
+        guard?.dispose();
+        if (client && guard?.destroyed !== true) {
+          client.release();
+        }
+      }
+    },
+
     async update(
       input: AdminAgentProfileUpdate,
       outerSignal?: AbortSignal,
@@ -140,7 +213,6 @@ export function createAdminAgentProfileService(
         await insertSafeAudit(client, input, before, revision);
         lifecycle.signal.throwIfAborted();
         await client.query("COMMIT");
-        lifecycle.signal.throwIfAborted();
         return { revision };
       } catch (error) {
         if (client && guard?.destroyed !== true) {
@@ -164,6 +236,70 @@ export function createAdminAgentProfileService(
         }
       }
     },
+  };
+}
+
+async function ensureDefaultProfileSettings(
+  client: PoolClient,
+  scope: AgentScope,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO agent_settings (
+       user_id, agent_id, persona, proactivity, cadence, search
+     )
+     SELECT $1, $2, $3, $4, $5, $6
+     FROM digital_agents
+     WHERE digital_agents.user_id = $1
+       AND digital_agents.id = $2
+       AND digital_agents.is_default = true
+       AND digital_agents.status = 'active'
+     ON CONFLICT (user_id, agent_id) DO NOTHING`,
+    [
+      scope.userId,
+      scope.agentId,
+      defaultSettings.persona,
+      defaultSettings.proactivity,
+      defaultSettings.cadence,
+      defaultSettings.search,
+    ],
+  );
+}
+
+async function readDefaultProfileSnapshot(
+  client: PoolClient,
+  scope: AgentScope,
+): Promise<AdminAgentProfileSnapshot | null> {
+  const result = await client.query<ProfileSnapshotRow>(
+    `SELECT digital_agents.id,
+            digital_agents.display_name,
+            agent_settings.persona,
+            agent_settings.proactivity,
+            agent_settings.cadence,
+            agent_settings.search,
+            agent_settings.revision
+     FROM digital_agents
+     JOIN agent_settings
+       ON agent_settings.user_id = digital_agents.user_id
+      AND agent_settings.agent_id = digital_agents.id
+     WHERE digital_agents.user_id = $1
+       AND digital_agents.id = $2
+       AND digital_agents.is_default = true
+       AND digital_agents.status = 'active'`,
+    [scope.userId, scope.agentId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    persona: mergeSettings(defaultSettings.persona, row.persona),
+    proactivity: mergeSettings(
+      defaultSettings.proactivity,
+      row.proactivity,
+    ),
+    cadence: mergeSettings(defaultSettings.cadence, row.cadence),
+    search: mergeSettings(defaultSettings.search, row.search),
+    revision: Number(row.revision),
   };
 }
 
@@ -323,4 +459,18 @@ function isPostgresTimeoutError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const code = Reflect.get(error, "code");
   return code === "55P03" || code === "57014";
+}
+
+function mergeSettings<T extends Record<string, unknown>>(
+  defaults: T,
+  value: unknown,
+): T {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    return defaults;
+  }
+  return { ...defaults, ...(value as Partial<T>) };
 }

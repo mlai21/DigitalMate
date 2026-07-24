@@ -11,6 +11,38 @@ import { AdminAgentProfileError } from "@/server/admin/agent-profile";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
+const OTHER_AGENT_ID = "10000000-0000-4000-8000-000000000012";
+const DISABLED_AGENT_MUTATIONS = [
+  ["POST", "/agents", "multi_agent_create"],
+  ["POST", "/agents/import", "multi_agent_import"],
+  [
+    "POST",
+    `/agents/${DEFAULT_AGENT_ID}/clone`,
+    "multi_agent_clone",
+  ],
+] as const;
+const UNREADABLE_DISABLED_BODIES = [
+  ["empty", undefined, undefined],
+  ["malformed", "{", undefined],
+  [
+    "over 16 KiB",
+    `"${"x".repeat(16 * 1024)}"`,
+    String(16 * 1024 + 2),
+  ],
+] as const;
+const DISABLED_BODY_CASES = DISABLED_AGENT_MUTATIONS.flatMap(
+  ([method, path, capability]) =>
+    UNREADABLE_DISABLED_BODIES.map(
+      ([bodyLabel, body, contentLength]) => [
+        method,
+        path,
+        capability,
+        bodyLabel,
+        body,
+        contentLength,
+      ] as const,
+    ),
+);
 
 function dependencies(
   overrides: Record<string, unknown> = {},
@@ -23,6 +55,29 @@ function dependencies(
     upstreamCommit:
       "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
     compatApiRevision: "test",
+    readAgentProfile: async () => ({
+      id: DEFAULT_AGENT_ID,
+      displayName: "DigitalMate",
+      persona: {
+        name: "DigitalMate",
+        style: "温暖自然",
+        emojiHabit: "少量使用",
+      },
+      proactivity: {
+        quietStart: "23:00",
+        quietEnd: "08:00",
+        minIntervalMinutes: 30,
+        maxPerHour: 2,
+        maxPerDay: 3,
+      },
+      cadence: {
+        responseDelayMs: 480,
+        segmentDelayMs: 240,
+        maxSegments: 5,
+      },
+      search: { aggressiveness: "conservative" },
+      revision: 1,
+    }),
     ...overrides,
   } as CoreAdminCompatDependencies;
 }
@@ -71,7 +126,9 @@ function resources(): AdminCompatResources {
   } as unknown as AdminCompatResources;
 }
 
-function runtime(): AdminCompatRuntime {
+function runtime(
+  securityOverrides: Partial<AdminCompatRuntime["security"]> = {},
+): AdminCompatRuntime {
   return {
     security: {
       defaultUserId: USER_ID,
@@ -80,6 +137,7 @@ function runtime(): AdminCompatRuntime {
       production: false,
       trustProxyHeaders: false,
       loadSessionGeneration: async () => 0,
+      ...securityOverrides,
     },
     withUserDataLease: async (_userId, work) =>
       work(resources(), new AbortController().signal),
@@ -88,6 +146,50 @@ function runtime(): AdminCompatRuntime {
       agentId: DEFAULT_AGENT_ID,
     }),
   };
+}
+
+async function rawMutationRequest(
+  method: string,
+  path: string,
+  body: string | undefined,
+  options: {
+    agentId?: string | null;
+    contentLength?: string;
+    csrf?: boolean;
+  } = {},
+): Promise<Request> {
+  const selectedRuntime = runtime();
+  const statusResponse = await createAdminAuthStatusResponse(
+    new Request("http://localhost/api/admin/compat/auth/status"),
+    selectedRuntime.security,
+  );
+  const status = (await statusResponse.json()) as {
+    csrf_token: string;
+  };
+  const headers = new Headers({
+    origin: "http://localhost",
+    "content-type": "application/json",
+  });
+  if (options.csrf !== false) {
+    headers.set("x-csrf-token", status.csrf_token);
+  }
+  if (options.agentId !== null) {
+    headers.set(
+      "x-digitalmate-agent-id",
+      options.agentId ?? DEFAULT_AGENT_ID,
+    );
+  }
+  if (options.contentLength) {
+    headers.set("content-length", options.contentLength);
+  }
+  return new Request(
+    `http://localhost/api/admin/compat${path}`,
+    {
+      method,
+      headers,
+      body,
+    },
+  );
 }
 
 async function mutationRequest(
@@ -348,6 +450,96 @@ describe("admin compatibility agents contract", () => {
         details: { capability },
       },
     });
+  });
+
+  it.each(DISABLED_BODY_CASES)(
+    "%s %s returns %s without reading a %s body",
+    async (
+      method,
+      path,
+      capability,
+      _bodyLabel,
+      body,
+      contentLength,
+    ) => {
+      const router = createCoreAdminCompatRouter(dependencies());
+      const response = await router.dispatch(
+        await rawMutationRequest(method, path, body, {
+          contentLength,
+        }),
+        runtime(),
+      );
+
+      expect(response.status).toBe(501);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "capability_disabled",
+          message: "capability_disabled",
+          details: { capability },
+        },
+      });
+    },
+  );
+
+  it("keeps authentication and CSRF ahead of disabled create", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const unauthenticated = await router.dispatch(
+      new Request("http://localhost/api/admin/compat/agents", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost",
+          "content-type": "application/json",
+        },
+        body: "{",
+      }),
+      runtime({
+        appPasswordEnabled: true,
+        production: true,
+      }),
+    );
+    const missingCsrf = await router.dispatch(
+      await rawMutationRequest("POST", "/agents", "{", {
+        csrf: false,
+      }),
+      runtime(),
+    );
+
+    expect(unauthenticated.status).toBe(401);
+    expect(missingCsrf.status).toBe(403);
+  });
+
+  it("keeps clone scope and path checks ahead of disabled body handling", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const headerScopeMismatch = await router.dispatch(
+      await rawMutationRequest(
+        "POST",
+        `/agents/${OTHER_AGENT_ID}/clone`,
+        "{",
+        { agentId: OTHER_AGENT_ID },
+      ),
+      runtime(),
+    );
+    const pathScopeMismatch = await router.dispatch(
+      await rawMutationRequest(
+        "POST",
+        `/agents/${OTHER_AGENT_ID}/clone`,
+        "{",
+      ),
+      runtime(),
+    );
+
+    for (const response of [
+      headerScopeMismatch,
+      pathScopeMismatch,
+    ]) {
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "not_found",
+          message: "agent_not_found",
+        },
+      });
+    }
   });
 
   it("keeps default toggle, pin and one-element ordering idempotent", async () => {
