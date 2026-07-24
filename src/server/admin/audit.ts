@@ -380,14 +380,7 @@ function prepareUpdate(
       };
     },
   );
-  const configText = JSON.stringify(config);
-  if (
-    secretValues.some(
-      (secret) =>
-        configText.includes(secret) ||
-        auditConfigFields.includes(secret),
-    )
-  ) {
+  if (containsExactStringValue(config, new Set(secretValues))) {
     throw new AdminAuditError(400, "secret_in_public_config");
   }
   return {
@@ -496,6 +489,22 @@ function pickConfig(
     fields
       .filter((field) => Object.hasOwn(config, field))
       .map((field) => [field, config[field]]),
+  );
+}
+
+function containsExactStringValue(
+  value: unknown,
+  secretValues: ReadonlySet<string>,
+): boolean {
+  if (typeof value === "string") return secretValues.has(value);
+  if (Array.isArray(value)) {
+    return value.some((item) =>
+      containsExactStringValue(item, secretValues)
+    );
+  }
+  if (typeof value !== "object" || value === null) return false;
+  return Object.values(value).some((item) =>
+    containsExactStringValue(item, secretValues)
   );
 }
 

@@ -532,6 +532,85 @@ describe("channel config revision, secret and audit transaction", () => {
     });
   });
 
+  it.each([
+    ["newline at top level", "line-one\nline-two", (secret: string) => ({
+      endpoint: secret,
+    })],
+    ["quote in a nested object", 'secret-"quoted"-value', (secret: string) => ({
+      endpoint: "safe",
+      nested: { token: secret },
+    })],
+    ["backslash in a nested array", String.raw`secret\path\value`, (secret: string) => ({
+      endpoint: "safe",
+      nested: ["safe", secret],
+    })],
+  ])(
+    "rejects an exact escaped secret value from public config: %s",
+    async (_label, secret, buildConfig) => {
+      if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+      const service = createChannelConnectionAuditService(
+        primaryPool,
+        keyState.key,
+      );
+
+      await expect(
+        service.update({
+          ...updateInput({ secret }),
+          config: buildConfig(secret),
+        }),
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "secret_in_public_config",
+      });
+      const unchanged = await primaryPool.query<{
+        revision: number;
+        audits: string;
+        secrets: string;
+      }>(
+        `SELECT revision,
+                (SELECT count(*) FROM admin_audit_logs) AS audits,
+                (SELECT count(*) FROM channel_secrets) AS secrets
+         FROM channel_connections
+         WHERE id = $1`,
+        [CONNECTION_A],
+      );
+      expect(unchanged.rows[0]).toEqual({
+        revision: 1,
+        audits: "0",
+        secrets: "0",
+      });
+    },
+  );
+
+  it("accepts safe public config containing but not equaling a one-character secret", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    );
+
+    await expect(
+      service.update({
+        ...updateInput({ secret: "e" }),
+        config: { endpoint: "safe" },
+      }),
+    ).resolves.toEqual({ revision: 2 });
+    const stored = await primaryPool.query<{
+      config: Record<string, unknown>;
+      audit_text: string;
+    }>(
+      `SELECT config,
+              (SELECT concat(before_summary::text, after_summary::text)
+               FROM admin_audit_logs
+               WHERE resource_id = channel_connections.id::text) AS audit_text
+       FROM channel_connections
+       WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    expect(stored.rows[0].config).toEqual({ endpoint: "safe" });
+    expect(stored.rows[0].audit_text).not.toContain('"bot_token":"e"');
+  });
+
   it("enforces scoped foreign keys and preserves audit history after agent deletion", async () => {
     await expect(
       primaryPool.query(
