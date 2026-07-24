@@ -29,6 +29,24 @@ describe("security environment contract", () => {
     ).toHaveLength(2);
   });
 
+  it("requires an independent channel encryption key in both Compose services", async () => {
+    const [example, compose] = await Promise.all([
+      readFile(path.join(process.cwd(), ".env.example"), "utf8"),
+      readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8"),
+    ]);
+
+    expect(example).toMatch(/^CHANNEL_SECRETS_KEY=/m);
+    expect(compose).not.toContain("${CHANNEL_SECRETS_KEY:-");
+    expect(compose).not.toMatch(
+      /CHANNEL_SECRETS_KEY:.*APP_SECRET/,
+    );
+    expect(
+      compose.match(
+        /CHANNEL_SECRETS_KEY:\s*"\$\{CHANNEL_SECRETS_KEY:\?请设置独立的32字节base64渠道加密密钥\}"/g,
+      ),
+    ).toHaveLength(2);
+  });
+
   it("defaults proxy trust off while the controlled Caddy service fixes it on", async () => {
     const [example, compose] = await Promise.all([
       readFile(path.join(process.cwd(), ".env.example"), "utf8"),

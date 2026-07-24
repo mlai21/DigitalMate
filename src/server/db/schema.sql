@@ -927,6 +927,123 @@ BEGIN
 END
 $goal_steps_agent_constraints$;
 
+CREATE TABLE IF NOT EXISTS channel_connections (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  channel_type text NOT NULL
+    CONSTRAINT channel_connections_channel_type_check
+    CHECK (btrim(channel_type) <> ''),
+  display_name text NOT NULL
+    CONSTRAINT channel_connections_display_name_check
+    CHECK (btrim(display_name) <> ''),
+  enabled boolean NOT NULL DEFAULT false,
+  runtime_node_id uuid,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb
+    CONSTRAINT channel_connections_config_object_check
+    CHECK (jsonb_typeof(config) = 'object'),
+  revision integer NOT NULL DEFAULT 1
+    CONSTRAINT channel_connections_revision_check
+    CHECK (revision > 0),
+  health_status text NOT NULL DEFAULT 'disabled'
+    CONSTRAINT channel_connections_health_status_check
+    CHECK (
+      health_status IN (
+        'disabled', 'starting', 'connected', 'degraded',
+        'disconnected', 'blocked'
+      )
+    ),
+  health_detail jsonb NOT NULL DEFAULT '{}'::jsonb
+    CONSTRAINT channel_connections_health_detail_object_check
+    CHECK (jsonb_typeof(health_detail) = 'object'),
+  last_connected_at timestamptz,
+  last_disconnected_at timestamptz,
+  last_event_at timestamptz,
+  deleted_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (id, user_id, agent_id),
+  CONSTRAINT channel_connections_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS channel_secrets (
+  connection_id uuid NOT NULL,
+  field_name text NOT NULL
+    CONSTRAINT channel_secrets_field_name_check
+    CHECK (
+      btrim(field_name) <> ''
+      AND length(field_name) <= 128
+    ),
+  ciphertext bytea NOT NULL
+    CONSTRAINT channel_secrets_ciphertext_length_check
+    CHECK (octet_length(ciphertext) > 0),
+  nonce bytea NOT NULL
+    CONSTRAINT channel_secrets_nonce_length_check
+    CHECK (octet_length(nonce) = 12),
+  auth_tag bytea NOT NULL
+    CONSTRAINT channel_secrets_auth_tag_length_check
+    CHECK (octet_length(auth_tag) = 16),
+  key_version integer NOT NULL
+    CONSTRAINT channel_secrets_key_version_check
+    CHECK (key_version > 0),
+  rotated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (connection_id, field_name),
+  CONSTRAINT channel_secrets_connection_id_fkey
+    FOREIGN KEY (connection_id)
+    REFERENCES channel_connections(id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS admin_audit_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid,
+  action text NOT NULL
+    CONSTRAINT admin_audit_logs_action_check
+    CHECK (btrim(action) <> ''),
+  resource_type text NOT NULL
+    CONSTRAINT admin_audit_logs_resource_type_check
+    CHECK (btrim(resource_type) <> ''),
+  resource_id text NOT NULL
+    CONSTRAINT admin_audit_logs_resource_id_check
+    CHECK (btrim(resource_id) <> ''),
+  before_summary jsonb NOT NULL DEFAULT '{}'::jsonb
+    CONSTRAINT admin_audit_logs_before_summary_object_check
+    CHECK (jsonb_typeof(before_summary) = 'object'),
+  after_summary jsonb NOT NULL DEFAULT '{}'::jsonb
+    CONSTRAINT admin_audit_logs_after_summary_object_check
+    CHECK (jsonb_typeof(after_summary) = 'object'),
+  confirmation_source jsonb
+    CONSTRAINT admin_audit_logs_confirmation_source_object_check
+    CHECK (
+      confirmation_source IS NULL
+      OR jsonb_typeof(confirmation_source) = 'object'
+    ),
+  status text NOT NULL
+    CONSTRAINT admin_audit_logs_status_check
+    CHECK (status IN ('success', 'failed')),
+  error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT admin_audit_logs_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE SET NULL (agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_connections_scope_type_active
+  ON channel_connections(user_id, agent_id, channel_type, created_at)
+  WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_channel_connections_scope_health
+  ON channel_connections(user_id, agent_id, health_status)
+  WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_scope_created
+  ON admin_audit_logs(user_id, agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_resource_created
+  ON admin_audit_logs(user_id, resource_type, resource_id, created_at DESC);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_turn_agent_role
   ON messages(user_id, agent_id, client_turn_id, role)
   WHERE client_turn_id IS NOT NULL;

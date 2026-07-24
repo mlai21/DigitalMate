@@ -1,5 +1,6 @@
 import path from "node:path";
 import { z } from "zod";
+import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 
 const LOCAL_APP_SECRET = "digitalmate-local-secret-change-me";
 const PUBLIC_APP_SECRET_PLACEHOLDERS = new Set([
@@ -18,6 +19,7 @@ const envSchema = z.object({
     .string()
     .min(16)
     .default(LOCAL_APP_SECRET),
+  CHANNEL_SECRETS_KEY: z.string().optional(),
   TRUST_PROXY_HEADERS: z
     .enum(["true", "false"])
     .default("false")
@@ -62,6 +64,9 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     databaseUrl: parsed.DATABASE_URL,
     appPassword: parsed.APP_PASSWORD,
     appSecret: parsed.APP_SECRET,
+    channelSecretsKey: createChannelSecretsKey(
+      parsed.CHANNEL_SECRETS_KEY,
+    ),
     trustProxyHeaders: parsed.TRUST_PROXY_HEADERS,
     kieAiApiKey: parsed.KIE_AI_API_KEY,
     kieAiBaseUrl: parsed.KIE_AI_BASE_URL,

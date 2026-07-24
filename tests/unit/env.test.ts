@@ -12,6 +12,43 @@ describe("readEnv", () => {
     expect(env.aliyunIqsBaseUrl).toBe("https://cloud-iqs.aliyuncs.com");
     expect(env.trustProxyHeaders).toBe(false);
     expect(env.appSecret).toBe("digitalmate-local-secret-change-me");
+    expect(env.channelSecretsKey).toEqual({
+      status: "blocked",
+      code: "channel_secrets_key_missing",
+    });
+  });
+
+  it("keeps channel secret encryption blocked without falling back to APP_SECRET", () => {
+    const env = readEnv({
+      NODE_ENV: "production",
+      APP_SECRET: "production-signing-secret-that-is-at-least-32-bytes",
+    });
+
+    expect(env.channelSecretsKey).toEqual({
+      status: "blocked",
+      code: "channel_secrets_key_missing",
+    });
+  });
+
+  it("keeps an invalid production channel key blocked without stopping the core app", () => {
+    const env = readEnv({
+      NODE_ENV: "production",
+      APP_SECRET: "production-signing-secret-that-is-at-least-32-bytes",
+      CHANNEL_SECRETS_KEY: Buffer.alloc(31).toString("base64"),
+    });
+
+    expect(env.channelSecretsKey).toEqual({
+      status: "blocked",
+      code: "channel_secrets_key_invalid",
+    });
+  });
+
+  it("exposes an opaque ready state for a valid channel encryption key", () => {
+    const encoded = Buffer.alloc(32, 9).toString("base64");
+    const env = readEnv({ CHANNEL_SECRETS_KEY: encoded });
+
+    expect(env.channelSecretsKey.status).toBe("ready");
+    expect(JSON.stringify(env)).not.toContain(encoded);
   });
 
   it("requires an explicit boolean to trust sanitized proxy headers", () => {

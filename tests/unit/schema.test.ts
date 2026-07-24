@@ -47,6 +47,9 @@ describe("database schema", () => {
       "tool_registrations",
       "llm_usage_logs",
       "settings",
+      "channel_connections",
+      "channel_secrets",
+      "admin_audit_logs",
     ]) {
       expect(schema).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
     }
@@ -89,6 +92,15 @@ describe("database schema", () => {
     expect(schema).toMatch(/proactive_tasks[\s\S]+'share'/);
     expect(schema).toContain("source_task_id uuid REFERENCES proactive_tasks(id) ON DELETE SET NULL");
     expect(schema).toContain("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task");
+    expect(schema).toContain("channel_connections_user_agent_fkey");
+    expect(schema).toContain("channel_connections_revision_check");
+    expect(schema).toContain("channel_connections_health_status_check");
+    expect(schema).toContain("idx_channel_connections_scope_type_active");
+    expect(schema).toContain("channel_secrets_connection_id_fkey");
+    expect(schema).toContain("channel_secrets_nonce_length_check");
+    expect(schema).toContain("channel_secrets_auth_tag_length_check");
+    expect(schema).toContain("admin_audit_logs_user_agent_fkey");
+    expect(schema).toContain("idx_admin_audit_logs_scope_created");
   });
 
   it("defines goal mode tables for the loop ledger (P3-1)", async () => {
