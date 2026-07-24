@@ -12,7 +12,10 @@ import type { EnabledToolContext, SkillContext, ToolLogInput } from "@/server/ag
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
 import type { SkillDraft } from "@/server/evolution/skills";
-import { buildPersonalDataExport } from "@/server/admin/personal-data";
+import {
+  buildPersonalDataExport,
+  PersonalDataExportError,
+} from "@/server/admin/personal-data";
 import type { LlmUsageLogInput } from "@/server/llm/usage";
 import type { ToolRegistrationDraft } from "@/server/tasks/tools";
 import {
@@ -38,6 +41,10 @@ import type { AgentScope } from "@/server/agents/types";
 import { createAgentRepository } from "@/server/agents/repository";
 import { createAgentSettingsRepository } from "@/server/settings/agent-settings";
 import { createUserPreferencesRepository } from "@/server/settings/user-preferences";
+import {
+  encryptedSecretFromStorage,
+  type ChannelSecretsKey,
+} from "@/server/security/encrypted-secret";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -78,6 +85,10 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   channel_identities: [
     "id", "user_id", "agent_id", "channel", "external_user_id", "display_name", "created_at", "updated_at",
+  ],
+  channel_connections: [
+    "id", "user_id", "agent_id", "channel_type", "display_name", "enabled",
+    "config", "revision", "health_status", "health_detail", "created_at", "updated_at",
   ],
   channel_messages: [
     "id", "user_id", "agent_id", "conversation_id", "channel", "external_conversation_id",
@@ -128,6 +139,11 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "id", "user_id", "persona", "proactivity", "model_routing", "cadence", "search",
     "language", "timezone", "revision", "updated_at",
   ],
+  admin_audit_logs: [
+    "id", "user_id", "agent_id", "action", "resource_type", "resource_id",
+    "before_summary", "after_summary", "confirmation_source", "status",
+    "error_code", "created_at",
+  ],
 } as const;
 const GOAL_STEP_EXPORT_COLUMNS = [
   "id", "agent_id", "goal_id", "round", "phase", "intent", "evidence", "candidate",
@@ -137,28 +153,6 @@ const ATTACHMENT_EXPORT_COLUMNS = [
   "id", "user_id", "agent_id", "message_id", "kind", "file_name", "mime_type",
   "size_bytes", "text_truncated", "status", "error_code", "created_at", "updated_at",
 ] as const;
-const SENSITIVE_EXPORT_KEY_SEGMENTS = new Set([
-  "secret",
-  "token",
-  "nonce",
-  "ciphertext",
-  "password",
-  "credential",
-  "credentials",
-]);
-const SENSITIVE_EXPORT_KEY_CONCEPTS = new Set([
-  "authtag",
-  "apikey",
-  "privatekey",
-  "accesskey",
-  "storagekey",
-  "storagepath",
-  "extractedtext",
-  "replytoken",
-  "pollcursor",
-  "temporarypath",
-]);
-
 export type DbUser = {
   id: string;
   displayName: string;
@@ -2556,34 +2550,130 @@ export function createRepositories(
       },
     },
     personalData: {
-      async export(userId: string) {
-        const exported: Record<string, unknown[]> = {};
-        for (const [table, columns] of Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)) {
-          const visibilityFilter = table === "task_artifacts" ? " AND status = 'ready'" : "";
-          const result = await pool.query(
-            `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}`,
+      async export(
+        userId: string,
+        channelSecretsKey: ChannelSecretsKey | null = null,
+      ) {
+        const client = await pool.connect();
+        try {
+          await client.query(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+          );
+          const exported: Record<string, unknown[]> = {};
+          for (
+            const [table, columns]
+              of Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)
+          ) {
+            const visibilityFilter = table === "task_artifacts"
+              ? " AND status = 'ready'"
+              : "";
+            const result = await client.query(
+              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}`,
+              [userId],
+            );
+            exported[table] = result.rows.map((row) =>
+              pickExportRow(row, columns)
+            );
+          }
+          const goalSteps = await client.query(
+            `SELECT ${GOAL_STEP_EXPORT_COLUMNS.map((column) => `goal_steps.${column}`).join(", ")}
+             FROM goal_steps
+             JOIN goals ON goals.id = goal_steps.goal_id
+             WHERE goals.user_id = $1
+             ORDER BY goal_steps.created_at ASC, goal_steps.id ASC`,
             [userId],
           );
-          exported[table] = result.rows.map((row) => pickExportRow(row, columns));
+          exported.goal_steps = goalSteps.rows.map((row) =>
+            pickExportRow(row, GOAL_STEP_EXPORT_COLUMNS)
+          );
+          const attachments = await client.query(
+            `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
+             FROM message_attachments
+             WHERE user_id = $1
+             ORDER BY created_at ASC, id ASC`,
+            [userId],
+          );
+          exported.message_attachments = attachments.rows.map((row) =>
+            pickExportRow(row, ATTACHMENT_EXPORT_COLUMNS)
+          );
+
+          const encryptedSecrets = await client.query<{
+            connection_id: string;
+            field_name: string;
+            ciphertext: Buffer;
+            nonce: Buffer;
+            auth_tag: Buffer;
+            key_version: number;
+            user_id: string;
+            agent_id: string;
+          }>(
+            `SELECT channel_secrets.connection_id,
+                    channel_secrets.field_name,
+                    channel_secrets.ciphertext,
+                    channel_secrets.nonce,
+                    channel_secrets.auth_tag,
+                    channel_secrets.key_version,
+                    channel_connections.user_id,
+                    channel_connections.agent_id
+             FROM channel_secrets
+             JOIN channel_connections
+               ON channel_connections.id = channel_secrets.connection_id
+             WHERE channel_connections.user_id = $1
+             ORDER BY channel_secrets.connection_id,
+                      channel_secrets.field_name`,
+            [userId],
+          );
+          if (
+            encryptedSecrets.rows.length > 0
+            && channelSecretsKey === null
+          ) {
+            throw new PersonalDataExportError();
+          }
+          const credentialValues = encryptedSecrets.rows.map((row) =>
+            channelSecretsKey!.decrypt(
+              encryptedSecretFromStorage({
+                ciphertext: row.ciphertext,
+                nonce: row.nonce,
+                authTag: row.auth_tag,
+                keyVersion: row.key_version,
+              }),
+              {
+                userId: row.user_id,
+                agentId: row.agent_id,
+                connectionId: row.connection_id,
+                fieldName: row.field_name,
+              },
+            )
+          );
+          const result = buildPersonalDataExport({
+            userId,
+            exportedAt: new Date(),
+            tables: exported,
+            credentialValues,
+          });
+          await client.query("COMMIT");
+          return result;
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          if (error instanceof PersonalDataExportError) throw error;
+          throw new PersonalDataExportError();
+        } finally {
+          client.release();
         }
-        const goalSteps = await pool.query(
-          `SELECT ${GOAL_STEP_EXPORT_COLUMNS.map((column) => `goal_steps.${column}`).join(", ")}
-           FROM goal_steps
-           JOIN goals ON goals.id = goal_steps.goal_id
-           WHERE goals.user_id = $1
-           ORDER BY goal_steps.created_at ASC, goal_steps.id ASC`,
+      },
+      async hasEnabledChannelConnections(
+        userId: string,
+      ): Promise<boolean> {
+        const result = await pool.query<{ has_enabled: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1
+             FROM channel_connections
+             WHERE user_id = $1
+               AND enabled = true
+           ) AS has_enabled`,
           [userId],
         );
-        exported.goal_steps = goalSteps.rows.map((row) => pickExportRow(row, GOAL_STEP_EXPORT_COLUMNS));
-        const attachments = await pool.query(
-          `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
-           FROM message_attachments
-           WHERE user_id = $1
-           ORDER BY created_at ASC, id ASC`,
-          [userId],
-        );
-        exported.message_attachments = attachments.rows.map((row) => pickExportRow(row, ATTACHMENT_EXPORT_COLUMNS));
-        return buildPersonalDataExport({ userId, exportedAt: new Date(), tables: exported });
+        return result.rows[0]?.has_enabled === true;
       },
       async listAttachmentStorageKeys(userId: string): Promise<string[]> {
         const result = await pool.query<{ storage_key: string }>(
@@ -2609,6 +2699,24 @@ export function createRepositories(
             [userId],
           );
           let defaultAgentId = selectedAgent.rows[0]?.id ?? null;
+
+          await client.query(
+            `DELETE FROM channel_secrets
+             WHERE connection_id IN (
+               SELECT id
+               FROM channel_connections
+               WHERE user_id = $1
+             )`,
+            [userId],
+          );
+          await client.query(
+            "DELETE FROM admin_audit_logs WHERE user_id = $1",
+            [userId],
+          );
+          await client.query(
+            "DELETE FROM channel_connections WHERE user_id = $1",
+            [userId],
+          );
 
           const tables = [
             "goals",
@@ -2977,31 +3085,8 @@ function pickExportRow(
   return Object.fromEntries(
     columns
       .filter((column) => Object.hasOwn(row, column))
-      .map((column) => [column, sanitizeExportValue(row[column])]),
+      .map((column) => [column, row[column]]),
   );
-}
-
-function sanitizeExportValue(value: unknown): unknown {
-  if (value instanceof Date) return value;
-  if (Array.isArray(value)) return value.map(sanitizeExportValue);
-  if (!isRecord(value)) return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([key]) => !isInternalExportKey(key))
-      .map(([key, nestedValue]) => [key, sanitizeExportValue(nestedValue)]),
-  );
-}
-
-function isInternalExportKey(key: string): boolean {
-  const segments = key
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .split(/[^a-zA-Z0-9]+/)
-    .map((segment) => segment.toLowerCase())
-    .filter(Boolean);
-  const concept = segments.join("");
-  return SENSITIVE_EXPORT_KEY_CONCEPTS.has(concept)
-    || segments.some((segment) => SENSITIVE_EXPORT_KEY_SEGMENTS.has(segment));
 }
 
 function createAdvisoryLease(

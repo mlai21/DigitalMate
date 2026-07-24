@@ -14,6 +14,7 @@ import {
 import type { AgentScope } from "@/server/agents/types";
 import { createRepositories } from "@/server/db/repositories";
 import type { LlmStreamInput } from "@/server/llm/types";
+import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 import { defaultSettings } from "@/server/settings/defaults";
 import {
   trackEmbeddedPostgresPool,
@@ -23,6 +24,11 @@ import {
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const AGENT_A = "10000000-0000-4000-8000-00000000000a";
 const AGENT_B = "10000000-0000-4000-8000-00000000000b";
+const OTHER_USER_ID = "20000000-0000-4000-8000-000000000001";
+const OTHER_AGENT_ID = "20000000-0000-4000-8000-00000000000a";
+const CHANNEL_KEY_STATE = createChannelSecretsKey(
+  Buffer.alloc(32, 41).toString("base64"),
+);
 const scopeA = { userId: USER_ID, agentId: AGENT_A } satisfies AgentScope;
 const scopeB = { userId: USER_ID, agentId: AGENT_B } satisfies AgentScope;
 
@@ -361,11 +367,235 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       .resolves.toEqual([expect.objectContaining({ model: "model-a" })]);
     await expect(repositories.llmUsage.list(scopeB)).resolves.toEqual([]);
 
+    if (CHANNEL_KEY_STATE.status !== "ready") {
+      throw new Error("test_channel_key_not_ready");
+    }
+    await pool.query(
+      "INSERT INTO users (id, display_name) VALUES ($1, 'Other User')",
+      [OTHER_USER_ID],
+    );
+    await pool.query(
+      `INSERT INTO digital_agents (
+         id, user_id, slug, display_name, is_default
+       )
+       VALUES ($1, $2, 'other-agent', 'Other Agent', true)`,
+      [OTHER_AGENT_ID, OTHER_USER_ID],
+    );
+    const ownConnection = await pool.query<{ id: string }>(
+      `INSERT INTO channel_connections (
+         user_id, agent_id, channel_type, display_name, enabled,
+         config, health_status
+       )
+       VALUES (
+         $1, $2, 'telegram', 'Telegram', false,
+         '{"endpoint":"https://owned.example.test"}'::jsonb, 'disabled'
+       )
+       RETURNING id`,
+      [USER_ID, AGENT_A],
+    );
+    const otherConnection = await pool.query<{ id: string }>(
+      `INSERT INTO channel_connections (
+         user_id, agent_id, channel_type, display_name, enabled,
+         config, health_status
+       )
+       VALUES (
+         $1, $2, 'slack', 'Other Slack', false,
+         '{"marker":"OTHER_USER_CONFIG"}'::jsonb, 'disabled'
+       )
+       RETURNING id`,
+      [OTHER_USER_ID, OTHER_AGENT_ID],
+    );
+    const ownConnectionId = ownConnection.rows[0].id;
+    const otherConnectionId = otherConnection.rows[0].id;
+    const ownSecretPlaintext = "owned-export-secret";
+    const otherSecretPlaintext = "other-user-secret";
+    const ownSecret = CHANNEL_KEY_STATE.key.encrypt(
+      ownSecretPlaintext,
+      {
+        userId: USER_ID,
+        agentId: AGENT_A,
+        connectionId: ownConnectionId,
+        fieldName: "bot_token",
+      },
+    ).toStorageRecord();
+    const otherSecret = CHANNEL_KEY_STATE.key.encrypt(
+      otherSecretPlaintext,
+      {
+        userId: OTHER_USER_ID,
+        agentId: OTHER_AGENT_ID,
+        connectionId: otherConnectionId,
+        fieldName: "bot_token",
+      },
+    ).toStorageRecord();
+    await pool.query(
+      `INSERT INTO channel_secrets (
+         connection_id, field_name, ciphertext, nonce, auth_tag,
+         key_version
+       )
+       VALUES
+         ($1, 'bot_token', $3, $4, $5, $6),
+         ($2, 'bot_token', $7, $8, $9, $10)`,
+      [
+        ownConnectionId,
+        otherConnectionId,
+        ownSecret.ciphertext,
+        ownSecret.nonce,
+        ownSecret.authTag,
+        ownSecret.keyVersion,
+        otherSecret.ciphertext,
+        otherSecret.nonce,
+        otherSecret.authTag,
+        otherSecret.keyVersion,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO admin_audit_logs (
+         user_id, agent_id, action, resource_type, resource_id,
+         before_summary, after_summary, status
+       )
+       VALUES
+         ($1, $2, 'channel_connection.update', 'channel_connection',
+          $3, '{}'::jsonb, '{"enabled":false}'::jsonb, 'success'),
+         ($4, $5, 'channel_connection.update', 'channel_connection',
+          $6, '{}'::jsonb, '{"marker":"OTHER_USER_AUDIT"}'::jsonb,
+          'success')`,
+      [
+        USER_ID,
+        AGENT_A,
+        ownConnectionId,
+        OTHER_USER_ID,
+        OTHER_AGENT_ID,
+        otherConnectionId,
+      ],
+    );
+
+    const exportSnapshot = await repositories.personalData.export(
+      USER_ID,
+      CHANNEL_KEY_STATE.key,
+    );
+    expect(exportSnapshot.tables.channel_connections).toEqual([
+      expect.objectContaining({
+        id: ownConnectionId,
+        user_id: USER_ID,
+        agent_id: AGENT_A,
+        channel_type: "telegram",
+      }),
+    ]);
+    expect(exportSnapshot.tables.admin_audit_logs).toEqual([
+      expect.objectContaining({
+        user_id: USER_ID,
+        resource_id: ownConnectionId,
+      }),
+    ]);
+    expect(JSON.stringify(exportSnapshot)).not.toMatch(
+      /owned-export-secret|other-user-secret|OTHER_USER_CONFIG|OTHER_USER_AUDIT|ciphertext|auth_tag|key_version/,
+    );
+
+    await pool.query(
+      `UPDATE channel_connections
+       SET config = jsonb_build_object(
+         'endpoint',
+         'https://owned.example.test?token=' || $2::text
+       )
+       WHERE id = $1`,
+      [ownConnectionId, ownSecretPlaintext],
+    );
+    await expect(
+      repositories.personalData.export(
+        USER_ID,
+        CHANNEL_KEY_STATE.key,
+      ),
+    ).rejects.toThrow("personal_data_export_failed");
+    await pool.query(
+      `UPDATE channel_connections
+       SET config = '{"endpoint":"https://owned.example.test"}'::jsonb
+       WHERE id = $1`,
+      [ownConnectionId],
+    );
+
     await pool.query(
       "UPDATE digital_agents SET status = 'archived' WHERE user_id = $1 AND id = $2",
       [USER_ID, AGENT_A],
     );
+    await pool.query(`
+      CREATE FUNCTION reject_personal_data_message_delete()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RAISE EXCEPTION 'forced_personal_data_clear_failure';
+      END
+      $$;
+      CREATE TRIGGER reject_personal_data_message_delete
+      BEFORE DELETE ON messages
+      FOR EACH STATEMENT
+      EXECUTE FUNCTION reject_personal_data_message_delete();
+    `);
+    await expect(
+      repositories.personalData.clear(USER_ID),
+    ).rejects.toThrow("forced_personal_data_clear_failure");
+    const rolledBackChannels = await pool.query<{
+      connections: string;
+      secrets: string;
+      audits: string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM channel_connections
+          WHERE user_id = $1) AS connections,
+         (SELECT count(*) FROM channel_secrets
+          JOIN channel_connections
+            ON channel_connections.id = channel_secrets.connection_id
+          WHERE channel_connections.user_id = $1) AS secrets,
+         (SELECT count(*) FROM admin_audit_logs
+          WHERE user_id = $1) AS audits`,
+      [USER_ID],
+    );
+    expect(rolledBackChannels.rows[0]).toEqual({
+      connections: "1",
+      secrets: "1",
+      audits: "1",
+    });
+    await pool.query(`
+      DROP TRIGGER reject_personal_data_message_delete ON messages;
+      DROP FUNCTION reject_personal_data_message_delete();
+    `);
     await repositories.personalData.clear(USER_ID);
+
+    const channelCounts = await pool.query<{
+      own_connections: string;
+      own_secrets: string;
+      own_audits: string;
+      other_connections: string;
+      other_secrets: string;
+      other_audits: string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM channel_connections
+          WHERE user_id = $1) AS own_connections,
+         (SELECT count(*) FROM channel_secrets
+          JOIN channel_connections
+            ON channel_connections.id = channel_secrets.connection_id
+          WHERE channel_connections.user_id = $1) AS own_secrets,
+         (SELECT count(*) FROM admin_audit_logs
+          WHERE user_id = $1) AS own_audits,
+         (SELECT count(*) FROM channel_connections
+          WHERE user_id = $2) AS other_connections,
+         (SELECT count(*) FROM channel_secrets
+          JOIN channel_connections
+            ON channel_connections.id = channel_secrets.connection_id
+          WHERE channel_connections.user_id = $2) AS other_secrets,
+         (SELECT count(*) FROM admin_audit_logs
+          WHERE user_id = $2) AS other_audits`,
+      [USER_ID, OTHER_USER_ID],
+    );
+    expect(channelCounts.rows[0]).toEqual({
+      own_connections: "0",
+      own_secrets: "0",
+      own_audits: "0",
+      other_connections: "1",
+      other_secrets: "1",
+      other_audits: "1",
+    });
 
     const agents = await pool.query(
       `SELECT id, slug, display_name, status, is_default, inherits_user_resources

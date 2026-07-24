@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   requireCurrentUser: vi.fn(async () => ({ id: USER_ID })),
   disconnectUser: vi.fn(async () => mocks.releaseConnectionDrain),
   releaseConnectionDrain: vi.fn(),
+  hasEnabledChannelConnections: vi.fn(async () => false),
   listAttachmentStorageKeys: vi.fn(async () => [OWNED_KEY]),
   clear: vi.fn(async () => undefined),
   acquireUserMutationLock: vi.fn<(userId: string) => Promise<UserDataLease>>(),
@@ -33,6 +34,17 @@ vi.mock("@/server/admin/user-connections", () => ({
     disconnectUser: mocks.disconnectUser,
   },
 }));
+
+vi.mock("@/server/attachments/storage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/server/attachments/storage")>();
+  return {
+    ...actual,
+    deleteAttachment: vi.fn(async (rootDirectory: string, storageKey: string) => {
+      mocks.callOrder.push("attachment");
+      return actual.deleteAttachment(rootDirectory, storageKey);
+    }),
+  };
+});
 
 vi.mock("@/server/config/env", () => ({
   readEnv: vi.fn(() => ({ attachmentStorageDir: mocks.attachmentStorageDir })),
@@ -54,16 +66,29 @@ describe("admin personal data clear route", () => {
     vi.clearAllMocks();
     mocks.callOrder.length = 0;
     mocks.listAttachmentStorageKeys.mockResolvedValue([OWNED_KEY]);
+    mocks.listAttachmentStorageKeys.mockImplementation(async () => {
+      mocks.callOrder.push("enumerate");
+      return [OWNED_KEY];
+    });
+    mocks.hasEnabledChannelConnections.mockImplementation(async () => {
+      mocks.callOrder.push("channel-shutdown");
+      return false;
+    });
     mocks.clear.mockImplementation(async () => {
       mocks.callOrder.push("database");
     });
-    mocks.acquireUserMutationLock.mockImplementation(async () => ({
-      userId: USER_ID,
-      epoch: "1",
-      mode: "exclusive",
-      release: mocks.releaseUserMutationLock,
-    }));
-    mocks.releaseUserMutationLock.mockResolvedValue(undefined);
+    mocks.acquireUserMutationLock.mockImplementation(async () => {
+      mocks.callOrder.push("lease");
+      return {
+        userId: USER_ID,
+        epoch: "1",
+        mode: "exclusive",
+        release: mocks.releaseUserMutationLock,
+      };
+    });
+    mocks.releaseUserMutationLock.mockImplementation(async () => {
+      mocks.callOrder.push("release-lease");
+    });
     mocks.deleteArtifactTree.mockImplementation(async () => {
       mocks.callOrder.push("artifacts");
     });
@@ -73,11 +98,15 @@ describe("admin personal data clear route", () => {
       return mocks.releaseConnectionDrain;
     });
     mocks.releaseConnectionDrain.mockReset();
+    mocks.releaseConnectionDrain.mockImplementation(() => {
+      mocks.callOrder.push("release-drain");
+    });
     mocks.createRepositories.mockReturnValue({
       userDataMutations: {
         acquireExclusiveClearLease: mocks.acquireUserMutationLock,
       },
       personalData: {
+        hasEnabledChannelConnections: mocks.hasEnabledChannelConnections,
         listAttachmentStorageKeys: mocks.listAttachmentStorageKeys,
         clear: mocks.clear,
       },
@@ -106,9 +135,60 @@ describe("admin personal data clear route", () => {
     expect(mocks.disconnectUser).toHaveBeenCalledWith(USER_ID);
     expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
     expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
-    expect(mocks.callOrder).toEqual(["disconnect", "artifacts", "database"]);
+    expect(mocks.callOrder).toEqual([
+      "lease",
+      "channel-shutdown",
+      "disconnect",
+      "enumerate",
+      "attachment",
+      "artifacts",
+      "database",
+      "release-drain",
+      "release-lease",
+    ]);
     await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readAttachment(root, OTHER_KEY)).resolves.toEqual(Buffer.from("other-user"));
+  });
+
+  it("refuses to clear while any channel connection remains enabled", async () => {
+    mocks.hasEnabledChannelConnections.mockImplementationOnce(async () => {
+      mocks.callOrder.push("channel-shutdown");
+      return true;
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ error: "personal_data_clear_failed" });
+    expect(mocks.disconnectUser).not.toHaveBeenCalled();
+    expect(mocks.listAttachmentStorageKeys).not.toHaveBeenCalled();
+    expect(mocks.deleteArtifactTree).not.toHaveBeenCalled();
+    expect(mocks.clear).not.toHaveBeenCalled();
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    expect(mocks.callOrder).toEqual([
+      "lease",
+      "channel-shutdown",
+      "release-lease",
+    ]);
+    consoleError.mockRestore();
+  });
+
+  it("keeps all locator rows when channel shutdown confirmation fails", async () => {
+    mocks.hasEnabledChannelConnections.mockImplementationOnce(async () => {
+      mocks.callOrder.push("channel-shutdown");
+      throw new Error("channel_shutdown_failed");
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(response.status).toBe(500);
+    expect(mocks.disconnectUser).not.toHaveBeenCalled();
+    expect(mocks.listAttachmentStorageKeys).not.toHaveBeenCalled();
+    expect(mocks.clear).not.toHaveBeenCalled();
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
   });
 
   it("returns a stable failure instead of claiming success when physical deletion fails", async () => {
@@ -124,6 +204,7 @@ describe("admin personal data clear route", () => {
     await expect(response.json()).resolves.toEqual({ error: "personal_data_clear_failed" });
     expect(response.headers.get("location")).toBeNull();
     expect(mocks.clear).not.toHaveBeenCalled();
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
     expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
     consoleError.mockRestore();
   });
@@ -198,7 +279,49 @@ describe("admin personal data clear route", () => {
     await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     expect(mocks.deleteArtifactTree).toHaveBeenCalledWith("/private/artifacts", USER_ID);
     expect(mocks.clear).not.toHaveBeenCalled();
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
     expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
+  });
+
+  it("treats a missing attachment as an idempotent retry and continues clearing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+
+    const response = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(response.status).toBe(303);
+    expect(mocks.deleteArtifactTree).toHaveBeenCalledTimes(1);
+    expect(mocks.clear).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("can retry after a database rollback even when physical files were already removed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+    await saveAttachment(root, OWNED_KEY, Buffer.from("owned"));
+    mocks.clear
+      .mockImplementationOnce(async () => {
+        mocks.callOrder.push("database");
+        throw new Error("database_failed");
+      })
+      .mockImplementationOnce(async () => {
+        mocks.callOrder.push("database");
+      });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const failed = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+    const retried = await POST(new Request("http://localhost/api/admin/data/clear", { method: "POST" }));
+
+    expect(failed.status).toBe(500);
+    expect(retried.status).toBe(303);
+    expect(mocks.clear).toHaveBeenCalledTimes(2);
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(2);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(2);
+    await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     consoleError.mockRestore();
   });
 });

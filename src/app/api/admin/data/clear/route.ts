@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteAttachment } from "@/server/attachments/storage";
+import { createDisabledOnlyChannelShutdownPort } from "@/server/admin/personal-data";
 import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
@@ -16,6 +17,10 @@ export async function POST(request: Request) {
   let releaseConnectionDrain: (() => void) | undefined;
   try {
     clearLease = await repositories.userDataMutations.acquireExclusiveClearLease(user.id);
+    const channelShutdown = createDisabledOnlyChannelShutdownPort(
+      repositories,
+    );
+    await channelShutdown.stopAll({ userId: user.id });
     releaseConnectionDrain = await userConnectionDisconnector.disconnectUser(user.id);
     const storageKeys = await repositories.personalData.listAttachmentStorageKeys(user.id);
     const storageRoot = readEnv().attachmentStorageDir;

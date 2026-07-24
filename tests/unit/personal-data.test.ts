@@ -5,9 +5,16 @@ import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import { createRepositories } from "@/server/db/repositories";
+import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 import { deleteArtifactTree, writeArtifactFile } from "@/server/tasks/artifacts";
 
 const roots: string[] = [];
+const USER_ID = "10000000-0000-4000-8000-000000000001";
+const AGENT_ID = "10000000-0000-4000-8000-000000000011";
+const CONNECTION_ID = "10000000-0000-4000-8000-000000000021";
+const KEY_STATE = createChannelSecretsKey(
+  Buffer.alloc(32, 31).toString("base64"),
+);
 
 describe("personal data helpers", () => {
   afterEach(async () => {
@@ -36,6 +43,63 @@ describe("personal data helpers", () => {
         messages: [{ id: "m1", user_id: "user-1" }],
       },
     });
+  });
+
+  it("recursively removes internal channel payload fields from the final export", () => {
+    const exported = buildPersonalDataExport({
+      userId: USER_ID,
+      exportedAt: new Date("2026-07-25T00:00:00Z"),
+      tables: {
+        channel_connections: [{
+          id: CONNECTION_ID,
+          user_id: USER_ID,
+          agent_id: AGENT_ID,
+          config: {
+            endpoint: "https://example.test/hook",
+            nested: {
+              poll_token: "SENTINEL_POLL_TOKEN",
+              temporary_url: "https://temporary.invalid/reply",
+              raw_payload: { event: "SENTINEL_RAW_PAYLOAD" },
+              provider_payload: "SENTINEL_PROVIDER_PAYLOAD",
+              internal_path: "/private/channel/runtime",
+            },
+          },
+        }],
+      },
+    });
+
+    expect(exported.tables.channel_connections).toEqual([
+      expect.objectContaining({
+        agent_id: AGENT_ID,
+        config: {
+          endpoint: "https://example.test/hook",
+          nested: {},
+        },
+      }),
+    ]);
+    expect(JSON.stringify(exported)).not.toMatch(
+      /poll_token|temporary_url|raw_payload|provider_payload|internal_path|SENTINEL_/,
+    );
+  });
+
+  it("fails closed when an allowed export value repeats a channel credential", () => {
+    expect(() =>
+      buildPersonalDataExport({
+        userId: USER_ID,
+        exportedAt: new Date("2026-07-25T00:00:00Z"),
+        tables: {
+          channel_connections: [{
+            id: CONNECTION_ID,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            config: {
+              endpoint: "https://example.test/hook?token=long-export-secret",
+            },
+          }],
+        },
+        credentialValues: ["long-export-secret"],
+      }),
+    ).toThrow("personal_data_export_failed");
   });
 
   it("deletes stored task artifacts for one user", async () => {
@@ -110,9 +174,20 @@ describe("personal data helpers", () => {
     };
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
       void params;
+      if (
+        sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        || sql === "COMMIT"
+        || sql === "ROLLBACK"
+        || sql.includes("FROM channel_secrets")
+      ) {
+        return { rows: [] };
+      }
       return { rows: [safeRow] };
     });
-    const repositories = createRepositories({ query } as unknown as Pool);
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release: vi.fn() })),
+    } as unknown as Pool);
 
     const exported = await repositories.personalData.export("user-1");
 
@@ -172,7 +247,10 @@ describe("personal data helpers", () => {
       void params;
       return { rows: [{ storage_key: "owned-key" }] };
     });
-    const repositories = createRepositories({ query } as unknown as Pool);
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release: vi.fn() })),
+    } as unknown as Pool);
 
     await expect(repositories.personalData.listAttachmentStorageKeys("user-1")).resolves.toEqual(["owned-key"]);
 
@@ -208,7 +286,10 @@ describe("personal data helpers", () => {
       void params;
       return { rows: [] };
     });
-    const repositories = createRepositories({ query } as unknown as Pool);
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release: vi.fn() })),
+    } as unknown as Pool);
 
     await repositories.personalData.export("user-1");
 
@@ -225,6 +306,184 @@ describe("personal data helpers", () => {
     expect(sql.some((statement) =>
       statement.includes("FROM goal_steps") && statement.includes("goals.user_id = $1"),
     )).toBe(true);
+  });
+
+  it("exports explicit channel and admin audit allow-lists without secret material", async () => {
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("$1")) expect(params).toEqual([USER_ID]);
+      if (
+        sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        || sql === "COMMIT"
+        || sql === "ROLLBACK"
+      ) {
+        return { rows: [] };
+      }
+      if (sql.includes("FROM channel_connections") && !sql.includes("JOIN channel_connections")) {
+        return {
+          rows: [{
+            id: CONNECTION_ID,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            channel_type: "telegram",
+            display_name: "Telegram",
+            enabled: false,
+            config: {
+              allow_from: ["owner"],
+              nested: {
+                poll_token: "SENTINEL_POLL_TOKEN",
+                temporary_url: "https://temporary.invalid",
+              },
+            },
+            revision: 3,
+            health_status: "disabled",
+            health_detail: { code: "manually_disabled" },
+            created_at: new Date("2026-07-25T00:00:00Z"),
+            updated_at: new Date("2026-07-25T00:00:00Z"),
+            runtime_node_id: "SENTINEL_RUNTIME_NODE",
+            deleted_at: new Date("2026-07-25T00:00:00Z"),
+            ciphertext: "SENTINEL_CIPHERTEXT",
+          }],
+        };
+      }
+      if (sql.includes("FROM admin_audit_logs")) {
+        return {
+          rows: [{
+            id: "10000000-0000-4000-8000-000000000031",
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            action: "channel_connection.update",
+            resource_type: "channel_connection",
+            resource_id: CONNECTION_ID,
+            before_summary: {
+              enabled: false,
+              nested: { bot_token: "SENTINEL_AUDIT_TOKEN" },
+            },
+            after_summary: { enabled: false },
+            confirmation_source: {
+              type: "console",
+              poll_token: "SENTINEL_CONFIRMATION_TOKEN",
+            },
+            status: "success",
+            error_code: null,
+            created_at: new Date("2026-07-25T00:00:00Z"),
+          }],
+        };
+      }
+      if (sql.includes("FROM channel_secrets")) return { rows: [] };
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const pool = {
+      query,
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool;
+    const repositories = createRepositories(pool);
+
+    const exported = await repositories.personalData.export(USER_ID);
+
+    expect(exported.tables.channel_connections).toEqual([
+      {
+        id: CONNECTION_ID,
+        user_id: USER_ID,
+        agent_id: AGENT_ID,
+        channel_type: "telegram",
+        display_name: "Telegram",
+        enabled: false,
+        config: {
+          allow_from: ["owner"],
+          nested: {},
+        },
+        revision: 3,
+        health_status: "disabled",
+        health_detail: { code: "manually_disabled" },
+        created_at: new Date("2026-07-25T00:00:00Z"),
+        updated_at: new Date("2026-07-25T00:00:00Z"),
+      },
+    ]);
+    expect(exported.tables.admin_audit_logs).toEqual([
+      expect.objectContaining({
+        user_id: USER_ID,
+        agent_id: AGENT_ID,
+        before_summary: { enabled: false, nested: {} },
+        confirmation_source: { type: "console" },
+      }),
+    ]);
+    const serialized = JSON.stringify(exported);
+    expect(serialized).not.toMatch(
+      /channel_secrets|ciphertext|nonce|auth_tag|key_version|SENTINEL_|poll_token|temporary_url|runtime_node_id|deleted_at/,
+    );
+    for (const [statement] of query.mock.calls) {
+      expect(String(statement)).not.toMatch(/\bSELECT\s+\*/i);
+      expect(String(statement)).not.toMatch(/\b\w+\.\*/i);
+    }
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("decrypts owned channel secrets only for a fail-closed export scan", async () => {
+    if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+    const plaintext = "long-export-secret";
+    const encrypted = KEY_STATE.key.encrypt(plaintext, {
+      userId: USER_ID,
+      agentId: AGENT_ID,
+      connectionId: CONNECTION_ID,
+      fieldName: "bot_token",
+    }).toStorageRecord();
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM channel_connections") && !sql.includes("JOIN channel_connections")) {
+        return {
+          rows: [{
+            id: CONNECTION_ID,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            channel_type: "telegram",
+            display_name: "Telegram",
+            enabled: false,
+            config: {
+              endpoint: `https://example.test/hook?token=${plaintext}`,
+            },
+            revision: 1,
+            health_status: "disabled",
+            health_detail: {},
+            created_at: new Date("2026-07-25T00:00:00Z"),
+            updated_at: new Date("2026-07-25T00:00:00Z"),
+          }],
+        };
+      }
+      if (sql.includes("FROM channel_secrets")) {
+        return {
+          rows: [{
+            connection_id: CONNECTION_ID,
+            field_name: "bot_token",
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            auth_tag: encrypted.authTag,
+            key_version: encrypted.keyVersion,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(USER_ID),
+    ).rejects.toThrow("personal_data_export_failed");
+    await expect(
+      repositories.personalData.export(USER_ID, KEY_STATE.key),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    const secretQuery = query.mock.calls.find(([sql]) =>
+      String(sql).includes("FROM channel_secrets"),
+    );
+    expect(String(secretQuery?.[0])).toContain("JOIN channel_connections");
+    expect(String(secretQuery?.[0])).toContain("channel_connections.user_id = $1");
+    expect(release).toHaveBeenCalledTimes(2);
   });
 
   it("clears and normalizes agent identity inside one database transaction", async () => {
@@ -244,6 +503,22 @@ describe("personal data helpers", () => {
     expect(sql[0]).toBe("BEGIN");
     expect(sql.at(-1)).toBe("COMMIT");
     expect(sql).toContain("DELETE FROM agent_resource_grants WHERE user_id = $1");
+    const secretDelete = sql.findIndex((statement) =>
+      statement.includes("DELETE FROM channel_secrets")
+      && statement.includes("channel_connections")
+      && statement.includes("user_id = $1"),
+    );
+    const connectionDelete = sql.findIndex((statement) =>
+      statement.includes("DELETE FROM channel_connections")
+      && statement.includes("user_id = $1"),
+    );
+    const auditDelete = sql.findIndex((statement) =>
+      statement.includes("DELETE FROM admin_audit_logs")
+      && statement.includes("user_id = $1"),
+    );
+    expect(secretDelete).toBeGreaterThan(0);
+    expect(connectionDelete).toBeGreaterThan(secretDelete);
+    expect(auditDelete).toBeGreaterThan(0);
     expect(sql.some((statement) =>
       statement.includes("DELETE FROM digital_agents")
       && statement.includes("id <> $2"),
