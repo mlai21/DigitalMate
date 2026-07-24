@@ -388,7 +388,7 @@ describe("agent-scoped repositories on PostgreSQL", () => {
        )
        VALUES (
          $1, $2, 'telegram', 'Telegram', false,
-         '{"endpoint":"https://owned.example.test"}'::jsonb, 'disabled'
+         '{"base_url":"https://owned.example.test"}'::jsonb, 'disabled'
        )
        RETURNING id`,
       [USER_ID, AGENT_A],
@@ -494,7 +494,7 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     await pool.query(
       `UPDATE channel_connections
        SET config = jsonb_build_object(
-         'endpoint',
+         'base_url',
          'https://owned.example.test?token=' || $2::text
        )
        WHERE id = $1`,
@@ -508,7 +508,7 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     ).rejects.toThrow("personal_data_export_failed");
     await pool.query(
       `UPDATE channel_connections
-       SET config = '{"endpoint":"https://owned.example.test"}'::jsonb
+       SET config = '{"base_url":"https://owned.example.test"}'::jsonb
        WHERE id = $1`,
       [ownConnectionId],
     );

@@ -29,7 +29,7 @@ export async function POST(request: Request) {
   const message = normalizeSlackEvent(payload);
   if (!message) return NextResponse.json({ ok: true });
 
-  scheduleChannelMessageHandling({ env, message, source: "Slack" });
+  await scheduleChannelMessageHandling({ env, message, source: "Slack" });
 
   return NextResponse.json({ ok: true });
 }

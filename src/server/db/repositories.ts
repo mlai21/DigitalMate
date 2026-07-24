@@ -10,6 +10,10 @@ import {
 import { embedText } from "@/server/llm/embeddings";
 import type { EnabledToolContext, SkillContext, ToolLogInput } from "@/server/agent/run-agent";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
+import {
+  getChannelManifest,
+  isChannelType,
+} from "@/server/channels/manifests/catalog";
 import type { ReflectionRecord } from "@/server/evolution/reflection";
 import type { SkillDraft } from "@/server/evolution/skills";
 import {
@@ -88,7 +92,7 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   channel_connections: [
     "id", "user_id", "agent_id", "channel_type", "display_name", "enabled",
-    "config", "revision", "health_status", "health_detail", "created_at", "updated_at",
+    "config", "revision", "health_status", "created_at", "updated_at",
   ],
   channel_messages: [
     "id", "user_id", "agent_id", "conversation_id", "channel", "external_conversation_id",
@@ -141,8 +145,7 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   admin_audit_logs: [
     "id", "user_id", "agent_id", "action", "resource_type", "resource_id",
-    "before_summary", "after_summary", "confirmation_source", "status",
-    "error_code", "created_at",
+    "status", "error_code", "created_at",
   ],
 } as const;
 const GOAL_STEP_EXPORT_COLUMNS = [
@@ -153,6 +156,44 @@ const ATTACHMENT_EXPORT_COLUMNS = [
   "id", "user_id", "agent_id", "message_id", "kind", "file_name", "mime_type",
   "size_bytes", "text_truncated", "status", "error_code", "created_at", "updated_at",
 ] as const;
+const PERSONAL_DATA_EXPORT_LOCK_TIMEOUT_MS = 10_000;
+const PERSONAL_DATA_EXPORT_STATEMENT_TIMEOUT_MS = 110_000;
+const PERSONAL_DATA_CLEAR_RECOVERY_TIMEOUT_MS = 10_000;
+const PERSONAL_DATA_EXPORT_LIMITS = Object.freeze({
+  maxRows: 100_000,
+  maxEstimatedBytes: 32 * 1024 * 1024,
+  maxSerializedBytes: 32 * 1024 * 1024,
+});
+const PERSONAL_DATA_CLEAR_TABLES = [
+  "goals",
+  "skill_usage_logs",
+  "skill_revisions",
+  "task_artifacts",
+  "task_runs",
+  "tool_registrations",
+  "skills",
+  "reflections",
+  "interjection_decisions",
+  "channel_messages",
+  "channel_identities",
+  "proactive_tasks",
+  "tool_call_logs",
+  "llm_usage_logs",
+  "memory_jobs",
+  "conversation_summaries",
+  "memory_entries",
+  "message_attachments",
+  "messages",
+  "conversations",
+  "projects",
+  "agent_resource_grants",
+] as const;
+
+type PersonalDataExportLimits = Readonly<{
+  maxRows: number;
+  maxEstimatedBytes: number;
+  maxSerializedBytes: number;
+}>;
 export type DbUser = {
   id: string;
   displayName: string;
@@ -421,6 +462,70 @@ export function createRepositories(
     return { userId, epoch };
   }
 
+  async function tryAdmitUserDataRequest(
+    userId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<UserDataRequestFence | null> {
+    const lockKey = `user-data-quiescence:${userId}`;
+    const client = await connectPoolClient(
+      userDataLockPool,
+      options.signal,
+    );
+    const clientGuard = guardPoolClientWithAbort(
+      client,
+      options.signal,
+    );
+    let locked = false;
+    try {
+      options.signal?.throwIfAborted();
+      const lock = await client.query<{ locked: boolean }>(
+        `SELECT pg_try_advisory_lock_shared(
+           hashtextextended($1, 0)
+         ) AS locked`,
+        [lockKey],
+      );
+      options.signal?.throwIfAborted();
+      if (lock.rows[0]?.locked !== true) return null;
+      locked = true;
+      await client.query(
+        `INSERT INTO user_data_epochs (user_id)
+         VALUES ($1)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [userId],
+      );
+      options.signal?.throwIfAborted();
+      const result = await client.query<{ epoch: string }>(
+        `SELECT epoch::text AS epoch
+         FROM user_data_epochs
+         WHERE user_id = $1`,
+        [userId],
+      );
+      options.signal?.throwIfAborted();
+      const epoch = result.rows[0]?.epoch;
+      if (epoch === undefined) {
+        throw new Error("user_data_epoch_missing");
+      }
+      return { userId, epoch };
+    } catch (error) {
+      if (!clientGuard.destroyed) clientGuard.destroy();
+      options.signal?.throwIfAborted();
+      throw error;
+    } finally {
+      clientGuard.dispose();
+      if (!clientGuard.destroyed) {
+        if (locked) {
+          await releaseAdvisoryLease(
+            client,
+            lockKey,
+            "shared",
+          );
+        } else {
+          client.release();
+        }
+      }
+    }
+  }
+
   async function acquireSharedUserDataLease(
     fence: UserDataRequestFence,
     options: { signal?: AbortSignal } = {},
@@ -501,6 +606,7 @@ export function createRepositories(
     agents,
     userDataMutations: {
       beginRequest: beginUserDataRequest,
+      tryAdmitRequest: tryAdmitUserDataRequest,
       acquireSharedLease: acquireSharedUserDataLease,
       acquireExclusiveClearLease,
     },
@@ -2553,26 +2659,58 @@ export function createRepositories(
       async export(
         userId: string,
         channelSecretsKey: ChannelSecretsKey | null = null,
+        signal?: AbortSignal,
+        requestedLimits?: Partial<PersonalDataExportLimits>,
       ) {
-        const client = await pool.connect();
+        let client: PoolClient | undefined;
+        let clientGuard: AbortablePoolClientGuard | undefined;
+        let transactionState:
+          | "none"
+          | "active"
+          | "committing"
+          | "finished" = "none";
         try {
+          const limits = normalizePersonalDataExportLimits(
+            requestedLimits,
+          );
+          const budget = createPersonalDataExportBudget(limits);
+          client = await connectPoolClient(pool, signal);
+          clientGuard = guardPoolClientWithAbort(client, signal);
+          signal?.throwIfAborted();
           await client.query(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
           );
+          signal?.throwIfAborted();
+          transactionState = "active";
+          await client.query(
+            `SET LOCAL lock_timeout = '${PERSONAL_DATA_EXPORT_LOCK_TIMEOUT_MS}ms'`,
+          );
+          signal?.throwIfAborted();
+          await client.query(
+            `SET LOCAL statement_timeout = '${PERSONAL_DATA_EXPORT_STATEMENT_TIMEOUT_MS}ms'`,
+          );
+          signal?.throwIfAborted();
           const exported: Record<string, unknown[]> = {};
           for (
             const [table, columns]
               of Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)
           ) {
+            signal?.throwIfAborted();
             const visibilityFilter = table === "task_artifacts"
               ? " AND status = 'ready'"
               : "";
             const result = await client.query(
-              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}`,
+              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}
+               LIMIT ${budget.nextQueryLimit()}`,
               [userId],
             );
-            exported[table] = result.rows.map((row) =>
-              pickExportRow(row, columns)
+            signal?.throwIfAborted();
+            exported[table] = budget.consumeRows(
+              table === "channel_connections"
+                ? result.rows.map(projectChannelConnectionExportRow)
+                : result.rows,
+              columns,
+              signal,
             );
           }
           const goalSteps = await client.query(
@@ -2580,21 +2718,29 @@ export function createRepositories(
              FROM goal_steps
              JOIN goals ON goals.id = goal_steps.goal_id
              WHERE goals.user_id = $1
-             ORDER BY goal_steps.created_at ASC, goal_steps.id ASC`,
+             ORDER BY goal_steps.created_at ASC, goal_steps.id ASC
+             LIMIT ${budget.nextQueryLimit()}`,
             [userId],
           );
-          exported.goal_steps = goalSteps.rows.map((row) =>
-            pickExportRow(row, GOAL_STEP_EXPORT_COLUMNS)
+          signal?.throwIfAborted();
+          exported.goal_steps = budget.consumeRows(
+            goalSteps.rows,
+            GOAL_STEP_EXPORT_COLUMNS,
+            signal,
           );
           const attachments = await client.query(
             `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
              FROM message_attachments
              WHERE user_id = $1
-             ORDER BY created_at ASC, id ASC`,
+             ORDER BY created_at ASC, id ASC
+             LIMIT ${budget.nextQueryLimit()}`,
             [userId],
           );
-          exported.message_attachments = attachments.rows.map((row) =>
-            pickExportRow(row, ATTACHMENT_EXPORT_COLUMNS)
+          signal?.throwIfAborted();
+          exported.message_attachments = budget.consumeRows(
+            attachments.rows,
+            ATTACHMENT_EXPORT_COLUMNS,
+            signal,
           );
 
           const encryptedSecrets = await client.query<{
@@ -2620,17 +2766,22 @@ export function createRepositories(
                ON channel_connections.id = channel_secrets.connection_id
              WHERE channel_connections.user_id = $1
              ORDER BY channel_secrets.connection_id,
-                      channel_secrets.field_name`,
+                      channel_secrets.field_name
+             LIMIT ${budget.nextQueryLimit()}`,
             [userId],
           );
+          signal?.throwIfAborted();
+          budget.consumeSupportingRows(encryptedSecrets.rows, signal);
           if (
             encryptedSecrets.rows.length > 0
             && channelSecretsKey === null
           ) {
             throw new PersonalDataExportError();
           }
-          const credentialValues = encryptedSecrets.rows.map((row) =>
-            channelSecretsKey!.decrypt(
+          const credentialValues: string[] = [];
+          for (const row of encryptedSecrets.rows) {
+            signal?.throwIfAborted();
+            const credentialValue = channelSecretsKey!.decrypt(
               encryptedSecretFromStorage({
                 ciphertext: row.ciphertext,
                 nonce: row.nonce,
@@ -2643,22 +2794,48 @@ export function createRepositories(
                 connectionId: row.connection_id,
                 fieldName: row.field_name,
               },
-            )
-          );
+            );
+            budget.consumeText(credentialValue);
+            credentialValues.push(credentialValue);
+          }
+          signal?.throwIfAborted();
           const result = buildPersonalDataExport({
             userId,
             exportedAt: new Date(),
             tables: exported,
             credentialValues,
           });
+          signal?.throwIfAborted();
+          budget.assertSerializedSize(result);
+          signal?.throwIfAborted();
+          transactionState = "committing";
           await client.query("COMMIT");
+          transactionState = "finished";
+          signal?.throwIfAborted();
           return result;
         } catch (error) {
-          await client.query("ROLLBACK").catch(() => undefined);
+          if (
+            client
+            && clientGuard
+            && !clientGuard.destroyed
+          ) {
+            if (transactionState === "active") {
+              try {
+                await client.query("ROLLBACK");
+              } catch {
+                clientGuard.destroy();
+              }
+            } else if (transactionState === "committing") {
+              clientGuard.destroy();
+            }
+          }
           if (error instanceof PersonalDataExportError) throw error;
           throw new PersonalDataExportError();
         } finally {
-          client.release();
+          clientGuard?.dispose();
+          if (client && clientGuard && !clientGuard.destroyed) {
+            client.release();
+          }
         }
       },
       async hasEnabledChannelConnections(
@@ -2687,8 +2864,15 @@ export function createRepositories(
       },
       async clear(userId: string): Promise<void> {
         const client = await pool.connect();
+        const clientGuard = guardPoolClientWithAbort(client);
+        let transactionState:
+          | "none"
+          | "active"
+          | "committing"
+          | "finished" = "none";
         try {
           await client.query("BEGIN");
+          transactionState = "active";
           const selectedAgent = await client.query<{ id: string }>(
             `SELECT id
              FROM digital_agents
@@ -2718,31 +2902,7 @@ export function createRepositories(
             [userId],
           );
 
-          const tables = [
-            "goals",
-            "skill_usage_logs",
-            "skill_revisions",
-            "task_artifacts",
-            "task_runs",
-            "tool_registrations",
-            "skills",
-            "reflections",
-            "interjection_decisions",
-            "channel_messages",
-            "channel_identities",
-            "proactive_tasks",
-            "tool_call_logs",
-            "llm_usage_logs",
-            "memory_jobs",
-            "conversation_summaries",
-            "memory_entries",
-            "message_attachments",
-            "messages",
-            "conversations",
-            "projects",
-            "agent_resource_grants",
-          ];
-          for (const table of tables) {
+          for (const table of PERSONAL_DATA_CLEAR_TABLES) {
             await client.query(`DELETE FROM ${table} WHERE user_id = $1`, [userId]);
           }
 
@@ -2826,12 +2986,33 @@ export function createRepositories(
               defaultSettings.search,
             ],
           );
+          transactionState = "committing";
           await client.query("COMMIT");
+          transactionState = "finished";
         } catch (error) {
-          await client.query("ROLLBACK");
+          if (transactionState === "committing") {
+            clientGuard.destroy();
+            const verification = await verifyPersonalDataClear(
+              pool,
+              userId,
+            );
+            if (verification === "committed") return;
+            throw new Error("personal_data_clear_failed");
+          }
+          if (
+            transactionState === "active"
+            && !clientGuard.destroyed
+          ) {
+            try {
+              await client.query("ROLLBACK");
+            } catch {
+              clientGuard.destroy();
+            }
+          }
           throw error;
         } finally {
-          client.release();
+          clientGuard.dispose();
+          if (!clientGuard.destroyed) client.release();
         }
       },
     },
@@ -3087,6 +3268,261 @@ function pickExportRow(
       .filter((column) => Object.hasOwn(row, column))
       .map((column) => [column, row[column]]),
   );
+}
+
+function projectChannelConnectionExportRow(
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...row,
+    config: projectApprovedChannelConfig(
+      row.channel_type,
+      row.config,
+    ),
+  };
+}
+
+function projectApprovedChannelConfig(
+  channelType: unknown,
+  config: unknown,
+): Record<string, unknown> {
+  if (
+    typeof channelType !== "string"
+    || !isChannelType(channelType)
+    || !isRecord(config)
+  ) {
+    return {};
+  }
+  const manifest = getChannelManifest(channelType);
+  const secretFields = new Set(manifest.secretFields);
+  const projected: Record<string, unknown> = {};
+  for (const field of manifest.fields) {
+    if (
+      secretFields.has(field.name)
+      || !Object.hasOwn(config, field.name)
+    ) {
+      continue;
+    }
+    const parsed = manifest.configSchema.safeParse({
+      [field.name]: config[field.name],
+    });
+    if (
+      parsed.success
+      && Object.hasOwn(parsed.data, field.name)
+    ) {
+      projected[field.name] = parsed.data[field.name];
+    }
+  }
+  return projected;
+}
+
+function normalizePersonalDataExportLimits(
+  requested?: Partial<PersonalDataExportLimits>,
+): PersonalDataExportLimits {
+  const normalize = (
+    value: number | undefined,
+    maximum: number,
+  ): number => {
+    if (value === undefined) return maximum;
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new PersonalDataExportError();
+    }
+    return Math.min(value, maximum);
+  };
+  return {
+    maxRows: normalize(
+      requested?.maxRows,
+      PERSONAL_DATA_EXPORT_LIMITS.maxRows,
+    ),
+    maxEstimatedBytes: normalize(
+      requested?.maxEstimatedBytes,
+      PERSONAL_DATA_EXPORT_LIMITS.maxEstimatedBytes,
+    ),
+    maxSerializedBytes: normalize(
+      requested?.maxSerializedBytes,
+      PERSONAL_DATA_EXPORT_LIMITS.maxSerializedBytes,
+    ),
+  };
+}
+
+function createPersonalDataExportBudget(
+  limits: PersonalDataExportLimits,
+) {
+  let rowCount = 0;
+  let estimatedBytes = 0;
+
+  const consumeValue = (value: unknown) => {
+    const serialized = JSON.stringify(value);
+    estimatedBytes += Buffer.byteLength(serialized ?? "", "utf8");
+    if (estimatedBytes > limits.maxEstimatedBytes) {
+      throw new PersonalDataExportError();
+    }
+  };
+  const consumeRow = (value: unknown) => {
+    rowCount += 1;
+    if (rowCount > limits.maxRows) {
+      throw new PersonalDataExportError();
+    }
+    consumeValue(value);
+  };
+
+  return {
+    nextQueryLimit(): number {
+      return Math.max(1, limits.maxRows - rowCount + 1);
+    },
+    consumeRows(
+      rows: Record<string, unknown>[],
+      columns: readonly string[],
+      signal?: AbortSignal,
+    ): Record<string, unknown>[] {
+      const pickedRows: Record<string, unknown>[] = [];
+      for (const row of rows) {
+        signal?.throwIfAborted();
+        const picked = pickExportRow(row, columns);
+        consumeRow(picked);
+        pickedRows.push(picked);
+      }
+      return pickedRows;
+    },
+    consumeSupportingRows(
+      rows: readonly unknown[],
+      signal?: AbortSignal,
+    ): void {
+      for (const row of rows) {
+        signal?.throwIfAborted();
+        consumeRow(row);
+      }
+    },
+    consumeText(value: string): void {
+      consumeValue(value);
+    },
+    assertSerializedSize(value: unknown): void {
+      const serialized = JSON.stringify(value);
+      if (
+        Buffer.byteLength(serialized ?? "", "utf8")
+        > limits.maxSerializedBytes
+      ) {
+        throw new PersonalDataExportError();
+      }
+    },
+  };
+}
+
+async function verifyPersonalDataClear(
+  pool: Pool,
+  userId: string,
+): Promise<"committed" | "not_committed" | "unknown"> {
+  const recoveryController = new AbortController();
+  const recoveryTimer = setTimeout(() => {
+    recoveryController.abort(
+      new Error("personal_data_clear_recovery_timeout"),
+    );
+  }, PERSONAL_DATA_CLEAR_RECOVERY_TIMEOUT_MS);
+  recoveryTimer.unref?.();
+  let client: PoolClient | undefined;
+  let clientGuard: AbortablePoolClientGuard | undefined;
+  try {
+    client = await connectPoolClient(
+      pool,
+      recoveryController.signal,
+    );
+    clientGuard = guardPoolClientWithAbort(
+      client,
+      recoveryController.signal,
+    );
+    recoveryController.signal.throwIfAborted();
+    const clearedTableChecks = PERSONAL_DATA_CLEAR_TABLES.map((table) =>
+      `NOT EXISTS (
+         SELECT 1 FROM ${table} WHERE user_id = $1
+       )`
+    ).join("\n       AND ");
+    const result = await client.query<{ clear_complete: boolean }>(
+      `SELECT (
+         NOT EXISTS (
+           SELECT 1
+           FROM channel_secrets
+           JOIN channel_connections
+             ON channel_connections.id = channel_secrets.connection_id
+           WHERE channel_connections.user_id = $1
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM channel_connections WHERE user_id = $1
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM admin_audit_logs WHERE user_id = $1
+         )
+         AND ${clearedTableChecks}
+         AND (
+           SELECT count(*) = 1
+           FROM digital_agents
+           WHERE user_id = $1
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM digital_agents
+           WHERE user_id = $1
+             AND slug = 'digitalmate'
+             AND display_name = 'DigitalMate'
+             AND persona = '{}'::jsonb
+             AND status = 'active'
+             AND is_default = true
+             AND inherits_user_resources = true
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM settings
+           WHERE user_id = $1
+             AND persona = $2::jsonb
+             AND proactivity = $3::jsonb
+             AND model_routing = $4::jsonb
+             AND cadence = $5::jsonb
+             AND search = $6::jsonb
+             AND language = 'zh'
+             AND timezone = 'Asia/Shanghai'
+         )
+         AND (
+           SELECT count(*) = 1
+           FROM agent_settings
+           WHERE user_id = $1
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM agent_settings
+           JOIN digital_agents
+             ON digital_agents.user_id = agent_settings.user_id
+            AND digital_agents.id = agent_settings.agent_id
+           WHERE agent_settings.user_id = $1
+             AND digital_agents.slug = 'digitalmate'
+             AND agent_settings.persona = $2::jsonb
+             AND agent_settings.proactivity = $3::jsonb
+             AND agent_settings.cadence = $5::jsonb
+             AND agent_settings.search = $6::jsonb
+             AND agent_settings.model_routing_override = '{}'::jsonb
+         )
+       ) AS clear_complete`,
+      [
+        userId,
+        defaultSettings.persona,
+        defaultSettings.proactivity,
+        defaultSettings.modelRouting,
+        defaultSettings.cadence,
+        defaultSettings.search,
+      ],
+    );
+    recoveryController.signal.throwIfAborted();
+    return result.rows[0]?.clear_complete === true
+      ? "committed"
+      : "not_committed";
+  } catch {
+    clientGuard?.destroy();
+    return "unknown";
+  } finally {
+    clearTimeout(recoveryTimer);
+    clientGuard?.dispose();
+    if (client && clientGuard && !clientGuard.destroyed) {
+      client.release();
+    }
+  }
 }
 
 function createAdvisoryLease(

@@ -20,7 +20,7 @@ export async function POST(request: Request) {
   const message = normalizeFeishuEvent(payload);
   if (!message) return NextResponse.json({ ok: true });
 
-  scheduleChannelMessageHandling({ env, message, source: "Feishu" });
+  await scheduleChannelMessageHandling({ env, message, source: "Feishu" });
 
   return NextResponse.json({ ok: true });
 }

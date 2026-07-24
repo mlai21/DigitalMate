@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const sharedLeaseMarkers = [
   "withUserDataLease(",
+  "withUserDataFence(",
   "acquireUserDataLease(",
   "withFreshUserDataLease(",
 ] as const;
@@ -85,7 +86,9 @@ describe("user data entry inventory", () => {
     expect(clearRoute).not.toContain("acquireSharedLease(");
   });
 
-  it("uses blocking advisory locks without polling try-locks", () => {
-    expect(source("src/server/db/repositories.ts")).not.toContain("pg_try_advisory");
+  it("uses a single non-blocking shared lock only for webhook admission", () => {
+    const repositories = source("src/server/db/repositories.ts");
+    expect(repositories.match(/pg_try_advisory_lock_shared/g)).toHaveLength(1);
+    expect(repositories).not.toContain("pg_try_advisory_lock(");
   });
 });

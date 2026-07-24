@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   handleChannelMessage: vi.fn(),
   readEnv: vi.fn(),
   beginUserDataRequest: vi.fn(),
+  tryAdmitUserDataRequest: vi.fn(),
   acquireSharedUserDataLease: vi.fn(),
   releaseUserDataLease: vi.fn(),
   sendChannelMessage: vi.fn(),
@@ -41,6 +42,10 @@ describe("channel webhook routes", () => {
     vi.clearAllMocks();
     mocks.readEnv.mockReturnValue({});
     mocks.beginUserDataRequest.mockImplementation(async (userId: string) => ({ userId, epoch: "1" }));
+    mocks.tryAdmitUserDataRequest.mockImplementation(async (userId: string) => ({
+      userId,
+      epoch: "1",
+    }));
     mocks.acquireSharedUserDataLease.mockImplementation(async (fence: { userId: string; epoch: string }) => ({
       ...fence,
       mode: "shared",
@@ -79,7 +84,64 @@ describe("channel webhook routes", () => {
     expect(mocks.createRepositories).not.toHaveBeenCalled();
   });
 
-  it("acks Telegram webhooks before initializing channel processing dependencies", async () => {
+  it("rejects Telegram and Slack authentication failures before admission", async () => {
+    mocks.readEnv
+      .mockReturnValueOnce({ telegramWebhookSecret: "expected-token" })
+      .mockReturnValueOnce({ slackSigningSecret: "expected-secret" });
+
+    const telegram = await postTelegramWebhook(
+      jsonRequest("http://localhost/api/webhooks/telegram", {
+        message: {
+          message_id: 9,
+          date: 1783185600,
+          chat: { id: 123, type: "private" },
+          from: { id: 456, is_bot: false },
+          text: "不应受理",
+        },
+      }),
+    );
+    const slack = await postSlackWebhook(
+      jsonRequest("http://localhost/api/webhooks/slack", {
+        type: "event_callback",
+        event: {
+          type: "message",
+          channel: "D1",
+          user: "U1",
+          text: "不应受理",
+          ts: "1783185600.000900",
+          channel_type: "im",
+        },
+      }),
+    );
+
+    expect(telegram.status).toBe(401);
+    expect(slack.status).toBe(401);
+    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.tryAdmitUserDataRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not acquire admission resources for malformed JSON", async () => {
+    const routes = [
+      [postTelegramWebhook, "telegram"],
+      [postSlackWebhook, "slack"],
+      [postFeishuWebhook, "feishu"],
+      [postDingTalkWebhook, "dingtalk"],
+    ] as const;
+
+    for (const [post, name] of routes) {
+      await expect(
+        post(new Request(`http://localhost/api/webhooks/${name}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{",
+        })),
+      ).rejects.toBeInstanceOf(SyntaxError);
+    }
+    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.tryAdmitUserDataRequest).not.toHaveBeenCalled();
+  });
+
+  it("captures Telegram admission before ACK and delays processing dependencies", async () => {
     vi.useFakeTimers();
 
     const response = await postTelegramWebhook(
@@ -95,18 +157,24 @@ describe("channel webhook routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
+    expect(mocks.tryAdmitUserDataRequest).toHaveBeenCalledWith("user-1");
     expect(mocks.getLlmClient).not.toHaveBeenCalled();
     expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
 
     await vi.runOnlyPendingTimersAsync();
 
     expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
+    expect(mocks.beginUserDataRequest).not.toHaveBeenCalled();
+    expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledWith(
+      { userId: "user-1", epoch: "1" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(mocks.getLlmClient).toHaveBeenCalledWith("main", expect.any(Object), { main: "mock-main", light: "mock-light" });
     expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("acks Slack webhooks before initializing channel processing dependencies", async () => {
+  it("captures Slack admission before ACK and delays processing dependencies", async () => {
     vi.useFakeTimers();
 
     const response = await postSlackWebhook(
@@ -124,7 +192,8 @@ describe("channel webhook routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
+    expect(mocks.tryAdmitUserDataRequest).toHaveBeenCalledWith("user-1");
     expect(mocks.getLlmClient).not.toHaveBeenCalled();
     expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
 
@@ -135,7 +204,7 @@ describe("channel webhook routes", () => {
     expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("acks Feishu webhooks before initializing channel processing dependencies", async () => {
+  it("captures Feishu admission before ACK and delays processing dependencies", async () => {
     vi.useFakeTimers();
 
     const response = await postFeishuWebhook(
@@ -156,7 +225,8 @@ describe("channel webhook routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
+    expect(mocks.tryAdmitUserDataRequest).toHaveBeenCalledWith("user-1");
     expect(mocks.getLlmClient).not.toHaveBeenCalled();
     expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
 
@@ -167,7 +237,7 @@ describe("channel webhook routes", () => {
     expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("acks DingTalk webhooks before initializing channel processing dependencies", async () => {
+  it("captures DingTalk admission before ACK and delays processing dependencies", async () => {
     vi.useFakeTimers();
 
     const response = await postDingTalkWebhook(
@@ -182,7 +252,8 @@ describe("channel webhook routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.createRepositories).not.toHaveBeenCalled();
+    expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
+    expect(mocks.tryAdmitUserDataRequest).toHaveBeenCalledWith("user-1");
     expect(mocks.getLlmClient).not.toHaveBeenCalled();
     expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
 
@@ -191,6 +262,113 @@ describe("channel webhook routes", () => {
     expect(mocks.createRepositories).toHaveBeenCalledTimes(1);
     expect(mocks.getLlmClient).toHaveBeenCalledWith("main", expect.any(Object), { main: "mock-main", light: "mock-light" });
     expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("ACKs and drops all four normalized events when clear owns admission", async () => {
+    vi.useFakeTimers();
+    mocks.tryAdmitUserDataRequest.mockResolvedValue(null);
+
+    const responses = await Promise.all([
+      postTelegramWebhook(
+        jsonRequest("http://localhost/api/webhooks/telegram", {
+          message: {
+            message_id: 11,
+            date: 1783185600,
+            chat: { id: 123, type: "private" },
+            from: { id: 456, is_bot: false },
+            text: "清空中",
+          },
+        }),
+      ),
+      postSlackWebhook(
+        jsonRequest("http://localhost/api/webhooks/slack", {
+          type: "event_callback",
+          event: {
+            type: "message",
+            channel: "D1",
+            user: "U1",
+            text: "清空中",
+            ts: "1783185600.001100",
+            channel_type: "im",
+          },
+        }),
+      ),
+      postFeishuWebhook(
+        jsonRequest("http://localhost/api/webhooks/feishu", {
+          schema: "2.0",
+          header: {
+            event_id: "evt-11",
+            create_time: "1783185600000",
+            event_type: "im.message.receive_v1",
+          },
+          event: {
+            message: {
+              message_id: "om_11",
+              chat_id: "oc_11",
+              chat_type: "p2p",
+              message_type: "text",
+              content: "{\"text\":\"清空中\"}",
+            },
+            sender: { sender_id: { open_id: "ou_11" } },
+          },
+        }),
+      ),
+      postDingTalkWebhook(
+        jsonRequest("http://localhost/api/webhooks/dingtalk", {
+          msgId: "msg-11",
+          conversationId: "cid-11",
+          conversationType: "1",
+          senderStaffId: "staff-11",
+          msgtype: "text",
+          text: { content: "清空中" },
+        }),
+      ),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([
+      200,
+      200,
+      200,
+      200,
+    ]);
+    expect(mocks.tryAdmitUserDataRequest).toHaveBeenCalledTimes(4);
+    await vi.runOnlyPendingTimersAsync();
+    expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
+    expect(mocks.acquireSharedUserDataLease).not.toHaveBeenCalled();
+  });
+
+  it("drops a pre-clear admission whose captured fence becomes stale", async () => {
+    vi.useFakeTimers();
+    mocks.acquireSharedUserDataLease.mockRejectedValueOnce(
+      new Error("user_data_epoch_changed"),
+    );
+    const consoleError = vi.spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    const response = await postTelegramWebhook(
+      jsonRequest("http://localhost/api/webhooks/telegram", {
+        message: {
+          message_id: 12,
+          date: 1783185600,
+          chat: { id: 123, type: "private" },
+          from: { id: 456, is_bot: false },
+          text: "旧 fence 不得执行",
+        },
+      }),
+    );
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(response.status).toBe(200);
+    expect(mocks.beginUserDataRequest).not.toHaveBeenCalled();
+    expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledWith(
+      { userId: "user-1", epoch: "1" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(mocks.handleChannelMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+      "旧 fence 不得执行",
+    );
+    consoleError.mockRestore();
   });
 
   it("keeps the channel shared lease until handler persistence and outbound work settle", async () => {
@@ -237,6 +415,7 @@ function fakeRepositories() {
   return {
     userDataMutations: {
       beginRequest: mocks.beginUserDataRequest,
+      tryAdmitRequest: mocks.tryAdmitUserDataRequest,
       acquireSharedLease: mocks.acquireSharedUserDataLease,
     },
     users: {

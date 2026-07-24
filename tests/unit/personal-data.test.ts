@@ -1,7 +1,7 @@
 import { mkdtemp, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import { createRepositories } from "@/server/db/repositories";
@@ -306,6 +306,131 @@ describe("personal data helpers", () => {
     expect(sql.some((statement) =>
       statement.includes("FROM goal_steps") && statement.includes("goals.user_id = $1"),
     )).toBe(true);
+    expect(sql).toContain("SET LOCAL lock_timeout = '10000ms'");
+    expect(sql).toContain("SET LOCAL statement_timeout = '110000ms'");
+  });
+
+  it("aborts export while waiting for a pool client", async () => {
+    let resolveClient: ((client: PoolClient) => void) | undefined;
+    const release = vi.fn();
+    const query = vi.fn(async () => ({ rows: [] }));
+    const client = { query, release } as unknown as PoolClient;
+    const connect = vi.fn(() => new Promise<PoolClient>((resolve) => {
+      resolveClient = resolve;
+    }));
+    const repositories = createRepositories({ connect } as unknown as Pool);
+    const controller = new AbortController();
+
+    const operation = repositories.personalData.export(
+      USER_ID,
+      null,
+      controller.signal,
+    );
+    controller.abort(new Error("request_cancelled"));
+    resolveClient?.(client);
+
+    await expect(operation).rejects.toThrow(
+      "personal_data_export_failed",
+    );
+    expect(query).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("destroys an export client when a query is aborted", async () => {
+    let resolveBegin: (() => void) | undefined;
+    const query = vi.fn((sql: string) => {
+      if (
+        sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+      ) {
+        return new Promise<{ rows: [] }>((resolve) => {
+          resolveBegin = () => resolve({ rows: [] });
+        });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+    const controller = new AbortController();
+
+    const operation = repositories.personalData.export(
+      USER_ID,
+      null,
+      controller.signal,
+    );
+    await vi.waitFor(() => {
+      expect(resolveBegin).toBeTypeOf("function");
+    });
+    controller.abort(new Error("request_cancelled"));
+    resolveBegin?.();
+
+    await expect(operation).rejects.toThrow(
+      "personal_data_export_failed",
+    );
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    [
+      "row count",
+      {
+        maxRows: 1,
+        maxEstimatedBytes: 10_000,
+        maxSerializedBytes: 10_000,
+      },
+      [{ id: "agent-1" }, { id: "agent-2" }],
+    ],
+    [
+      "estimated bytes",
+      {
+        maxRows: 10,
+        maxEstimatedBytes: 32,
+        maxSerializedBytes: 10_000,
+      },
+      [{ id: "agent-1", display_name: "x".repeat(128) }],
+    ],
+    [
+      "serialized bytes",
+      {
+        maxRows: 10,
+        maxEstimatedBytes: 10_000,
+        maxSerializedBytes: 64,
+      },
+      [{ id: "agent-1", display_name: "safe" }],
+    ],
+  ])("fails closed when export exceeds the %s limit", async (
+    _label,
+    limits,
+    rows,
+  ) => {
+    const query = vi.fn(async (sql: string) => {
+      if (
+        sql.includes("FROM digital_agents")
+        && !sql.includes("JOIN digital_agents")
+      ) {
+        return { rows };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(
+        USER_ID,
+        null,
+        undefined,
+        limits,
+      ),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    expect(query.mock.calls.map(([sql]) => String(sql)))
+      .toContain("ROLLBACK");
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("exports explicit channel and admin audit allow-lists without secret material", async () => {
@@ -329,14 +454,20 @@ describe("personal data helpers", () => {
             enabled: false,
             config: {
               allow_from: ["owner"],
-              nested: {
-                poll_token: "SENTINEL_POLL_TOKEN",
-                temporary_url: "https://temporary.invalid",
-              },
+              base_url: "https://api.telegram.org",
+              bot_token: "SENTINEL_CONFIG_BOT_TOKEN",
+              login_url: "https://login.invalid",
+              response_body: "SENTINEL_RESPONSE_BODY",
+              x_api_key: "SENTINEL_X_API_KEY",
+              authorization_header: "SENTINEL_AUTHORIZATION",
+              history: [{ bot_token: "SENTINEL_HISTORY_TOKEN" }],
             },
             revision: 3,
             health_status: "disabled",
-            health_detail: { code: "manually_disabled" },
+            health_detail: {
+              code: "manually_disabled",
+              response_body: "SENTINEL_HEALTH_RESPONSE",
+            },
             created_at: new Date("2026-07-25T00:00:00Z"),
             updated_at: new Date("2026-07-25T00:00:00Z"),
             runtime_node_id: "SENTINEL_RUNTIME_NODE",
@@ -391,11 +522,10 @@ describe("personal data helpers", () => {
         enabled: false,
         config: {
           allow_from: ["owner"],
-          nested: {},
+          base_url: "https://api.telegram.org",
         },
         revision: 3,
         health_status: "disabled",
-        health_detail: { code: "manually_disabled" },
         created_at: new Date("2026-07-25T00:00:00Z"),
         updated_at: new Date("2026-07-25T00:00:00Z"),
       },
@@ -404,13 +534,25 @@ describe("personal data helpers", () => {
       expect.objectContaining({
         user_id: USER_ID,
         agent_id: AGENT_ID,
-        before_summary: { enabled: false, nested: {} },
-        confirmation_source: { type: "console" },
+        action: "channel_connection.update",
+        resource_type: "channel_connection",
+        resource_id: CONNECTION_ID,
+        status: "success",
+        error_code: null,
       }),
     ]);
+    expect(exported.tables.admin_audit_logs[0]).not.toHaveProperty(
+      "before_summary",
+    );
+    expect(exported.tables.admin_audit_logs[0]).not.toHaveProperty(
+      "after_summary",
+    );
+    expect(exported.tables.admin_audit_logs[0]).not.toHaveProperty(
+      "confirmation_source",
+    );
     const serialized = JSON.stringify(exported);
     expect(serialized).not.toMatch(
-      /channel_secrets|ciphertext|nonce|auth_tag|key_version|SENTINEL_|poll_token|temporary_url|runtime_node_id|deleted_at/,
+      /channel_secrets|ciphertext|nonce|auth_tag|key_version|SENTINEL_|bot_token|login_url|response_body|x_api_key|authorization_header|history|runtime_node_id|deleted_at|health_detail|before_summary|after_summary|confirmation_source/,
     );
     for (const [statement] of query.mock.calls) {
       expect(String(statement)).not.toMatch(/\bSELECT\s+\*/i);
@@ -439,7 +581,7 @@ describe("personal data helpers", () => {
             display_name: "Telegram",
             enabled: false,
             config: {
-              endpoint: `https://example.test/hook?token=${plaintext}`,
+              base_url: `https://example.test/hook?token=${plaintext}`,
             },
             revision: 1,
             health_status: "disabled",
@@ -558,4 +700,174 @@ describe("personal data helpers", () => {
     expect(sql).not.toContain("COMMIT");
     expect(release).toHaveBeenCalledTimes(1);
   });
+
+  it("destroys the export client when rollback fails without leaking the database error", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM digital_agents")) {
+        throw new Error("SENTINEL_EXPORT_QUERY_SECRET");
+      }
+      if (sql === "ROLLBACK") {
+        throw new Error("SENTINEL_EXPORT_ROLLBACK_SECRET");
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(USER_ID),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys an export client after an ambiguous read-only COMMIT", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "COMMIT") {
+        throw new Error("SENTINEL_EXPORT_COMMIT_SECRET");
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(USER_ID),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    expect(query.mock.calls.map(([sql]) => String(sql)))
+      .not.toContain("ROLLBACK");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys the clear client when rollback fails and preserves the primary error", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("DELETE FROM messages")) {
+        throw new Error("delete_failed");
+      }
+      if (sql === "ROLLBACK") {
+        throw new Error("rollback_failed");
+      }
+      if (
+        sql.includes("SELECT id")
+        && sql.includes("FROM digital_agents")
+      ) {
+        return { rows: [{ id: "agent-default" }] };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.clear(USER_ID),
+    ).rejects.toThrow("delete_failed");
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("recovers an ambiguously committed clear from persisted canonical state", async () => {
+    const harness = createClearCommitAmbiguityHarness("committed");
+    const repositories = createRepositories(harness.pool);
+
+    await expect(
+      repositories.personalData.clear(USER_ID),
+    ).resolves.toBeUndefined();
+
+    expect(harness.transactionSql()).not.toContain("ROLLBACK");
+    expect(harness.transactionRelease).toHaveBeenCalledWith(true);
+    expect(harness.verificationSql()).toMatch(
+      /channel_secrets[\s\S]*channel_connections[\s\S]*admin_audit_logs/,
+    );
+    expect(harness.verificationSql()).toContain("digital_agents");
+    expect(harness.verificationSql()).toContain("agent_settings");
+    expect(harness.verificationRelease).toHaveBeenCalledTimes(1);
+    expect(harness.verificationRelease).not.toHaveBeenCalledWith(true);
+  });
+
+  it("reports an ambiguously uncommitted clear as a stable retryable failure", async () => {
+    const harness = createClearCommitAmbiguityHarness(
+      "not_committed",
+    );
+    const repositories = createRepositories(harness.pool);
+
+    await expect(
+      repositories.personalData.clear(USER_ID),
+    ).rejects.toThrow("personal_data_clear_failed");
+
+    expect(harness.transactionSql()).not.toContain("ROLLBACK");
+    expect(harness.transactionRelease).toHaveBeenCalledWith(true);
+    expect(harness.verificationRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports unknown clear commit state stably and destroys both uncertain clients", async () => {
+    const harness = createClearCommitAmbiguityHarness("unknown");
+    const repositories = createRepositories(harness.pool);
+
+    await expect(
+      repositories.personalData.clear(USER_ID),
+    ).rejects.toThrow("personal_data_clear_failed");
+
+    expect(harness.transactionRelease).toHaveBeenCalledWith(true);
+    expect(harness.verificationRelease).toHaveBeenCalledWith(true);
+  });
 });
+
+function createClearCommitAmbiguityHarness(
+  outcome: "committed" | "not_committed" | "unknown",
+) {
+  const transactionQuery = vi.fn(async (sql: string) => {
+    if (
+      sql.includes("SELECT id")
+      && sql.includes("FROM digital_agents")
+    ) {
+      return { rows: [{ id: "agent-default" }] };
+    }
+    if (sql === "COMMIT") {
+      throw new Error("clear_commit_connection_lost");
+    }
+    return { rows: [] };
+  });
+  const verificationQuery = vi.fn(async (sql: string) => {
+    void sql;
+    if (outcome === "unknown") {
+      throw new Error("clear_verification_unavailable");
+    }
+    return {
+      rows: [{
+        clear_complete: outcome === "committed",
+      }],
+    };
+  });
+  const transactionRelease = vi.fn();
+  const verificationRelease = vi.fn();
+  const transactionClient = {
+    query: transactionQuery,
+    release: transactionRelease,
+  } as unknown as PoolClient;
+  const verificationClient = {
+    query: verificationQuery,
+    release: verificationRelease,
+  } as unknown as PoolClient;
+  const connect = vi.fn<() => Promise<PoolClient>>()
+    .mockResolvedValueOnce(transactionClient)
+    .mockResolvedValueOnce(verificationClient);
+  return {
+    pool: { connect } as unknown as Pool,
+    transactionRelease,
+    verificationRelease,
+    transactionSql: () =>
+      transactionQuery.mock.calls.map(([sql]) => String(sql)),
+    verificationSql: () =>
+      String(verificationQuery.mock.calls[0]?.[0] ?? ""),
+  };
+}

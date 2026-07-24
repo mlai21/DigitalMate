@@ -66,6 +66,38 @@ export async function withUserDataLease<T>(
   }
 }
 
+export async function withUserDataFence<T>(
+  repositories: UserDataLeaseRepositories,
+  fence: UserDataRequestFence,
+  work: (lease: UserDataLease, signal: AbortSignal) => Promise<T>,
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    timeoutCode?: string;
+  } = {},
+): Promise<T> {
+  const lifecycle = createBoundedAbortLifecycle({
+    sourceSignal: options.signal,
+    timeoutMs: options.timeoutMs ?? USER_DATA_WORK_TIMEOUT_MS,
+    timeoutCode: options.timeoutCode ?? "user_data_work_timeout",
+  });
+  let lease: UserDataLease | undefined;
+  try {
+    lifecycle.signal.throwIfAborted();
+    lease = await repositories.userDataMutations.acquireSharedLease(
+      fence,
+      { signal: lifecycle.signal },
+    );
+    lifecycle.signal.throwIfAborted();
+    const result = await work(lease, lifecycle.signal);
+    lifecycle.signal.throwIfAborted();
+    return result;
+  } finally {
+    if (lease) await lease.release();
+    lifecycle.dispose();
+  }
+}
+
 export async function withFreshUserDataLease<T>(
   userId: string,
   work: (

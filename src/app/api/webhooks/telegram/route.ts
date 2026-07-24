@@ -16,7 +16,7 @@ export async function POST(request: Request) {
   const message = normalizeTelegramUpdate(update);
   if (!message) return NextResponse.json({ ok: true });
 
-  scheduleChannelMessageHandling({ env, message, source: "Telegram" });
+  await scheduleChannelMessageHandling({ env, message, source: "Telegram" });
 
   return NextResponse.json({ ok: true });
 }

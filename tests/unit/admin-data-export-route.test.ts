@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const channelSecretsKey = { marker: "test-channel-key" };
+const leaseSignal = new AbortController().signal;
 
 const mocks = vi.hoisted(() => ({
   requireCurrentUser: vi.fn(async () => ({ id: USER_ID })),
@@ -45,20 +46,28 @@ describe("admin personal data export route", () => {
               export: typeof mocks.exportData;
             };
           },
+          signal: AbortSignal,
         ) => Promise<Response>,
+        options?: { signal?: AbortSignal },
       ) => {
         expect(userId).toBe(USER_ID);
+        expect(options?.signal).toBeInstanceOf(AbortSignal);
         return work({
           personalData: {
             export: mocks.exportData,
           },
-        });
+        }, leaseSignal);
       },
     );
   });
 
   it("exports under the fresh user-data lease with the channel credential key", async () => {
-    const response = await GET();
+    const requestController = new AbortController();
+    const request = new Request(
+      "http://localhost/api/admin/data/export",
+      { signal: requestController.signal },
+    );
+    const response = await GET(request);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("content-disposition")).toBe(
@@ -67,7 +76,17 @@ describe("admin personal data export route", () => {
     expect(mocks.exportData).toHaveBeenCalledWith(
       USER_ID,
       channelSecretsKey,
+      leaseSignal,
     );
+    expect(mocks.withFreshUserDataLease).toHaveBeenCalledWith(
+      USER_ID,
+      expect.any(Function),
+      { signal: request.signal },
+    );
+    expect(response.headers.get("cache-control")).toBe(
+      "private, no-store",
+    );
+    expect(response.headers.get("pragma")).toBe("no-cache");
     await expect(response.json()).resolves.toEqual({
       userId: USER_ID,
       exportedAt: "2026-07-25T00:00:00.000Z",
@@ -82,14 +101,39 @@ describe("admin personal data export route", () => {
     const consoleError = vi.spyOn(console, "error")
       .mockImplementation(() => undefined);
 
-    const response = await GET();
+    const response = await GET(
+      new Request("http://localhost/api/admin/data/export"),
+    );
 
     expect(response.status).toBe(500);
+    expect(response.headers.get("cache-control")).toBe(
+      "private, no-store",
+    );
+    expect(response.headers.get("pragma")).toBe("no-cache");
     await expect(response.json()).resolves.toEqual({
       error: "personal_data_export_failed",
     });
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
       "SENTINEL_SECRET_MUST_NOT_LEAK",
+    );
+    consoleError.mockRestore();
+  });
+
+  it("preserves authentication failures outside the export error mapping", async () => {
+    mocks.requireCurrentUser.mockRejectedValueOnce(
+      new Error("authentication_required"),
+    );
+    const consoleError = vi.spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    await expect(
+      GET(new Request("http://localhost/api/admin/data/export")),
+    ).rejects.toThrow("authentication_required");
+
+    expect(mocks.withFreshUserDataLease).not.toHaveBeenCalled();
+    expect(consoleError).not.toHaveBeenCalledWith(
+      "personal_data_export_failed",
+      expect.anything(),
     );
     consoleError.mockRestore();
   });

@@ -16,7 +16,7 @@ export async function POST(request: Request) {
   const message = normalizeDingTalkEvent(payload);
   if (!message) return NextResponse.json({ ok: true });
 
-  scheduleChannelMessageHandling({ env, message, source: "DingTalk" });
+  await scheduleChannelMessageHandling({ env, message, source: "DingTalk" });
 
   return NextResponse.json({ ok: true });
 }

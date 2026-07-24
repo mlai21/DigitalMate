@@ -874,9 +874,12 @@ describe("message attachment PostgreSQL concurrency", () => {
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         slug text NOT NULL,
         display_name text NOT NULL,
+        persona jsonb NOT NULL DEFAULT '{}'::jsonb,
         status text NOT NULL DEFAULT 'active',
         is_default boolean NOT NULL DEFAULT true,
         inherits_user_resources boolean NOT NULL DEFAULT true,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE (user_id, id)
       );
       CREATE TABLE conversations (
@@ -1571,6 +1574,90 @@ describe("message attachment PostgreSQL concurrency", () => {
     ).rejects.toThrow("user_data_epoch_changed");
   });
 
+  it("fences webhook admission across repository processes before, during, and after clear", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const webhookLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 2,
+    });
+    const clearLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 2,
+    });
+    const webhookRepositories = createRepositories(
+      databasePool,
+      webhookLockPool,
+      webhookLockPool,
+    );
+    const clearRepositories = createRepositories(
+      databasePool,
+      clearLockPool,
+      clearLockPool,
+    );
+    const userId = "50000000-0000-4000-8000-000000000018";
+    await databasePool.query(
+      "INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING",
+      [userId],
+    );
+
+    try {
+      const beforeClear = await webhookRepositories.userDataMutations
+        .tryAdmitRequest(userId);
+      expect(beforeClear).toMatchObject({ userId, epoch: "0" });
+
+      const exclusive = await clearRepositories.userDataMutations
+        .acquireExclusiveClearLease(userId);
+      const duringClear = await Promise.race([
+        webhookRepositories.userDataMutations.tryAdmitRequest(userId),
+        new Promise<"timed-out">((resolve) =>
+          setTimeout(() => resolve("timed-out"), 100)
+        ),
+      ]);
+      expect(duringClear).toBeNull();
+      await exclusive.release();
+
+      await expect(
+        webhookRepositories.userDataMutations.acquireSharedLease(
+          beforeClear!,
+        ),
+      ).rejects.toThrow("user_data_epoch_changed");
+
+      const activeFence = await webhookRepositories.userDataMutations
+        .tryAdmitRequest(userId);
+      expect(activeFence).toMatchObject({ userId, epoch: "1" });
+      const activeLease = await webhookRepositories.userDataMutations
+        .acquireSharedLease(activeFence!);
+      let clearAcquired = false;
+      const queuedClear = clearRepositories.userDataMutations
+        .acquireExclusiveClearLease(userId)
+        .then((lease) => {
+          clearAcquired = true;
+          return lease;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(clearAcquired).toBe(false);
+      await expect(
+        webhookRepositories.userDataMutations.tryAdmitRequest(userId),
+      ).resolves.toBeNull();
+
+      await activeLease.release();
+      const secondExclusive = await queuedClear;
+      await secondExclusive.release();
+
+      const afterClear = await webhookRepositories.userDataMutations
+        .tryAdmitRequest(userId);
+      expect(afterClear).toMatchObject({ userId, epoch: "2" });
+      const afterLease = await webhookRepositories.userDataMutations
+        .acquireSharedLease(afterClear!);
+      await afterLease.release();
+    } finally {
+      await webhookLockPool.end();
+      await clearLockPool.end();
+    }
+  });
+
   it("aborts a shared advisory-lock waiter and releases its dedicated pool client", async () => {
     const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
     const clearLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
@@ -1621,6 +1708,109 @@ describe("message attachment PostgreSQL concurrency", () => {
 
     const clearLease = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
     await clearLease.release();
+  });
+
+  it("aborts a PostgreSQL-blocked export and releases its shared lease so clear can proceed", async () => {
+    const userId = "50000000-0000-4000-8000-000000000026";
+    await databasePool.query(
+      "INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING",
+      [userId],
+    );
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const blockerPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const exportPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const exportLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const clearLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const blocker = await blockerPool.connect();
+    const exportRepositories = createRepositories(
+      exportPool,
+      exportLockPool,
+      exportLockPool,
+    );
+    const clearRepositories = createRepositories(
+      databasePool,
+      clearLockPool,
+      clearLockPool,
+    );
+    const controller = new AbortController();
+
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        "LOCK TABLE digital_agents IN ACCESS EXCLUSIVE MODE",
+      );
+      const operation = withUserDataLease(
+        exportRepositories,
+        userId,
+        async (_lease, signal) =>
+          exportRepositories.personalData.export(
+            userId,
+            null,
+            signal,
+          ),
+        { signal: controller.signal },
+      );
+
+      await vi.waitFor(async () => {
+        const blocked = await adminPool.query<{ count: string }>(
+          `SELECT count(*) AS count
+           FROM pg_stat_activity
+           WHERE pid <> pg_backend_pid()
+             AND state = 'active'
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%FROM digital_agents%'`,
+        );
+        expect(Number(blocked.rows[0]?.count ?? 0)).toBeGreaterThan(0);
+      });
+      controller.abort(new Error("export_cancelled"));
+
+      await expect(Promise.race([
+        operation.then(
+          () => "resolved",
+          (error: unknown) =>
+            error instanceof Error ? error.message : "rejected",
+        ),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("still-running"), 500)
+        ),
+      ])).resolves.toBe("personal_data_export_failed");
+
+      const clearLease = await Promise.race([
+        clearRepositories.userDataMutations
+          .acquireExclusiveClearLease(userId),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(
+            () => reject(new Error("clear_stuck_after_export_abort")),
+            500,
+          )
+        ),
+      ]);
+      await clearLease.release();
+      await vi.waitFor(() => expect(exportPool.totalCount).toBe(0));
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+      await blockerPool.end();
+      await exportPool.end();
+      await exportLockPool.end();
+      await clearLockPool.end();
+    }
   });
 
   it("keeps the business pool available while many copies wait for one turn lock", async () => {
