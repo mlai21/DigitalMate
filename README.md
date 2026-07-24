@@ -90,7 +90,7 @@ cp .env.example .env   # 填入配置，其中 DOMAIN 为解析到本机的域�
 docker compose up -d --build
 ```
 
-Caddy 作为反向代理接管 80/443：`.env` 中配置 `DOMAIN`（域名 A 记录需指向服务器 IP，安全组放行 80/443）后自动申请并续期 Let's Encrypt 证书，HTTP 自动跳转 HTTPS；`DOMAIN` 留空则仅提供 80 端口 HTTP。
+Caddy 作为唯一生产入口接管 80/443：`.env` 中配置 `DOMAIN`（域名 A 记录需指向服务器 IP，安全组放行 80/443）后自动申请并续期 Let's Encrypt 证书，HTTP 自动跳转 HTTPS；`DOMAIN` 留空则仅提供 80 端口 HTTP。Caddy 会覆盖注入原始 request URI，供兼容 API 在 Next.js 路径规范化前识别编码绕过；直连 Next.js 不具备这项严格保证，不应作为生产入口。
 
 ## 后台能力
 

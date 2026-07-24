@@ -1331,10 +1331,10 @@ index ce104e5..661a6c0 100644
      });
 
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..1b999d7 100644
+index ce94f9a..3f44aac 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
-@@ -1,19 +1,22 @@
+@@ -1,19 +1,23 @@
  import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
  import { request } from "./request";
 
@@ -1357,10 +1357,11 @@ index ce94f9a..1b999d7 100644
 +  buildAuthHeaders,
 +  buildMutationHeaders,
 +} from "./authHeaders";
++import { parseErrorDetail } from "../utils/error";
 
  // Helper: create a mock Response
  function mockFetch(
-@@ -41,9 +44,19 @@ function mockFetch(
+@@ -41,9 +45,19 @@ function mockFetch(
 
  describe("request", () => {
    beforeEach(() => {
@@ -1381,7 +1382,7 @@ index ce94f9a..1b999d7 100644
        writable: true,
      });
    });
-@@ -70,6 +83,18 @@ describe("request", () => {
+@@ -70,6 +84,18 @@ describe("request", () => {
      expect(headers.get("Content-Type")).toBe("application/json");
    });
 
@@ -1400,7 +1401,7 @@ index ce94f9a..1b999d7 100644
    it("PUT request automatically adds Content-Type", async () => {
      mockFetch(200, { status: "ok" });
      await request("/models/active", { method: "PUT", body: "{}" });
-@@ -113,15 +138,17 @@ describe("request", () => {
+@@ -113,15 +139,17 @@ describe("request", () => {
      mockFetch(401);
      await expect(request("/models")).rejects.toThrow("Not authenticated");
      expect(clearAuthToken).toHaveBeenCalledOnce();
@@ -1421,21 +1422,42 @@ index ce94f9a..1b999d7 100644
    });
 
    it("throws error with status code for non-401 errors", async () => {
-@@ -136,14 +163,27 @@ describe("request", () => {
+@@ -136,14 +164,48 @@ describe("request", () => {
      await expect(request("/models")).rejects.toThrow("server exploded");
    });
 
 -  it("injects Authorization header when token is present", async () => {
-+  it("uses the stable DigitalMate nested error message", async () => {
++  it("preserves the stable DigitalMate error envelope without raw JSON", async () => {
 +    mockFetch(409, {
 +      error: {
 +        code: "config_revision_conflict",
 +        message: "revision_conflict",
++        details: {
++          fields: [{ path: ["revision"], reason: "stale" }],
++        },
 +      },
 +    });
 +
-+    await expect(request("/models")).rejects.toMatchObject({
++    const error = await request("/models").catch(
++      (caught: unknown) => caught,
++    );
++
++    expect(error).toMatchObject({
 +      message: "revision_conflict",
++      status: 409,
++      code: "config_revision_conflict",
++      details: {
++        fields: [{ path: ["revision"], reason: "stale" }],
++      },
++    });
++    expect((error as Error).message).not.toContain('{"error"');
++    expect(parseErrorDetail(error)).toEqual({
++      status: 409,
++      code: "config_revision_conflict",
++      message: "revision_conflict",
++      details: {
++        fields: [{ path: ["revision"], reason: "stale" }],
++      },
 +    });
 +  });
 +
@@ -1452,7 +1474,7 @@ index ce94f9a..1b999d7 100644
    });
 
    it("request URL is correctly built by getApiUrl", async () => {
-@@ -332,6 +372,48 @@ describe("request", () => {
+@@ -332,6 +394,48 @@ describe("request", () => {
      expect(fetch).not.toHaveBeenCalled();
    });
 
@@ -1502,20 +1524,47 @@ index ce94f9a..1b999d7 100644
      let attemptCount = 0;
 
 diff --git a/src/api/request.ts b/src/api/request.ts
-index 7f4cb7d..8f3bf29 100644
+index 7f4cb7d..1ac4fb5 100644
 --- a/src/api/request.ts
 +++ b/src/api/request.ts
-@@ -1,5 +1,8 @@
+@@ -1,5 +1,35 @@
  import { getApiUrl, clearAuthToken } from "./config";
 -import { buildAuthHeaders } from "./authHeaders";
 +import {
 +  buildAuthHeaders,
 +  buildMutationHeaders,
 +} from "./authHeaders";
++
++export class ApiError extends Error {
++  readonly status: number;
++  readonly code: string;
++  readonly details?: unknown;
++
++  constructor(
++    message: string,
++    options: {
++      status: number;
++      code: string;
++      details?: unknown;
++    },
++  ) {
++    super(message);
++    this.name = "ApiError";
++    this.status = options.status;
++    this.code = options.code;
++    this.details = options.details;
++  }
++}
++
++type StableCompatError = Readonly<{
++  code: string;
++  message: string;
++  details?: unknown;
++}>;
 
  function getErrorMessageFromBody(
    text: string,
-@@ -29,6 +32,16 @@ function getErrorMessageFromBody(
+@@ -29,6 +59,16 @@ function getErrorMessageFromBody(
      if (typeof payload.error === "string" && payload.error) {
        return payload.error;
      }
@@ -1532,31 +1581,44 @@ index 7f4cb7d..8f3bf29 100644
    } catch {
      return text;
    }
-@@ -36,7 +49,33 @@ function getErrorMessageFromBody(
+@@ -36,7 +76,46 @@ function getErrorMessageFromBody(
    return text;
  }
 
 -function buildHeaders(method?: string, extra?: HeadersInit): Headers {
-+function hasStableCompatErrorBody(
++function parseStableCompatErrorBody(
 +  text: string,
 +  contentType: string,
-+): boolean {
++): StableCompatError | null {
 +  if (!contentType.includes("application/json")) {
-+    return false;
++    return null;
 +  }
 +
 +  try {
 +    const nestedError = (JSON.parse(text) as { error?: unknown }).error;
 +    if (typeof nestedError !== "object" || nestedError === null) {
-+      return false;
++      return null;
 +    }
-+    const error = nestedError as { code?: unknown; message?: unknown };
-+    return (
-+      typeof error.code === "string" &&
-+      typeof error.message === "string"
-+    );
++    const error = nestedError as {
++      code?: unknown;
++      message?: unknown;
++      details?: unknown;
++    };
++    if (
++      typeof error.code !== "string" ||
++      error.code.length === 0 ||
++      typeof error.message !== "string" ||
++      error.message.length === 0
++    ) {
++      return null;
++    }
++    return {
++      code: error.code,
++      message: error.message,
++      ...("details" in error ? { details: error.details } : {}),
++    };
 +  } catch {
-+    return false;
++    return null;
 +  }
 +}
 +
@@ -1567,7 +1629,7 @@ index 7f4cb7d..8f3bf29 100644
    // Normalize extra to a Headers instance for consistent handling
    const headers = extra instanceof Headers ? extra : new Headers(extra);
 
-@@ -48,12 +87,6 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
+@@ -48,12 +127,6 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
      }
    }
 
@@ -1580,7 +1642,7 @@ index 7f4cb7d..8f3bf29 100644
    return headers;
  }
 
-@@ -89,6 +122,20 @@ export async function request<T = unknown>(
+@@ -89,6 +162,20 @@ export async function request<T = unknown>(
    if (callerSignal?.aborted) {
      throw new DOMException("The operation was aborted", "AbortError");
    }
@@ -1601,7 +1663,7 @@ index 7f4cb7d..8f3bf29 100644
 
    let lastError: Error | null = null;
 
-@@ -123,7 +170,14 @@ export async function request<T = unknown>(
+@@ -123,13 +210,33 @@ export async function request<T = unknown>(
          if (response.status === 401) {
            clearAuthToken();
            if (window.location.pathname !== "/login") {
@@ -1617,19 +1679,25 @@ index 7f4cb7d..8f3bf29 100644
            }
            throw new Error("Not authenticated");
          }
-@@ -133,8 +187,11 @@ export async function request<T = unknown>(
+
+         const text = await response.text().catch(() => "");
+         const contentType = response.headers.get("content-type") || "";
++        const stableError = parseStableCompatErrorBody(
++          text,
++          contentType,
++        );
++        if (stableError) {
++          throw new ApiError(stableError.message, {
++            status: response.status,
++            code: stableError.code,
++            ...("details" in stableError
++              ? { details: stableError.details }
++              : {}),
++          });
++        }
          const errorMessage = getErrorMessageFromBody(text, contentType);
 
          // Preserve raw body for parseErrorDetail() to extract structured fields
-+        const preserveRawBody = !hasStableCompatErrorBody(text, contentType);
-         const finalMessage = errorMessage
--          ? `${errorMessage} - ${text}`
-+          ? preserveRawBody
-+            ? `${errorMessage} - ${text}`
-+            : errorMessage
-           : `Request failed: ${response.status} ${response.statusText}`;
-
-         throw new Error(finalMessage);
 diff --git a/src/components/AgentSelector/AgentSelector.test.tsx b/src/components/AgentSelector/AgentSelector.test.tsx
 index 8684213..788b005 100644
 --- a/src/components/AgentSelector/AgentSelector.test.tsx
@@ -2653,3 +2721,31 @@ index b745352..6417cc9 100644
      if (!res.ok) {
        console.warn(`[PluginLoader] /api/plugins returned ${res.status}`);
        return { loaded: 0, failed: [] };
+diff --git a/src/utils/error.ts b/src/utils/error.ts
+index 5e19f38..1744a41 100644
+--- a/src/utils/error.ts
++++ b/src/utils/error.ts
+@@ -1,5 +1,23 @@
+ export function parseErrorDetail(error: unknown): Record<string, any> | null {
+   if (!(error instanceof Error)) return null;
++  const structured = error as Error & {
++    status?: unknown;
++    code?: unknown;
++    details?: unknown;
++  };
++  if (
++    typeof structured.status === "number" &&
++    typeof structured.code === "string"
++  ) {
++    return {
++      status: structured.status,
++      code: structured.code,
++      message: structured.message,
++      ...("details" in structured
++        ? { details: structured.details }
++        : {}),
++    };
++  }
+   const msg = error.message;
+   // Try " - " separator first (from request.ts formatted errors)
+   const idx = msg.indexOf(" - ");

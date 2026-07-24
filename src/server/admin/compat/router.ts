@@ -11,6 +11,7 @@ import {
   type AdminCompatSessionHandler,
   type AdminCompatStatusHandler,
 } from "@/server/admin/compat/types";
+import { readTrustedOriginalRequestPath } from "@/server/admin/compat/original-uri";
 import type { AgentScope } from "@/server/agents/types";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
@@ -105,6 +106,10 @@ export class AdminCompatRouter {
     try {
       const statusRoute = this.findCanonicalStatusRoute(request);
       if (statusRoute) {
+        this.resolveRequestPathSegments(
+          request,
+          runtime.security.trustProxyHeaders,
+        );
         const result = await (
           statusRoute.handler as AdminCompatStatusHandler
         )(request);
@@ -188,17 +193,14 @@ export class AdminCompatRouter {
     csrfVerified: boolean,
     routeSegments?: readonly string[],
   ): Promise<Response> {
-    const pathSegments = parseAdminCompatPath(
-      extractCompatPath(request.url),
+    const pathSegments = this.resolveRequestPathSegments(
+      request,
+      runtime.security.trustProxyHeaders,
     );
     if (
       routeSegments &&
-      (routeSegments.length !== pathSegments.length ||
-        routeSegments.some(
-          (segment, index) =>
-            !isSafeDecodedSegment(segment) ||
-            segment !== pathSegments[index],
-        ))
+      (!routeSegments.every(isSafeDecodedSegment) ||
+        !segmentsEqual(routeSegments, pathSegments))
     ) {
       throw invalidPath();
     }
@@ -291,6 +293,32 @@ export class AdminCompatRouter {
       return toResponse(result);
     });
   }
+
+  private resolveRequestPathSegments(
+    request: Request,
+    trustProxyHeaders: boolean,
+  ): readonly string[] {
+    const canonicalPathSegments = parseAdminCompatPath(
+      extractCompatPath(request.url),
+    );
+    const originalPath = readTrustedOriginalRequestPath(
+      request,
+      trustProxyHeaders,
+    );
+    const pathSegments =
+      originalPath === null
+        ? canonicalPathSegments
+        : parseAdminCompatPath(
+            extractCompatPathname(originalPath),
+          );
+    if (
+      originalPath !== null &&
+      !segmentsEqual(pathSegments, canonicalPathSegments)
+    ) {
+      throw invalidPath();
+    }
+    return pathSegments;
+  }
 }
 
 export function parseAdminCompatPath(
@@ -339,11 +367,25 @@ function extractCompatPath(requestUrl: string): string {
   } catch {
     throw invalidPath();
   }
+  return extractCompatPathname(pathname);
+}
+
+function extractCompatPathname(pathname: string): string {
   if (pathname === COMPAT_BASE_PATH) return "/";
   if (!pathname.startsWith(`${COMPAT_BASE_PATH}/`)) {
     throw invalidPath();
   }
   return pathname.slice(COMPAT_BASE_PATH.length);
+}
+
+function segmentsEqual(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((segment, index) => segment === right[index])
+  );
 }
 
 function parsePattern(path: string): readonly PatternSegment[] {

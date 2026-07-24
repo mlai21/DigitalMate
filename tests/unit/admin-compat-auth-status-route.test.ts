@@ -34,6 +34,11 @@ describe("Console auth status route", () => {
   beforeEach(() => {
     mocks.ensureDefault.mockClear();
     mocks.readEnv.mockClear();
+    mocks.readEnv.mockReturnValue({
+      appPassword: "password",
+      appSecret: "route-test-app-secret-value",
+      trustProxyHeaders: false,
+    });
   });
 
   it("returns the shared authenticated session and an in-memory CSRF token", async () => {
@@ -67,5 +72,35 @@ describe("Console auth status route", () => {
       "route-test-app-secret-value",
     );
     expect(mocks.ensureDefault).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a trusted unsafe original URI before initializing user data", async () => {
+    mocks.readEnv.mockReturnValueOnce({
+      appPassword: "password",
+      appSecret: "route-test-app-secret-value",
+      trustProxyHeaders: true,
+    });
+
+    const response = await GET(
+      new Request(
+        "https://mate.example/api/admin/compat/auth/status",
+        {
+          headers: {
+            "x-digitalmate-original-uri":
+              "/api/admin/compat/private/%2e%2e/auth/status",
+          },
+        },
+      ),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: "invalid_path" },
+    });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("x-content-type-options")).toBe(
+      "nosniff",
+    );
+    expect(mocks.ensureDefault).not.toHaveBeenCalled();
   });
 });

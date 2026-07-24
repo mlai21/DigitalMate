@@ -96,12 +96,6 @@ export const putUserTimezone: AdminCompatHandler = async ({
 
 export function normalizeIanaTimezone(value: string): string | null {
   const timezone = value.trim();
-  if (
-    timezone !== "UTC" &&
-    !/^[A-Za-z_+-]+(?:\/[A-Za-z0-9_.+-]+)+$/.test(timezone)
-  ) {
-    return null;
-  }
   try {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: timezone,

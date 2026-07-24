@@ -10,5 +10,8 @@
 	request_body @attachmentUpload {
 		max_size 11MB
 	}
-	reverse_proxy web:3000
+	reverse_proxy web:3000 {
+		header_up -X-DigitalMate-Original-URI
+		header_up X-DigitalMate-Original-URI {http.request.orig_uri}
+	}
 }

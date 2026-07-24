@@ -742,6 +742,172 @@ describe("admin compatibility exact router", () => {
     },
   );
 
+  it.each([
+    "/api/admin/compat/agents/%2e%2e/root",
+    "/api/admin/compat/agents/%2E%2E/root",
+    "/api/admin/compat/agents/../root",
+    "/api/admin/compat/agents\\..\\root",
+    "/api/admin/compat/agents/%252e%252e/root",
+    "/api/admin/compat/agents/%2froot",
+    "/api/admin/compat/agents/%5croot",
+    "/api/admin/compat/agents//root",
+    "/api/admin/compat/root/",
+  ])("rejects a trusted unsafe original URI after auth: %s", async (originalUri) => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const fixture = await authenticatedFixture({
+      requestUrl: "https://mate.example/api/admin/compat/root",
+      headers: {
+        "x-digitalmate-original-uri": originalUri,
+      },
+      security: { trustProxyHeaders: true },
+    });
+
+    const response = await router.dispatch(
+      fixture.request("GET"),
+      routerRuntime(fixture.security),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "invalid_request", message: "invalid_path" },
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    "api/admin/compat/root",
+    "//mate.example/api/admin/compat/root",
+    "/api/admin/compat/root,/api/admin/compat/root",
+    "/api/admin/compat/root\u007f",
+  ])("fails closed for malformed trusted original URI %j", async (originalUri) => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const fixture = await authenticatedFixture({
+      requestUrl: "https://mate.example/api/admin/compat/root",
+      headers:
+        originalUri === undefined
+          ? undefined
+          : { "x-digitalmate-original-uri": originalUri },
+      security: { trustProxyHeaders: true },
+    });
+
+    const response = await router.dispatch(
+      fixture.request("GET"),
+      routerRuntime(fixture.security),
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("ignores a spoofed original URI unless controlled proxy trust is enabled", async () => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const fixture = await authenticatedFixture({
+      requestUrl: "https://mate.example/api/admin/compat/root",
+      headers: {
+        "x-digitalmate-original-uri":
+          "/api/admin/compat/agents/%2e%2e/root",
+      },
+    });
+
+    const response = await router.dispatch(
+      fixture.request("GET"),
+      routerRuntime(fixture.security),
+    );
+
+    expect(response.status).toBe(200);
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("validates trusted raw paths before the public auth-status exception", async () => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ authenticated: false }));
+    router.statusGet("/auth/status", handler);
+    const request = new Request(
+      "https://mate.example/api/admin/compat/auth/status",
+      {
+        headers: {
+          "x-digitalmate-original-uri":
+            "/api/admin/compat/private/%2e%2e/auth/status",
+        },
+      },
+    );
+
+    const response = await router.dispatch(
+      request,
+      routerRuntime(options({ trustProxyHeaders: true })),
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("accepts one legal trusted original URI and requires canonical params to agree", async () => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const fixture = await authenticatedFixture({
+      requestUrl:
+        "https://mate.example/api/admin/compat/root?tags=a,b",
+      headers: {
+        "x-digitalmate-original-uri":
+          "/api/admin/compat/root?tags=a,b",
+      },
+      security: { trustProxyHeaders: true },
+    });
+
+    const accepted = await router.dispatch(
+      fixture.request("GET"),
+      routerRuntime(fixture.security),
+      { routeSegments: ["root"] },
+    );
+    expect(accepted.status).toBe(200);
+    expect(handler).toHaveBeenCalledOnce();
+
+    const mismatched = await router.dispatch(
+      fixture.request("GET"),
+      routerRuntime(fixture.security),
+      { routeSegments: ["agents", "default"] },
+    );
+    expect(mismatched.status).toBe(400);
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("rejects multiple trusted original-URI header values after Fetch folding", async () => {
+    const router = new AdminCompatRouter();
+    const handler = vi.fn(async () => ({ ok: true }));
+    router.get("/root", handler);
+    const fixture = await authenticatedFixture({
+      requestUrl: "https://mate.example/api/admin/compat/root",
+      headers: {
+        "x-digitalmate-original-uri": "/api/admin/compat/root",
+      },
+      security: { trustProxyHeaders: true },
+    });
+    const request = fixture.request("GET");
+    request.headers.append(
+      "x-digitalmate-original-uri",
+      "/api/admin/compat/root",
+    );
+
+    const response = await router.dispatch(
+      request,
+      routerRuntime(fixture.security),
+    );
+
+    expect(request.headers.get("x-digitalmate-original-uri")).toContain(
+      ", ",
+    );
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("fails registration when two routes are ambiguous but allows fixed-over-dynamic precedence", () => {
     const router = new AdminCompatRouter();
     router.get("/agents/:agentId", async () => ({}));
@@ -1350,6 +1516,32 @@ describe("admin compatibility core contracts", () => {
     expect(preferences.update).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "GMT",
+    "CET",
+    "EET",
+    "PRC",
+    "W-SU",
+    "Zulu",
+  ])("accepts the ICU-supported IANA alias %s", async (timezone) => {
+    const preferences = preferenceResources();
+    const router = createCoreAdminCompatRouter(coreDependencies());
+    const response = await coreRequest({
+      router,
+      method: "PUT",
+      path: "/user-timezone",
+      body: { timezone, revision: 1 },
+      resources: preferences.resources,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      timezone: new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+      }).resolvedOptions().timeZone,
+    });
+  });
+
   it("uses one atomic user-settings revision so concurrent writes cannot silently overwrite", async () => {
     const preferences = preferenceResources();
     const router = createCoreAdminCompatRouter(coreDependencies());
@@ -1660,7 +1852,7 @@ describe("admin compatibility catch-all route", () => {
     const dispatcher = vi.fn(async () =>
       Response.json({ forwarded: true }),
     );
-    const handler = createAdminCompatRouteHandler(dispatcher);
+    const handler = createAdminCompatRouteHandler(() => dispatcher);
     const request = new Request(
       "https://mate.example/api/admin/compat/agents/default",
       { method },
@@ -1675,5 +1867,55 @@ describe("admin compatibility catch-all route", () => {
     expect(dispatcher).toHaveBeenCalledWith(request, {
       routeSegments: ["agents", "default"],
     });
+  });
+
+  it.each([
+    {
+      label: "factory",
+      createHandler: () =>
+        createAdminCompatRouteHandler(() => {
+          throw new Error("factory-secret-value");
+        }),
+      createParams: () => Promise.resolve({ segments: ["root"] }),
+    },
+    {
+      label: "dispatcher",
+      createHandler: () =>
+        createAdminCompatRouteHandler(() => async () => {
+          throw new Error("dispatcher-secret-value");
+        }),
+      createParams: () => Promise.resolve({ segments: ["root"] }),
+    },
+    {
+      label: "params",
+      createHandler: () =>
+        createAdminCompatRouteHandler(() => async () =>
+          Response.json({ shouldNotRun: true }),
+        ),
+      createParams: () =>
+        Promise.reject(new Error("params-secret-value")),
+    },
+  ])("returns a fixed outer 500 when $label initialization fails", async ({
+    createHandler,
+    createParams,
+  }) => {
+    const response = await createHandler()(
+      new Request("https://mate.example/api/admin/compat/root"),
+      { params: createParams() },
+    );
+    const serialized = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("content-type")).toContain(
+      "application/json",
+    );
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("x-content-type-options")).toBe(
+      "nosniff",
+    );
+    expect(serialized).toBe(
+      '{"error":{"code":"internal_error","message":"internal_error"}}',
+    );
+    expect(serialized).not.toContain("secret-value");
   });
 });

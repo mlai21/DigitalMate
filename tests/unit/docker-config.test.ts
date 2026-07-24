@@ -38,6 +38,30 @@ describe("docker deployment config", () => {
     expect(caddyfile).toMatch(/request_body @attachmentUpload[\s\S]*max_size 11MB/);
   });
 
+  it("replaces any client original-URI header with Caddy's raw request URI", async () => {
+    const caddyfile = await readFile(
+      path.join(process.cwd(), "Caddyfile"),
+      "utf8",
+    );
+    const proxyStart = caddyfile.indexOf("reverse_proxy web:3000 {");
+    const removeHeader = caddyfile.indexOf(
+      "header_up -X-DigitalMate-Original-URI",
+      proxyStart,
+    );
+    const setHeader = caddyfile.indexOf(
+      "header_up X-DigitalMate-Original-URI {http.request.orig_uri}",
+      removeHeader,
+    );
+    const proxyEnd = caddyfile.indexOf("\n\t}", setHeader);
+    expect(proxyStart).toBeGreaterThanOrEqual(0);
+    expect(removeHeader).toBeGreaterThan(proxyStart);
+    expect(setHeader).toBeGreaterThan(removeHeader);
+    expect(proxyEnd).toBeGreaterThan(setHeader);
+    expect(caddyfile.match(/X-DigitalMate-Original-URI/g)).toHaveLength(
+      2,
+    );
+  });
+
   it("sets the app runtime timezone for local reminder scheduling", async () => {
     const compose = await readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8");
     const dockerfile = await readFile(path.join(process.cwd(), "Dockerfile"), "utf8");

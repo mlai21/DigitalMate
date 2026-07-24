@@ -11,18 +11,44 @@ type AdminCompatDispatcher = (
   route: { routeSegments?: readonly string[] },
 ) => Promise<Response>;
 
+type AdminCompatDispatcherFactory = () => AdminCompatDispatcher;
+
 export function createAdminCompatRouteHandler(
-  dispatcher: AdminCompatDispatcher = dispatchAdminCompatRequest,
+  createDispatcher: AdminCompatDispatcherFactory = () =>
+    dispatchAdminCompatRequest,
 ) {
   return async function adminCompatRoute(
     request: Request,
     context: RouteContext,
   ): Promise<Response> {
-    const { segments } = await context.params;
-    return dispatcher(request, {
-      routeSegments: segments ?? [],
-    });
+    try {
+      const { segments } = await context.params;
+      const dispatcher = createDispatcher();
+      return await dispatcher(request, {
+        routeSegments: segments ?? [],
+      });
+    } catch {
+      return internalErrorResponse();
+    }
   };
+}
+
+function internalErrorResponse(): Response {
+  return Response.json(
+    {
+      error: {
+        code: "internal_error",
+        message: "internal_error",
+      },
+    },
+    {
+      status: 500,
+      headers: {
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    },
+  );
 }
 
 const handle = createAdminCompatRouteHandler();
