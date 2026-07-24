@@ -840,7 +840,7 @@ index ce94f9a6a471da073610f25b48fe9ae79d05b3ac..0ed9e15ed484739c505bf344e623164b
 +
  // Helper: create a mock Response
  function mockFetch(
-@@ -42,6 +41,11 @@ function mockFetch(
+@@ -42,6 +41,15 @@ function mockFetch(
  describe("request", () => {
    beforeEach(() => {
 -    vi.mocked(buildAuthHeaders).mockReturnValue({});
@@ -851,9 +851,14 @@ index ce94f9a6a471da073610f25b48fe9ae79d05b3ac..0ed9e15ed484739c505bf344e623164b
 +          : {},
 +    );
      Object.defineProperty(window, "location", {
-       value: { pathname: "/chat", href: "" },
+-      value: { pathname: "/chat", href: "" },
++      value: {
++        pathname: "/admin/settings/models",
++        search: "?tab=active",
++        assign: vi.fn(),
++      },
        writable: true,
-@@ -70,6 +74,18 @@ describe("request", () => {
+@@ -70,6 +78,18 @@ describe("request", () => {
      expect(headers.get("Content-Type")).toBe("application/json");
    });
 -
@@ -873,7 +878,31 @@ index ce94f9a6a471da073610f25b48fe9ae79d05b3ac..0ed9e15ed484739c505bf344e623164b
    it("PUT request automatically adds Content-Type", async () => {
      mockFetch(200, { status: "ok" });
      await request("/models/active", { method: "PUT", body: "{}" });
-@@ -136,14 +152,14 @@ describe("request", () => {
+@@ -112,16 +132,18 @@ describe("request", () => {
+   it("calls clearAuthToken and redirects to /login on 401", async () => {
+     mockFetch(401);
+     await expect(request("/models")).rejects.toThrow("Not authenticated");
+     expect(clearAuthToken).toHaveBeenCalledOnce();
+-    expect(window.location.href).toBe("/login");
++    expect(window.location.assign).toHaveBeenCalledWith(
++      "/login?redirect=%2Fadmin%2Fsettings%2Fmodels%3Ftab%3Dactive",
++    );
+   });
+-
++
+   it("does not redirect again when already on /login for 401", async () => {
+     window.location.pathname = "/login";
+-    window.location.href = "";
++    vi.mocked(window.location.assign).mockClear();
+     mockFetch(401);
+     await expect(request("/models")).rejects.toThrow("Not authenticated");
+-    expect(window.location.href).toBe("");
++    expect(window.location.assign).not.toHaveBeenCalled();
+   });
+-
++
+   it("throws error with status code for non-401 errors", async () => {
+@@ -136,14 +158,14 @@ describe("request", () => {
      await expect(request("/models")).rejects.toThrow("server exploded");
    });
 -
@@ -916,6 +945,22 @@ index 7f4cb7db038488d1446a2eccaa32688c28498f5f..ebcd0b32d468589a3e92c524b1bf85ee
      if (!headers.has(key)) {
        headers.set(key, value);
      }
+@@ -123,7 +123,14 @@ export async function request<T = unknown>(
+         if (response.status === 401) {
+           clearAuthToken();
+           if (window.location.pathname !== "/login") {
+-            window.location.href = "/login";
++            const returnTo = `${window.location.pathname}${window.location.search}`;
++            const safeReturnTo =
++              returnTo.startsWith("/") && !returnTo.startsWith("//")
++                ? returnTo
++                : "/admin";
++            window.location.assign(
++              `/login?redirect=${encodeURIComponent(safeReturnTo)}`,
++            );
+           }
+           throw new Error("Not authenticated");
+         }
 diff --git a/src/components/AgentSelector/AgentSelector.test.tsx b/src/components/AgentSelector/AgentSelector.test.tsx
 index 8684213959728c6967321743ad21a1e733b8edf5..788b005f50a66f4d24af3afc5e17f11f3c39e9c2 100644
 --- a/src/components/AgentSelector/AgentSelector.test.tsx

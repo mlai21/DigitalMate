@@ -4,7 +4,11 @@ import { z } from "zod";
 const envSchema = z.object({
   DATABASE_URL: z.string().default("postgres://digitalmate:digitalmate@localhost:5432/digitalmate"),
   APP_PASSWORD: z.string().optional(),
-  APP_SECRET: z.string().default("digitalmate-local-secret"),
+  APP_SECRET: z.string().min(16).default("digitalmate-local-secret"),
+  TRUST_PROXY_HEADERS: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   KIE_AI_API_KEY: z.string().optional(),
   KIE_AI_BASE_URL: z.string().default("https://api.kie.ai"),
   GEMINI_3_5_FLASH_ENDPOINT: z.string().default("/gemini-3-5-flash-openai/v1/chat/completions"),
@@ -44,6 +48,7 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     databaseUrl: parsed.DATABASE_URL,
     appPassword: parsed.APP_PASSWORD,
     appSecret: parsed.APP_SECRET,
+    trustProxyHeaders: parsed.TRUST_PROXY_HEADERS,
     kieAiApiKey: parsed.KIE_AI_API_KEY,
     kieAiBaseUrl: parsed.KIE_AI_BASE_URL,
     geminiEndpoint: parsed.GEMINI_3_5_FLASH_ENDPOINT,

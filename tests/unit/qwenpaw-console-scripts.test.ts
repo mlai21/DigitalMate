@@ -1969,6 +1969,10 @@ describe("QwenPaw Console patch preparation", () => {
       expect(appSource).toContain('pathname.startsWith("/admin/")');
       expect(appSource).toContain('return "/admin"');
       expect(appSource).toContain('fetch("/api/admin/compat/auth/status"');
+      expect(appSource).toContain("function getDigitalMateLoginUrl(");
+      expect(appSource).toContain(
+        'returnTo.startsWith("/") && !returnTo.startsWith("//")',
+      );
       expect(routesSource).toContain('window.location.assign("/")');
       expect(sidebarSource).toContain(
         "function getCollapsedNavAriaLabel(item: FlatMenuEntry): string",
@@ -2022,7 +2026,14 @@ describe("QwenPaw Console patch preparation", () => {
         'const API_BASE_URL = "/api/admin/compat"',
       );
       expect(configSource).toContain('let csrfToken = ""');
+      expect(configSource).not.toContain("localStorage.setItem");
+      expect(configSource).not.toContain("sessionStorage.setItem");
       expect(requestSource).toContain("buildMutationHeaders");
+      expect(requestSource).toContain("window.location.assign(");
+      expect(requestSource).toContain(
+        "`/login?redirect=${encodeURIComponent(safeReturnTo)}`",
+      );
+      expect(requestSource).not.toContain('window.location.href = "/login"');
       expect.soft(authHeadersSource).toContain("buildMutationHeaders");
       expect
         .soft(authHeadersSource)

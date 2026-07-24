@@ -1,11 +1,31 @@
-import { createHmac, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  scrypt as scryptCallback,
+  timingSafeEqual,
+} from "node:crypto";
 import { promisify } from "node:util";
+import {
+  resolveRequestOrigin,
+  type RequestOriginOptions,
+} from "@/server/http/request-origin";
 
 export const sessionCookieName = "dm_session";
 const scrypt = promisify(scryptCallback);
 
-export async function createSessionToken(userId: string, secret: string): Promise<string> {
-  const payload = base64UrlEncode(JSON.stringify({ sub: userId, iat: Date.now() }));
+export async function createSessionToken(
+  userId: string,
+  secret: string,
+  now: Date = new Date(),
+): Promise<string> {
+  const payload = base64UrlEncode(
+    JSON.stringify({
+      sub: userId,
+      iat: now.getTime(),
+      sid: randomBytes(18).toString("base64url"),
+    }),
+  );
   const signature = sign(payload, secret);
   return `${payload}.${signature}`;
 }
@@ -40,12 +60,21 @@ export async function verifySessionRequest(
   defaultUserId: string,
   secret: string,
 ): Promise<string | null> {
+  const sessionToken = getSessionTokenFromRequest(request);
+  if (!sessionToken) return null;
+
+  const sessionUserId = await verifySessionToken(sessionToken, secret);
+  return sessionUserId && safeEqual(sessionUserId, defaultUserId) ? sessionUserId : null;
+}
+
+export function getSessionTokenFromRequest(
+  request: Request,
+): string | null {
   const cookieHeader = request.headers.get("cookie");
   if (!cookieHeader) return null;
 
   let sessionToken: string | null = null;
   let foundSessionCookie = false;
-
   for (const rawCookie of cookieHeader.split(";")) {
     const cookie = rawCookie.trim();
     if (!cookie) continue;
@@ -65,11 +94,7 @@ export async function verifySessionRequest(
     if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) return null;
     sessionToken = value;
   }
-
-  if (!sessionToken) return null;
-
-  const sessionUserId = await verifySessionToken(sessionToken, secret);
-  return sessionUserId && safeEqual(sessionUserId, defaultUserId) ? sessionUserId : null;
+  return sessionToken;
 }
 
 export async function verifyPassword(input: string, expected: string): Promise<boolean> {
@@ -77,11 +102,12 @@ export async function verifyPassword(input: string, expected: string): Promise<b
   return timingSafeEqual(left, right);
 }
 
-export function shouldUseSecureSessionCookie(request: Request): boolean {
-  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
-  if (forwardedProto) return forwardedProto === "https";
-
-  return new URL(request.url).protocol === "https:";
+export function shouldUseSecureSessionCookie(
+  request: Request,
+  options: RequestOriginOptions = {},
+): boolean {
+  const origin = resolveRequestOrigin(request, options);
+  return origin?.startsWith("https://") ?? false;
 }
 
 function sign(payload: string, secret: string): string {
@@ -89,10 +115,9 @@ function sign(payload: string, secret: string): string {
 }
 
 function safeEqual(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-  if (leftBuffer.length !== rightBuffer.length) return false;
-  return timingSafeEqual(leftBuffer, rightBuffer);
+  const leftDigest = createHash("sha256").update(left).digest();
+  const rightDigest = createHash("sha256").update(right).digest();
+  return timingSafeEqual(leftDigest, rightDigest);
 }
 
 function base64UrlEncode(value: string): string {

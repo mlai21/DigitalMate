@@ -10,6 +10,21 @@ describe("readEnv", () => {
     expect(env.llmModelLight).toBe("gemini-3-5-flash-openai");
     expect(env.proactiveMaxPerDay).toBe(3);
     expect(env.aliyunIqsBaseUrl).toBe("https://cloud-iqs.aliyuncs.com");
+    expect(env.trustProxyHeaders).toBe(false);
+  });
+
+  it("requires an explicit boolean to trust sanitized proxy headers", () => {
+    expect(readEnv({ TRUST_PROXY_HEADERS: "true" }).trustProxyHeaders).toBe(
+      true,
+    );
+    expect(() => readEnv({ TRUST_PROXY_HEADERS: "yes" })).toThrow();
+  });
+
+  it("rejects an APP_SECRET too short for session and CSRF signing", () => {
+    expect(() => readEnv({ APP_SECRET: "short" })).toThrow();
+    expect(
+      readEnv({ APP_SECRET: "at-least-sixteen-characters" }).appSecret,
+    ).toBe("at-least-sixteen-characters");
   });
 
   it("reads optional channel credentials", () => {

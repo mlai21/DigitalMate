@@ -23,6 +23,15 @@ describe("docker deployment config", () => {
     expect(compose).toMatch(/expose:\s*\n\s*- "3000"/);
   });
 
+  it("explicitly trusts proxy headers only in the Caddy-fronted web service", async () => {
+    const compose = await readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8");
+
+    expect(compose.match(/^\s+TRUST_PROXY_HEADERS:/gm)).toHaveLength(1);
+    expect(compose).toContain(
+      "TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}",
+    );
+  });
+
   it("caps attachment upload request bodies before proxying to the web service", async () => {
     const caddyfile = await readFile(path.join(process.cwd(), "Caddyfile"), "utf8");
 

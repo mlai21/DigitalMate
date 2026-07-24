@@ -75,7 +75,7 @@ index 53fb39ad9a1980830ea4ecd938326ad9a9c5d02a..3439cb878d8c2634226a8174edc52f95
        }
      })();
      return () => {
-@@ -111,18 +89,29 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+@@ -111,18 +89,45 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
    }, []);
 -
 +
@@ -94,10 +94,26 @@ index 53fb39ad9a1980830ea4ecd938326ad9a9c5d02a..3439cb878d8c2634226a8174edc52f95
 +
 +function DigitalMateLoginRedirect() {
 +  useEffect(() => {
-+    const returnTo = `${window.location.pathname}${window.location.search}`;
-+    window.location.assign(`/login?redirect=${encodeURIComponent(returnTo)}`);
++    window.location.assign(
++      getDigitalMateLoginUrl(
++        window.location.pathname,
++        window.location.search,
++      ),
++    );
 +  }, []);
 +  return null;
++}
++
++function getDigitalMateLoginUrl(
++  pathname: string,
++  search: string,
++): string {
++  const returnTo = `${pathname}${search}`;
++  const safeReturnTo =
++    returnTo.startsWith("/") && !returnTo.startsWith("//")
++      ? returnTo
++      : "/admin";
++  return `/login?redirect=${encodeURIComponent(safeReturnTo)}`;
 +}
 +
  function getRouterBasename(pathname: string): string | undefined {
@@ -116,7 +132,7 @@ index 53fb39ad9a1980830ea4ecd938326ad9a9c5d02a..3439cb878d8c2634226a8174edc52f95
 -
 +
  function AppInner() {
-@@ -211,11 +200,7 @@ function AppInner() {
+@@ -211,11 +216,7 @@ function AppInner() {
                  <Routes>
                    <Route
                      path="/login"

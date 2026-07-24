@@ -26,7 +26,9 @@ export async function POST(request: Request) {
   cookieStore.set(sessionCookieName, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: shouldUseSecureSessionCookie(request),
+    secure: shouldUseSecureSessionCookie(request, {
+      trustProxyHeaders: env.trustProxyHeaders,
+    }),
     path: "/",
     maxAge: 60 * 60 * 24 * 30,
   });
