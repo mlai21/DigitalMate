@@ -16,6 +16,7 @@ import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import type { LlmUsageLogInput } from "@/server/llm/usage";
 import type { ToolRegistrationDraft } from "@/server/tasks/tools";
 import {
+  TASK_COMPLETION_RECOVERY_TIMEOUT_MS,
   TaskCompletionAmbiguousError,
   TaskCompletionNotCommittedError,
 } from "@/server/tasks/completion-errors";
@@ -327,16 +328,30 @@ export function createRepositories(
     taskRunId: string,
     artifactIds: string[],
   ): Promise<"committed" | "not_committed" | "ambiguous"> {
+    const recoveryController = new AbortController();
+    const recoveryTimer = setTimeout(() => {
+      recoveryController.abort(new Error("task_completion_recovery_timeout"));
+    }, TASK_COMPLETION_RECOVERY_TIMEOUT_MS);
+    recoveryTimer.unref?.();
     let verificationClient: PoolClient | undefined;
-    let verificationFailed = false;
+    let verificationClientGuard: AbortablePoolClientGuard | undefined;
     try {
-      verificationClient = await verificationPool.connect();
+      verificationClient = await connectPoolClient(
+        verificationPool,
+        recoveryController.signal,
+      );
+      verificationClientGuard = guardPoolClientWithAbort(
+        verificationClient,
+        recoveryController.signal,
+      );
+      recoveryController.signal.throwIfAborted();
       const task = await verificationClient.query<{ status: string }>(
         `SELECT status
          FROM task_runs
          WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
         [scope.userId, scope.agentId, taskRunId],
       );
+      recoveryController.signal.throwIfAborted();
       if (task.rows.length !== 1) return "ambiguous";
 
       let artifactRows: Array<{ id: string; status: string }> = [];
@@ -350,6 +365,7 @@ export function createRepositories(
              AND id = ANY($4::uuid[])`,
           [scope.userId, scope.agentId, taskRunId, artifactIds],
         );
+        recoveryController.signal.throwIfAborted();
         artifactRows = artifacts.rows;
       }
 
@@ -373,12 +389,12 @@ export function createRepositories(
 
       return "ambiguous";
     } catch {
-      verificationFailed = true;
+      verificationClientGuard?.destroy();
       return "ambiguous";
     } finally {
-      if (verificationFailed) {
-        verificationClient?.release(true);
-      } else {
+      clearTimeout(recoveryTimer);
+      verificationClientGuard?.dispose();
+      if (verificationClientGuard && !verificationClientGuard.destroyed) {
         verificationClient?.release();
       }
     }
@@ -2244,17 +2260,21 @@ export function createRepositories(
         taskRunId: string,
         outputSummary: string,
         artifactIds: string[],
+        signal?: AbortSignal,
       ): Promise<void> {
         const uniqueArtifactIds = [...new Set(artifactIds)];
         if (uniqueArtifactIds.length !== artifactIds.length) {
           throw new Error("task_artifact_transition_failed");
         }
 
-        const client = await pool.connect();
+        signal?.throwIfAborted();
+        const client = await connectPoolClient(pool, signal);
+        const clientGuard = guardPoolClientWithAbort(client, signal);
         let commitAttempted = false;
-        let clientReleased = false;
         try {
+          signal?.throwIfAborted();
           await client.query("BEGIN");
+          signal?.throwIfAborted();
           if (uniqueArtifactIds.length > 0) {
             const artifacts = await client.query<{ id: string }>(
               `UPDATE task_artifacts
@@ -2267,6 +2287,7 @@ export function createRepositories(
                RETURNING id`,
               [scope.userId, scope.agentId, taskRunId, uniqueArtifactIds],
             );
+            signal?.throwIfAborted();
             if (artifacts.rows.length !== uniqueArtifactIds.length) {
               throw new Error("task_artifact_transition_failed");
             }
@@ -2279,13 +2300,14 @@ export function createRepositories(
              RETURNING id`,
             [scope.userId, scope.agentId, taskRunId, outputSummary],
           );
+          signal?.throwIfAborted();
           if (!task.rows[0]) throw new Error("task_completion_transition_failed");
           commitAttempted = true;
           await client.query("COMMIT");
+          signal?.throwIfAborted();
         } catch (error) {
           if (commitAttempted) {
-            client.release(true);
-            clientReleased = true;
+            clientGuard.destroy();
             const outcome = await verifyTaskCompletionAfterCommitError(
               pool,
               scope,
@@ -2298,10 +2320,16 @@ export function createRepositories(
             }
             throw new TaskCompletionAmbiguousError();
           }
-          await client.query("ROLLBACK").catch(() => undefined);
+          if (!clientGuard.destroyed) {
+            await client.query("ROLLBACK").catch(() => {
+              clientGuard.destroy();
+            });
+          }
+          signal?.throwIfAborted();
           throw error;
         } finally {
-          if (!clientReleased) client.release();
+          clientGuard.dispose();
+          if (!clientGuard.destroyed) client.release();
         }
       },
       async fail(scope: AgentScope, taskRunId: string, error: string): Promise<void> {
@@ -2987,6 +3015,38 @@ async function releaseTurnExecutionLock(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type AbortablePoolClientGuard = {
+  readonly destroyed: boolean;
+  destroy(): void;
+  dispose(): void;
+};
+
+function guardPoolClientWithAbort(
+  client: PoolClient,
+  signal?: AbortSignal,
+): AbortablePoolClientGuard {
+  let destroyed = false;
+  const destroy = () => {
+    if (destroyed) return;
+    destroyed = true;
+    client.release(true);
+  };
+  if (signal?.aborted) {
+    destroy();
+  } else {
+    signal?.addEventListener("abort", destroy, { once: true });
+  }
+  return {
+    get destroyed() {
+      return destroyed;
+    },
+    destroy,
+    dispose() {
+      signal?.removeEventListener("abort", destroy);
+    },
+  };
 }
 
 async function connectPoolClient(pool: Pool, signal?: AbortSignal): Promise<PoolClient> {

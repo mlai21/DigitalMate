@@ -7,7 +7,7 @@ const routeMocks = vi.hoisted(() => ({
   requireCurrentUser: vi.fn(async () => ({ id: "user-1" })),
   taskArtifactsCreate: vi.fn<(...args: unknown[]) => Promise<string>>(async () => "artifact-id"),
   releaseLease: vi.fn(async () => undefined),
-  taskRunsComplete: vi.fn(async () => undefined),
+  taskRunsComplete: vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined),
   taskRunsFail: vi.fn(async () => undefined),
   taskRunsCreate: vi.fn(async () => "task-1"),
   skillsCreate: vi.fn(async () => undefined),
@@ -100,6 +100,9 @@ describe("csv task route", () => {
     } as Request);
 
     expect(response.status).toBe(303);
+    expect(routeMocks.taskRunsComplete.mock.calls[0]?.[4]).toMatchObject({
+      aborted: false,
+    });
     expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledTimes(2);
     expect(routeMocks.taskArtifactsCreate).toHaveBeenCalledWith(
       { userId: "user-1", agentId: "agent-1" },

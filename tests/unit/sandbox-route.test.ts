@@ -1,11 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/tasks/sandbox/route";
+import { USER_DATA_WORK_TIMEOUT_MS } from "@/server/admin/user-data-lease";
 
 const mocks = vi.hoisted(() => ({
   releaseLease: vi.fn(async () => undefined),
   publishTaskArtifact: vi.fn(),
   discardPublishedTaskArtifacts: vi.fn(async () => undefined),
-  taskRunComplete: vi.fn(async () => undefined),
+  taskRunComplete: vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined),
   taskRunFail: vi.fn(async () => undefined),
   runSandboxTask: vi.fn(async () => ({ stdout: "ok\n", stderr: "" })),
 }));
@@ -71,6 +72,10 @@ describe("sandbox task route", () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("publishes the sandbox output before completing and releases the shared lease", async () => {
     const form = new FormData();
     form.set("script", "node -e \"console.log('ok')\"");
@@ -81,6 +86,9 @@ describe("sandbox task route", () => {
     } as Request);
 
     expect(response.status).toBe(303);
+    expect(mocks.taskRunComplete.mock.calls[0]?.[4]).toMatchObject({
+      aborted: false,
+    });
     expect(mocks.publishTaskArtifact).toHaveBeenCalledWith(
       expect.objectContaining({
         scope: { userId: "user-1", agentId: "agent-1" },
@@ -137,6 +145,42 @@ describe("sandbox task route", () => {
     });
     expect(mocks.discardPublishedTaskArtifacts).not.toHaveBeenCalled();
     expect(mocks.taskRunFail).not.toHaveBeenCalled();
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a half-open completion, compensates confirmed pre-COMMIT work, and releases the lease", async () => {
+    vi.useFakeTimers();
+    let completionSignal: AbortSignal | undefined;
+    let markCompletionReached: (() => void) | undefined;
+    const completionReached = new Promise<void>((resolve) => {
+      markCompletionReached = resolve;
+    });
+    mocks.taskRunComplete.mockImplementationOnce((...args: unknown[]) => {
+      completionSignal = args[4] as AbortSignal | undefined;
+      markCompletionReached?.();
+      return new Promise<void>((_resolve, reject) => {
+        const rejectFromAbort = () => reject(completionSignal?.reason);
+        if (completionSignal?.aborted) {
+          rejectFromAbort();
+        } else {
+          completionSignal?.addEventListener("abort", rejectFromAbort, { once: true });
+        }
+      });
+    });
+    const form = new FormData();
+    form.set("script", "node -e \"console.log('ok')\"");
+
+    const operation = POST({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/sandbox",
+    } as Request);
+    await completionReached;
+    await vi.advanceTimersByTimeAsync(USER_DATA_WORK_TIMEOUT_MS);
+
+    await expect(operation).rejects.toThrow("user_data_work_timeout");
+    expect(completionSignal?.aborted).toBe(true);
+    expect(mocks.discardPublishedTaskArtifacts).toHaveBeenCalledTimes(1);
+    expect(mocks.taskRunFail).toHaveBeenCalledTimes(1);
     expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
   });
 });

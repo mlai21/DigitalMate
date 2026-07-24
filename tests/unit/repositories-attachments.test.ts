@@ -795,6 +795,23 @@ async function reservePort(): Promise<number> {
   });
 }
 
+async function waitForBlockedTaskArtifactUpdate(pool: Pool): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*) AS count
+       FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid()
+         AND state = 'active'
+         AND wait_event_type = 'Lock'
+         AND query LIKE '%UPDATE task_artifacts%'`,
+    );
+    if (Number(result.rows[0]?.count ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("task_artifact_update_did_not_block");
+}
+
 describe("message attachment PostgreSQL concurrency", () => {
   const schemaName = `attachment_repository_${process.pid}_${Date.now()}`;
   let adminPool: Pool;
@@ -899,6 +916,24 @@ describe("message attachment PostgreSQL concurrency", () => {
           (status = 'bound' AND message_id IS NOT NULL)
           OR (status <> 'bound' AND message_id IS NULL)
         )
+      );
+      CREATE TABLE task_runs (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_id uuid NOT NULL,
+        status text NOT NULL,
+        output_summary text,
+        error text,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE task_artifacts (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        agent_id uuid NOT NULL,
+        task_run_id uuid NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+        status text NOT NULL,
+        temporary_storage_path text,
+        updated_at timestamptz NOT NULL DEFAULT now()
       );
     `);
     legacyConstraintDefinition = (await readStatusConstraint()).definition;
@@ -1283,6 +1318,116 @@ describe("message attachment PostgreSQL concurrency", () => {
       await waiterTurnPool.end();
       await waiterUserDataPool.end();
       await clearUserDataPool.end();
+    }
+  });
+
+  it("cancels a PostgreSQL-blocked task transaction, rolls it back, and releases its shared lease", async () => {
+    const userId = "50000000-0000-4000-8000-000000000025";
+    const conversationId = "51000000-0000-4000-8000-000000000025";
+    const taskRunId = "57000000-0000-4000-8000-000000000025";
+    const artifactId = "58000000-0000-4000-8000-000000000025";
+    await seedConversation(userId, conversationId);
+    const scope = scopeForUser(userId);
+    await databasePool.query(
+      `INSERT INTO task_runs (id, user_id, agent_id, status)
+       VALUES ($1, $2, $3, 'running')`,
+      [taskRunId, userId, scope.agentId],
+    );
+    await databasePool.query(
+      `INSERT INTO task_artifacts (
+         id, user_id, agent_id, task_run_id, status, temporary_storage_path
+       )
+       VALUES ($1, $2, $3, $4, 'pending', 'staging/output.txt')`,
+      [artifactId, userId, scope.agentId, taskRunId],
+    );
+
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const blockerPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const completionPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const clearPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 1 });
+    const blocker = await blockerPool.connect();
+    const repositories = createRepositories(completionPool, completionPool, completionPool);
+    const clearRepositories = createRepositories(clearPool, clearPool, clearPool);
+    const controller = new AbortController();
+    let compensationCount = 0;
+
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        "SELECT id FROM task_artifacts WHERE id = $1 FOR UPDATE",
+        [artifactId],
+      );
+
+      const operation = withUserDataLease(
+        repositories,
+        userId,
+        async (_lease, signal) => {
+          try {
+            await repositories.taskRuns.completeWithArtifacts(
+              scope,
+              taskRunId,
+              "任务完成",
+              [artifactId],
+              signal,
+            );
+          } catch (error) {
+            const authoritative = await completionPool.query<{
+              task_status: string;
+              artifact_status: string;
+            }>(
+              `SELECT task.status AS task_status, artifact.status AS artifact_status
+               FROM task_runs AS task
+               JOIN task_artifacts AS artifact ON artifact.task_run_id = task.id
+               WHERE task.id = $1 AND artifact.id = $2`,
+              [taskRunId, artifactId],
+            );
+            expect(authoritative.rows[0]).toEqual({
+              task_status: "running",
+              artifact_status: "pending",
+            });
+            compensationCount += 1;
+            await repositories.taskRuns.fail(scope, taskRunId, "task_cancelled");
+            throw error;
+          }
+        },
+        { signal: controller.signal },
+      );
+
+      await waitForBlockedTaskArtifactUpdate(adminPool);
+      controller.abort(new Error("task_cancelled"));
+
+      await expect(Promise.race([
+        operation.then(() => "resolved", (error: unknown) => error instanceof Error ? error.message : "rejected"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-running"), 500)),
+      ])).resolves.toBe("task_cancelled");
+      expect(compensationCount).toBe(1);
+
+      const clearLease = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
+      await clearLease.release();
+      await expect(completionPool.query("SELECT 1 AS reusable")).resolves.toMatchObject({
+        rows: [{ reusable: 1 }],
+      });
+
+      const persisted = await databasePool.query<{
+        task_status: string;
+        artifact_status: string;
+      }>(
+        `SELECT task.status AS task_status, artifact.status AS artifact_status
+         FROM task_runs AS task
+         JOIN task_artifacts AS artifact ON artifact.task_run_id = task.id
+         WHERE task.id = $1 AND artifact.id = $2`,
+        [taskRunId, artifactId],
+      );
+      expect(persisted.rows[0]).toEqual({
+        task_status: "failed",
+        artifact_status: "pending",
+      });
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+      await blockerPool.end();
+      await completionPool.end();
+      await clearPool.end();
     }
   });
 

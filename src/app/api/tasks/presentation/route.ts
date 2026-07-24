@@ -20,14 +20,15 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
-  return withFreshUserDataLease(user.id, (repositories) =>
-    processPresentationTask(request, user.id, repositories));
+  return withFreshUserDataLease(user.id, (repositories, signal) =>
+    processPresentationTask(request, user.id, repositories, signal));
 }
 
 async function processPresentationTask(
   request: Request,
   userId: string,
   repositories: ReturnType<typeof createRepositories>,
+  signal: AbortSignal,
 ) {
   const form = await request.formData();
   const title = String(form.get("title") ?? "DigitalMate 汇报");
@@ -74,6 +75,7 @@ async function processPresentationTask(
       inputSummary,
       outputSummary: "PPT 文件已生成。",
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
+      signal,
     });
   } catch (error) {
     if (isTaskCompletionAmbiguousError(error)) {

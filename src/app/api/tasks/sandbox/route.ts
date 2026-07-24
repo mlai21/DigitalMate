@@ -22,14 +22,15 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
-  return withFreshUserDataLease(user.id, (repositories) =>
-    processSandboxTask(request, user.id, repositories));
+  return withFreshUserDataLease(user.id, (repositories, signal) =>
+    processSandboxTask(request, user.id, repositories, signal));
 }
 
 async function processSandboxTask(
   request: Request,
   userId: string,
   repositories: ReturnType<typeof createRepositories>,
+  signal: AbortSignal,
 ) {
   const form = await request.formData();
   const script = String(form.get("script") ?? "").trim();
@@ -78,6 +79,7 @@ async function processSandboxTask(
       inputSummary,
       outputSummary: "沙箱任务已执行，输出文件已生成。",
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
+      signal,
     });
   } catch (error) {
     if (isTaskCompletionAmbiguousError(error)) {

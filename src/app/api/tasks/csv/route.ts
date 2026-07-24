@@ -19,14 +19,15 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
-  return withFreshUserDataLease(user.id, (repositories) =>
-    processSpreadsheetTask(request, user.id, repositories));
+  return withFreshUserDataLease(user.id, (repositories, signal) =>
+    processSpreadsheetTask(request, user.id, repositories, signal));
 }
 
 async function processSpreadsheetTask(
   request: Request,
   userId: string,
   repositories: ReturnType<typeof createRepositories>,
+  signal: AbortSignal,
 ) {
   const form = await request.formData();
   const file = form.get("file");
@@ -66,6 +67,7 @@ async function processSpreadsheetTask(
       inputSummary,
       outputSummary: "表格汇总报告和图表已生成。",
       artifactIds: publishedArtifacts.map((artifact) => artifact.artifactId),
+      signal,
     });
   } catch (error) {
     if (isTaskCompletionAmbiguousError(error)) {

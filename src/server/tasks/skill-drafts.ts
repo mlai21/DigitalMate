@@ -8,6 +8,7 @@ type TaskSkillDraftRepositories = {
       taskRunId: string,
       outputSummary: string,
       artifactIds: string[],
+      signal?: AbortSignal,
     ): Promise<unknown> | unknown;
   };
   skills: {
@@ -21,14 +22,25 @@ export async function completeTaskWithSkillDraft(
     scope: AgentScope;
     taskRunId: string;
     artifactIds: string[];
+    signal?: AbortSignal;
   },
 ): Promise<void> {
-  await repositories.taskRuns.completeWithArtifacts(
-    input.scope,
-    input.taskRunId,
-    input.outputSummary,
-    input.artifactIds,
-  );
+  if (input.signal) {
+    await repositories.taskRuns.completeWithArtifacts(
+      input.scope,
+      input.taskRunId,
+      input.outputSummary,
+      input.artifactIds,
+      input.signal,
+    );
+  } else {
+    await repositories.taskRuns.completeWithArtifacts(
+      input.scope,
+      input.taskRunId,
+      input.outputSummary,
+      input.artifactIds,
+    );
+  }
 
   try {
     await repositories.skills.create(input.scope.userId, createTaskSkillDraft(input));

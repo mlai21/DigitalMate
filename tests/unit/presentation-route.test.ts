@@ -16,7 +16,7 @@ const routeMocks = vi.hoisted(() => ({
     routeMocks.callOrder.push("locator");
     return "artifact-id";
   }),
-  taskRunsComplete: vi.fn(async () => {
+  taskRunsComplete: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {
     routeMocks.callOrder.push("complete");
   }),
   taskRunsFail: vi.fn(async () => {
@@ -114,6 +114,9 @@ describe("presentation task route", () => {
     } as Request);
 
     expect(response.status).toBe(303);
+    expect(routeMocks.taskRunsComplete.mock.calls[0]?.[4]).toMatchObject({
+      aborted: false,
+    });
     expect(routeMocks.storedBuffers).toHaveLength(1);
     expect(pptxText(routeMocks.storedBuffers[0])).toContain("数据概览");
     expect(routeMocks.callOrder).toEqual([

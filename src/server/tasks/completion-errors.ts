@@ -1,3 +1,5 @@
+export const TASK_COMPLETION_RECOVERY_TIMEOUT_MS = 5_000;
+
 export class TaskCompletionAmbiguousError extends Error {
   readonly code = "task_completion_ambiguous";
 
