@@ -4,18 +4,27 @@ import { describe, expect, it } from "vitest";
 import { readEnv } from "@/server/config/env";
 
 describe("security environment contract", () => {
-  it("keeps the APP_SECRET development placeholder consistent in all three entry points", async () => {
+  it("keeps a development placeholder but rejects it in production", async () => {
     const [example, compose] = await Promise.all([
       readFile(path.join(process.cwd(), ".env.example"), "utf8"),
       readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8"),
     ]);
-    const placeholder = "digitalmate-local-secret-change-me";
+    const placeholder = example.match(/^APP_SECRET=(.+)$/m)?.[1];
 
-    expect(readEnv({}).appSecret).toBe(placeholder);
-    expect(example).toContain(`APP_SECRET=${placeholder}`);
+    expect(placeholder).toBeTruthy();
+    expect(readEnv({}).appSecret).toBe(
+      "digitalmate-local-secret-change-me",
+    );
+    expect(() =>
+      readEnv({
+        NODE_ENV: "production",
+        APP_SECRET: placeholder,
+      }),
+    ).toThrow(/APP_SECRET.*高熵/);
+    expect(compose).not.toContain("${APP_SECRET:-");
     expect(
       compose.match(
-        new RegExp(`APP_SECRET: \\\\?\\$\\{APP_SECRET:-${placeholder}\\}`, "g"),
+        /APP_SECRET:\s*"\$\{APP_SECRET:\?请设置至少32字节的高熵APP_SECRET\}"/g,
       ),
     ).toHaveLength(2);
   });

@@ -38,7 +38,7 @@ describe("embedded PostgreSQL lifecycle", () => {
     expect(order).toEqual(["pool-end", "client-end", "postgres-stop"]);
   });
 
-  it("fails teardown and keeps PostgreSQL running when pool counters do not converge", async () => {
+  it("reports undrained counters but still stops PostgreSQL", async () => {
     const pool = Object.assign(new EventEmitter(), {
       totalCount: 1,
       idleCount: 0,
@@ -53,6 +53,78 @@ describe("embedded PostgreSQL lifecycle", () => {
     await expect(lifecycle.stop(database)).rejects.toThrow(
       "embedded_postgres_pool_not_drained:1:0:0",
     );
-    expect(database.stop).not.toHaveBeenCalled();
+    expect(database.stop).toHaveBeenCalledOnce();
+    expect(pool.listenerCount("connect")).toBe(0);
+  });
+
+  it("bounds a missing client end event and removes lifecycle listeners", async () => {
+    const client = new EventEmitter() as PoolClient;
+    const pool = Object.assign(new EventEmitter(), {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      end: vi.fn(async () => undefined),
+    }) as unknown as Pool;
+    const database = {
+      stop: vi.fn(async () => undefined),
+    } as unknown as EmbeddedPostgres;
+    const lifecycle = trackEmbeddedPostgresPool(pool, {
+      clientEndTimeoutMs: 5,
+    });
+    pool.emit("connect", client);
+
+    await expect(lifecycle.stop(database)).rejects.toThrow(
+      "embedded_postgres_client_end_timeout:1",
+    );
+
+    expect(database.stop).toHaveBeenCalledOnce();
+    expect(pool.listenerCount("connect")).toBe(0);
+    expect(client.listenerCount("end")).toBe(0);
+  });
+
+  it("preserves a pool.end failure while still stopping PostgreSQL", async () => {
+    const primaryError = new Error("pool end failed");
+    const pool = Object.assign(new EventEmitter(), {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      end: vi.fn(async () => {
+        throw primaryError;
+      }),
+    }) as unknown as Pool;
+    const database = {
+      stop: vi.fn(async () => undefined),
+    } as unknown as EmbeddedPostgres;
+    const lifecycle = trackEmbeddedPostgresPool(pool);
+
+    await expect(lifecycle.stop(database)).rejects.toBe(primaryError);
+    expect(database.stop).toHaveBeenCalledOnce();
+    expect(pool.listenerCount("connect")).toBe(0);
+  });
+
+  it("aggregates pool and PostgreSQL stop failures without swallowing either", async () => {
+    const poolError = new Error("pool end failed");
+    const stopError = new Error("postgres stop failed");
+    const pool = Object.assign(new EventEmitter(), {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      end: vi.fn(async () => {
+        throw poolError;
+      }),
+    }) as unknown as Pool;
+    const database = {
+      stop: vi.fn(async () => {
+        throw stopError;
+      }),
+    } as unknown as EmbeddedPostgres;
+    const lifecycle = trackEmbeddedPostgresPool(pool);
+
+    const failure = await lifecycle.stop(database).catch((error) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      poolError,
+      stopError,
+    ]);
   });
 });

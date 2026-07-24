@@ -61,7 +61,7 @@ cp .env.example .env
 编辑 `.env`，至少配置：
 
 - `APP_PASSWORD`：Web 登录口令
-- `APP_SECRET`：会话签名密钥
+- `APP_SECRET`：会话与 CSRF 签名根密钥；生产环境必须显式配置至少 32 字节的独立高熵随机值
 - `DATABASE_URL`：PostgreSQL 连接
 - `AI_API_KEY`：真实模型调用需要
 

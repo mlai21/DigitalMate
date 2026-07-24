@@ -1790,6 +1790,28 @@ describe("QwenPaw Console patch preparation", () => {
     }
   });
 
+  it("0004 对每个目标文件只保留一个 canonical diff header", async () => {
+    const patchSource = await readFile(
+      path.resolve(
+        "patches/qwenpaw-console/0004-api-compat.patch",
+      ),
+      "utf8",
+    );
+    const counts = new Map<string, number>();
+
+    for (const match of patchSource.matchAll(
+      /^diff --git a\/(.+) b\/(.+)$/gm,
+    )) {
+      expect(match[2]).toBe(match[1]);
+      counts.set(match[1], (counts.get(match[1]) ?? 0) + 1);
+    }
+
+    expect(counts.size).toBeGreaterThan(0);
+    expect(
+      [...counts.entries()].filter(([, count]) => count > 1),
+    ).toEqual([]);
+  });
+
   it("生产准备路径与全新 vendor 副本均使用普通 git apply", async () => {
     const prepareSource = await readFile(
       path.resolve("scripts/qwenpaw-console/prepare.mjs"),

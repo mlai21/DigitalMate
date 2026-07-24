@@ -43,7 +43,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: postgres://digitalmate:${POSTGRES_PASSWORD:-digitalmate}@postgres:5432/digitalmate
       APP_PASSWORD: ${APP_PASSWORD:-}
-      APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
+      APP_SECRET: "${APP_SECRET:?请设置至少32字节的高熵APP_SECRET}"
       TRUST_PROXY_HEADERS: "true"
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
@@ -80,7 +80,7 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: postgres://digitalmate:${POSTGRES_PASSWORD:-digitalmate}@postgres:5432/digitalmate
-      APP_SECRET: ${APP_SECRET:-digitalmate-local-secret-change-me}
+      APP_SECRET: "${APP_SECRET:?请设置至少32字节的高熵APP_SECRET}"
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
       GEMINI_3_5_FLASH_ENDPOINT: ${GEMINI_3_5_FLASH_ENDPOINT:-/gemini-3-5-flash-openai/v1/chat/completions}

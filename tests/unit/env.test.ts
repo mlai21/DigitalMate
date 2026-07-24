@@ -28,6 +28,41 @@ describe("readEnv", () => {
     ).toBe("at-least-sixteen-characters");
   });
 
+  it("fails fast when production APP_SECRET is missing even with APP_PASSWORD", () => {
+    expect(() =>
+      readEnv({
+        NODE_ENV: "production",
+        APP_PASSWORD: "password-cannot-replace-signing-secret",
+      }),
+    ).toThrow(/APP_SECRET.*32.*高熵/);
+  });
+
+  it.each([
+    "digitalmate-local-secret",
+    "digitalmate-local-secret-change-me",
+    "change-me-use-at-least-32-random-bytes",
+  ])("rejects the public APP_SECRET placeholder in production: %s", (secret) => {
+    expect(() =>
+      readEnv({ NODE_ENV: "production", APP_SECRET: secret }),
+    ).toThrow(/APP_SECRET.*高熵/);
+  });
+
+  it("requires at least 32 bytes for a production APP_SECRET", () => {
+    expect(() =>
+      readEnv({
+        NODE_ENV: "production",
+        APP_SECRET: "only-31-bytes-long-1234567890",
+      }),
+    ).toThrow(/APP_SECRET.*32/);
+
+    expect(
+      readEnv({
+        NODE_ENV: "production",
+        APP_SECRET: "1f9eb9813df44927b516cb19171b554fffd1da2a",
+      }).appSecret,
+    ).toBe("1f9eb9813df44927b516cb19171b554fffd1da2a");
+  });
+
   it("reads optional channel credentials", () => {
     const env = readEnv({
       TELEGRAM_BOT_TOKEN: "telegram",

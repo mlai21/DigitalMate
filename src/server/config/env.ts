@@ -1,13 +1,23 @@
 import path from "node:path";
 import { z } from "zod";
 
+const LOCAL_APP_SECRET = "digitalmate-local-secret-change-me";
+const PUBLIC_APP_SECRET_PLACEHOLDERS = new Set([
+  "digitalmate-local-secret",
+  LOCAL_APP_SECRET,
+  "change-me-use-at-least-32-random-bytes",
+]);
+
 const envSchema = z.object({
+  NODE_ENV: z
+    .enum(["development", "test", "production"])
+    .default("development"),
   DATABASE_URL: z.string().default("postgres://digitalmate:digitalmate@localhost:5432/digitalmate"),
   APP_PASSWORD: z.string().optional(),
   APP_SECRET: z
     .string()
     .min(16)
-    .default("digitalmate-local-secret-change-me"),
+    .default(LOCAL_APP_SECRET),
   TRUST_PROXY_HEADERS: z
     .enum(["true", "false"])
     .default("false")
@@ -45,6 +55,7 @@ export type AppEnv = ReturnType<typeof readEnv>;
 
 export function readEnv(source: Record<string, string | undefined> = process.env) {
   const parsed = envSchema.parse(source);
+  assertProductionAppSecret(parsed.NODE_ENV, source.APP_SECRET, parsed.APP_SECRET);
   const attachmentStorageDir = parsed.ATTACHMENT_STORAGE_DIR?.trim();
 
   return {
@@ -81,4 +92,26 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     attachmentStorageDir:
       attachmentStorageDir || path.join(process.cwd(), "data", "attachments"),
   };
+}
+
+function assertProductionAppSecret(
+  nodeEnv: "development" | "test" | "production",
+  configuredSecret: string | undefined,
+  parsedSecret: string,
+): void {
+  if (nodeEnv !== "production") return;
+
+  const secret = configuredSecret?.trim();
+  const isPublicPlaceholder =
+    !secret ||
+    PUBLIC_APP_SECRET_PLACEHOLDERS.has(secret) ||
+    /(?:change[-_ ]?me|replace[-_ ]?me|placeholder)/i.test(secret);
+  if (
+    isPublicPlaceholder ||
+    Buffer.byteLength(parsedSecret, "utf8") < 32
+  ) {
+    throw new Error(
+      "生产环境 APP_SECRET 必须显式设置为至少 32 字节的独立高熵随机值，不能使用公开默认值或占位符；APP_PASSWORD 不能替代该密钥。",
+    );
+  }
 }

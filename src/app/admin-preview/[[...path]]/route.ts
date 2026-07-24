@@ -12,8 +12,12 @@ type RouteContext = {
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
   const repositories = createRepositories();
   const defaultUser = await repositories.users.ensureDefault();
+  const env = readEnv();
   const handler = createAdminConsolePreviewHandler({
-    appSecret: readEnv().appSecret,
+    appSecret: env.appSecret,
+    appPasswordEnabled: Boolean(env.appPassword),
+    production: process.env.NODE_ENV === "production",
+    trustProxyHeaders: env.trustProxyHeaders,
     defaultUserId: defaultUser.id,
     loadSessionGeneration: (userId) =>
       repositories.sessionStates.getGeneration(userId),

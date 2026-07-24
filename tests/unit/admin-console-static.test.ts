@@ -376,14 +376,54 @@ describe("admin Console static reader", () => {
 });
 
 describe("admin Console preview route", () => {
-  it("uses the Node.js runtime and keeps the production route authenticated", async () => {
+  it("serves the Console without a cookie in passwordless development", async () => {
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      appPasswordEnabled: false,
+      production: false,
+      trustProxyHeaders: false,
+      defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
+      rootDirectory: fixtureRoot,
+    });
+
+    const response = await handler(
+      new Request("http://localhost:3000/admin-preview"),
+      { params: Promise.resolve({}) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("<title>DigitalMate</title>");
+    expect(routeMocks.getGeneration).not.toHaveBeenCalled();
+  });
+
+  it("still redirects a cookieless production request", async () => {
+    const handler = createAdminConsolePreviewHandler({
+      appSecret: secret,
+      appPasswordEnabled: false,
+      production: true,
+      trustProxyHeaders: false,
+      defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
+      rootDirectory: fixtureRoot,
+    });
+
+    const response = await handler(
+      new Request("https://digitalmate.example/admin-preview"),
+      { params: Promise.resolve({}) },
+    );
+
+    expect(response.status).toBe(307);
+  });
+
+  it("uses the Node.js runtime and serves the passwordless development route", async () => {
     expect(previewRuntime).toBe("nodejs");
 
     const response = await productionPreviewGet(
       new Request("https://digitalmate.example/admin-preview"),
       { params: Promise.resolve({}) },
     );
-    expect(response.status).toBe(307);
+    expect(response.status).toBe(200);
     expect(routeMocks.ensureDefault).toHaveBeenCalledOnce();
   });
 

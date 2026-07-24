@@ -34,7 +34,7 @@ export type AdminSecurityHandler = (
   context: AdminSecurityContext,
 ) => Promise<Response>;
 
-type ResolvedAdminSession = {
+export type ResolvedAdminSession = {
   userId: string;
   sessionToken: string;
 };
@@ -101,7 +101,7 @@ export async function createAdminAuthStatusResponse(
   });
 }
 
-async function resolveAdminSession(
+export async function resolveAdminSession(
   request: Request,
   options: AdminSecurityOptions,
 ): Promise<ResolvedAdminSession | null> {

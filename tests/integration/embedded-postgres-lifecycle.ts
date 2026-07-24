@@ -5,33 +5,125 @@ export type EmbeddedPostgresLifecycle = {
   stop(database: EmbeddedPostgres): Promise<void>;
 };
 
-export function trackEmbeddedPostgresPool(pool: Pool): EmbeddedPostgresLifecycle {
-  const clientEnds = new Map<PoolClient, Promise<void>>();
+export type EmbeddedPostgresLifecycleOptions = {
+  clientEndTimeoutMs?: number;
+};
+
+type TrackedClientEnd = {
+  ended: Promise<void>;
+  onEnd: () => void;
+};
+
+const defaultClientEndTimeoutMs = 5_000;
+
+export function trackEmbeddedPostgresPool(
+  pool: Pool,
+  options: EmbeddedPostgresLifecycleOptions = {},
+): EmbeddedPostgresLifecycle {
+  const clientEnds = new Map<PoolClient, TrackedClientEnd>();
   const trackClient = (client: PoolClient) => {
+    if (clientEnds.has(client)) return;
     let markEnded: (() => void) | undefined;
     const ended = new Promise<void>((resolve) => {
       markEnded = resolve;
     });
-    clientEnds.set(client, ended);
-    client.once("end", () => {
+    const onEnd = () => {
       clientEnds.delete(client);
       markEnded?.();
-    });
+    };
+    clientEnds.set(client, { ended, onEnd });
+    client.once("end", onEnd);
   };
   pool.on("connect", trackClient);
 
   return {
     async stop(database) {
-      await pool.end();
-      pool.off("connect", trackClient);
-      await Promise.all([...clientEnds.values()]);
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (pool.totalCount !== 0 || pool.idleCount !== 0 || pool.waitingCount !== 0) {
-        throw new Error(
-          `embedded_postgres_pool_not_drained:${pool.totalCount}:${pool.idleCount}:${pool.waitingCount}`,
+      const errors: unknown[] = [];
+      try {
+        await captureFailure(errors, () => pool.end());
+        await captureFailure(errors, () =>
+          waitForClientEnds(
+            clientEnds,
+            options.clientEndTimeoutMs ?? defaultClientEndTimeoutMs,
+          ),
         );
+        await captureFailure(
+          errors,
+          () => new Promise<void>((resolve) => setImmediate(resolve)),
+        );
+        await captureFailure(errors, async () => {
+          if (
+            pool.totalCount !== 0 ||
+            pool.idleCount !== 0 ||
+            pool.waitingCount !== 0
+          ) {
+            throw new Error(
+              `embedded_postgres_pool_not_drained:${pool.totalCount}:${pool.idleCount}:${pool.waitingCount}`,
+            );
+          }
+        });
+      } finally {
+        try {
+          pool.off("connect", trackClient);
+        } catch (error) {
+          errors.push(error);
+        }
+        for (const [client, tracked] of clientEnds) {
+          try {
+            client.off("end", tracked.onEnd);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        clientEnds.clear();
+        await captureFailure(errors, () => database.stop());
       }
-      await database.stop();
+      throwTeardownErrors(errors);
     },
   };
+}
+
+async function waitForClientEnds(
+  clientEnds: Map<PoolClient, TrackedClientEnd>,
+  timeoutMs: number,
+): Promise<void> {
+  if (clientEnds.size === 0) return;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new Error(
+          `embedded_postgres_client_end_timeout:${clientEnds.size}`,
+        ),
+      );
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([
+      Promise.all([...clientEnds.values()].map(({ ended }) => ended)),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+async function captureFailure(
+  errors: unknown[],
+  action: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function throwTeardownErrors(errors: unknown[]): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(
+    errors,
+    "embedded_postgres_teardown_failed",
+  );
 }

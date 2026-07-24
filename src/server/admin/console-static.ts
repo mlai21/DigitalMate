@@ -1,7 +1,10 @@
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
-import { verifySessionRequest } from "@/server/auth/session";
+import {
+  resolveAdminSession,
+  type AdminSecurityOptions,
+} from "@/server/admin/compat/security";
 
 const previewPathPrefix = "/admin-preview";
 const immutableCacheControl = "public, max-age=31536000, immutable";
@@ -26,9 +29,13 @@ type StaticTestHooks = {
 
 type PreviewHandlerOptions = {
   appSecret: string;
+  appPasswordEnabled?: boolean;
+  production?: boolean;
+  trustProxyHeaders?: boolean;
   defaultUserId: string;
   loadSessionGeneration: (userId: string) => Promise<number | null>;
   rootDirectory: string;
+  now?: Date;
 };
 
 type InspectedFile =
@@ -87,13 +94,11 @@ export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions)
     request: Request,
     context: RouteContext,
   ): Promise<Response> {
-    const userId = await verifySessionRequest(
+    const session = await resolveAdminSession(
       request,
-      options.defaultUserId,
-      options.appSecret,
-      options.loadSessionGeneration,
+      buildPreviewSecurityOptions(options),
     );
-    if (!userId) return loginRedirect(request);
+    if (!session) return loginRedirect(request);
 
     const url = new URL(request.url);
     if (url.hash) return errorResponse(400);
@@ -110,6 +115,20 @@ export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions)
       pathSegments: params.path,
       rawPathname: url.pathname,
     });
+  };
+}
+
+function buildPreviewSecurityOptions(
+  options: PreviewHandlerOptions,
+): AdminSecurityOptions {
+  return {
+    appSecret: options.appSecret,
+    appPasswordEnabled: options.appPasswordEnabled ?? true,
+    production: options.production ?? true,
+    trustProxyHeaders: options.trustProxyHeaders ?? false,
+    defaultUserId: options.defaultUserId,
+    loadSessionGeneration: options.loadSessionGeneration,
+    now: options.now,
   };
 }
 
