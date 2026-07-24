@@ -213,7 +213,9 @@ function parseChannelWrite(
           !secretFields.has(name),
       ) ?? "unknown";
     throw invalidSecretChange(
-      ["clear_secret", invalidField],
+      secretFields.has(invalidField)
+        ? ["clear_secret", invalidField]
+        : ["clear_secret"],
       "invalid_value",
     );
   }

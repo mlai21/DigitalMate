@@ -1032,6 +1032,189 @@ describe("admin compatibility exact router", () => {
     }
   });
 
+  it("sanitizes Zod paths with static fields and truncates dynamic record keys", async () => {
+    const router = new AdminCompatRouter();
+    router.put("/zod-paths", async () => {
+      z.object({
+        groups: z.record(
+          z.string(),
+          z
+            .object({
+              requireMention: z.boolean(),
+            })
+            .strict(),
+        ),
+        settings: z
+          .object({
+            cadence: z
+              .object({
+                maxSegments: z.number().int().max(20),
+              })
+              .strict(),
+          })
+          .strict(),
+        agent_ids: z.array(z.string().uuid()),
+      })
+        .strict()
+        .parse({
+          groups: {
+            PureAlphaRoom: {
+              requireMention: "raw-value",
+              StripeSecret: "SELECT secret FROM private_table",
+            },
+          },
+          settings: {
+            cadence: {
+              maxSegments: 99,
+            },
+          },
+          agent_ids: ["not-a-uuid"],
+        });
+    });
+    const fixture = await authenticatedRouterRequest(
+      "PUT",
+      "/zod-paths",
+    );
+
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+    const body = (await response.json()) as {
+      error: {
+        details: {
+          issues: Array<{ code: string; path: Array<string | number> }>;
+        };
+      };
+    };
+    const serialized = JSON.stringify(body);
+
+    expect(response.status).toBe(400);
+    expect(body.error.details.issues).toEqual(
+      expect.arrayContaining([
+        { code: "invalid_type", path: ["groups"] },
+        { code: "unrecognized_keys", path: ["groups"] },
+        {
+          code: "too_big",
+          path: ["settings", "cadence", "maxSegments"],
+        },
+        { code: "invalid_format", path: ["agent_ids", 0] },
+      ]),
+    );
+    expect(serialized).not.toContain("PureAlphaRoom");
+    expect(serialized).not.toContain("StripeSecret");
+    expect(serialized).not.toContain("raw-value");
+    expect(serialized).not.toContain("private_table");
+  });
+
+  it("sanitizes AdminCompat validation paths with the same fail-closed rules", async () => {
+    const router = new AdminCompatRouter();
+    const reflected = [
+      "UnknownClearKey",
+      "StripeSecretKey",
+      "purealphasecret",
+      "PureAlphaRoom",
+      "UnknownTopLevel",
+      "raw-value",
+      "private_table",
+    ];
+    router.put("/compat-validation-paths", async () => {
+      throw new AdminCompatError(
+        400,
+        "invalid_request",
+        "validation_failed",
+        {
+          issues: [
+            {
+              code: "invalid_value",
+              path: ["clear_secret", "UnknownClearKey"],
+            },
+            {
+              code: "invalid_value",
+              path: ["clear_secret", "StripeSecretKey"],
+            },
+            {
+              code: "invalid_value",
+              path: ["clear_secret", "purealphasecret"],
+            },
+            {
+              code: "invalid_type",
+              path: ["clear_secret", 0],
+            },
+            {
+              code: "unrecognized_keys",
+              path: ["groups", "PureAlphaRoom", "requireMention"],
+            },
+            {
+              code: "unrecognized_keys",
+              path: ["UnknownTopLevel"],
+            },
+            {
+              code: "invalid_value",
+              path: ["clear_secret", "bot_token"],
+            },
+            { code: "invalid_format", path: ["base_url"] },
+            {
+              code: "too_big",
+              path: ["settings", "cadence", "maxSegments"],
+            },
+            {
+              code: "invalid_format",
+              path: ["agent_ids", 0],
+            },
+            {
+              code: "invalid_format",
+              path: ["agent_ids", 65_536],
+            },
+          ],
+          raw: "raw-value",
+          sql: "SELECT secret FROM private_table",
+        },
+      );
+    });
+    const fixture = await authenticatedRouterRequest(
+      "PUT",
+      "/compat-validation-paths",
+    );
+
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+    const body = (await response.json()) as {
+      error: {
+        details: {
+          issues: Array<{ code: string; path: Array<string | number> }>;
+        };
+      };
+    };
+    const serialized = JSON.stringify(body);
+
+    expect(response.status).toBe(400);
+    expect(body.error.details.issues).toEqual([
+      { code: "invalid_value", path: ["clear_secret"] },
+      { code: "invalid_value", path: ["clear_secret"] },
+      { code: "invalid_value", path: ["clear_secret"] },
+      { code: "invalid_type", path: ["clear_secret"] },
+      { code: "unrecognized_keys", path: ["groups"] },
+      { code: "unrecognized_keys", path: [] },
+      {
+        code: "invalid_value",
+        path: ["clear_secret", "bot_token"],
+      },
+      { code: "invalid_format", path: ["base_url"] },
+      {
+        code: "too_big",
+        path: ["settings", "cadence", "maxSegments"],
+      },
+      { code: "invalid_format", path: ["agent_ids", 0] },
+      { code: "invalid_format", path: ["agent_ids"] },
+    ]);
+    for (const value of reflected) {
+      expect(serialized).not.toContain(value);
+    }
+  });
+
   it.each([
     "invalid_config_revision",
     "invalid_secret_field",

@@ -187,13 +187,13 @@ describe("admin compatibility channel contract", () => {
         type: "matrix",
         body: {
           groups: {
-            "!room:example.com": {
+            "PureAlphaRoom": {
               requireMention: true,
-              nested: "must-not-appear",
+              StripeSecret: "must-not-appear",
             },
           },
         },
-        path: ["groups", "!room:example.com"],
+        path: ["groups"],
       },
     ] as const;
 
@@ -216,9 +216,50 @@ describe("admin compatibility channel contract", () => {
           .map((part) => JSON.stringify(part))
           .join(",")}`,
       );
+      expect(serialized).not.toContain("PureAlphaRoom");
+      expect(serialized).not.toContain("StripeSecret");
       expect(serialized).not.toContain("must-not-appear");
     }
   });
+
+  it.each([
+    "UnknownClearKey",
+    "StripeSecretKey",
+    "purealphasecret",
+    "app_secret",
+  ])(
+    "does not reflect unknown clear_secret key %s",
+    async (unknownSecret) => {
+      const router = createCoreAdminCompatRouter(dependencies());
+      const response = await router.dispatch(
+        await request("/config/channels/telegram", {
+          method: "PUT",
+          body: {
+            operation_id: OPERATION_ID,
+            revision: 0,
+            clear_secret: [unknownSecret],
+          },
+        }),
+        runtime(),
+      );
+      const serialized = JSON.stringify(await response.json());
+
+      expect(response.status).toBe(400);
+      expect(serialized).not.toContain(unknownSecret);
+      expect(JSON.parse(serialized)).toMatchObject({
+        error: {
+          details: {
+            issues: [
+              {
+                code: "invalid_value",
+                path: ["clear_secret"],
+              },
+            ],
+          },
+        },
+      });
+    },
+  );
 
   it("requires the canonical default-agent header on every channel route", async () => {
     const router = createCoreAdminCompatRouter(dependencies());

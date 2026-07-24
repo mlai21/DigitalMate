@@ -21,6 +21,9 @@ import {
 import {
   AdminChannelConfigError,
 } from "@/server/admin/channel-config";
+import {
+  CHANNEL_MANIFESTS,
+} from "@/server/channels/manifests/catalog";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
 const METHODS = [
@@ -664,16 +667,12 @@ function mapError(error: unknown): Response {
     return errorResponse(500, "internal_error", "internal_error");
   }
   if (error instanceof ZodError) {
+    const issues = sanitizeValidationIssues(error.issues);
     return errorResponse(
       400,
       "invalid_request",
       "validation_failed",
-      {
-        issues: error.issues.map((issue) => ({
-          code: issue.code,
-          path: issue.path.map(String),
-        })),
-      },
+      issues ? { issues } : undefined,
     );
   }
   if (isRevisionConflict(error)) {
@@ -786,13 +785,71 @@ const SAFE_VALIDATION_ISSUE_CODES = new Set([
   "unrecognized_keys",
 ]);
 
+const CHANNEL_SECRET_VALIDATION_PATH_SEGMENTS = new Set(
+  Object.values(CHANNEL_MANIFESTS).flatMap(
+    (manifest) => manifest.secretFields,
+  ),
+);
+const CHANNEL_LIST_VALIDATION_PATH_SEGMENTS = new Set(
+  Object.values(CHANNEL_MANIFESTS).flatMap((manifest) =>
+    manifest.fields
+      .filter((field) => field.kind === "string-list")
+      .map((field) => field.name)
+  ),
+);
+const STATIC_VALIDATION_PATH_SEGMENTS = new Set([
+  ...Object.values(CHANNEL_MANIFESTS).flatMap((manifest) =>
+    manifest.fields.map((field) => field.name)
+  ),
+  "clear_secret",
+  "operation_id",
+  "id",
+  "name",
+  "persona",
+  "style",
+  "emojiHabit",
+  "settings",
+  "proactivity",
+  "quietStart",
+  "quietEnd",
+  "minIntervalMinutes",
+  "maxPerHour",
+  "maxPerDay",
+  "cadence",
+  "responseDelayMs",
+  "segmentDelayMs",
+  "maxSegments",
+  "search",
+  "aggressiveness",
+  "enabled",
+  "pinned",
+  "agent_ids",
+  "language",
+  "timezone",
+  "revision",
+]);
+const ARRAY_VALIDATION_PATH_PARENTS = new Set([
+  ...CHANNEL_LIST_VALIDATION_PATH_SEGMENTS,
+  "agent_ids",
+]);
+const DYNAMIC_RECORD_VALIDATION_PATH_PARENTS = new Set([
+  "groups",
+]);
+const MAX_VALIDATION_ARRAY_INDEX = 65_535;
+
 function sanitizeValidationIssues(
   value: unknown,
-): Array<{ code: string; path: string[] }> | undefined {
+): Array<{
+  code: string;
+  path: Array<string | number>;
+}> | undefined {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
     return undefined;
   }
-  const sanitized: Array<{ code: string; path: string[] }> = [];
+  const sanitized: Array<{
+    code: string;
+    path: Array<string | number>;
+  }> = [];
   for (const issue of value) {
     if (
       typeof issue !== "object" ||
@@ -807,28 +864,55 @@ function sanitizeValidationIssues(
       typeof code !== "string" ||
       !SAFE_VALIDATION_ISSUE_CODES.has(code) ||
       !Array.isArray(path) ||
-      path.length === 0 ||
-      path.length > 16 ||
-      !path.every(
-        (segment) =>
-          (
-            typeof segment === "string" &&
-            segment.length > 0 &&
-            segment.length <= 512
-          ) ||
-          (
-            typeof segment === "number" &&
-            Number.isSafeInteger(segment) &&
-            segment >= 0
-          ),
-      )
+      path.length > 16
     ) {
       return undefined;
     }
+    const sanitizedPath = sanitizeValidationPath(path);
+    if (!sanitizedPath) return undefined;
     sanitized.push({
       code,
-      path: path.map(String),
+      path: sanitizedPath,
     });
+  }
+  return sanitized;
+}
+
+function sanitizeValidationPath(
+  path: readonly unknown[],
+): Array<string | number> | undefined {
+  const sanitized: Array<string | number> = [];
+  for (const segment of path) {
+    const parent = sanitized.at(-1);
+    if (typeof segment === "number") {
+      if (
+        typeof parent !== "string" ||
+        !ARRAY_VALIDATION_PATH_PARENTS.has(parent) ||
+        !Number.isSafeInteger(segment) ||
+        segment < 0 ||
+        segment > MAX_VALIDATION_ARRAY_INDEX
+      ) {
+        break;
+      }
+      sanitized.push(segment);
+      continue;
+    }
+    if (typeof segment !== "string") {
+      return undefined;
+    }
+    if (parent === "clear_secret") {
+      if (CHANNEL_SECRET_VALIDATION_PATH_SEGMENTS.has(segment)) {
+        sanitized.push(segment);
+      }
+      break;
+    }
+    if (!STATIC_VALIDATION_PATH_SEGMENTS.has(segment)) {
+      break;
+    }
+    sanitized.push(segment);
+    if (DYNAMIC_RECORD_VALIDATION_PATH_PARENTS.has(segment)) {
+      break;
+    }
   }
   return sanitized;
 }
