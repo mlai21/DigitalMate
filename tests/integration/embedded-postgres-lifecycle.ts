@@ -6,6 +6,7 @@ export type EmbeddedPostgresLifecycle = {
 };
 
 export type EmbeddedPostgresLifecycleOptions = {
+  poolEndTimeoutMs?: number;
   clientEndTimeoutMs?: number;
 };
 
@@ -15,6 +16,7 @@ type TrackedClientEnd = {
 };
 
 const defaultClientEndTimeoutMs = 5_000;
+const defaultPoolEndTimeoutMs = 5_000;
 
 export function trackEmbeddedPostgresPool(
   pool: Pool,
@@ -40,10 +42,11 @@ export function trackEmbeddedPostgresPool(
     async stop(database) {
       const errors: unknown[] = [];
       try {
-        await captureFailure(errors, () => pool.end());
         await captureFailure(errors, () =>
-          waitForClientEnds(
+          endPoolAndDrainClients(
+            pool,
             clientEnds,
+            options.poolEndTimeoutMs ?? defaultPoolEndTimeoutMs,
             options.clientEndTimeoutMs ?? defaultClientEndTimeoutMs,
           ),
         );
@@ -81,6 +84,38 @@ export function trackEmbeddedPostgresPool(
       throwTeardownErrors(errors);
     },
   };
+}
+
+async function endPoolAndDrainClients(
+  pool: Pool,
+  clientEnds: Map<PoolClient, TrackedClientEnd>,
+  poolEndTimeoutMs: number,
+  clientEndTimeoutMs: number,
+): Promise<void> {
+  await endPoolWithTimeout(pool, poolEndTimeoutMs);
+  await waitForClientEnds(clientEnds, clientEndTimeoutMs);
+}
+
+async function endPoolWithTimeout(
+  pool: Pool,
+  timeoutMs: number,
+): Promise<void> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new Error(`embedded_postgres_pool_end_timeout:${timeoutMs}`),
+      );
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => pool.end()),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 async function waitForClientEnds(
