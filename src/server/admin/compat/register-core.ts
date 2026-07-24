@@ -42,6 +42,21 @@ import { resolveDefaultAgentScope } from "@/server/agents/service";
 import { STABLE_CAPABILITY_CODES } from "@/server/capabilities";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
+import { getPool } from "@/server/db/client";
+import {
+  createAdminChannelConfigService,
+} from "@/server/admin/channel-config";
+import {
+  createGetChannelHandler,
+  createListChannelsHandler,
+  createUpdateChannelHandler,
+  createUpdateChannelsHandler,
+  listChannelSchemas,
+  listChannelTypes,
+  type AdminChannelConfigReader,
+  type AdminChannelConfigBatchWriter,
+  type AdminChannelConfigWriter,
+} from "@/server/admin/compat/handlers/channels";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
@@ -56,6 +71,9 @@ export type CoreAdminCompatDependencies = Readonly<{
   compatApiRevision: string;
   readAgentProfile?: AdminAgentProfileReader;
   updateAgentProfile?: AdminAgentProfileUpdater;
+  readChannelConfigs?: AdminChannelConfigReader;
+  updateChannelConfig?: AdminChannelConfigWriter;
+  updateChannelConfigs?: AdminChannelConfigBatchWriter;
 }>;
 
 export function createCoreAdminCompatRouter(
@@ -108,6 +126,46 @@ export function createCoreAdminCompatRouter(
     agentHeader: "required",
   });
 
+  if (
+    dependencies.readChannelConfigs &&
+    dependencies.updateChannelConfig &&
+    dependencies.updateChannelConfigs
+  ) {
+    const channelRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/config/channels/types",
+      listChannelTypes,
+      channelRouteOptions,
+    );
+    router.put(
+      "/config/channels",
+      createUpdateChannelsHandler(dependencies.updateChannelConfigs),
+      channelRouteOptions,
+    );
+    router.get(
+      "/config/channels/schemas",
+      listChannelSchemas,
+      channelRouteOptions,
+    );
+    router.get(
+      "/config/channels",
+      createListChannelsHandler(dependencies.readChannelConfigs),
+      channelRouteOptions,
+    );
+    router.get(
+      "/config/channels/:channelType",
+      createGetChannelHandler(dependencies.readChannelConfigs),
+      channelRouteOptions,
+    );
+    router.put(
+      "/config/channels/:channelType",
+      createUpdateChannelHandler(dependencies.updateChannelConfig),
+      channelRouteOptions,
+    );
+  }
+
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);
     router.put(path, putLanguage);
@@ -140,6 +198,12 @@ export async function dispatchAdminCompatRequest(
   route: { routeSegments?: readonly string[] } = {},
 ): Promise<Response> {
   const env = readEnv();
+  const channelSecretKey =
+    env.channelSecretsKey?.status === "ready"
+      ? env.channelSecretsKey.key
+      : null;
+  const getChannelConfigService = () =>
+    createAdminChannelConfigService(getPool(), channelSecretKey);
   const securityRepositories = createRepositories();
   const defaultUser = await securityRepositories.users.ensureDefault();
   const security = {
@@ -158,6 +222,12 @@ export async function dispatchAdminCompatRequest(
     upstreamTag: consoleUpstreamTag,
     upstreamCommit: consoleUpstreamCommit,
     compatApiRevision: adminCompatApiRevision,
+    readChannelConfigs: (scope, signal) =>
+      getChannelConfigService().read(scope, signal),
+    updateChannelConfig: (input, signal) =>
+      getChannelConfigService().update(input, signal),
+    updateChannelConfigs: (inputs, signal) =>
+      getChannelConfigService().updateMany(inputs, signal),
   });
   const runtime = {
     security,

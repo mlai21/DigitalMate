@@ -18,6 +18,9 @@ import { isStableCapabilityCode } from "@/server/capabilities";
 import {
   AdminAgentProfileError,
 } from "@/server/admin/agent-profile";
+import {
+  AdminChannelConfigError,
+} from "@/server/admin/channel-config";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
 const METHODS = [
@@ -607,6 +610,55 @@ function mapError(error: unknown): Response {
         409,
         "config_revision_conflict",
         "revision_conflict",
+      );
+    }
+    return errorResponse(500, "internal_error", "internal_error");
+  }
+  if (error instanceof AdminChannelConfigError) {
+    if (error.status === 400) {
+      return errorResponse(400, "invalid_request", error.code);
+    }
+    if (
+      error.status === 409 &&
+      (
+        error.code === "config_revision_conflict" ||
+        error.code === "operation_id_reused"
+      )
+    ) {
+      return errorResponse(
+        409,
+        "config_revision_conflict",
+        "revision_conflict",
+      );
+    }
+    if (
+      error.status === 409 &&
+      error.code === "channel_connection_ambiguous"
+    ) {
+      return errorResponse(
+        409,
+        "channel_connection_ambiguous",
+        "channel_connection_ambiguous",
+      );
+    }
+    if (
+      error.status === 409 &&
+      error.code === "channel_secret_storage_blocked"
+    ) {
+      return errorResponse(
+        409,
+        "channel_secret_storage_blocked",
+        "channel_secret_storage_blocked",
+      );
+    }
+    if (
+      error.status === 409 &&
+      error.code === "bulk_operation_incomplete"
+    ) {
+      return errorResponse(
+        409,
+        "bulk_operation_incomplete",
+        "bulk_operation_incomplete",
       );
     }
     return errorResponse(500, "internal_error", "internal_error");

@@ -1,6 +1,7 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
   randomBytes,
 } from "node:crypto";
 import { inspect } from "node:util";
@@ -164,6 +165,13 @@ export class ChannelSecretsKey {
     context: SecretEncryptionContext,
   ): string {
     return decryptSecret(encrypted, this.#material, context);
+  }
+
+  fingerprint(value: string): string {
+    return createHmac("sha256", this.#material)
+      .update("digitalmate.channel-operation\0", "utf8")
+      .update(value, "utf8")
+      .digest("hex");
   }
 
   toJSON(): Readonly<{
