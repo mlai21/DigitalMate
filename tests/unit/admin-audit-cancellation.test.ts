@@ -294,11 +294,23 @@ function classifyDatabaseStage(sql: string): DatabaseStage {
   if (sql.includes("FROM channel_connections")) {
     return "connection_lock";
   }
-  if (sql.includes("FROM channel_secrets")) return "secret_read";
+  if (
+    sql.includes("FROM channel_secrets")
+    || sql.includes(
+      "FROM channel_secret_exposure_fingerprints",
+    )
+  ) {
+    return "secret_read";
+  }
   if (sql.startsWith("UPDATE channel_connections")) {
     return "connection_update";
   }
-  if (sql.includes("INSERT INTO channel_secrets")) {
+  if (
+    sql.includes("INSERT INTO channel_secrets")
+    || sql.includes(
+      "INSERT INTO channel_secret_exposure_fingerprints",
+    )
+  ) {
     return "secret_write";
   }
   if (sql.includes("INSERT INTO admin_audit_logs")) {

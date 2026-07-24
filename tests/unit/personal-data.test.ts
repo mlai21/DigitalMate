@@ -4,6 +4,9 @@ import path from "node:path";
 import type { Pool, PoolClient } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPersonalDataExport } from "@/server/admin/personal-data";
+import {
+  createSecretExposureFingerprint,
+} from "@/server/admin/secret-content";
 import { createRepositories } from "@/server/db/repositories";
 import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 import { deleteArtifactTree, writeArtifactFile } from "@/server/tasks/artifacts";
@@ -102,6 +105,36 @@ describe("personal data helpers", () => {
     ).toThrow("personal_data_export_failed");
   });
 
+  it("fails closed when an allowed export value repeats a historical channel credential", () => {
+    if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+    const historicalSecret = "rotated-export-secret";
+
+    expect(() =>
+      buildPersonalDataExport({
+        userId: USER_ID,
+        exportedAt: new Date("2026-07-25T00:00:00Z"),
+        tables: {
+          channel_connections: [{
+            id: CONNECTION_ID,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            config: {
+              base_url:
+                `https://example.test/hook?token=${historicalSecret}`,
+            },
+          }],
+        },
+        credentialFingerprints: [
+          createSecretExposureFingerprint(
+            KEY_STATE.key,
+            historicalSecret,
+          ),
+        ],
+        credentialFingerprintKey: KEY_STATE.key,
+      }),
+    ).toThrow("personal_data_export_failed");
+  });
+
   it("deletes stored task artifacts for one user", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-artifacts-"));
     roots.push(root);
@@ -174,11 +207,17 @@ describe("personal data helpers", () => {
     };
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
       void params;
+      if (sql.includes("personal_data_export_preflight")) {
+        return emptyExportPreflight();
+      }
       if (
         sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
         || sql === "COMMIT"
         || sql === "ROLLBACK"
         || sql.includes("FROM channel_secrets")
+        || sql.includes(
+          "FROM channel_secret_exposure_fingerprints",
+        )
       ) {
         return { rows: [] };
       }
@@ -282,8 +321,10 @@ describe("personal data helpers", () => {
 
   it("exports agent identities, settings, grants, and agent-scoped goal steps", async () => {
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
-      void sql;
       void params;
+      if (sql.includes("personal_data_export_preflight")) {
+        return emptyExportPreflight();
+      }
       return { rows: [] };
     });
     const repositories = createRepositories({
@@ -406,6 +447,15 @@ describe("personal data helpers", () => {
     rows,
   ) => {
     const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        if (_label === "row count") {
+          return exportPreflight("2", "16");
+        }
+        if (_label === "estimated bytes") {
+          return exportPreflight("1", "128");
+        }
+        return exportPreflight("1", "16");
+      }
       if (
         sql.includes("FROM digital_agents")
         && !sql.includes("JOIN digital_agents")
@@ -433,9 +483,123 @@ describe("personal data helpers", () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it("preflights the whole snapshot before fetching deterministic batches of at most 256 rows", async () => {
+    const rows = Array.from({ length: 300 }, (_, index) => ({
+      id: `agent-${String(index).padStart(3, "0")}`,
+      user_id: USER_ID,
+      slug: `agent-${index}`,
+      display_name: `Agent ${index}`,
+    }));
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return {
+          rows: [{
+            total_rows: "300",
+            estimated_bytes: "12000",
+          }],
+        };
+      }
+      if (
+        sql.includes("personal_data_export_batch")
+        && sql.includes("FROM digital_agents")
+        && !sql.includes("JOIN digital_agents")
+      ) {
+        const offset = Number(
+          sql.match(/\bOFFSET\s+(\d+)/)?.[1] ?? "0",
+        );
+        return { rows: rows.slice(offset, offset + 256) };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    const exported = await repositories.personalData.export(
+      USER_ID,
+      null,
+      undefined,
+      {
+        maxRows: 1_000,
+        maxEstimatedBytes: 100_000,
+        maxSerializedBytes: 1_000_000,
+      },
+    );
+
+    expect(exported.tables.digital_agents).toHaveLength(300);
+    expect(exported.tables.digital_agents.map((row) =>
+      (row as { id: string }).id
+    )).toEqual(rows.map((row) => row.id));
+    const sql = query.mock.calls.map(([statement]) =>
+      String(statement)
+    );
+    const preflightIndex = sql.findIndex((statement) =>
+      statement.includes("personal_data_export_preflight")
+    );
+    const firstBatchIndex = sql.findIndex((statement) =>
+      statement.includes("personal_data_export_batch")
+    );
+    expect(preflightIndex).toBeGreaterThanOrEqual(0);
+    expect(firstBatchIndex).toBeGreaterThan(preflightIndex);
+    const batchSql = sql.filter((statement) =>
+      statement.includes("personal_data_export_batch")
+    );
+    expect(batchSql.length).toBeGreaterThan(1);
+    expect(batchSql.every((statement) =>
+      statement.includes("LIMIT 256")
+    )).toBe(true);
+    expect(sql.at(-1)).toBe("COMMIT");
+  });
+
+  it("rejects an oversized single row during DB preflight before any data fetch", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return {
+          rows: [{
+            total_rows: "1",
+            estimated_bytes: "4096",
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(
+        USER_ID,
+        null,
+        undefined,
+        {
+          maxRows: 10,
+          maxEstimatedBytes: 1_024,
+          maxSerializedBytes: 10_000,
+        },
+      ),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    const sql = query.mock.calls.map(([statement]) =>
+      String(statement)
+    );
+    expect(sql.some((statement) =>
+      statement.includes("personal_data_export_preflight")
+    )).toBe(true);
+    expect(sql.some((statement) =>
+      statement.includes("personal_data_export_batch")
+    )).toBe(false);
+    expect(sql).toContain("ROLLBACK");
+  });
+
   it("exports explicit channel and admin audit allow-lists without secret material", async () => {
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
       if (sql.includes("$1")) expect(params).toEqual([USER_ID]);
+      if (sql.includes("personal_data_export_preflight")) {
+        return exportPreflight("2", "512");
+      }
       if (
         sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
         || sql === "COMMIT"
@@ -571,6 +735,9 @@ describe("personal data helpers", () => {
       fieldName: "bot_token",
     }).toStorageRecord();
     const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return exportPreflight("2", "512");
+      }
       if (sql.includes("FROM channel_connections") && !sql.includes("JOIN channel_connections")) {
         return {
           rows: [{
@@ -628,6 +795,101 @@ describe("personal data helpers", () => {
     expect(release).toHaveBeenCalledTimes(2);
   });
 
+  it("loads owned historical credential fingerprints only for a fail-closed export scan", async () => {
+    if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+    const historicalSecret = "rotated-export-secret";
+    const currentSecret = "current-export-secret";
+    const encrypted = KEY_STATE.key.encrypt(currentSecret, {
+      userId: USER_ID,
+      agentId: AGENT_ID,
+      connectionId: CONNECTION_ID,
+      fieldName: "bot_token",
+    }).toStorageRecord();
+    const fingerprint = createSecretExposureFingerprint(
+      KEY_STATE.key,
+      historicalSecret,
+    );
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return exportPreflight("3", "768");
+      }
+      if (
+        sql.includes("FROM channel_connections")
+        && !sql.includes("JOIN channel_connections")
+      ) {
+        return {
+          rows: [{
+            id: CONNECTION_ID,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+            channel_type: "telegram",
+            display_name: "Telegram",
+            enabled: false,
+            config: {
+              base_url:
+                `https://example.test/hook?token=${historicalSecret}`,
+            },
+            revision: 1,
+            health_status: "disabled",
+            created_at: new Date("2026-07-25T00:00:00Z"),
+            updated_at: new Date("2026-07-25T00:00:00Z"),
+          }],
+        };
+      }
+      if (
+        sql.includes(
+          "FROM channel_secret_exposure_fingerprints",
+        )
+      ) {
+        return {
+          rows: [{
+            key_version: fingerprint.keyVersion,
+            digest: fingerprint.digest,
+            utf8_bytes: fingerprint.utf8Bytes,
+            character_length: fingerprint.characterLength,
+          }],
+        };
+      }
+      if (sql.includes("FROM channel_secrets")) {
+        return {
+          rows: [{
+            connection_id: CONNECTION_ID,
+            field_name: "bot_token",
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            auth_tag: encrypted.authTag,
+            key_version: encrypted.keyVersion,
+            user_id: USER_ID,
+            agent_id: AGENT_ID,
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(USER_ID, KEY_STATE.key),
+    ).rejects.toThrow("personal_data_export_failed");
+
+    const fingerprintQuery = query.mock.calls.find(([sql]) =>
+      String(sql).includes(
+        "FROM channel_secret_exposure_fingerprints",
+      ),
+    );
+    expect(String(fingerprintQuery?.[0])).toContain(
+      "JOIN channel_connections",
+    );
+    expect(String(fingerprintQuery?.[0])).toContain(
+      "channel_connections.user_id = $1",
+    );
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it("clears and normalizes agent identity inside one database transaction", async () => {
     const clientQuery = vi.fn(async (sql: string) => {
       if (sql.includes("SELECT id") && sql.includes("FROM digital_agents")) {
@@ -645,6 +907,13 @@ describe("personal data helpers", () => {
     expect(sql[0]).toBe("BEGIN");
     expect(sql.at(-1)).toBe("COMMIT");
     expect(sql).toContain("DELETE FROM agent_resource_grants WHERE user_id = $1");
+    const fingerprintDelete = sql.findIndex((statement) =>
+      statement.includes(
+        "DELETE FROM channel_secret_exposure_fingerprints",
+      )
+      && statement.includes("channel_connections")
+      && statement.includes("user_id = $1"),
+    );
     const secretDelete = sql.findIndex((statement) =>
       statement.includes("DELETE FROM channel_secrets")
       && statement.includes("channel_connections")
@@ -658,7 +927,9 @@ describe("personal data helpers", () => {
       statement.includes("DELETE FROM admin_audit_logs")
       && statement.includes("user_id = $1"),
     );
+    expect(fingerprintDelete).toBeGreaterThan(0);
     expect(secretDelete).toBeGreaterThan(0);
+    expect(secretDelete).toBeGreaterThan(fingerprintDelete);
     expect(connectionDelete).toBeGreaterThan(secretDelete);
     expect(auditDelete).toBeGreaterThan(0);
     expect(sql.some((statement) =>
@@ -703,6 +974,9 @@ describe("personal data helpers", () => {
 
   it("destroys the export client when rollback fails without leaking the database error", async () => {
     const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return emptyExportPreflight();
+      }
       if (sql.includes("FROM digital_agents")) {
         throw new Error("SENTINEL_EXPORT_QUERY_SECRET");
       }
@@ -726,6 +1000,9 @@ describe("personal data helpers", () => {
 
   it("destroys an export client after an ambiguous read-only COMMIT", async () => {
     const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return emptyExportPreflight();
+      }
       if (sql === "COMMIT") {
         throw new Error("SENTINEL_EXPORT_COMMIT_SECRET");
       }
@@ -745,6 +1022,76 @@ describe("personal data helpers", () => {
     expect(release).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledWith(true);
   });
+
+  it.each(["synchronous", "asynchronous"])(
+    "destroys an export client when BEGIN has an %s failure",
+    async (failureKind) => {
+      const query = failureKind === "synchronous"
+        ? vi.fn((sql: string) => {
+            if (
+              sql ===
+              "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            ) {
+              throw new Error("export_begin_unknown");
+            }
+            return Promise.resolve({ rows: [] });
+          })
+        : vi.fn(async (sql: string) => {
+            if (
+              sql ===
+              "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            ) {
+              throw new Error("export_begin_unknown");
+            }
+            return { rows: [] };
+          });
+      const release = vi.fn();
+      const repositories = createRepositories({
+        connect: vi.fn(async () => ({ query, release })),
+      } as unknown as Pool);
+
+      await expect(
+        repositories.personalData.export(USER_ID),
+      ).rejects.toThrow("personal_data_export_failed");
+
+      expect(query.mock.calls.map(([sql]) => String(sql)))
+        .not.toContain("ROLLBACK");
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledWith(true);
+    },
+  );
+
+  it.each(["synchronous", "asynchronous"])(
+    "destroys a clear client when BEGIN has an %s failure",
+    async (failureKind) => {
+      const query = failureKind === "synchronous"
+        ? vi.fn((sql: string) => {
+            if (sql === "BEGIN") {
+              throw new Error("clear_begin_unknown");
+            }
+            return Promise.resolve({ rows: [] });
+          })
+        : vi.fn(async (sql: string) => {
+            if (sql === "BEGIN") {
+              throw new Error("clear_begin_unknown");
+            }
+            return { rows: [] };
+          });
+      const release = vi.fn();
+      const repositories = createRepositories({
+        connect: vi.fn(async () => ({ query, release })),
+      } as unknown as Pool);
+
+      await expect(
+        repositories.personalData.clear(USER_ID),
+      ).rejects.toThrow("clear_begin_unknown");
+
+      expect(query.mock.calls.map(([sql]) => String(sql)))
+        .not.toContain("ROLLBACK");
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledWith(true);
+    },
+  );
 
   it("destroys the clear client when rollback fails and preserves the primary error", async () => {
     const query = vi.fn(async (sql: string) => {
@@ -786,7 +1133,7 @@ describe("personal data helpers", () => {
     expect(harness.transactionSql()).not.toContain("ROLLBACK");
     expect(harness.transactionRelease).toHaveBeenCalledWith(true);
     expect(harness.verificationSql()).toMatch(
-      /channel_secrets[\s\S]*channel_connections[\s\S]*admin_audit_logs/,
+      /channel_secret_exposure_fingerprints[\s\S]*channel_secrets[\s\S]*channel_connections[\s\S]*admin_audit_logs/,
     );
     expect(harness.verificationSql()).toContain("digital_agents");
     expect(harness.verificationSql()).toContain("agent_settings");
@@ -870,4 +1217,20 @@ function createClearCommitAmbiguityHarness(
     verificationSql: () =>
       String(verificationQuery.mock.calls[0]?.[0] ?? ""),
   };
+}
+
+function exportPreflight(
+  totalRows: string,
+  estimatedBytes: string,
+) {
+  return {
+    rows: [{
+      total_rows: totalRows,
+      estimated_bytes: estimatedBytes,
+    }],
+  };
+}
+
+function emptyExportPreflight() {
+  return exportPreflight("0", "0");
 }

@@ -174,6 +174,13 @@ export class ChannelSecretsKey {
       .digest("hex");
   }
 
+  secretExposureFingerprint(value: string): Buffer {
+    return createHmac("sha256", this.#material)
+      .update("digitalmate.channel-secret-exposure\0", "utf8")
+      .update(value, "utf8")
+      .digest();
+  }
+
   toJSON(): Readonly<{
     configured: true;
     keyVersion: number;

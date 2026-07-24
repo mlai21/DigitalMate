@@ -165,12 +165,14 @@ describe("channel config revision, secret and audit transaction", () => {
          FROM unnest(ARRAY[
            'channel_connections',
            'channel_secrets',
+           'channel_secret_exposure_fingerprints',
            'admin_audit_logs'
          ]) AS name`,
       );
       expect(tables.rows.map((row) => row.name)).toEqual([
         "channel_connections",
         "channel_secrets",
+        "channel_secret_exposure_fingerprints",
         "admin_audit_logs",
       ]);
     } finally {
@@ -384,6 +386,52 @@ describe("channel config revision, secret and audit transaction", () => {
       },
     });
     expect(JSON.stringify(audit.rows[0])).not.toContain(TEST_SECRET);
+  });
+
+  it("blocks Task 5 public config from reusing a rotated historical secret", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    );
+    await service.update(updateInput({ secret: TEST_SECRET }));
+    await service.update(updateInput({
+      expectedRevision: 2,
+      secret: OTHER_SECRET,
+    }));
+
+    await expect(service.update({
+      ...updateInput({
+        expectedRevision: 3,
+        secret: OTHER_SECRET,
+      }),
+      config: {
+        endpoint:
+          `https://example.test/hook?token=${TEST_SECRET}`,
+      },
+      secretChanges: [],
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    const persisted = await primaryPool.query<{
+      revision: number;
+      fingerprints: string;
+    }>(
+      `SELECT revision,
+              (
+                SELECT count(*)
+                FROM channel_secret_exposure_fingerprints
+                WHERE connection_id = channel_connections.id
+              ) AS fingerprints
+       FROM channel_connections
+       WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    expect(persisted.rows[0]).toEqual({
+      revision: 3,
+      fingerprints: "2",
+    });
   });
 
   it.each([

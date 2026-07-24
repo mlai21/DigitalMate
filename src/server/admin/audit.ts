@@ -1,7 +1,15 @@
 import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
-import { containsSecretExposure } from "@/server/admin/secret-content";
+import {
+  containsSecretExposure,
+  containsSecretFingerprintExposure,
+  type SecretExposureFingerprint,
+} from "@/server/admin/secret-content";
+import {
+  readSecretExposureFingerprints,
+  rememberSecretExposureFingerprint,
+} from "@/server/admin/secret-exposure-store";
 import {
   connectPoolClient,
   guardPoolClientWithAbort,
@@ -91,6 +99,7 @@ type PreparedSecretChange =
 type DeclaredSecretState = Readonly<{
   configuredFields: ReadonlySet<string>;
   plaintextValues: readonly string[];
+  fingerprints: readonly SecretExposureFingerprint[];
 }>;
 
 export class AdminAuditError extends Error {
@@ -172,6 +181,12 @@ export function createChannelConnectionAuditService(
           containsSecretExposure(
             prepared.config,
             beforeSecrets.plaintextValues,
+            prepared.auditConfigFields,
+          )
+          || containsSecretFingerprintExposure(
+            prepared.config,
+            beforeSecrets.fingerprints,
+            secretKey,
             prepared.auditConfigFields,
           )
         ) {
@@ -298,6 +313,7 @@ async function readDeclaredSecrets(
     return {
       configuredFields: new Set(),
       plaintextValues: [],
+      fingerprints: [],
     };
   }
   // Task 7 manifests are the authority for the complete secret-field list.
@@ -315,25 +331,41 @@ async function readDeclaredSecrets(
        AND field_name = ANY($2::text[])`,
     [connection.id, secretFieldNames],
   );
+  const plaintextValues = result.rows.map((row) => ({
+    fieldName: row.field_name,
+    value: secretKey.decrypt(
+      encryptedSecretFromStorage({
+        ciphertext: row.ciphertext,
+        nonce: row.nonce,
+        authTag: row.auth_tag,
+        keyVersion: row.key_version,
+      }),
+      {
+        userId: connection.user_id,
+        agentId: connection.agent_id,
+        connectionId: connection.id,
+        fieldName: row.field_name,
+      },
+    ),
+  }));
+  for (const secret of plaintextValues) {
+    await rememberSecretExposureFingerprint(
+      client,
+      connection.id,
+      secret.fieldName,
+      secret.value,
+      secretKey,
+    );
+  }
   return {
     configuredFields: new Set(
       result.rows.map((row) => row.field_name),
     ),
-    plaintextValues: result.rows.map((row) =>
-      secretKey.decrypt(
-        encryptedSecretFromStorage({
-          ciphertext: row.ciphertext,
-          nonce: row.nonce,
-          authTag: row.auth_tag,
-          keyVersion: row.key_version,
-        }),
-        {
-          userId: connection.user_id,
-          agentId: connection.agent_id,
-          connectionId: connection.id,
-          fieldName: row.field_name,
-        },
-      )
+    plaintextValues: plaintextValues.map((secret) => secret.value),
+    fingerprints: await readSecretExposureFingerprints(
+      client,
+      connection.id,
+      secretFieldNames,
     ),
   };
 }
@@ -363,6 +395,14 @@ async function applySecretChanges(
       fieldName: change.fieldName,
     });
     const storage = encrypted.toStorageRecord();
+    await rememberSecretExposureFingerprint(
+      client,
+      connection.id,
+      change.fieldName,
+      change.plaintext,
+      secretKey,
+    );
+    signal.throwIfAborted();
     await client.query(
       `INSERT INTO channel_secrets (
          connection_id, field_name, ciphertext, nonce, auth_tag,

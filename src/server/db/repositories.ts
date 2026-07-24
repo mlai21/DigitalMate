@@ -49,6 +49,9 @@ import {
   encryptedSecretFromStorage,
   type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
+import type {
+  SecretExposureFingerprint,
+} from "@/server/admin/secret-content";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -148,6 +151,37 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "status", "error_code", "created_at",
   ],
 } as const;
+const PERSONAL_DATA_EXPORT_ORDER_BY: {
+  [TTable in keyof typeof PERSONAL_DATA_EXPORT_COLUMNS]: string;
+} = {
+  digital_agents: "id ASC",
+  agent_settings: "agent_id ASC",
+  agent_resource_grants:
+    "agent_id ASC, resource_type ASC, resource_id ASC",
+  projects: "id ASC",
+  conversations: "id ASC",
+  messages: "id ASC",
+  conversation_summaries: "id ASC",
+  memory_entries: "id ASC",
+  tool_call_logs: "id ASC",
+  proactive_tasks: "id ASC",
+  channel_identities: "id ASC",
+  channel_connections: "id ASC",
+  channel_messages: "id ASC",
+  interjection_decisions: "id ASC",
+  reflections: "id ASC",
+  skills: "id ASC",
+  skill_revisions: "id ASC",
+  skill_usage_logs: "id ASC",
+  task_runs: "id ASC",
+  task_artifacts: "id ASC",
+  tool_registrations: "id ASC",
+  llm_usage_logs: "id ASC",
+  memory_jobs: "id ASC",
+  goals: "id ASC",
+  settings: "id ASC",
+  admin_audit_logs: "id ASC",
+};
 const GOAL_STEP_EXPORT_COLUMNS = [
   "id", "agent_id", "goal_id", "round", "phase", "intent", "evidence", "candidate",
   "verify_result", "failed_paths", "tokens_used", "duration_ms", "error", "created_at",
@@ -158,7 +192,12 @@ const ATTACHMENT_EXPORT_COLUMNS = [
 ] as const;
 const PERSONAL_DATA_EXPORT_LOCK_TIMEOUT_MS = 10_000;
 const PERSONAL_DATA_EXPORT_STATEMENT_TIMEOUT_MS = 110_000;
+const PERSONAL_DATA_EXPORT_BATCH_SIZE = 256;
 const PERSONAL_DATA_CLEAR_RECOVERY_TIMEOUT_MS = 10_000;
+const TRY_SHARED_USER_DATA_LOCK_SQL =
+  `SELECT pg_try_advisory_lock_shared(
+     hashtextextended($1, 0)
+   ) AS locked`;
 const PERSONAL_DATA_EXPORT_LIMITS = Object.freeze({
   maxRows: 100_000,
   maxEstimatedBytes: 32 * 1024 * 1024,
@@ -479,9 +518,7 @@ export function createRepositories(
     try {
       options.signal?.throwIfAborted();
       const lock = await client.query<{ locked: boolean }>(
-        `SELECT pg_try_advisory_lock_shared(
-           hashtextextended($1, 0)
-         ) AS locked`,
+        TRY_SHARED_USER_DATA_LOCK_SQL,
         [lockKey],
       );
       options.signal?.throwIfAborted();
@@ -514,6 +551,78 @@ export function createRepositories(
       clientGuard.dispose();
       if (!clientGuard.destroyed) {
         if (locked) {
+          await releaseAdvisoryLease(
+            client,
+            lockKey,
+            "shared",
+          );
+        } else {
+          client.release();
+        }
+      }
+    }
+  }
+
+  async function tryAdmitDefaultUserDataRequest(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<UserDataRequestFence | null> {
+    const client = await connectPoolClient(
+      userDataLockPool,
+      options.signal,
+    );
+    const clientGuard = guardPoolClientWithAbort(
+      client,
+      options.signal,
+    );
+    let locked = false;
+    let lockKey: string | undefined;
+    try {
+      options.signal?.throwIfAborted();
+      const selectedUser = await client.query<{ id: string }>(
+        `SELECT id
+         FROM users
+         ORDER BY id ASC
+         LIMIT 1`,
+      );
+      options.signal?.throwIfAborted();
+      const userId = selectedUser.rows[0]?.id;
+      if (!userId) return null;
+
+      lockKey = `user-data-quiescence:${userId}`;
+      const lock = await client.query<{ locked: boolean }>(
+        TRY_SHARED_USER_DATA_LOCK_SQL,
+        [lockKey],
+      );
+      options.signal?.throwIfAborted();
+      if (lock.rows[0]?.locked !== true) return null;
+      locked = true;
+      await client.query(
+        `INSERT INTO user_data_epochs (user_id)
+         VALUES ($1)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [userId],
+      );
+      options.signal?.throwIfAborted();
+      const result = await client.query<{ epoch: string }>(
+        `SELECT epoch::text AS epoch
+         FROM user_data_epochs
+         WHERE user_id = $1`,
+        [userId],
+      );
+      options.signal?.throwIfAborted();
+      const epoch = result.rows[0]?.epoch;
+      if (epoch === undefined) {
+        throw new Error("user_data_epoch_missing");
+      }
+      return { userId, epoch };
+    } catch (error) {
+      if (!clientGuard.destroyed) clientGuard.destroy();
+      options.signal?.throwIfAborted();
+      throw error;
+    } finally {
+      clientGuard.dispose();
+      if (!clientGuard.destroyed) {
+        if (locked && lockKey) {
           await releaseAdvisoryLease(
             client,
             lockKey,
@@ -607,6 +716,7 @@ export function createRepositories(
     userDataMutations: {
       beginRequest: beginUserDataRequest,
       tryAdmitRequest: tryAdmitUserDataRequest,
+      tryAdmitDefaultUserRequest: tryAdmitDefaultUserDataRequest,
       acquireSharedLease: acquireSharedUserDataLease,
       acquireExclusiveClearLease,
     },
@@ -2666,6 +2776,7 @@ export function createRepositories(
         let clientGuard: AbortablePoolClientGuard | undefined;
         let transactionState:
           | "none"
+          | "starting"
           | "active"
           | "committing"
           | "finished" = "none";
@@ -2677,6 +2788,7 @@ export function createRepositories(
           client = await connectPoolClient(pool, signal);
           clientGuard = guardPoolClientWithAbort(client, signal);
           signal?.throwIfAborted();
+          transactionState = "starting";
           await client.query(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
           );
@@ -2690,6 +2802,65 @@ export function createRepositories(
             `SET LOCAL statement_timeout = '${PERSONAL_DATA_EXPORT_STATEMENT_TIMEOUT_MS}ms'`,
           );
           signal?.throwIfAborted();
+          const preflight = await client.query<{
+            total_rows: string;
+            estimated_bytes: string;
+          }>(
+            buildPersonalDataExportPreflightSql(),
+            [userId],
+          );
+          signal?.throwIfAborted();
+          assertPersonalDataExportPreflight(
+            preflight.rows,
+            limits,
+          );
+
+          const fetchRowsInBatches = async (
+            selectSql: string,
+            orderBy: string,
+            columns: readonly string[],
+            transform?: (
+              row: Record<string, unknown>,
+            ) => Record<string, unknown>,
+          ): Promise<Record<string, unknown>[]> => {
+            const fetched: Record<string, unknown>[] = [];
+            let offset = 0;
+            while (true) {
+              signal?.throwIfAborted();
+              const batch = await client!.query(
+                `/* personal_data_export_batch */
+                 ${selectSql}
+                 ORDER BY ${orderBy}
+                 LIMIT ${PERSONAL_DATA_EXPORT_BATCH_SIZE}
+                 OFFSET ${offset}`,
+                [userId],
+              );
+              signal?.throwIfAborted();
+              if (
+                batch.rows.length
+                > PERSONAL_DATA_EXPORT_BATCH_SIZE
+              ) {
+                throw new PersonalDataExportError();
+              }
+              const rows = transform
+                ? batch.rows.map(transform)
+                : batch.rows;
+              fetched.push(...budget.consumeRows(
+                rows,
+                columns,
+                signal,
+              ));
+              if (
+                batch.rows.length
+                < PERSONAL_DATA_EXPORT_BATCH_SIZE
+              ) {
+                break;
+              }
+              offset += batch.rows.length;
+            }
+            return fetched;
+          };
+
           const exported: Record<string, unknown[]> = {};
           for (
             const [table, columns]
@@ -2699,51 +2870,36 @@ export function createRepositories(
             const visibilityFilter = table === "task_artifacts"
               ? " AND status = 'ready'"
               : "";
-            const result = await client.query(
-              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}
-               LIMIT ${budget.nextQueryLimit()}`,
-              [userId],
-            );
-            signal?.throwIfAborted();
-            exported[table] = budget.consumeRows(
-              table === "channel_connections"
-                ? result.rows.map(projectChannelConnectionExportRow)
-                : result.rows,
+            exported[table] = await fetchRowsInBatches(
+              `SELECT ${columns.join(", ")}
+               FROM ${table}
+               WHERE user_id = $1${visibilityFilter}`,
+              PERSONAL_DATA_EXPORT_ORDER_BY[
+                table as keyof typeof PERSONAL_DATA_EXPORT_ORDER_BY
+              ],
               columns,
-              signal,
+              table === "channel_connections"
+                ? projectChannelConnectionExportRow
+                : undefined,
             );
           }
-          const goalSteps = await client.query(
+          exported.goal_steps = await fetchRowsInBatches(
             `SELECT ${GOAL_STEP_EXPORT_COLUMNS.map((column) => `goal_steps.${column}`).join(", ")}
              FROM goal_steps
              JOIN goals ON goals.id = goal_steps.goal_id
-             WHERE goals.user_id = $1
-             ORDER BY goal_steps.created_at ASC, goal_steps.id ASC
-             LIMIT ${budget.nextQueryLimit()}`,
-            [userId],
-          );
-          signal?.throwIfAborted();
-          exported.goal_steps = budget.consumeRows(
-            goalSteps.rows,
+             WHERE goals.user_id = $1`,
+            "goal_steps.created_at ASC, goal_steps.id ASC",
             GOAL_STEP_EXPORT_COLUMNS,
-            signal,
           );
-          const attachments = await client.query(
+          exported.message_attachments = await fetchRowsInBatches(
             `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
              FROM message_attachments
-             WHERE user_id = $1
-             ORDER BY created_at ASC, id ASC
-             LIMIT ${budget.nextQueryLimit()}`,
-            [userId],
-          );
-          signal?.throwIfAborted();
-          exported.message_attachments = budget.consumeRows(
-            attachments.rows,
+             WHERE user_id = $1`,
+            "created_at ASC, id ASC",
             ATTACHMENT_EXPORT_COLUMNS,
-            signal,
           );
 
-          const encryptedSecrets = await client.query<{
+          type EncryptedSecretExportRow = {
             connection_id: string;
             field_name: string;
             ciphertext: Buffer;
@@ -2752,34 +2908,127 @@ export function createRepositories(
             key_version: number;
             user_id: string;
             agent_id: string;
-          }>(
-            `SELECT channel_secrets.connection_id,
-                    channel_secrets.field_name,
-                    channel_secrets.ciphertext,
-                    channel_secrets.nonce,
-                    channel_secrets.auth_tag,
-                    channel_secrets.key_version,
-                    channel_connections.user_id,
-                    channel_connections.agent_id
-             FROM channel_secrets
-             JOIN channel_connections
-               ON channel_connections.id = channel_secrets.connection_id
-             WHERE channel_connections.user_id = $1
-             ORDER BY channel_secrets.connection_id,
-                      channel_secrets.field_name
-             LIMIT ${budget.nextQueryLimit()}`,
-            [userId],
-          );
-          signal?.throwIfAborted();
-          budget.consumeSupportingRows(encryptedSecrets.rows, signal);
+          };
+          const encryptedSecrets: EncryptedSecretExportRow[] = [];
+          let secretOffset = 0;
+          while (true) {
+            signal?.throwIfAborted();
+            const secretBatch = await client.query<
+              EncryptedSecretExportRow
+            >(
+              `/* personal_data_export_batch */
+               SELECT channel_secrets.connection_id,
+                      channel_secrets.field_name,
+                      channel_secrets.ciphertext,
+                      channel_secrets.nonce,
+                      channel_secrets.auth_tag,
+                      channel_secrets.key_version,
+                      channel_connections.user_id,
+                      channel_connections.agent_id
+               FROM channel_secrets
+               JOIN channel_connections
+                 ON channel_connections.id =
+                    channel_secrets.connection_id
+               WHERE channel_connections.user_id = $1
+               ORDER BY channel_secrets.connection_id ASC,
+                        channel_secrets.field_name ASC
+               LIMIT ${PERSONAL_DATA_EXPORT_BATCH_SIZE}
+               OFFSET ${secretOffset}`,
+              [userId],
+            );
+            signal?.throwIfAborted();
+            if (
+              secretBatch.rows.length
+              > PERSONAL_DATA_EXPORT_BATCH_SIZE
+            ) {
+              throw new PersonalDataExportError();
+            }
+            budget.consumeSupportingRows(
+              secretBatch.rows,
+              signal,
+            );
+            encryptedSecrets.push(...secretBatch.rows);
+            if (
+              secretBatch.rows.length
+              < PERSONAL_DATA_EXPORT_BATCH_SIZE
+            ) {
+              break;
+            }
+            secretOffset += secretBatch.rows.length;
+          }
+
+          type SecretExposureFingerprintExportRow = {
+            key_version: number;
+            digest: Buffer;
+            utf8_bytes: number;
+            character_length: number;
+          };
+          const credentialFingerprints:
+            SecretExposureFingerprint[] = [];
+          let fingerprintOffset = 0;
+          while (true) {
+            signal?.throwIfAborted();
+            const fingerprintBatch = await client.query<
+              SecretExposureFingerprintExportRow
+            >(
+              `/* personal_data_export_batch */
+               SELECT
+                 channel_secret_exposure_fingerprints.key_version,
+                 channel_secret_exposure_fingerprints.digest,
+                 channel_secret_exposure_fingerprints.utf8_bytes,
+                 channel_secret_exposure_fingerprints.character_length
+               FROM channel_secret_exposure_fingerprints
+               JOIN channel_connections
+                 ON channel_connections.id =
+                    channel_secret_exposure_fingerprints.connection_id
+               WHERE channel_connections.user_id = $1
+               ORDER BY
+                 channel_secret_exposure_fingerprints.connection_id ASC,
+                 channel_secret_exposure_fingerprints.field_name ASC,
+                 channel_secret_exposure_fingerprints.key_version ASC,
+                 channel_secret_exposure_fingerprints.digest ASC
+               LIMIT ${PERSONAL_DATA_EXPORT_BATCH_SIZE}
+               OFFSET ${fingerprintOffset}`,
+              [userId],
+            );
+            signal?.throwIfAborted();
+            if (
+              fingerprintBatch.rows.length
+              > PERSONAL_DATA_EXPORT_BATCH_SIZE
+            ) {
+              throw new PersonalDataExportError();
+            }
+            budget.consumeSupportingRows(
+              fingerprintBatch.rows,
+              signal,
+            );
+            credentialFingerprints.push(
+              ...fingerprintBatch.rows.map((row) => ({
+                keyVersion: row.key_version,
+                digest: row.digest,
+                utf8Bytes: row.utf8_bytes,
+                characterLength: row.character_length,
+              })),
+            );
+            if (
+              fingerprintBatch.rows.length
+              < PERSONAL_DATA_EXPORT_BATCH_SIZE
+            ) {
+              break;
+            }
+            fingerprintOffset += fingerprintBatch.rows.length;
+          }
           if (
-            encryptedSecrets.rows.length > 0
+            (
+              encryptedSecrets.length > 0
+              || credentialFingerprints.length > 0
+            )
             && channelSecretsKey === null
           ) {
             throw new PersonalDataExportError();
           }
           const credentialValues: string[] = [];
-          for (const row of encryptedSecrets.rows) {
+          for (const row of encryptedSecrets) {
             signal?.throwIfAborted();
             const credentialValue = channelSecretsKey!.decrypt(
               encryptedSecretFromStorage({
@@ -2804,6 +3053,8 @@ export function createRepositories(
             exportedAt: new Date(),
             tables: exported,
             credentialValues,
+            credentialFingerprints,
+            credentialFingerprintKey: channelSecretsKey ?? undefined,
           });
           signal?.throwIfAborted();
           budget.assertSerializedSize(result);
@@ -2826,6 +3077,8 @@ export function createRepositories(
                 clientGuard.destroy();
               }
             } else if (transactionState === "committing") {
+              clientGuard.destroy();
+            } else if (transactionState === "starting") {
               clientGuard.destroy();
             }
           }
@@ -2867,10 +3120,12 @@ export function createRepositories(
         const clientGuard = guardPoolClientWithAbort(client);
         let transactionState:
           | "none"
+          | "starting"
           | "active"
           | "committing"
           | "finished" = "none";
         try {
+          transactionState = "starting";
           await client.query("BEGIN");
           transactionState = "active";
           const selectedAgent = await client.query<{ id: string }>(
@@ -2884,6 +3139,15 @@ export function createRepositories(
           );
           let defaultAgentId = selectedAgent.rows[0]?.id ?? null;
 
+          await client.query(
+            `DELETE FROM channel_secret_exposure_fingerprints
+             WHERE connection_id IN (
+               SELECT id
+               FROM channel_connections
+               WHERE user_id = $1
+             )`,
+            [userId],
+          );
           await client.query(
             `DELETE FROM channel_secrets
              WHERE connection_id IN (
@@ -2998,6 +3262,10 @@ export function createRepositories(
             );
             if (verification === "committed") return;
             throw new Error("personal_data_clear_failed");
+          }
+          if (transactionState === "starting") {
+            clientGuard.destroy();
+            throw error;
           }
           if (
             transactionState === "active"
@@ -3367,9 +3635,6 @@ function createPersonalDataExportBudget(
   };
 
   return {
-    nextQueryLimit(): number {
-      return Math.max(1, limits.maxRows - rowCount + 1);
-    },
     consumeRows(
       rows: Record<string, unknown>[],
       columns: readonly string[],
@@ -3408,6 +3673,109 @@ function createPersonalDataExportBudget(
   };
 }
 
+function buildPersonalDataExportPreflightSql(): string {
+  const sources = Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)
+    .map(([table, columns]) => {
+      const visibilityFilter = table === "task_artifacts"
+        ? " AND status = 'ready'"
+        : "";
+      return buildPersonalDataExportPreflightSource(
+        `SELECT ${columns.join(", ")}
+         FROM ${table}
+         WHERE user_id = $1${visibilityFilter}`,
+      );
+    });
+  sources.push(
+    buildPersonalDataExportPreflightSource(
+      `SELECT ${GOAL_STEP_EXPORT_COLUMNS.map((column) =>
+        `goal_steps.${column}`
+      ).join(", ")}
+       FROM goal_steps
+       JOIN goals ON goals.id = goal_steps.goal_id
+       WHERE goals.user_id = $1`,
+    ),
+    buildPersonalDataExportPreflightSource(
+      `SELECT ${ATTACHMENT_EXPORT_COLUMNS.join(", ")}
+       FROM message_attachments
+       WHERE user_id = $1`,
+    ),
+    buildPersonalDataExportPreflightSource(
+      `SELECT channel_secrets.connection_id,
+              channel_secrets.field_name,
+              channel_secrets.ciphertext,
+              channel_secrets.nonce,
+              channel_secrets.auth_tag,
+              channel_secrets.key_version,
+              channel_connections.user_id,
+              channel_connections.agent_id
+       FROM channel_secrets
+       JOIN channel_connections
+         ON channel_connections.id = channel_secrets.connection_id
+       WHERE channel_connections.user_id = $1`,
+    ),
+    buildPersonalDataExportPreflightSource(
+      `SELECT
+         channel_secret_exposure_fingerprints.connection_id,
+         channel_secret_exposure_fingerprints.field_name,
+         channel_secret_exposure_fingerprints.key_version,
+         channel_secret_exposure_fingerprints.digest,
+         channel_secret_exposure_fingerprints.utf8_bytes,
+         channel_secret_exposure_fingerprints.character_length
+       FROM channel_secret_exposure_fingerprints
+       JOIN channel_connections
+         ON channel_connections.id =
+            channel_secret_exposure_fingerprints.connection_id
+       WHERE channel_connections.user_id = $1`,
+    ),
+  );
+  return `/* personal_data_export_preflight */
+    SELECT COALESCE(sum(source.row_count), 0)::text AS total_rows,
+           COALESCE(
+             sum(source.estimated_bytes),
+             0
+           )::text AS estimated_bytes
+    FROM (
+      ${sources.join("\n      UNION ALL\n      ")}
+    ) AS source`;
+}
+
+function buildPersonalDataExportPreflightSource(
+  selectSql: string,
+): string {
+  return `SELECT count(*)::bigint AS row_count,
+                 COALESCE(
+                   sum(pg_column_size(export_row)),
+                   0
+                 )::bigint AS estimated_bytes
+          FROM (
+            ${selectSql}
+          ) AS export_row`;
+}
+
+function assertPersonalDataExportPreflight(
+  rows: Array<{
+    total_rows: string;
+    estimated_bytes: string;
+  }>,
+  limits: PersonalDataExportLimits,
+): void {
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (
+    !row
+    || !/^\d+$/.test(row.total_rows)
+    || !/^\d+$/.test(row.estimated_bytes)
+  ) {
+    throw new PersonalDataExportError();
+  }
+  if (
+    BigInt(row.total_rows) > BigInt(limits.maxRows)
+    || BigInt(row.estimated_bytes)
+      > BigInt(limits.maxEstimatedBytes)
+  ) {
+    throw new PersonalDataExportError();
+  }
+}
+
 async function verifyPersonalDataClear(
   pool: Pool,
   userId: string,
@@ -3439,6 +3807,14 @@ async function verifyPersonalDataClear(
     const result = await client.query<{ clear_complete: boolean }>(
       `SELECT (
          NOT EXISTS (
+           SELECT 1
+           FROM channel_secret_exposure_fingerprints
+           JOIN channel_connections
+             ON channel_connections.id =
+                channel_secret_exposure_fingerprints.connection_id
+           WHERE channel_connections.user_id = $1
+         )
+         AND NOT EXISTS (
            SELECT 1
            FROM channel_secrets
            JOIN channel_connections

@@ -812,6 +812,23 @@ async function waitForBlockedTaskArtifactUpdate(pool: Pool): Promise<void> {
   throw new Error("task_artifact_update_did_not_block");
 }
 
+async function waitForBlockedWebhookAdmission(pool: Pool): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ count: string }>(
+      `SELECT count(*) AS count
+       FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid()
+         AND state = 'active'
+         AND wait_event_type = 'Lock'
+         AND query LIKE '%FROM users%'`,
+    );
+    if (Number(result.rows[0]?.count ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("webhook_admission_query_did_not_block");
+}
+
 describe("message attachment PostgreSQL concurrency", () => {
   const schemaName = `attachment_repository_${process.pid}_${Date.now()}`;
   let adminPool: Pool;
@@ -1655,6 +1672,126 @@ describe("message attachment PostgreSQL concurrency", () => {
     } finally {
       await webhookLockPool.end();
       await clearLockPool.end();
+    }
+  });
+
+  it("cancels default-user admission while ten shared leases exhaust the lock pool and later recovers", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const admissionLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 10,
+    });
+    const repositories = createRepositories(
+      databasePool,
+      admissionLockPool,
+      admissionLockPool,
+    );
+    const selectedUser = await databasePool.query<{ id: string }>(
+      "SELECT id FROM users ORDER BY id ASC LIMIT 1",
+    );
+    const userId = selectedUser.rows[0].id;
+    const fence = await repositories.userDataMutations.beginRequest(
+      userId,
+    );
+    const leases = await Promise.all(
+      Array.from(
+        { length: 10 },
+        () => repositories.userDataMutations.acquireSharedLease(fence),
+      ),
+    );
+    const controller = new AbortController();
+
+    try {
+      const pending = repositories.userDataMutations
+        .tryAdmitDefaultUserRequest({ signal: controller.signal });
+      await vi.waitFor(() =>
+        expect(admissionLockPool.waitingCount).toBe(1)
+      );
+      controller.abort(new Error("channel_webhook_admission_timeout"));
+
+      await expect(Promise.race([
+        pending.then(
+          () => "resolved",
+          (error: unknown) =>
+            error instanceof Error ? error.message : "rejected",
+        ),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("still-waiting"), 250)
+        ),
+      ])).resolves.toBe("channel_webhook_admission_timeout");
+
+      await Promise.all(leases.map((lease) => lease.release()));
+      await vi.waitFor(() =>
+        expect(admissionLockPool.waitingCount).toBe(0)
+      );
+      await expect(
+        repositories.userDataMutations
+          .tryAdmitDefaultUserRequest(),
+      ).resolves.toMatchObject({ userId });
+    } finally {
+      await Promise.all(
+        leases.map((lease) => lease.release().catch(() => undefined)),
+      );
+      await admissionLockPool.end();
+    }
+  });
+
+  it("destroys a blocked default-user admission query on abort and later recovers", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const blockerPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const admissionLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 1,
+    });
+    const repositories = createRepositories(
+      databasePool,
+      admissionLockPool,
+      admissionLockPool,
+    );
+    const blocker = await blockerPool.connect();
+    const controller = new AbortController();
+
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("LOCK TABLE users IN ACCESS EXCLUSIVE MODE");
+      const pending = repositories.userDataMutations
+        .tryAdmitDefaultUserRequest({ signal: controller.signal });
+      await waitForBlockedWebhookAdmission(adminPool);
+      controller.abort(new Error("channel_webhook_admission_timeout"));
+
+      await expect(Promise.race([
+        pending.then(
+          () => "resolved",
+          (error: unknown) =>
+            error instanceof Error ? error.message : "rejected",
+        ),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("still-waiting"), 250)
+        ),
+      ])).resolves.toBe("channel_webhook_admission_timeout");
+      await vi.waitFor(() =>
+        expect(admissionLockPool.totalCount).toBe(0)
+      );
+
+      await blocker.query("ROLLBACK");
+      await expect(
+        repositories.userDataMutations
+          .tryAdmitDefaultUserRequest(),
+      ).resolves.toEqual(expect.objectContaining({
+        userId: expect.any(String),
+        epoch: expect.any(String),
+      }));
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+      await blockerPool.end();
+      await admissionLockPool.end();
     }
   });
 

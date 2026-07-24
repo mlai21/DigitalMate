@@ -20,29 +20,44 @@ type ChannelMessageAdmission = Readonly<{
   fence: UserDataRequestFence;
 }>;
 
+export const CHANNEL_WEBHOOK_ADMISSION_TIMEOUT_MS = 750;
+
 export async function scheduleChannelMessageHandling(input: {
   env: AppEnv;
   message: NormalizedChannelMessage;
   source: string;
 }): Promise<void> {
+  const admissionController = new AbortController();
+  const admissionTimer = setTimeout(() => {
+    admissionController.abort(
+      new Error("channel_webhook_admission_timeout"),
+    );
+  }, CHANNEL_WEBHOOK_ADMISSION_TIMEOUT_MS);
+  admissionTimer.unref?.();
   let admission: ChannelMessageAdmission;
   try {
     const repositories = createRepositories();
-    const user = await repositories.users.ensureDefault();
     const fence = await repositories.userDataMutations
-      .tryAdmitRequest(user.id);
+      .tryAdmitDefaultUserRequest({
+        signal: admissionController.signal,
+      });
     if (fence === null) return;
     admission = {
       repositories,
-      userId: user.id,
+      userId: fence.userId,
       fence,
     };
   } catch {
-    console.error("channel_webhook_admission_failed", {
-      code: "channel_webhook_admission_failed",
+    const code = admissionController.signal.aborted
+      ? "channel_webhook_admission_timeout"
+      : "channel_webhook_admission_failed";
+    console.error(code, {
+      code,
       source: input.source,
     });
     return;
+  } finally {
+    clearTimeout(admissionTimer);
   }
 
   const timeout = setTimeout(() => {

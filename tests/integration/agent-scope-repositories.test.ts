@@ -626,6 +626,54 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     await expect(repositories.memories.list(scopeA)).resolves.toEqual([]);
     await expect(repositories.taskArtifacts.list(scopeA)).resolves.toEqual([]);
   }, 30_000);
+
+  it("exports more than one batch in stable PostgreSQL order and rejects preflight overflow", async () => {
+    const inserted = await pool.query<{ id: string }>(
+      `INSERT INTO projects (
+         id, user_id, agent_id, name, description
+       )
+       SELECT
+         md5('personal-export-batch-' || series.value::text)::uuid,
+         $1,
+         $2,
+         'Project ' || series.value::text,
+         ''
+       FROM generate_series(1, 300) AS series(value)
+       RETURNING id`,
+      [USER_ID, AGENT_A],
+    );
+    const repositories = createRepositories(pool);
+
+    try {
+      const exported = await repositories.personalData.export(USER_ID);
+      const exportedIds = exported.tables.projects.map((row) =>
+        String((row as { id: string }).id)
+      );
+      const expectedIds = inserted.rows
+        .map((row) => row.id)
+        .sort((left, right) => left.localeCompare(right));
+      expect(exportedIds).toEqual(expectedIds);
+      expect(exportedIds).toHaveLength(300);
+
+      await expect(
+        repositories.personalData.export(
+          USER_ID,
+          null,
+          undefined,
+          {
+            maxRows: 100,
+            maxEstimatedBytes: 1_000_000,
+            maxSerializedBytes: 1_000_000,
+          },
+        ),
+      ).rejects.toThrow("personal_data_export_failed");
+    } finally {
+      await pool.query(
+        "DELETE FROM projects WHERE user_id = $1",
+        [USER_ID],
+      );
+    }
+  }, 30_000);
 });
 
 async function collectAgentOutput(

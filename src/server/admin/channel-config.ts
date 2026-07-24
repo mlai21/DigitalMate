@@ -7,7 +7,15 @@ import type {
   AdminChannelConfigWrite,
   AdminChannelSecretStatus,
 } from "@/server/admin/compat/handlers/channels";
-import { containsSecretExposure } from "@/server/admin/secret-content";
+import {
+  containsSecretExposure,
+  containsSecretFingerprintExposure,
+  type SecretExposureFingerprint,
+} from "@/server/admin/secret-content";
+import {
+  readSecretExposureFingerprints,
+  rememberSecretExposureFingerprint,
+} from "@/server/admin/secret-exposure-store";
 import {
   CHANNEL_TYPES,
   getChannelManifest,
@@ -649,6 +657,7 @@ async function validatePublicConfigSecrets(
   const plaintextValues = input.secretChanges.flatMap((change) =>
     change.operation === "set" ? [change.value] : []
   );
+  const fingerprints: SecretExposureFingerprint[] = [];
   if (connection) {
     const manifest = getChannelManifest(input.type);
     const result = await client.query<StoredSecretRow>(
@@ -665,17 +674,35 @@ async function validatePublicConfigSecrets(
         authTag: row.auth_tag,
         keyVersion: row.key_version,
       });
-      plaintextValues.push(
-        key.decrypt(encrypted, {
-          userId: input.scope.userId,
-          agentId: input.scope.agentId,
-          connectionId: connection.id,
-          fieldName: row.field_name,
-        }),
+      const plaintext = key.decrypt(encrypted, {
+        userId: input.scope.userId,
+        agentId: input.scope.agentId,
+        connectionId: connection.id,
+        fieldName: row.field_name,
+      });
+      plaintextValues.push(plaintext);
+      await rememberSecretExposureFingerprint(
+        client,
+        connection.id,
+        row.field_name,
+        plaintext,
+        key,
       );
     }
+    fingerprints.push(...await readSecretExposureFingerprints(
+      client,
+      connection.id,
+      manifest.secretFields,
+    ));
   }
-  if (containsSecretExposure(input.config, plaintextValues)) {
+  if (
+    containsSecretExposure(input.config, plaintextValues)
+    || containsSecretFingerprintExposure(
+      input.config,
+      fingerprints,
+      key,
+    )
+  ) {
     throw new AdminChannelConfigError(
       400,
       "secret_in_public_config",
@@ -764,6 +791,14 @@ async function applySecrets(
         [connection.id, change.fieldName],
       );
     } else {
+      await rememberSecretExposureFingerprint(
+        client,
+        connection.id,
+        change.fieldName,
+        change.value,
+        key,
+      );
+      signal.throwIfAborted();
       const encrypted = key.encrypt(change.value, {
         userId: input.scope.userId,
         agentId: input.scope.agentId,

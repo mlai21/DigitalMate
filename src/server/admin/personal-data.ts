@@ -1,10 +1,19 @@
-import { containsSecretExposure } from "@/server/admin/secret-content";
+import {
+  containsSecretExposure,
+  containsSecretFingerprintExposure,
+  type SecretExposureFingerprint,
+} from "@/server/admin/secret-content";
+import type {
+  ChannelSecretsKey,
+} from "@/server/security/encrypted-secret";
 
 export type PersonalDataExportInput = {
   userId: string;
   exportedAt: Date;
   tables: Record<string, unknown[]>;
   credentialValues?: readonly string[];
+  credentialFingerprints?: readonly SecretExposureFingerprint[];
+  credentialFingerprintKey?: ChannelSecretsKey;
 };
 
 const SENSITIVE_EXPORT_KEY_SEGMENTS = new Set([
@@ -90,6 +99,17 @@ export function buildPersonalDataExport(input: PersonalDataExportInput) {
     containsSecretExposure(
       exported,
       input.credentialValues ?? [],
+    )
+    || (
+      (input.credentialFingerprints?.length ?? 0) > 0
+      && (
+        input.credentialFingerprintKey === undefined
+        || containsSecretFingerprintExposure(
+          exported,
+          input.credentialFingerprints ?? [],
+          input.credentialFingerprintKey,
+        )
+      )
     )
   ) {
     throw new PersonalDataExportError();

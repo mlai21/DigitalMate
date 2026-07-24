@@ -376,6 +376,125 @@ describe("admin channel configuration service", () => {
     });
   });
 
+  it("rejects a rotated or deleted historical credential in later public config", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    const rotated = "integration-rotated-token";
+    await service.update(createInput(OPERATION_ID));
+    await service.update({
+      ...createInput(OTHER_OPERATION_ID),
+      expectedRevision: 1,
+      secretChanges: [{
+        fieldName: "bot_token",
+        operation: "set",
+        value: rotated,
+      }],
+    });
+
+    await expect(service.update({
+      ...createInput("30000000-0000-4000-8000-000000000033"),
+      expectedRevision: 2,
+      config: {
+        bot_prefix: `Bearer ${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+
+    await service.update({
+      ...createInput("30000000-0000-4000-8000-000000000034"),
+      expectedRevision: 2,
+      secretChanges: [{
+        fieldName: "bot_token",
+        operation: "delete",
+      }],
+    });
+    await expect(service.update({
+      ...createInput("30000000-0000-4000-8000-000000000035"),
+      expectedRevision: 3,
+      config: {
+        bot_prefix: `Bearer ${rotated}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+
+    const fingerprints = await primary.query<{
+      digest: Buffer;
+      utf8_bytes: number;
+      character_length: number;
+    }>(
+      `SELECT digest, utf8_bytes, character_length
+       FROM channel_secret_exposure_fingerprints
+       ORDER BY created_at`,
+    );
+    expect(fingerprints.rows).toHaveLength(2);
+    expect(fingerprints.rows.every((row) =>
+      row.digest.length === 32
+      && row.utf8_bytes > 0
+      && row.character_length > 0
+    )).toBe(true);
+    expect(JSON.stringify(fingerprints.rows)).not.toContain(TOKEN);
+    expect(JSON.stringify(fingerprints.rows)).not.toContain(rotated);
+  });
+
+  it("isolates historical credential fingerprints by connection owner", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const otherUserId =
+      "10000000-0000-4000-8000-000000000002";
+    const otherAgentId =
+      "10000000-0000-4000-8000-000000000012";
+    await primary.query(
+      `INSERT INTO users (id, display_name)
+       VALUES ($1, 'Other user')`,
+      [otherUserId],
+    );
+    await primary.query(
+      `INSERT INTO digital_agents (
+         id, user_id, slug, display_name, is_default
+       )
+       VALUES ($1, $2, 'default', 'Other mate', true)`,
+      [otherAgentId, otherUserId],
+    );
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+    await service.update({
+      ...createInput("30000000-0000-4000-8000-000000000036"),
+      scope: {
+        userId: otherUserId,
+        agentId: otherAgentId,
+      },
+      secretChanges: [{
+        fieldName: "bot_token",
+        operation: "set",
+        value: "other-owner-secret",
+      }],
+    });
+
+    await expect(service.update({
+      ...createInput("30000000-0000-4000-8000-000000000037"),
+      scope: {
+        userId: otherUserId,
+        agentId: otherAgentId,
+      },
+      expectedRevision: 1,
+      config: {
+        bot_prefix: `Bearer ${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    })).resolves.toMatchObject({ revision: 2 });
+  });
+
   it("rejects a secret exposure in the second bulk item before the first item writes", async () => {
     if (key.status !== "ready") throw new Error("test_key_not_ready");
     const service = createAdminChannelConfigService(primary, key.key);

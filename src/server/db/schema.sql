@@ -997,6 +997,34 @@ CREATE TABLE IF NOT EXISTS channel_secrets (
     ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS channel_secret_exposure_fingerprints (
+  connection_id uuid NOT NULL,
+  field_name text NOT NULL
+    CONSTRAINT channel_secret_exposure_fingerprints_field_name_check
+    CHECK (
+      btrim(field_name) <> ''
+      AND length(field_name) <= 128
+    ),
+  key_version integer NOT NULL
+    CONSTRAINT channel_secret_exposure_fingerprints_key_version_check
+    CHECK (key_version > 0),
+  digest bytea NOT NULL
+    CONSTRAINT channel_secret_exposure_fingerprints_digest_length_check
+    CHECK (octet_length(digest) = 32),
+  utf8_bytes integer NOT NULL
+    CONSTRAINT channel_secret_exposure_fingerprints_utf8_bytes_check
+    CHECK (utf8_bytes > 0),
+  character_length integer NOT NULL
+    CONSTRAINT channel_secret_exposure_fingerprints_character_length_check
+    CHECK (character_length > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (connection_id, field_name, key_version, digest),
+  CONSTRAINT channel_secret_exposure_fingerprints_connection_id_fkey
+    FOREIGN KEY (connection_id)
+    REFERENCES channel_connections(id)
+    ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,

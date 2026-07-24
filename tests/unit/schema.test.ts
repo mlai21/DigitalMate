@@ -49,6 +49,7 @@ describe("database schema", () => {
       "settings",
       "channel_connections",
       "channel_secrets",
+      "channel_secret_exposure_fingerprints",
       "admin_audit_logs",
     ]) {
       expect(schema).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
@@ -99,6 +100,12 @@ describe("database schema", () => {
     expect(schema).toContain("channel_secrets_connection_id_fkey");
     expect(schema).toContain("channel_secrets_nonce_length_check");
     expect(schema).toContain("channel_secrets_auth_tag_length_check");
+    expect(schema).toContain(
+      "channel_secret_exposure_fingerprints_connection_id_fkey",
+    );
+    expect(schema).toContain(
+      "channel_secret_exposure_fingerprints_digest_length_check",
+    );
     expect(schema).toContain("admin_audit_logs_user_agent_fkey");
     expect(schema).toContain("idx_admin_audit_logs_scope_created");
   });
