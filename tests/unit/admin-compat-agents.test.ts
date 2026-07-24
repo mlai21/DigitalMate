@@ -12,6 +12,7 @@ import { AdminAgentProfileError } from "@/server/admin/agent-profile";
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
 const OTHER_AGENT_ID = "10000000-0000-4000-8000-000000000012";
+const OPERATION_ID = "30000000-0000-4000-8000-000000000031";
 const DISABLED_AGENT_MUTATIONS = [
   ["POST", "/agents", "multi_agent_create"],
   ["POST", "/agents/import", "multi_agent_import"],
@@ -637,6 +638,7 @@ describe("admin compatibility agents contract", () => {
     );
     const body = {
       id: DEFAULT_AGENT_ID,
+      operation_id: OPERATION_ID,
       name: "Mate",
       persona: {
         name: "Mate",
@@ -685,6 +687,7 @@ describe("admin compatibility agents contract", () => {
           userId: USER_ID,
           agentId: DEFAULT_AGENT_ID,
         },
+        operationId: OPERATION_ID,
         expectedRevision: 1,
         displayName: "Mate",
         persona: body.persona,
@@ -694,6 +697,67 @@ describe("admin compatibility agents contract", () => {
     );
   });
 
+  it.each([
+    ["missing", undefined],
+    ["placeholder", "default"],
+    ["uppercase", "30000000-0000-4000-8000-00000000003A"],
+    [
+      "ambiguous",
+      `${OPERATION_ID},30000000-0000-4000-8000-000000000032`,
+    ],
+  ])(
+    "rejects a %s profile operation id before the domain service",
+    async (_label, operationId) => {
+      const updateAgentProfile = vi.fn();
+      const router = createCoreAdminCompatRouter(
+        dependencies({ updateAgentProfile }),
+      );
+      const body = {
+        id: DEFAULT_AGENT_ID,
+        ...(operationId === undefined
+          ? {}
+          : { operation_id: operationId }),
+        name: "Mate",
+        persona: {
+          name: "Mate",
+          style: "温暖自然",
+          emojiHabit: "少量",
+        },
+        settings: {
+          proactivity: {
+            quietStart: "22:30",
+            quietEnd: "08:30",
+            minIntervalMinutes: 60,
+            maxPerHour: 1,
+            maxPerDay: 2,
+          },
+          cadence: {
+            responseDelayMs: 600,
+            segmentDelayMs: 300,
+            maxSegments: 4,
+          },
+          search: { aggressiveness: "off" },
+        },
+        revision: 1,
+      };
+
+      const response = await router.dispatch(
+        await mutationRequest(
+          "PUT",
+          `/agents/${DEFAULT_AGENT_ID}`,
+          body,
+        ),
+        runtime(),
+      );
+
+      expect(response.status).toBe(400);
+      expect(updateAgentProfile).not.toHaveBeenCalled();
+      expect(JSON.stringify(await response.json())).not.toContain(
+        String(operationId),
+      );
+    },
+  );
+
   const invalidProfileBodies: Array<{
     name: string;
     body: unknown;
@@ -702,6 +766,7 @@ describe("admin compatibility agents contract", () => {
       name: "extra model field",
       body: {
         id: DEFAULT_AGENT_ID,
+        operation_id: OPERATION_ID,
         name: "Mate",
         persona: {
           name: "Mate",
@@ -734,6 +799,7 @@ describe("admin compatibility agents contract", () => {
       name: "oversized persona",
       body: {
         id: DEFAULT_AGENT_ID,
+        operation_id: OPERATION_ID,
         name: "Mate",
         persona: {
           name: "Mate",
@@ -762,6 +828,7 @@ describe("admin compatibility agents contract", () => {
       name: "prototype-shaped persona",
       body: {
         id: DEFAULT_AGENT_ID,
+        operation_id: OPERATION_ID,
         name: "Mate",
         persona: {
           name: "Mate",
@@ -826,6 +893,7 @@ describe("admin compatibility agents contract", () => {
         `/agents/${DEFAULT_AGENT_ID}`,
         {
           id: DEFAULT_AGENT_ID,
+          operation_id: OPERATION_ID,
           name: "Mate",
           persona: {
             name: "Mate",

@@ -32,6 +32,9 @@ const USER_B = "20000000-0000-4000-8000-000000000002";
 const AGENT_A = "10000000-0000-4000-8000-000000000011";
 const AGENT_A2 = "10000000-0000-4000-8000-000000000012";
 const AGENT_B = "20000000-0000-4000-8000-000000000011";
+const OPERATION_ID = "30000000-0000-4000-8000-000000000031";
+const OTHER_OPERATION_ID =
+  "30000000-0000-4000-8000-000000000032";
 
 describe("admin default-agent profile transaction", () => {
   let embeddedPostgres: EmbeddedPostgres;
@@ -133,6 +136,46 @@ describe("admin default-agent profile transaction", () => {
     }
   });
 
+  it.each([
+    "default",
+    "30000000-0000-4000-8000-00000000003A",
+    `${OPERATION_ID},${OTHER_OPERATION_ID}`,
+  ])(
+    "rejects invalid profile operation id %j before database mutation",
+    async (operationId) => {
+      await expect(
+        createAdminAgentProfileService(primaryPool).update(
+          updateInput({ operationId }),
+        ),
+      ).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_operation_id",
+        message: "invalid_operation_id",
+      });
+      const stored = await primaryPool.query<{
+        display_name: string;
+        revision: number;
+        audit_count: string;
+      }>(
+        `SELECT digital_agents.display_name,
+                agent_settings.revision,
+                (SELECT count(*) FROM admin_audit_logs) AS audit_count
+         FROM digital_agents
+         JOIN agent_settings
+           ON agent_settings.user_id = digital_agents.user_id
+          AND agent_settings.agent_id = digital_agents.id
+         WHERE digital_agents.user_id = $1
+           AND digital_agents.id = $2`,
+        [USER_A, AGENT_A],
+      );
+      expect(stored.rows[0]).toEqual({
+        display_name: "Agent A",
+        revision: 1,
+        audit_count: "0",
+      });
+    },
+  );
+
   it("updates display name, persona, agent settings and safe audit atomically", async () => {
     const result = await createAdminAgentProfileService(
       primaryPool,
@@ -194,8 +237,10 @@ describe("admin default-agent profile transaction", () => {
       action: string;
       before_summary: Record<string, unknown>;
       after_summary: Record<string, unknown>;
+      confirmation_source: Record<string, unknown>;
     }>(
-      `SELECT action, before_summary, after_summary
+      `SELECT action, before_summary, after_summary,
+              confirmation_source
        FROM admin_audit_logs
        WHERE user_id = $1 AND agent_id = $2`,
       [USER_A, AGENT_A],
@@ -217,6 +262,10 @@ describe("admin default-agent profile transaction", () => {
             "cadence",
             "search",
           ],
+        },
+        confirmation_source: {
+          type: "console",
+          requestId: OPERATION_ID,
         },
       },
     ]);
@@ -496,6 +545,191 @@ describe("admin default-agent profile transaction", () => {
     });
   });
 
+  it("recovers success when COMMIT commits and then loses confirmation", async () => {
+    const wrapped = controlledCommitPool(
+      primaryPool,
+      "commit_then_throw",
+    );
+
+    await expect(
+      createAdminAgentProfileService(wrapped.pool).update(
+        updateInput(),
+      ),
+    ).resolves.toEqual({ revision: 2 });
+
+    expect(wrapped.connectCalls()).toBe(2);
+    expect(wrapped.originalReleaseArgs()).toEqual([true]);
+    expect(wrapped.recoveryReleaseArgs()).toEqual([undefined]);
+    const committed = await primaryPool.query<{
+      display_name: string;
+      digital_persona_name: string;
+      settings_persona_name: string;
+      revision: number;
+      audit_count: string;
+      request_id: string;
+      audit_revision: string;
+    }>(
+      `SELECT digital_agents.display_name,
+              digital_agents.persona->>'name' AS digital_persona_name,
+              agent_settings.persona->>'name' AS settings_persona_name,
+              agent_settings.revision,
+              (
+                SELECT count(*)
+                FROM admin_audit_logs
+                WHERE user_id = $1
+                  AND agent_id = $2
+                  AND action = 'agent_profile.update'
+              ) AS audit_count,
+              (
+                SELECT confirmation_source->>'requestId'
+                FROM admin_audit_logs
+                WHERE user_id = $1
+                  AND agent_id = $2
+                  AND action = 'agent_profile.update'
+              ) AS request_id,
+              (
+                SELECT after_summary->>'revision'
+                FROM admin_audit_logs
+                WHERE user_id = $1
+                  AND agent_id = $2
+                  AND action = 'agent_profile.update'
+              ) AS audit_revision
+       FROM digital_agents
+       JOIN agent_settings
+         ON agent_settings.user_id = digital_agents.user_id
+        AND agent_settings.agent_id = digital_agents.id
+       WHERE digital_agents.user_id = $1
+         AND digital_agents.id = $2`,
+      [USER_A, AGENT_A],
+    );
+    expect(committed.rows[0]).toEqual({
+      display_name: "Mate",
+      digital_persona_name: "Mate",
+      settings_persona_name: "Mate",
+      revision: 2,
+      audit_count: "1",
+      request_id: OPERATION_ID,
+      audit_revision: "2",
+    });
+    await expect(primaryPool.query("SELECT 1 AS ok")).resolves.toMatchObject({
+      rows: [{ ok: 1 }],
+    });
+  });
+
+  it("uses recovery independent of an outer abort after COMMIT", async () => {
+    const controller = new AbortController();
+    const wrapped = controlledCommitPool(
+      primaryPool,
+      "commit_then_throw",
+      () => controller.abort(),
+    );
+
+    await expect(
+      createAdminAgentProfileService(wrapped.pool).update(
+        updateInput(),
+        controller.signal,
+      ),
+    ).resolves.toEqual({ revision: 2 });
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(wrapped.connectCalls()).toBe(2);
+    expect(wrapped.originalReleaseArgs()).toEqual([true]);
+    expect(wrapped.recoveryReleaseArgs()).toEqual([undefined]);
+  });
+
+  it("returns safe failure when COMMIT was not executed and no audit committed", async () => {
+    const wrapped = controlledCommitPool(
+      primaryPool,
+      "throw_before_commit",
+    );
+
+    await expect(
+      createAdminAgentProfileService(wrapped.pool).update(
+        updateInput(),
+      ),
+    ).rejects.toMatchObject({
+      status: 500,
+      code: "agent_profile_update_failed",
+      message: "agent_profile_update_failed",
+    });
+
+    expect(wrapped.connectCalls()).toBe(2);
+    expect(wrapped.originalReleaseArgs()).toEqual([true]);
+    expect(wrapped.recoveryReleaseArgs()).toEqual([undefined]);
+    const stored = await primaryPool.query<{
+      display_name: string;
+      revision: number;
+      audit_count: string;
+    }>(
+      `SELECT digital_agents.display_name,
+              agent_settings.revision,
+              (SELECT count(*) FROM admin_audit_logs) AS audit_count
+       FROM digital_agents
+       JOIN agent_settings
+         ON agent_settings.user_id = digital_agents.user_id
+        AND agent_settings.agent_id = digital_agents.id
+       WHERE digital_agents.user_id = $1
+         AND digital_agents.id = $2`,
+      [USER_A, AGENT_A],
+    );
+    expect(stored.rows[0]).toEqual({
+      display_name: "Agent A",
+      revision: 1,
+      audit_count: "0",
+    });
+  });
+
+  it.each([
+    ["wrong operation", USER_A, AGENT_A, OTHER_OPERATION_ID, 2],
+    ["wrong revision", USER_A, AGENT_A, OPERATION_ID, 9],
+    ["other user", USER_B, AGENT_B, OPERATION_ID, 2],
+    ["other agent", USER_A, AGENT_A2, OPERATION_ID, 2],
+  ])(
+    "does not recover from a forged %s audit",
+    async (
+      _label,
+      auditUserId,
+      auditAgentId,
+      operationId,
+      revision,
+    ) => {
+      await insertForgedProfileAudit(primaryPool, {
+        userId: auditUserId,
+        agentId: auditAgentId,
+        operationId,
+        revision,
+      });
+      const wrapped = controlledCommitPool(
+        primaryPool,
+        "throw_before_commit",
+      );
+
+      await expect(
+        createAdminAgentProfileService(wrapped.pool).update(
+          updateInput(),
+        ),
+      ).rejects.toMatchObject({
+        status: 500,
+        code: "agent_profile_update_failed",
+      });
+      expect(wrapped.connectCalls()).toBe(2);
+    },
+  );
+
+  it("does not open a recovery connection on a confirmed COMMIT", async () => {
+    const wrapped = controlledCommitPool(primaryPool, "normal");
+
+    await expect(
+      createAdminAgentProfileService(wrapped.pool).update(
+        updateInput(),
+      ),
+    ).resolves.toEqual({ revision: 2 });
+
+    expect(wrapped.connectCalls()).toBe(1);
+    expect(wrapped.originalReleaseArgs()).toEqual([undefined]);
+    expect(wrapped.recoveryReleaseArgs()).toEqual([]);
+  });
+
   it("aborts a held row lock with a stable error and leaves the pool reusable", async () => {
     const blocker = await secondaryPool.connect();
     const controller = new AbortController();
@@ -549,10 +783,12 @@ describe("admin default-agent profile transaction", () => {
 function updateInput(
   overrides: {
     displayName?: string;
+    operationId?: string;
   } = {},
 ) {
   return {
     scope: { userId: USER_A, agentId: AGENT_A },
+    operationId: overrides.operationId ?? OPERATION_ID,
     expectedRevision: 1,
     displayName: overrides.displayName ?? "Mate",
     persona: {
@@ -673,6 +909,113 @@ function abortAfterCommitPool(
     } as Pool,
     releaseCalls: () => releases,
   };
+}
+
+function controlledCommitPool(
+  pool: Pool,
+  mode: "normal" | "commit_then_throw" | "throw_before_commit",
+  afterUnknownCommit: () => void = () => undefined,
+): {
+  pool: Pool;
+  connectCalls(): number;
+  originalReleaseArgs(): unknown[];
+  recoveryReleaseArgs(): unknown[];
+} {
+  let connects = 0;
+  const originalReleases: unknown[] = [];
+  const recoveryReleases: unknown[] = [];
+  return {
+    pool: {
+      async connect() {
+        connects += 1;
+        const connectionNumber = connects;
+        const client = await pool.connect();
+        return new Proxy(client, {
+          get(target, property, receiver) {
+            if (property === "query") {
+              return async (...args: unknown[]) => {
+                const sql =
+                  typeof args[0] === "string"
+                    ? args[0].trim().toUpperCase()
+                    : "";
+                if (
+                  connectionNumber === 1 &&
+                  sql === "COMMIT" &&
+                  mode !== "normal"
+                ) {
+                  if (mode === "commit_then_throw") {
+                    await target.query("COMMIT");
+                  }
+                  afterUnknownCommit();
+                  throw Object.assign(
+                    new Error("sensitive socket reset"),
+                    { code: "ECONNRESET" },
+                  );
+                }
+                return Reflect.apply(target.query, target, args);
+              };
+            }
+            if (property === "release") {
+              return (...args: unknown[]) => {
+                const releases =
+                  connectionNumber === 1
+                    ? originalReleases
+                    : recoveryReleases;
+                releases.push(args[0]);
+                return Reflect.apply(target.release, target, args);
+              };
+            }
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === "function"
+              ? value.bind(target)
+              : value;
+          },
+        }) as PoolClient;
+      },
+    } as Pool,
+    connectCalls: () => connects,
+    originalReleaseArgs: () => [...originalReleases],
+    recoveryReleaseArgs: () => [...recoveryReleases],
+  };
+}
+
+async function insertForgedProfileAudit(
+  pool: Pool,
+  input: {
+    userId: string;
+    agentId: string;
+    operationId: string;
+    revision: number;
+  },
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO admin_audit_logs (
+       user_id, agent_id, action, resource_type, resource_id,
+       before_summary, after_summary, confirmation_source,
+       status, error_code
+     )
+     VALUES (
+       $1, $2::uuid, 'agent_profile.update', 'digital_agent',
+       ($2::uuid)::text,
+       '{"display_name":"forged","revision":1}',
+       jsonb_build_object(
+         'display_name', 'forged',
+         'revision', $4::integer,
+         'changed_fields', '[]'::jsonb
+       ),
+       jsonb_build_object(
+         'type', 'console',
+         'requestId', $3::text
+       ),
+       'success', NULL
+     )`,
+    [
+      input.userId,
+      input.agentId,
+      input.operationId,
+      input.revision,
+    ],
+  );
 }
 
 function adaptSchemaForEmbeddedPostgres(source: string): string {

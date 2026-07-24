@@ -37,6 +37,7 @@ const personaSchema = z
 const profileUpdateBodySchema = z
   .object({
     id: canonicalUuidSchema.optional(),
+    operation_id: canonicalUuidSchema,
     name: z.string().trim().min(1).max(80),
     persona: personaSchema,
     settings: z
@@ -124,6 +125,7 @@ export function createUpdateAgentHandler(
     const updated = await updateProfile(
       {
         scope: context.scope,
+        operationId: input.operation_id,
         expectedRevision: input.revision,
         displayName: input.name,
         persona: input.persona,

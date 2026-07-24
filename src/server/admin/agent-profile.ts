@@ -16,6 +16,7 @@ import {
 
 export type AdminAgentProfileUpdate = Readonly<{
   scope: AgentScope;
+  operationId: string;
   expectedRevision: number;
   displayName: string;
   persona: PersonaSettings;
@@ -79,6 +80,9 @@ export class AdminAgentProfileError extends Error {
 
 const MAX_LIFECYCLE_TIMEOUT_MS = 30_000;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
+const COMMIT_RECOVERY_TIMEOUT_MS = 3_000;
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export function createAdminAgentProfileService(
   pool: Pool,
@@ -144,12 +148,14 @@ export function createAdminAgentProfileService(
       input: AdminAgentProfileUpdate,
       outerSignal?: AbortSignal,
     ): Promise<AdminAgentProfileUpdateResult> {
+      validateOperationId(input.operationId);
       const lifecycle = createBoundedLifecycle(
         lifecycleTimeoutMs,
         outerSignal,
       );
       let client: PoolClient | undefined;
       let guard: AbortablePoolClientGuard | undefined;
+      let commitOutcomeUnknown = false;
       try {
         lifecycle.signal.throwIfAborted();
         client = await connectPoolClient(pool, lifecycle.signal);
@@ -212,10 +218,28 @@ export function createAdminAgentProfileService(
         }
         await insertSafeAudit(client, input, before, revision);
         lifecycle.signal.throwIfAborted();
-        await client.query("COMMIT");
-        return { revision };
+        try {
+          await client.query("COMMIT");
+          return { revision };
+        } catch {
+          commitOutcomeUnknown = true;
+          guard.destroy();
+          const recoveredRevision =
+            await recoverCommittedProfileUpdate(pool, input);
+          if (recoveredRevision !== null) {
+            return { revision: recoveredRevision };
+          }
+          throw new AdminAgentProfileError(
+            500,
+            "agent_profile_update_failed",
+          );
+        }
       } catch (error) {
-        if (client && guard?.destroyed !== true) {
+        if (
+          !commitOutcomeUnknown &&
+          client &&
+          guard?.destroyed !== true
+        ) {
           await client.query("ROLLBACK").catch(() => undefined);
         }
         if (
@@ -237,6 +261,83 @@ export function createAdminAgentProfileService(
       }
     },
   };
+}
+
+function validateOperationId(operationId: string): void {
+  if (
+    typeof operationId !== "string" ||
+    !CANONICAL_UUID_PATTERN.test(operationId)
+  ) {
+    throw new AdminAgentProfileError(400, "invalid_operation_id");
+  }
+}
+
+async function recoverCommittedProfileUpdate(
+  pool: Pool,
+  input: AdminAgentProfileUpdate,
+): Promise<number | null> {
+  const lifecycle = createBoundedLifecycle(
+    COMMIT_RECOVERY_TIMEOUT_MS,
+  );
+  let client: PoolClient | undefined;
+  let guard: AbortablePoolClientGuard | undefined;
+  let commitStarted = false;
+  try {
+    client = await connectPoolClient(pool, lifecycle.signal);
+    guard = guardPoolClientWithAbort(client, lifecycle.signal);
+    lifecycle.signal.throwIfAborted();
+    await client.query("BEGIN");
+    await setTransactionTimeouts(
+      client,
+      COMMIT_RECOVERY_TIMEOUT_MS,
+    );
+    const expectedRevision = input.expectedRevision + 1;
+    const result = await client.query<{ revision: string }>(
+      `SELECT after_summary->>'revision' AS revision
+       FROM admin_audit_logs
+       WHERE user_id = $1
+         AND agent_id = $2
+         AND action = 'agent_profile.update'
+         AND resource_type = 'digital_agent'
+         AND resource_id = ($2::uuid)::text
+         AND status = 'success'
+         AND error_code IS NULL
+         AND confirmation_source->>'type' = 'console'
+         AND confirmation_source->>'requestId' = $3
+         AND jsonb_typeof(after_summary->'revision') = 'number'
+         AND after_summary->>'revision' = $4
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [
+        input.scope.userId,
+        input.scope.agentId,
+        input.operationId,
+        String(expectedRevision),
+      ],
+    );
+    lifecycle.signal.throwIfAborted();
+    commitStarted = true;
+    await client.query("COMMIT");
+    const revision = Number(result.rows[0]?.revision);
+    return revision === expectedRevision ? revision : null;
+  } catch {
+    if (client && guard?.destroyed !== true) {
+      if (commitStarted) {
+        guard?.destroy();
+      } else {
+        await client.query("ROLLBACK").catch(() => {
+          guard?.destroy();
+        });
+      }
+    }
+    return null;
+  } finally {
+    lifecycle.dispose();
+    guard?.dispose();
+    if (client && guard?.destroyed !== true) {
+      client.release();
+    }
+  }
 }
 
 async function ensureDefaultProfileSettings(
@@ -379,7 +480,7 @@ async function insertSafeAudit(
      VALUES (
        $1, $2::uuid, 'agent_profile.update', 'digital_agent',
        ($2::uuid)::text,
-       $3, $4, '{"type":"console"}'::jsonb, 'success', NULL
+       $3, $4, $5, 'success', NULL
      )`,
     [
       input.scope.userId,
@@ -392,6 +493,10 @@ async function insertSafeAudit(
         display_name: input.displayName,
         revision,
         changed_fields: changedFields,
+      },
+      {
+        type: "console",
+        requestId: input.operationId,
       },
     ],
   );

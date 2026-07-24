@@ -865,6 +865,22 @@ index 20eed03..1de9f75 100644
        body: formData,
      });
      if (!response.ok) {
+diff --git a/src/api/modules/agents.test.ts b/src/api/modules/agents.test.ts
+index 02e0a15..bbb9642 100644
+--- a/src/api/modules/agents.test.ts
++++ b/src/api/modules/agents.test.ts
+@@ -45,7 +45,10 @@ describe("agentsApi", () => {
+   });
+
+   it("updateAgent sends PUT /agents/${id} with JSON body", async () => {
+-    const agent = { name: "updated" } as any;
++    const agent = {
++      name: "updated",
++      operation_id: "30000000-0000-4000-8000-000000000031",
++    } as any;
+     vi.mocked(request).mockResolvedValue(agent);
+     const result = await agentsApi.updateAgent("a1", agent);
+     expect(request).toHaveBeenCalledWith("/agents/a1", {
 diff --git a/src/api/modules/agents.ts b/src/api/modules/agents.ts
 index 20c37c4..da6235f 100644
 --- a/src/api/modules/agents.ts
@@ -1424,7 +1440,7 @@ index ce104e5..661a6c0 100644
      });
 
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..3f44aac 100644
+index ce94f9a..2a45a5e 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
 @@ -1,19 +1,23 @@
@@ -1567,7 +1583,40 @@ index ce94f9a..3f44aac 100644
    });
 
    it("request URL is correctly built by getApiUrl", async () => {
-@@ -332,6 +394,48 @@ describe("request", () => {
+@@ -271,6 +333,9 @@ describe("request", () => {
+   it("succeeds on retry after initial timeout", async () => {
+     vi.useFakeTimers();
+     let attemptCount = 0;
++    const body = JSON.stringify({
++      operation_id: "30000000-0000-4000-8000-000000000031",
++    });
+
+     global.fetch = vi.fn().mockImplementation((_url, options) => {
+       attemptCount++;
+@@ -299,10 +364,13 @@ describe("request", () => {
+     });
+
+     const requestPromise = request("/flaky-endpoint", {
++      method: "PUT",
++      body,
+       timeout: 1000,
+       retries: 1,
+       retryDelay: 100,
+     });
++    await vi.advanceTimersByTimeAsync(0);
+
+     // First attempt timeout
+     vi.advanceTimersByTime(1000);
+@@ -311,6 +379,8 @@ describe("request", () => {
+     const result = await requestPromise;
+     expect(result).toEqual({ data: "success" });
+     expect(attemptCount).toBe(2);
++    expect(vi.mocked(fetch).mock.calls[0]?.[1]?.body).toBe(body);
++    expect(vi.mocked(fetch).mock.calls[1]?.[1]?.body).toBe(body);
+
+     vi.useRealTimers();
+   });
+@@ -332,6 +402,48 @@ describe("request", () => {
      expect(fetch).not.toHaveBeenCalled();
    });
 
@@ -1792,7 +1841,7 @@ index 7f4cb7d..1ac4fb5 100644
 
          // Preserve raw body for parseErrorDetail() to extract structured fields
 diff --git a/src/api/types/agents.ts b/src/api/types/agents.ts
-index 9daaea6..42d5c96 100644
+index 9daaea6..56e9df5 100644
 --- a/src/api/types/agents.ts
 +++ b/src/api/types/agents.ts
 @@ -18,6 +18,40 @@ export interface AgentSummary {
@@ -1836,7 +1885,7 @@ index 9daaea6..42d5c96 100644
  }
 
  export interface AgentListResponse {
-@@ -32,18 +66,26 @@ export interface ReorderAgentsResponse {
+@@ -32,18 +66,27 @@ export interface ReorderAgentsResponse {
  export interface AgentProfileConfig {
    id: string;
    name: string;
@@ -1869,6 +1918,7 @@ index 9daaea6..42d5c96 100644
 +  persona: AgentPersona;
 +  settings: AgentBehaviorSettings;
 +  revision: number;
++  operation_id: string;
  }
 
  export interface CreateAgentRequest {
@@ -3547,7 +3597,7 @@ index 5bdc7fb..64f6b69 100644
                  }
                />
 diff --git a/src/pages/Settings/Agents/index.tsx b/src/pages/Settings/Agents/index.tsx
-index 20bea0b..e7e8402 100644
+index 20bea0b..a030400 100644
 --- a/src/pages/Settings/Agents/index.tsx
 +++ b/src/pages/Settings/Agents/index.tsx
 @@ -1,20 +1,25 @@
@@ -3567,7 +3617,7 @@ index 20bea0b..e7e8402 100644
  import { PageHeader } from "@/components/PageHeader";
  import { reorderAgents } from "./reorder";
 +import {
-+  buildAgentProfileUpdate,
++  createAgentProfileUpdate,
 +  type AgentProfileFormValues,
 +} from "./profileForm";
  import styles from "./index.module.less";
@@ -3703,7 +3753,7 @@ index 20bea0b..e7e8402 100644
        }
 +      const values =
 +        (await form.validateFields()) as AgentProfileFormValues;
-+      const payload = buildAgentProfileUpdate(values);
++      const payload = createAgentProfileUpdate(values);
 +      await agentsApi.updateAgent(editingAgent.id, payload);
 +      message.success(t("agent.updateSuccess"));
 
@@ -3773,47 +3823,54 @@ index 20bea0b..e7e8402 100644
        />
 diff --git a/src/pages/Settings/Agents/profileForm.test.ts b/src/pages/Settings/Agents/profileForm.test.ts
 new file mode 100644
-index 0000000..47fed81
+index 0000000..5a66e55
 --- /dev/null
 +++ b/src/pages/Settings/Agents/profileForm.test.ts
-@@ -0,0 +1,66 @@
-+import { describe, expect, it } from "vitest";
-+import { buildAgentProfileUpdate } from "./profileForm";
+@@ -0,0 +1,83 @@
++import { describe, expect, it, vi } from "vitest";
++import {
++  buildAgentProfileUpdate,
++  createAgentProfileUpdate,
++} from "./profileForm";
++
++const OPERATION_ID = "30000000-0000-4000-8000-000000000031";
++
++const profileValues = {
++  id: "10000000-0000-4000-8000-000000000011",
++  name: "  DigitalMate  ",
++  persona: {
++    name: "  小D  ",
++    style: "  真诚、简洁  ",
++    emojiHabit: "  偶尔使用 🙂  ",
++  },
++  settings: {
++    proactivity: {
++      quietStart: "23:00",
++      quietEnd: "08:00",
++      minIntervalMinutes: 30,
++      maxPerHour: 2,
++      maxPerDay: 6,
++    },
++    cadence: {
++      responseDelayMs: 300,
++      segmentDelayMs: 500,
++      maxSegments: 4,
++    },
++    search: {
++      aggressiveness: "conservative" as const,
++    },
++  },
++  revision: 7,
++  active_model: { provider_id: "secret", model: "secret-model" },
++  tools: ["hidden"],
++  skills: ["hidden"],
++  workspace_dir: "/hidden",
++};
 +
 +describe("buildAgentProfileUpdate", () => {
 +  it("only serializes the approved single-avatar profile fields", () => {
 +    expect(
-+      buildAgentProfileUpdate({
-+        id: "10000000-0000-4000-8000-000000000011",
-+        name: "  DigitalMate  ",
-+        persona: {
-+          name: "  小D  ",
-+          style: "  真诚、简洁  ",
-+          emojiHabit: "  偶尔使用 🙂  ",
-+        },
-+        settings: {
-+          proactivity: {
-+            quietStart: "23:00",
-+            quietEnd: "08:00",
-+            minIntervalMinutes: 30,
-+            maxPerHour: 2,
-+            maxPerDay: 6,
-+          },
-+          cadence: {
-+            responseDelayMs: 300,
-+            segmentDelayMs: 500,
-+            maxSegments: 4,
-+          },
-+          search: {
-+            aggressiveness: "conservative",
-+          },
-+        },
-+        revision: 7,
-+        active_model: { provider_id: "secret", model: "secret-model" },
-+        tools: ["hidden"],
-+        skills: ["hidden"],
-+        workspace_dir: "/hidden",
-+      }),
++      buildAgentProfileUpdate(profileValues, OPERATION_ID),
 +    ).toEqual({
 +      id: "10000000-0000-4000-8000-000000000011",
 +      name: "DigitalMate",
@@ -3840,15 +3897,25 @@ index 0000000..47fed81
 +        },
 +      },
 +      revision: 7,
++      operation_id: OPERATION_ID,
 +    });
++  });
++
++  it("generates exactly one operation id for one save payload", () => {
++    const createOperationId = vi.fn(() => OPERATION_ID);
++
++    expect(
++      createAgentProfileUpdate(profileValues, createOperationId),
++    ).toMatchObject({ operation_id: OPERATION_ID });
++    expect(createOperationId).toHaveBeenCalledTimes(1);
 +  });
 +});
 diff --git a/src/pages/Settings/Agents/profileForm.ts b/src/pages/Settings/Agents/profileForm.ts
 new file mode 100644
-index 0000000..7c466d5
+index 0000000..06cab95
 --- /dev/null
 +++ b/src/pages/Settings/Agents/profileForm.ts
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,56 @@
 +import type {
 +  AgentBehaviorSettings,
 +  AgentPersona,
@@ -3866,6 +3933,7 @@ index 0000000..7c466d5
 +
 +export function buildAgentProfileUpdate(
 +  values: AgentProfileFormValues,
++  operationId: string,
 +): UpdateAgentProfileRequest {
 +  return {
 +    id: values.id,
@@ -3894,7 +3962,15 @@ index 0000000..7c466d5
 +      },
 +    },
 +    revision: values.revision,
++    operation_id: operationId,
 +  };
++}
++
++export function createAgentProfileUpdate(
++  values: AgentProfileFormValues,
++  createOperationId: () => string = () => crypto.randomUUID(),
++): UpdateAgentProfileRequest {
++  return buildAgentProfileUpdate(values, createOperationId());
 +}
 diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
 index 5607a73..de360b3 100644
