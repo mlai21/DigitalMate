@@ -1288,12 +1288,16 @@ describe("message attachment PostgreSQL concurrency", () => {
       const fence = await waiterRepositories.userDataMutations.beginRequest(userId);
       sharedLease = await waiterRepositories.userDataMutations.acquireSharedLease(fence);
       const abortController = new AbortController();
+      const waiterAcquired = new Promise<void>((resolve) => {
+        waiterTurnPool.once("acquire", () => resolve());
+      });
       const waiting = waiterRepositories.messages.acquireClientTurnExecutionLock(
         scopeForUser(userId),
         clientTurnId,
         abortController.signal,
       );
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await waiterAcquired;
+      await new Promise<void>((resolve) => setImmediate(resolve));
       abortController.abort(new Error(reason));
 
       await expect(Promise.race([
@@ -1305,7 +1309,10 @@ describe("message attachment PostgreSQL concurrency", () => {
 
       const clearLease = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
       await clearLease.release();
-      await vi.waitFor(() => expect(waiterTurnPool.totalCount).toBe(0));
+      await vi.waitFor(
+        () => expect(waiterTurnPool.totalCount).toBe(0),
+        { timeout: 3_000, interval: 10 },
+      );
       const releaseFresh = await waiterRepositories.messages.acquireClientTurnExecutionLock(
         scopeForUser(userId),
         `${clientTurnId.slice(0, -1)}9`,

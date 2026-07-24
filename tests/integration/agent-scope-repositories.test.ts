@@ -15,6 +15,10 @@ import type { AgentScope } from "@/server/agents/types";
 import { createRepositories } from "@/server/db/repositories";
 import type { LlmStreamInput } from "@/server/llm/types";
 import { defaultSettings } from "@/server/settings/defaults";
+import {
+  trackEmbeddedPostgresPool,
+  type EmbeddedPostgresLifecycle,
+} from "./embedded-postgres-lifecycle";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const AGENT_A = "10000000-0000-4000-8000-00000000000a";
@@ -26,6 +30,7 @@ describe("agent-scoped repositories on PostgreSQL", () => {
   let embeddedPostgres: EmbeddedPostgres;
   let databaseDirectory: string;
   let pool: Pool;
+  let databaseLifecycle: EmbeddedPostgresLifecycle;
 
   beforeAll(async () => {
     const port = await reservePort();
@@ -45,13 +50,13 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       connectionString: `postgresql://postgres:digitalmate-test@127.0.0.1:${port}/postgres`,
       options: "-c statement_timeout=15000 -c lock_timeout=5000",
     });
+    databaseLifecycle = trackEmbeddedPostgresPool(pool);
     await installSchema(pool);
     await seedAgents(pool);
   }, 60_000);
 
   afterAll(async () => {
-    await pool?.end();
-    await embeddedPostgres?.stop();
+    await databaseLifecycle?.stop(embeddedPostgres);
     if (databaseDirectory) {
       await rm(databaseDirectory, { recursive: true, force: true });
     }
