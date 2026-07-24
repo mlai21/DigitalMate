@@ -12,25 +12,47 @@ import {
 } from "@/server/http/request-origin";
 
 export const sessionCookieName = "dm_session";
+export const sessionLifetimeSeconds = 60 * 60 * 24 * 30;
 const scrypt = promisify(scryptCallback);
+
+export type VerifiedSession = Readonly<{
+  userId: string;
+  generation: number;
+  issuedAt: Date;
+  expiresAt: Date;
+  sessionId: string;
+}>;
+
+export type SessionGenerationLoader = (
+  userId: string,
+) => Promise<number | null>;
 
 export async function createSessionToken(
   userId: string,
+  generation: number,
   secret: string,
   now: Date = new Date(),
 ): Promise<string> {
+  const issuedAt = now.getTime();
   const payload = base64UrlEncode(
     JSON.stringify({
+      v: 1,
       sub: userId,
-      iat: now.getTime(),
-      sid: randomBytes(18).toString("base64url"),
+      gen: generation,
+      iat: issuedAt,
+      exp: issuedAt + sessionLifetimeSeconds * 1_000,
+      jti: randomBytes(18).toString("base64url"),
     }),
   );
   const signature = sign(payload, secret);
   return `${payload}.${signature}`;
 }
 
-export async function verifySessionToken(token: string, secret: string): Promise<string | null> {
+export async function verifySessionToken(
+  token: string,
+  secret: string,
+  now: Date = new Date(),
+): Promise<VerifiedSession | null> {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
 
@@ -38,8 +60,9 @@ export async function verifySessionToken(token: string, secret: string): Promise
   if (
     !payload ||
     !signature ||
+    payload.length > 2_048 ||
     !/^[A-Za-z0-9_-]+$/.test(payload) ||
-    !/^[A-Za-z0-9_-]+$/.test(signature)
+    !/^[A-Za-z0-9_-]{43}$/.test(signature)
   ) {
     return null;
   }
@@ -48,8 +71,44 @@ export async function verifySessionToken(token: string, secret: string): Promise
   if (!safeEqual(signature, expected)) return null;
 
   try {
-    const parsed = JSON.parse(base64UrlDecode(payload)) as { sub?: unknown };
-    return typeof parsed.sub === "string" && parsed.sub.length > 0 ? parsed.sub : null;
+    const decoded = base64UrlDecode(payload);
+    if (base64UrlEncode(decoded) !== payload) return null;
+    const parsed = JSON.parse(decoded) as Record<string, unknown>;
+    if (
+      !hasOnlySessionClaimKeys(parsed) ||
+      parsed.v !== 1 ||
+      typeof parsed.sub !== "string" ||
+      parsed.sub.length === 0 ||
+      parsed.sub.length > 128 ||
+      !Number.isSafeInteger(parsed.gen) ||
+      Number(parsed.gen) < 1 ||
+      !Number.isSafeInteger(parsed.iat) ||
+      !Number.isSafeInteger(parsed.exp) ||
+      typeof parsed.jti !== "string" ||
+      !/^[A-Za-z0-9_-]{24}$/.test(parsed.jti)
+    ) {
+      return null;
+    }
+
+    const issuedAt = Number(parsed.iat);
+    const expiresAt = Number(parsed.exp);
+    const nowMs = now.getTime();
+    if (
+      !Number.isFinite(nowMs) ||
+      expiresAt - issuedAt !== sessionLifetimeSeconds * 1_000 ||
+      expiresAt <= nowMs ||
+      issuedAt > nowMs + 60_000
+    ) {
+      return null;
+    }
+
+    return {
+      userId: parsed.sub,
+      generation: Number(parsed.gen),
+      issuedAt: new Date(issuedAt),
+      expiresAt: new Date(expiresAt),
+      sessionId: parsed.jti,
+    };
   } catch {
     return null;
   }
@@ -59,12 +118,16 @@ export async function verifySessionRequest(
   request: Request,
   defaultUserId: string,
   secret: string,
+  loadGeneration: SessionGenerationLoader,
+  now: Date = new Date(),
 ): Promise<string | null> {
   const sessionToken = getSessionTokenFromRequest(request);
   if (!sessionToken) return null;
 
-  const sessionUserId = await verifySessionToken(sessionToken, secret);
-  return sessionUserId && safeEqual(sessionUserId, defaultUserId) ? sessionUserId : null;
+  const session = await verifySessionToken(sessionToken, secret, now);
+  if (!session || !safeEqual(session.userId, defaultUserId)) return null;
+  const currentGeneration = await loadGeneration(session.userId);
+  return currentGeneration === session.generation ? session.userId : null;
 }
 
 export function getSessionTokenFromRequest(
@@ -95,6 +158,19 @@ export function getSessionTokenFromRequest(
     sessionToken = value;
   }
   return sessionToken;
+}
+
+export function hasSessionCookie(request: Request): boolean {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) return false;
+  return cookieHeader.split(";").some((rawCookie) => {
+    const cookie = rawCookie.trim();
+    const separatorIndex = cookie.indexOf("=");
+    const name = separatorIndex < 0
+      ? cookie
+      : cookie.slice(0, separatorIndex).trim();
+    return name === sessionCookieName;
+  });
 }
 
 export async function verifyPassword(input: string, expected: string): Promise<boolean> {
@@ -130,4 +206,11 @@ function base64UrlDecode(value: string): string {
 
 async function hashPassword(password: string): Promise<Buffer> {
   return (await scrypt(password, "digitalmate-app-password", 32)) as Buffer;
+}
+
+function hasOnlySessionClaimKeys(
+  value: Record<string, unknown>,
+): boolean {
+  const keys = Object.keys(value).sort();
+  return keys.join(",") === "exp,gen,iat,jti,sub,v";
 }

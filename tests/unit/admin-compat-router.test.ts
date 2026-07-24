@@ -28,6 +28,7 @@ function options(
     appPasswordEnabled: true,
     production: true,
     trustProxyHeaders: false,
+    loadSessionGeneration: async () => 1,
     now,
     ...overrides,
   };
@@ -39,7 +40,7 @@ async function authenticatedFixture(input?: {
   headers?: Record<string, string>;
   security?: Partial<AdminSecurityOptions>;
 }) {
-  const sessionToken = await createSessionToken(userId, appSecret);
+  const sessionToken = await createSessionToken(userId, 1, appSecret, now);
   const security = options(input?.security);
   const token = createCsrfToken({
     userId,
@@ -88,7 +89,7 @@ async function dispatch(
 
 describe("admin compatibility CSRF token", () => {
   it("binds a short-lived signed token to the user and exact session", async () => {
-    const sessionToken = await createSessionToken(userId, appSecret);
+    const sessionToken = await createSessionToken(userId, 1, appSecret, now);
     const secret = deriveCsrfSecret(appSecret);
     const token = createCsrfToken({
       userId,
@@ -116,7 +117,7 @@ describe("admin compatibility CSRF token", () => {
     expect(
       verifyCsrfToken(token, {
         userId,
-        sessionToken: await createSessionToken(userId, appSecret),
+        sessionToken: await createSessionToken(userId, 1, appSecret, now),
         secret,
         now,
       }),
@@ -132,7 +133,7 @@ describe("admin compatibility CSRF token", () => {
   });
 
   it("rejects expiration, excessive future time, tampering and malformed fields", async () => {
-    const sessionToken = await createSessionToken(userId, appSecret);
+    const sessionToken = await createSessionToken(userId, 1, appSecret, now);
     const secret = deriveCsrfSecret(appSecret);
     const token = createCsrfToken({
       userId,
@@ -191,7 +192,7 @@ describe("admin compatibility CSRF token", () => {
   });
 
   it("does not accept a correctly shaped payload with the wrong HMAC", async () => {
-    const sessionToken = await createSessionToken(userId, appSecret);
+    const sessionToken = await createSessionToken(userId, 1, appSecret, now);
     const token = createCsrfToken({
       userId,
       sessionToken,
@@ -267,7 +268,7 @@ describe("admin compatibility security boundary", () => {
           origin: "https://mate.example",
           token: createCsrfToken({
             userId,
-            sessionToken: await createSessionToken(userId, appSecret),
+            sessionToken: await createSessionToken(userId, 1, appSecret, now),
             secret,
             now,
           }),
@@ -509,7 +510,35 @@ describe("admin compatibility security boundary", () => {
       enabled: true,
       authenticated: false,
       csrf_token: "",
+      csrf_expires_at: null,
     });
+  });
+
+  it("returns 401 and no CSRF for a revoked cookie and rejects its old write pair", async () => {
+    const fixture = await authenticatedFixture({
+      security: {
+        loadSessionGeneration: async () => 2,
+      },
+    });
+    const statusResponse = await createAdminAuthStatusResponse(
+      fixture.request("GET"),
+      fixture.security,
+    );
+
+    expect(statusResponse.status).toBe(401);
+    expect(await statusResponse.json()).toEqual({
+      enabled: true,
+      authenticated: false,
+      csrf_token: "",
+      csrf_expires_at: null,
+    });
+
+    const { handler, response } = await dispatch(
+      fixture.request("POST"),
+      fixture.security,
+    );
+    expect(response.status).toBe(401);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("does not log or echo invalid tokens and signing material", async () => {

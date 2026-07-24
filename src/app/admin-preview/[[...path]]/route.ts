@@ -10,10 +10,13 @@ type RouteContext = {
 };
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
-  const defaultUser = await createRepositories().users.ensureDefault();
+  const repositories = createRepositories();
+  const defaultUser = await repositories.users.ensureDefault();
   const handler = createAdminConsolePreviewHandler({
     appSecret: readEnv().appSecret,
     defaultUserId: defaultUser.id,
+    loadSessionGeneration: (userId) =>
+      repositories.sessionStates.getGeneration(userId),
     rootDirectory: path.join(process.cwd(), "public", "_admin-console"),
   });
   return handler(request, context);

@@ -1,11 +1,14 @@
 import Link from "next/link";
+import { sanitizeInternalRedirect } from "@/server/http/internal-redirect";
 
-export default async function LoginPage({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
+export default async function LoginPage({ searchParams }: { searchParams: Promise<{ error?: string; redirect?: string }> }) {
   const params = await searchParams;
+  const redirect = sanitizeInternalRedirect(params.redirect);
 
   return (
     <main className="login-page">
       <form className="login-panel" action="/api/login" method="post">
+        <input name="redirect" type="hidden" value={redirect} />
         <p className="eyebrow">DigitalMate</p>
         <h1>欢迎回来</h1>
         <p className="muted">输入口令后，就能继续和你的数字伙伴聊天。</p>

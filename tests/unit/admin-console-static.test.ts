@@ -24,11 +24,13 @@ import {
 
 const routeMocks = vi.hoisted(() => ({
   ensureDefault: vi.fn(async () => ({ id: "user-1" })),
+  getGeneration: vi.fn(async () => 1),
 }));
 
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
     users: { ensureDefault: routeMocks.ensureDefault },
+    sessionStates: { getGeneration: routeMocks.getGeneration },
   })),
 }));
 
@@ -73,10 +75,11 @@ async function authenticatedRequest(
   pathSegments?: string[],
   search = "",
 ) {
-  const token = await createSessionToken("user-1", secret);
+  const token = await createSessionToken("user-1", 1, secret);
   const handler = createAdminConsolePreviewHandler({
     appSecret: secret,
     defaultUserId: "user-1",
+    loadSessionGeneration: routeMocks.getGeneration,
     rootDirectory: fixtureRoot,
   });
   return handler(
@@ -388,6 +391,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -411,6 +415,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -434,6 +439,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -454,6 +460,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const request = new Request(
@@ -483,6 +490,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -497,6 +505,7 @@ describe("admin Console preview route", () => {
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(
@@ -511,10 +520,11 @@ describe("admin Console preview route", () => {
   });
 
   it("rejects a valid signed session belonging to a different user", async () => {
-    const token = await createSessionToken("not-the-default-user", secret);
+    const token = await createSessionToken("not-the-default-user", 1, secret);
     const handler = createAdminConsolePreviewHandler({
       appSecret: secret,
       defaultUserId: "user-1",
+      loadSessionGeneration: routeMocks.getGeneration,
       rootDirectory: fixtureRoot,
     });
     const response = await handler(

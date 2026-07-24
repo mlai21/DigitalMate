@@ -27,6 +27,7 @@ type StaticTestHooks = {
 type PreviewHandlerOptions = {
   appSecret: string;
   defaultUserId: string;
+  loadSessionGeneration: (userId: string) => Promise<number | null>;
   rootDirectory: string;
 };
 
@@ -90,6 +91,7 @@ export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions)
       request,
       options.defaultUserId,
       options.appSecret,
+      options.loadSessionGeneration,
     );
     if (!userId) return loginRedirect(request);
 

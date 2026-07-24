@@ -27,9 +27,8 @@ describe("docker deployment config", () => {
     const compose = await readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8");
 
     expect(compose.match(/^\s+TRUST_PROXY_HEADERS:/gm)).toHaveLength(1);
-    expect(compose).toContain(
-      "TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}",
-    );
+    expect(compose).toContain('TRUST_PROXY_HEADERS: "true"');
+    expect(compose).not.toContain("${TRUST_PROXY_HEADERS");
   });
 
   it("caps attachment upload request bodies before proxying to the web service", async () => {

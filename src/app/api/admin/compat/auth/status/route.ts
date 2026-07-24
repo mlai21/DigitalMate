@@ -6,12 +6,15 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request): Promise<Response> {
   const env = readEnv();
-  const defaultUser = await createRepositories().users.ensureDefault();
+  const repositories = createRepositories();
+  const defaultUser = await repositories.users.ensureDefault();
   return createAdminAuthStatusResponse(request, {
     defaultUserId: defaultUser.id,
     appSecret: env.appSecret,
     appPasswordEnabled: Boolean(env.appPassword),
     production: process.env.NODE_ENV === "production",
     trustProxyHeaders: env.trustProxyHeaders,
+    loadSessionGeneration: (userId) =>
+      repositories.sessionStates.getGeneration(userId),
   });
 }

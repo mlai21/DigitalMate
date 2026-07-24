@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
     id: "user-1",
     displayName: "Tang",
   })),
+  getGeneration: vi.fn(async () => 1),
   readEnv: vi.fn(() => ({
     appPassword: "password",
     appSecret: "route-test-app-secret-value",
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: () => ({
     users: { ensureDefault: mocks.ensureDefault },
+    sessionStates: { getGeneration: mocks.getGeneration },
   }),
 }));
 
@@ -37,6 +39,7 @@ describe("Console auth status route", () => {
   it("returns the shared authenticated session and an in-memory CSRF token", async () => {
     const sessionToken = await createSessionToken(
       "user-1",
+      1,
       "route-test-app-secret-value",
     );
     const response = await GET(
@@ -57,6 +60,7 @@ describe("Console auth status route", () => {
     expect(body).toMatchObject({
       enabled: true,
       authenticated: true,
+      csrf_expires_at: expect.any(Number),
     });
     expect(body.csrf_token).toEqual(expect.any(String));
     expect(String(body.csrf_token)).not.toContain(

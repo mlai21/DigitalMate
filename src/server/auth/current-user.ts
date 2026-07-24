@@ -16,8 +16,11 @@ export async function getCurrentUser() {
   const token = cookieStore.get(sessionCookieName)?.value;
   if (!token) return null;
 
-  const userId = await verifySessionToken(token, env.appSecret);
-  return userId === defaultUser.id ? defaultUser : null;
+  const session = await verifySessionToken(token, env.appSecret);
+  if (!session || session.userId !== defaultUser.id) return null;
+  const currentGeneration =
+    await repositories.sessionStates.getGeneration(session.userId);
+  return currentGeneration === session.generation ? defaultUser : null;
 }
 
 export async function requireCurrentUser() {

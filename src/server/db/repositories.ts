@@ -519,6 +519,36 @@ export function createRepositories(
         return mapUser(created.rows[0]);
       },
     },
+    sessionStates: {
+      async getGeneration(userId: string): Promise<number | null> {
+        const result = await pool.query<{ generation: string }>(
+          `SELECT generation::text AS generation
+           FROM user_session_states
+           WHERE user_id = $1`,
+          [userId],
+        );
+        const generation = result.rows[0]?.generation;
+        return generation === undefined
+          ? null
+          : parseSessionGeneration(generation);
+      },
+      async rotate(userId: string): Promise<number> {
+        const result = await pool.query<{ generation: string }>(
+          `INSERT INTO user_session_states (user_id, generation)
+           VALUES ($1, 1)
+           ON CONFLICT (user_id) DO UPDATE
+           SET generation = user_session_states.generation + 1,
+               updated_at = now()
+           RETURNING generation::text AS generation`,
+          [userId],
+        );
+        const generation = result.rows[0]?.generation;
+        if (generation === undefined) {
+          throw new Error("session_generation_missing");
+        }
+        return parseSessionGeneration(generation);
+      },
+    },
     conversations: {
       async getOrCreateDefault(scope: AgentScope): Promise<DbConversation> {
         const existing = await pool.query(
@@ -3015,6 +3045,14 @@ async function releaseTurnExecutionLock(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseSessionGeneration(value: string): number {
+  const generation = Number(value);
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("invalid_session_generation");
+  }
+  return generation;
 }
 
 type AbortablePoolClientGuard = {

@@ -1,9 +1,11 @@
 import { createHmac } from "node:crypto";
 import {
   getSessionTokenFromRequest,
+  hasSessionCookie,
   verifySessionToken,
 } from "@/server/auth/session";
 import {
+  csrfTokenLifetimeSeconds,
   createCsrfToken,
   deriveCsrfSecret,
   verifyCsrfToken,
@@ -18,6 +20,7 @@ export type AdminSecurityOptions = {
   appPasswordEnabled: boolean;
   production: boolean;
   trustProxyHeaders: boolean;
+  loadSessionGeneration: (userId: string) => Promise<number | null>;
   now?: Date;
 };
 
@@ -72,6 +75,8 @@ export async function createAdminAuthStatusResponse(
   options: AdminSecurityOptions,
 ): Promise<Response> {
   const session = await resolveAdminSession(request, options);
+  const invalidPresentedSession =
+    session === null && hasSessionCookie(request);
   const body = {
     enabled: options.appPasswordEnabled || options.production,
     authenticated: session !== null,
@@ -83,8 +88,13 @@ export async function createAdminAuthStatusResponse(
           now: options.now,
         })
       : "",
+    csrf_expires_at: session
+      ? Math.floor((options.now ?? new Date()).getTime() / 1_000) +
+        csrfTokenLifetimeSeconds
+      : null,
   };
   return Response.json(body, {
+    status: invalidPresentedSession ? 401 : 200,
     headers: {
       "cache-control": "no-store",
     },
@@ -97,12 +107,16 @@ async function resolveAdminSession(
 ): Promise<ResolvedAdminSession | null> {
   const sessionToken = getSessionTokenFromRequest(request);
   if (sessionToken) {
-    const sessionUserId = await verifySessionToken(
+    const verifiedSession = await verifySessionToken(
       sessionToken,
       options.appSecret,
+      options.now,
     );
-    if (sessionUserId !== options.defaultUserId) return null;
-    return { userId: sessionUserId, sessionToken };
+    if (verifiedSession?.userId !== options.defaultUserId) return null;
+    const currentGeneration =
+      await options.loadSessionGeneration(verifiedSession.userId);
+    if (currentGeneration !== verifiedSession.generation) return null;
+    return { userId: verifiedSession.userId, sessionToken };
   }
 
   if (!options.appPasswordEnabled && !options.production) {

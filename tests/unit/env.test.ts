@@ -11,6 +11,7 @@ describe("readEnv", () => {
     expect(env.proactiveMaxPerDay).toBe(3);
     expect(env.aliyunIqsBaseUrl).toBe("https://cloud-iqs.aliyuncs.com");
     expect(env.trustProxyHeaders).toBe(false);
+    expect(env.appSecret).toBe("digitalmate-local-secret-change-me");
   });
 
   it("requires an explicit boolean to trust sanitized proxy headers", () => {

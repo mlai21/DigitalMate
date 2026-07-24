@@ -4,7 +4,10 @@ import { z } from "zod";
 const envSchema = z.object({
   DATABASE_URL: z.string().default("postgres://digitalmate:digitalmate@localhost:5432/digitalmate"),
   APP_PASSWORD: z.string().optional(),
-  APP_SECRET: z.string().min(16).default("digitalmate-local-secret"),
+  APP_SECRET: z
+    .string()
+    .min(16)
+    .default("digitalmate-local-secret-change-me"),
   TRUST_PROXY_HEADERS: z
     .enum(["true", "false"])
     .default("false")

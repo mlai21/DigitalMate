@@ -9,20 +9,42 @@ import {
 
 describe("session token", () => {
   it("verifies signed tokens and rejects tampering", async () => {
-    const token = await createSessionToken("user-1", "secret");
+    const now = new Date("2026-07-24T00:00:00.000Z");
+    const token = await createSessionToken("user-1", 7, "secret", now);
 
-    expect(await verifySessionToken(token, "secret")).toBe("user-1");
-    expect(await verifySessionToken(`${token}x`, "secret")).toBeNull();
+    expect(await verifySessionToken(token, "secret", now)).toMatchObject({
+      userId: "user-1",
+      generation: 7,
+      expiresAt: new Date("2026-08-23T00:00:00.000Z"),
+    });
+    expect(await verifySessionToken(`${token}x`, "secret", now)).toBeNull();
   });
 
   it("rotates the signed session even when two logins happen in the same millisecond", async () => {
     const now = new Date("2026-07-24T00:00:00.000Z");
-    const first = await createSessionToken("user-1", "secret", now);
-    const second = await createSessionToken("user-1", "secret", now);
+    const first = await createSessionToken("user-1", 1, "secret", now);
+    const second = await createSessionToken("user-1", 2, "secret", now);
 
     expect(first).not.toBe(second);
-    expect(await verifySessionToken(first, "secret")).toBe("user-1");
-    expect(await verifySessionToken(second, "secret")).toBe("user-1");
+    expect(await verifySessionToken(first, "secret", now)).toMatchObject({
+      generation: 1,
+    });
+    expect(await verifySessionToken(second, "secret", now)).toMatchObject({
+      generation: 2,
+    });
+  });
+
+  it("rejects an expired token even when its signature is valid", async () => {
+    const issuedAt = new Date("2026-07-24T00:00:00.000Z");
+    const token = await createSessionToken("user-1", 1, "secret", issuedAt);
+
+    expect(
+      await verifySessionToken(
+        token,
+        "secret",
+        new Date("2026-08-23T00:00:00.001Z"),
+      ),
+    ).toBeNull();
   });
 
   it("only marks session cookies secure for https requests", () => {
@@ -63,7 +85,7 @@ describe("session token", () => {
   });
 
   it("verifies only the signed dm_session cookie from a Request", async () => {
-    const token = await createSessionToken("user-1", "secret");
+    const token = await createSessionToken("user-1", 3, "secret");
     const request = new Request("https://digitalmate.example/admin-preview?dm_session=ignored", {
       headers: {
         authorization: `Bearer ${token}`,
@@ -72,7 +94,14 @@ describe("session token", () => {
       },
     });
 
-    expect(await verifySessionRequest(request, "user-1", "secret")).toBe("user-1");
+    expect(
+      await verifySessionRequest(
+        request,
+        "user-1",
+        "secret",
+        async () => 3,
+      ),
+    ).toBe("user-1");
     expect(getSessionTokenFromRequest(request)).toBe(token);
     expect(
       await verifySessionRequest(
@@ -81,21 +110,33 @@ describe("session token", () => {
         }),
         "user-1",
         "secret",
+        async () => 3,
       ),
     ).toBeNull();
   });
 
   it("rejects a valid signed session belonging to a different user", async () => {
-    const token = await createSessionToken("not-the-default-user", "secret");
+    const token = await createSessionToken(
+      "not-the-default-user",
+      1,
+      "secret",
+    );
     const request = new Request("https://digitalmate.example/admin-preview", {
       headers: { cookie: `dm_session=${token}` },
     });
 
-    expect(await verifySessionRequest(request, "user-1", "secret")).toBeNull();
+    expect(
+      await verifySessionRequest(
+        request,
+        "user-1",
+        "secret",
+        async () => 1,
+      ),
+    ).toBeNull();
   });
 
   it("rejects missing, empty, duplicate, tampered and malformed session cookies", async () => {
-    const token = await createSessionToken("user-1", "secret");
+    const token = await createSessionToken("user-1", 1, "secret");
     const cases = [
       undefined,
       "",
@@ -118,6 +159,7 @@ describe("session token", () => {
           request,
           "user-1",
           "secret",
+          async () => 1,
         ),
       ).toBeNull();
       if (cookie === `dm_session=${token}x`) {

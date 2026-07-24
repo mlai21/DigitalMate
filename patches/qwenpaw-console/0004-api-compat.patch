@@ -1946,3 +1946,908 @@ diff --git a/src/layouts/Sidebar.tsx b/src/layouts/Sidebar.tsx
                    className={`${styles.collapsedNavItem} ${
                      isActive ? styles.collapsedNavItemActive : ""
                    }`}
+diff --git a/src/App.tsx b/src/App.tsx
+index d7b92b6..e119d8b 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -87,10 +87,12 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
+         const result = (await response.json()) as {
+           authenticated?: boolean;
+           csrf_token?: string;
++          csrf_expires_at?: number | null;
+         };
+         if (cancelled) return;
+         setCsrfToken(
+           typeof result.csrf_token === "string" ? result.csrf_token : "",
++          result.csrf_expires_at,
+         );
+         setStatus(result.authenticated === true ? "ok" : "auth-required");
+       } catch {
+diff --git a/src/api/authHeaders.test.ts b/src/api/authHeaders.test.ts
+index 41ed65c..b174dd5 100644
+--- a/src/api/authHeaders.test.ts
++++ b/src/api/authHeaders.test.ts
+@@ -1,9 +1,6 @@
+-import { beforeEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { buildAuthHeaders, buildMutationHeaders } from "./authHeaders";
+-
+-vi.mock("./config", () => ({
+-  getCsrfToken: vi.fn(() => "csrf-value"),
+-}));
++import { setCsrfToken } from "./config";
+
+ describe("auth headers", () => {
+   beforeEach(() => {
+@@ -13,6 +10,15 @@ describe("auth headers", () => {
+       "qwenpaw-agent-storage",
+       JSON.stringify({ state: { selectedAgent: "default" } }),
+     );
++    setCsrfToken(
++      "csrf-value",
++      Math.floor(Date.now() / 1_000) + 1_800,
++    );
++  });
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++    vi.useRealTimers();
+   });
+
+   it("default helper carries the agent id without CSRF", () => {
+@@ -21,8 +27,8 @@ describe("auth headers", () => {
+
+   it.each(["GET", "HEAD", "OPTIONS"])(
+     "does not attach CSRF to %s",
+-    (method) => {
+-      expect(buildMutationHeaders(method)).toEqual({
++    async (method) => {
++      await expect(buildMutationHeaders(method)).resolves.toEqual({
+         "X-Agent-Id": "default",
+       });
+     },
+@@ -30,11 +36,38 @@ describe("auth headers", () => {
+
+   it.each(["POST", "PUT", "PATCH", "DELETE"])(
+     "attaches in-memory CSRF to %s",
+-    (method) => {
+-      expect(buildMutationHeaders(method)).toEqual({
++    async (method) => {
++      await expect(buildMutationHeaders(method)).resolves.toEqual({
+         "X-Agent-Id": "default",
+         "x-csrf-token": "csrf-value",
+       });
+     },
+   );
++
++  it("refreshes an expired token once before returning mutation headers", async () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-07-24T00:00:00.000Z"));
++    setCsrfToken("old-token", 1_753_315_200);
++    vi.advanceTimersByTime(31 * 60 * 1_000);
++    global.fetch = vi.fn().mockResolvedValue(
++      Response.json({
++        authenticated: true,
++        csrf_token: "fresh-token",
++        csrf_expires_at:
++          Math.floor(Date.now() / 1_000) + 1_800,
++      }),
++    );
++
++    await expect(buildMutationHeaders("POST")).resolves.toMatchObject({
++      "x-csrf-token": "fresh-token",
++    });
++    expect(fetch).toHaveBeenCalledTimes(1);
++    expect(fetch).toHaveBeenCalledWith(
++      "/api/admin/compat/auth/status",
++      expect.objectContaining({ credentials: "same-origin" }),
++    );
++    expect(localStorage.length).toBe(0);
++    expect(sessionStorage.getItem("csrf_token")).toBeNull();
++    expect(vi.getTimerCount()).toBe(0);
++  });
+ });
+diff --git a/src/api/authHeaders.ts b/src/api/authHeaders.ts
+index 8683148..f8832a4 100644
+--- a/src/api/authHeaders.ts
++++ b/src/api/authHeaders.ts
+@@ -1,6 +1,12 @@
+-import { getCsrfToken } from "./config";
++import {
++  clearAuthToken,
++  getCsrfToken,
++  hasFreshCsrfToken,
++  setCsrfToken,
++} from "./config";
+
+ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
++let csrfRefresh: Promise<void> | null = null;
+
+ /** X-Agent-Id for all API requests. Caller sets Content-Type when needed. */
+ export function buildAuthHeaders(): Record<string, string> {
+@@ -24,14 +30,73 @@ export function buildAuthHeaders(): Record<string, string> {
+ }
+
+ /** X-Agent-Id plus in-memory CSRF for state-changing requests only. */
+-export function buildMutationHeaders(method: string): Record<string, string> {
++export async function buildMutationHeaders(
++  method: string,
++): Promise<Record<string, string>> {
+   const headers = buildAuthHeaders();
+   if (!MUTATION_METHODS.has(method.toUpperCase())) {
+     return headers;
+   }
++  await ensureFreshCsrfToken();
+   const csrfToken = getCsrfToken();
+   if (csrfToken) {
+     headers["x-csrf-token"] = csrfToken;
+   }
+   return headers;
+ }
++
++async function ensureFreshCsrfToken(): Promise<void> {
++  if (hasFreshCsrfToken()) return;
++  if (!csrfRefresh) {
++    csrfRefresh = refreshCsrfToken().finally(() => {
++      csrfRefresh = null;
++    });
++  }
++  await csrfRefresh;
++}
++
++async function refreshCsrfToken(): Promise<void> {
++  const response = await fetch("/api/admin/compat/auth/status", {
++    credentials: "same-origin",
++    headers: { Accept: "application/json" },
++  });
++  if (response.status === 401) {
++    clearAuthToken();
++    redirectToDigitalMateLogin();
++    throw new Error("Not authenticated");
++  }
++  if (!response.ok) {
++    throw new Error("Failed to refresh CSRF token");
++  }
++  const result = (await response.json()) as {
++    authenticated?: unknown;
++    csrf_token?: unknown;
++    csrf_expires_at?: unknown;
++  };
++  if (
++    result.authenticated !== true ||
++    typeof result.csrf_token !== "string" ||
++    !Number.isSafeInteger(result.csrf_expires_at)
++  ) {
++    clearAuthToken();
++    redirectToDigitalMateLogin();
++    throw new Error("Not authenticated");
++  }
++  setCsrfToken(result.csrf_token, Number(result.csrf_expires_at));
++  if (!hasFreshCsrfToken()) {
++    clearAuthToken();
++    throw new Error("Invalid CSRF token expiry");
++  }
++}
++
++function redirectToDigitalMateLogin(): void {
++  if (window.location.pathname === "/login") return;
++  const returnTo = `${window.location.pathname}${window.location.search}`;
++  const safeReturnTo =
++    returnTo.startsWith("/") && !returnTo.startsWith("//")
++      ? returnTo
++      : "/admin";
++  window.location.assign(
++    `/login?redirect=${encodeURIComponent(safeReturnTo)}`,
++  );
++}
+diff --git a/src/api/config.test.ts b/src/api/config.test.ts
+index 0697b69..4f857f1 100644
+--- a/src/api/config.test.ts
++++ b/src/api/config.test.ts
+@@ -4,6 +4,8 @@ import {
+   getApiToken,
+   getApiUrl,
+   getCsrfToken,
++  getCsrfTokenExpiresAt,
++  hasFreshCsrfToken,
+   setAuthToken,
+   setCsrfToken,
+ } from "./config";
+@@ -43,8 +45,12 @@ describe("same-origin auth compatibility", () => {
+   });
+
+   it("keeps the CSRF token in module memory", () => {
+-    setCsrfToken("csrf-value");
++    setCsrfToken("csrf-value", 1_800_000_000);
+     expect(getCsrfToken()).toBe("csrf-value");
++    expect(getCsrfTokenExpiresAt()).toBe(1_800_000_000_000);
++    expect(
++      hasFreshCsrfToken(1_799_999_000_000, 30_000),
++    ).toBe(true);
+     expect(localStorage.length).toBe(0);
+   });
+ });
+diff --git a/src/api/config.ts b/src/api/config.ts
+index d31e3b0..ffd5b24 100644
+--- a/src/api/config.ts
++++ b/src/api/config.ts
+@@ -1,5 +1,6 @@
+ const API_BASE_URL = "/api/admin/compat";
+ let csrfToken = "";
++let csrfTokenExpiresAt = 0;
+
+ /**
+  * Get the full API URL with /api prefix
+@@ -24,13 +25,41 @@ export function setAuthToken(_token: string): void {
+ }
+
+ export function clearAuthToken(): void {
+-  // No-op: Console never owns the host login session.
++  csrfToken = "";
++  csrfTokenExpiresAt = 0;
+ }
+
+-export function setCsrfToken(token: string): void {
++export function setCsrfToken(
++  token: string,
++  expiresAtSeconds?: number | null,
++): void {
++  if (
++    !token ||
++    !Number.isSafeInteger(expiresAtSeconds) ||
++    Number(expiresAtSeconds) <= 0
++  ) {
++    csrfToken = "";
++    csrfTokenExpiresAt = 0;
++    return;
++  }
+   csrfToken = token;
++  csrfTokenExpiresAt = Number(expiresAtSeconds) * 1_000;
+ }
+
+ export function getCsrfToken(): string {
+   return csrfToken;
+ }
++
++export function getCsrfTokenExpiresAt(): number {
++  return csrfTokenExpiresAt;
++}
++
++export function hasFreshCsrfToken(
++  now = Date.now(),
++  minimumValidityMs = 30_000,
++): boolean {
++  return (
++    csrfToken.length > 0 &&
++    csrfTokenExpiresAt > now + minimumValidityMs
++  );
++}
+diff --git a/src/api/csrfRefresh.test.ts b/src/api/csrfRefresh.test.ts
+new file mode 100644
+index 0000000..f44a330
+--- /dev/null
++++ b/src/api/csrfRefresh.test.ts
+@@ -0,0 +1,88 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { request } from "./request";
++import { setCsrfToken } from "./config";
++
++describe("CSRF refresh before a mutation", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-07-24T00:00:00.000Z"));
++    Object.defineProperty(window, "location", {
++      value: {
++        pathname: "/admin/settings/models",
++        search: "",
++        assign: vi.fn(),
++      },
++      writable: true,
++    });
++  });
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++    vi.useRealTimers();
++  });
++
++  it("refreshes after 31 minutes and sends the mutation exactly once", async () => {
++    setCsrfToken(
++      "initial-token",
++      Math.floor(Date.now() / 1_000) + 1_800,
++    );
++    vi.advanceTimersByTime(31 * 60 * 1_000);
++    global.fetch = vi.fn(async (url) => {
++      if (url === "/api/admin/compat/auth/status") {
++        return Response.json({
++          authenticated: true,
++          csrf_token: "refreshed-token",
++          csrf_expires_at:
++            Math.floor(Date.now() / 1_000) + 1_800,
++        });
++      }
++      return Response.json({ ok: true });
++    });
++
++    await request("/models", { method: "POST", body: "{}" });
++
++    expect(fetch).toHaveBeenCalledTimes(2);
++    expect(
++      vi.mocked(fetch).mock.calls.filter(
++        ([url]) => url === "/api/admin/compat/models",
++      ),
++    ).toHaveLength(1);
++    const mutationOptions = vi.mocked(fetch).mock.calls[1]?.[1];
++    expect(new Headers(mutationOptions?.headers).get("x-csrf-token"))
++      .toBe("refreshed-token");
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  it("does not refresh or replay a general 403 response", async () => {
++    setCsrfToken(
++      "fresh-token",
++      Math.floor(Date.now() / 1_000) + 1_800,
++    );
++    global.fetch = vi.fn().mockResolvedValue(
++      Response.json(
++        { error: { code: "forbidden" } },
++        { status: 403 },
++      ),
++    );
++
++    await expect(
++      request("/models", { method: "POST", body: "{}" }),
++    ).rejects.toThrow();
++    expect(fetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("routes a refresh 401 to safe login without sending the mutation", async () => {
++    setCsrfToken("expired-token", 1);
++    global.fetch = vi.fn().mockResolvedValue(
++      Response.json({}, { status: 401 }),
++    );
++
++    await expect(
++      request("/models", { method: "POST", body: "{}" }),
++    ).rejects.toThrow("Not authenticated");
++    expect(fetch).toHaveBeenCalledTimes(1);
++    expect(window.location.assign).toHaveBeenCalledWith(
++      "/login?redirect=%2Fadmin%2Fsettings%2Fmodels",
++    );
++  });
++});
+diff --git a/src/api/logout.test.ts b/src/api/logout.test.ts
+new file mode 100644
+index 0000000..df2c0d9
+--- /dev/null
++++ b/src/api/logout.test.ts
+@@ -0,0 +1,43 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { logoutAndRedirect } from "./logout";
++import { authApi } from "./modules/auth";
++import { clearAuthToken } from "./config";
++
++vi.mock("./modules/auth", () => ({
++  authApi: { logout: vi.fn() },
++}));
++vi.mock("./config", () => ({
++  clearAuthToken: vi.fn(),
++}));
++
++describe("DigitalMate logout handoff", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    Object.defineProperty(window, "location", {
++      value: { assign: vi.fn() },
++      writable: true,
++    });
++  });
++
++  it("clears memory and redirects only after server revocation succeeds", async () => {
++    vi.mocked(authApi.logout).mockResolvedValue(undefined);
++
++    await logoutAndRedirect();
++
++    expect(authApi.logout).toHaveBeenCalledOnce();
++    expect(vi.mocked(authApi.logout).mock.invocationCallOrder[0])
++      .toBeLessThan(vi.mocked(clearAuthToken).mock.invocationCallOrder[0]);
++    expect(clearAuthToken).toHaveBeenCalledOnce();
++    expect(window.location.assign).toHaveBeenCalledWith("/login");
++  });
++
++  it("does not clear or redirect when server revocation fails", async () => {
++    vi.mocked(authApi.logout).mockRejectedValue(
++      new Error("Logout failed"),
++    );
++
++    await expect(logoutAndRedirect()).rejects.toThrow("Logout failed");
++    expect(clearAuthToken).not.toHaveBeenCalled();
++    expect(window.location.assign).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/api/logout.ts b/src/api/logout.ts
+new file mode 100644
+index 0000000..9cbb6d4
+--- /dev/null
++++ b/src/api/logout.ts
+@@ -0,0 +1,8 @@
++import { clearAuthToken } from "./config";
++import { authApi } from "./modules/auth";
++
++export async function logoutAndRedirect(): Promise<void> {
++  await authApi.logout();
++  clearAuthToken();
++  window.location.assign("/login");
++}
+diff --git a/src/api/modules/agent.ts b/src/api/modules/agent.ts
+index 7a50d2b..1de9f75 100644
+--- a/src/api/modules/agent.ts
++++ b/src/api/modules/agent.ts
+@@ -109,7 +109,7 @@ export const agentApi = {
+     formData.append("file", file);
+     const response = await fetch(getApiUrl("/workspace/transcribe"), {
+       method: "POST",
+-      headers: buildMutationHeaders("POST"),
++      headers: await buildMutationHeaders("POST"),
+       body: formData,
+     });
+     if (!response.ok) {
+diff --git a/src/api/modules/auth.test.ts b/src/api/modules/auth.test.ts
+index 5d90746..744c011 100644
+--- a/src/api/modules/auth.test.ts
++++ b/src/api/modules/auth.test.ts
+@@ -6,7 +6,7 @@ vi.mock("../config", () => ({
+   getApiUrl: (path: string) => `/api${path}`,
+ }));
+ vi.mock("../authHeaders", () => ({
+-  buildMutationHeaders: (method: string) =>
++  buildMutationHeaders: async (method: string) =>
+     method === "POST" ? { "x-csrf-token": "csrf-value" } : {},
+ }));
+
+@@ -148,3 +148,29 @@ describe("authApi.updateProfile", () => {
+     );
+   });
+ });
++
++describe("authApi.logout", () => {
++  afterEach(() => vi.clearAllMocks());
++
++  it("posts to the DigitalMate host logout endpoint with CSRF", async () => {
++    mockFetch(204, undefined);
++
++    await authApi.logout();
++
++    expect(fetch).toHaveBeenCalledWith(
++      "/api/logout",
++      expect.objectContaining({
++        method: "POST",
++        credentials: "same-origin",
++        headers: expect.objectContaining({
++          "x-csrf-token": "csrf-value",
++        }),
++      }),
++    );
++  });
++
++  it("rejects failure so callers do not pretend logout succeeded", async () => {
++    mockFetch(500, {});
++    await expect(authApi.logout()).rejects.toThrow("Logout failed");
++  });
++});
+diff --git a/src/api/modules/auth.ts b/src/api/modules/auth.ts
+index 2fa9149..95b8619 100644
+--- a/src/api/modules/auth.ts
++++ b/src/api/modules/auth.ts
+@@ -17,7 +17,7 @@ export const authApi = {
+     const res = await fetch(getApiUrl("/auth/login"), {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({ username, password }),
+@@ -36,7 +36,7 @@ export const authApi = {
+     const res = await fetch(getApiUrl("/auth/register"), {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({ username, password }),
+@@ -62,7 +62,7 @@ export const authApi = {
+     const res = await fetch(getApiUrl("/auth/update-profile"), {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({
+@@ -77,4 +77,15 @@ export const authApi = {
+     }
+     return res.json();
+   },
++
++  logout: async (): Promise<void> => {
++    const res = await fetch("/api/logout", {
++      method: "POST",
++      credentials: "same-origin",
++      headers: await buildMutationHeaders("POST"),
++    });
++    if (!res.ok) {
++      throw new Error("Logout failed");
++    }
++  },
+ };
+diff --git a/src/api/modules/backup.ts b/src/api/modules/backup.ts
+index 1b7bdb8..d8a7307 100644
+--- a/src/api/modules/backup.ts
++++ b/src/api/modules/backup.ts
+@@ -31,7 +31,7 @@ export const backupApi = {
+     const res = await fetch(url, {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify(data),
+@@ -106,7 +106,7 @@ export const backupApi = {
+     const url = getApiUrl("/backups/import");
+     const res = await fetch(url, {
+       method: "POST",
+-      headers: buildMutationHeaders("POST"),
++      headers: await buildMutationHeaders("POST"),
+       body: formData,
+     });
+     if (res.status === 409) {
+@@ -130,7 +130,7 @@ export const backupApi = {
+     const url = getApiUrl("/backups/import");
+     const res = await fetch(url, {
+       method: "POST",
+-      headers: buildMutationHeaders("POST"),
++      headers: await buildMutationHeaders("POST"),
+       body: formData,
+     });
+     if (!res.ok) {
+diff --git a/src/api/modules/chat.ts b/src/api/modules/chat.ts
+index 982140e..4324581 100644
+--- a/src/api/modules/chat.ts
++++ b/src/api/modules/chat.ts
+@@ -26,7 +26,7 @@ export const chatApi = {
+     formData.append("file", file);
+     const response = await fetch(getApiUrl("/console/upload"), {
+       method: "POST",
+-      headers: buildMutationHeaders("POST"),
++      headers: await buildMutationHeaders("POST"),
+       body: formData,
+     });
+     if (!response.ok) {
+diff --git a/src/api/modules/codingProject.ts b/src/api/modules/codingProject.ts
+index 1b91563..ab1aa11 100644
+--- a/src/api/modules/codingProject.ts
++++ b/src/api/modules/codingProject.ts
+@@ -82,7 +82,7 @@ export const codingProjectApi = {
+       {
+         method: "POST",
+         // No Content-Type header — browser sets multipart/form-data with boundary
+-        headers: buildMutationHeaders("POST"),
++        headers: await buildMutationHeaders("POST"),
+         body: formData,
+       },
+     );
+@@ -102,11 +102,11 @@ export const codingProjectApi = {
+     ),
+
+   /** Low-level: POST to clone endpoint and return a ReadableStream of SSE. */
+-  cloneStream: (url: string, name?: string): Promise<Response> =>
++  cloneStream: async (url: string, name?: string): Promise<Response> =>
+     fetch(getApiUrl("/workspace/coding-project/clone"), {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({ url, name: name || undefined }),
+diff --git a/src/api/modules/plugin.ts b/src/api/modules/plugin.ts
+index 0934167..46c0263 100644
+--- a/src/api/modules/plugin.ts
++++ b/src/api/modules/plugin.ts
+@@ -112,7 +112,7 @@ export async function installPlugin(
+   const response = await fetch(getApiUrl("/plugins/install"), {
+     method: "POST",
+     headers: {
+-      ...buildMutationHeaders("POST"),
++      ...await buildMutationHeaders("POST"),
+       "Content-Type": "application/json",
+     },
+     body: JSON.stringify({ source, force: options?.force ?? false }),
+@@ -135,7 +135,7 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
+
+   const response = await fetch(getApiUrl("/plugins/upload"), {
+     method: "POST",
+-    headers: buildMutationHeaders("POST"),
++    headers: await buildMutationHeaders("POST"),
+     body: form,
+   });
+
+@@ -153,7 +153,7 @@ export async function uploadPlugin(file: File): Promise<InstallPluginResult> {
+ export async function uninstallPlugin(pluginId: string): Promise<void> {
+   const response = await fetch(getApiUrl(`/plugins/${pluginId}`), {
+     method: "DELETE",
+-    headers: buildMutationHeaders("DELETE"),
++    headers: await buildMutationHeaders("DELETE"),
+   });
+
+   if (!response.ok) {
+diff --git a/src/api/modules/skill.ts b/src/api/modules/skill.ts
+index 285297d..16cd3e3 100644
+--- a/src/api/modules/skill.ts
++++ b/src/api/modules/skill.ts
+@@ -85,7 +85,7 @@ async function _uploadZip(
+   const qs = params.toString();
+   const url = getApiUrl(`${endpoint}${qs ? `?${qs}` : ""}`);
+
+-  const headers = buildMutationHeaders("POST");
++  const headers = await buildMutationHeaders("POST");
+
+   const response = await fetch(url, {
+     method: "POST",
+@@ -521,7 +521,7 @@ export const skillApi = {
+     const response = await fetch(getApiUrl("/skills/ai/optimize/stream"), {
+       method: "POST",
+       headers: {
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+         "Content-Type": "application/json",
+       },
+       body: JSON.stringify({ content, language }),
+diff --git a/src/api/modules/workspace.ts b/src/api/modules/workspace.ts
+index 4d6bbc7..661a6c0 100644
+--- a/src/api/modules/workspace.ts
++++ b/src/api/modules/workspace.ts
+@@ -82,7 +82,7 @@ export const workspaceApi = {
+
+     const response = await fetch(getApiUrl("/workspace/upload"), {
+       method: "POST",
+-      headers: buildMutationHeaders("POST"),
++      headers: await buildMutationHeaders("POST"),
+       body: formData,
+     });
+
+diff --git a/src/api/request.test.ts b/src/api/request.test.ts
+index 066d06c..9c9e645 100644
+--- a/src/api/request.test.ts
++++ b/src/api/request.test.ts
+@@ -8,11 +8,15 @@ vi.mock("./config", () => ({
+ }));
+
+ vi.mock("./authHeaders", () => ({
+-  buildMutationHeaders: vi.fn(() => ({})),
++  buildAuthHeaders: vi.fn(() => ({})),
++  buildMutationHeaders: vi.fn(async () => ({})),
+ }));
+
+ import { clearAuthToken } from "./config";
+-import { buildMutationHeaders } from "./authHeaders";
++import {
++  buildAuthHeaders,
++  buildMutationHeaders,
++} from "./authHeaders";
+
+ // Helper: create a mock Response
+ function mockFetch(
+@@ -41,11 +45,12 @@ function mockFetch(
+ describe("request", () => {
+   beforeEach(() => {
+     vi.mocked(buildMutationHeaders).mockImplementation(
+-      (method): Record<string, string> =>
++      async (method): Promise<Record<string, string>> =>
+         ["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase())
+           ? { "x-csrf-token": "csrf-value" }
+           : {},
+     );
++    vi.mocked(buildAuthHeaders).mockReturnValue({});
+     Object.defineProperty(window, "location", {
+       value: {
+         pathname: "/admin/settings/models",
+@@ -159,7 +164,7 @@ describe("request", () => {
+   });
+
+   it("passes through the selected agent header", async () => {
+-    vi.mocked(buildMutationHeaders).mockReturnValue({
++    vi.mocked(buildAuthHeaders).mockReturnValue({
+       "X-Agent-Id": "default",
+     });
+     mockFetch(200, {});
+diff --git a/src/api/request.ts b/src/api/request.ts
+index 499bb09..354ccab 100644
+--- a/src/api/request.ts
++++ b/src/api/request.ts
+@@ -1,5 +1,8 @@
+ import { getApiUrl, clearAuthToken } from "./config";
+-import { buildMutationHeaders } from "./authHeaders";
++import {
++  buildAuthHeaders,
++  buildMutationHeaders,
++} from "./authHeaders";
+
+ function getErrorMessageFromBody(
+   text: string,
+@@ -36,7 +39,10 @@ function getErrorMessageFromBody(
+   return text;
+ }
+
+-function buildHeaders(method?: string, extra?: HeadersInit): Headers {
++function buildHeaders(
++  method?: string,
++  extra?: HeadersInit,
++): Headers {
+   // Normalize extra to a Headers instance for consistent handling
+   const headers = extra instanceof Headers ? extra : new Headers(extra);
+
+@@ -48,12 +54,6 @@ function buildHeaders(method?: string, extra?: HeadersInit): Headers {
+     }
+   }
+
+-  for (const [key, value] of Object.entries(buildMutationHeaders(method || "GET"))) {
+-    if (!headers.has(key)) {
+-      headers.set(key, value);
+-    }
+-  }
+-
+   return headers;
+ }
+
+@@ -89,6 +89,20 @@ export async function request<T = unknown>(
+   if (callerSignal?.aborted) {
+     throw new DOMException("The operation was aborted", "AbortError");
+   }
++  const normalizedMethod = method.toUpperCase();
++  const authHeaders = ["POST", "PUT", "PATCH", "DELETE"].includes(
++    normalizedMethod,
++  )
++    ? await buildMutationHeaders(normalizedMethod)
++    : buildAuthHeaders();
++  for (const [key, value] of Object.entries(authHeaders)) {
++    if (!headers.has(key)) {
++      headers.set(key, value);
++    }
++  }
++  if (callerSignal?.aborted) {
++    throw new DOMException("The operation was aborted", "AbortError");
++  }
+
+   let lastError: Error | null = null;
+
+diff --git a/src/components/CodingModeToggle/index.tsx b/src/components/CodingModeToggle/index.tsx
+index fa8127e..921d2f7 100644
+--- a/src/components/CodingModeToggle/index.tsx
++++ b/src/components/CodingModeToggle/index.tsx
+@@ -41,7 +41,7 @@ export default function CodingModeToggle() {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+-          ...buildMutationHeaders("POST"),
++          ...await buildMutationHeaders("POST"),
+           "X-Agent-Id": selectedAgent,
+         },
+         body: JSON.stringify({ enabled: true }),
+@@ -72,7 +72,7 @@ export default function CodingModeToggle() {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+-          ...buildMutationHeaders("POST"),
++          ...await buildMutationHeaders("POST"),
+           "X-Agent-Id": selectedAgent,
+         },
+         body: JSON.stringify({ enabled: false }),
+diff --git a/src/layouts/Sidebar.tsx b/src/layouts/Sidebar.tsx
+index 24e9b4c..c28a5eb 100644
+--- a/src/layouts/Sidebar.tsx
++++ b/src/layouts/Sidebar.tsx
+@@ -25,7 +25,7 @@ import {
+ } from "@agentscope-ai/icons";
+ import SidebarSessionList from "./SidebarSessionList";
+ import SidebarSettingsPanel from "./SidebarSettingsPanel";
+-import { clearAuthToken } from "../api/config";
++import { logoutAndRedirect } from "../api/logout";
+ import { authApi } from "../api/modules/auth";
+ import api from "../api";
+ import {
+@@ -128,6 +128,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+   const [authEnabled, setAuthEnabled] = useState(false);
+   const [accountModalOpen, setAccountModalOpen] = useState(false);
+   const [accountLoading, setAccountLoading] = useState(false);
++  const [logoutLoading, setLogoutLoading] = useState(false);
+   const [accountForm] = Form.useForm();
+   // Start collapsed on mobile so the first paint does not overlay/obscure
+   // the main content on narrow viewports.
+@@ -401,8 +402,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+       message.success(t("account.updateSuccess"));
+       setAccountModalOpen(false);
+       accountForm.resetFields();
+-      clearAuthToken();
+-      window.location.href = "/login";
++      await logoutAndRedirect();
+     } catch (err: unknown) {
+       const raw = err instanceof Error ? err.message : "";
+       let msg = t("account.updateFailed");
+@@ -421,6 +421,16 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+     }
+   };
+
++  const handleLogout = useCallback(async () => {
++    setLogoutLoading(true);
++    try {
++      await logoutAndRedirect();
++    } catch {
++      message.error(t("common.operationFailed"));
++      setLogoutLoading(false);
++    }
++  }, [message, t]);
++
+   // ── Render ────────────────────────────────────────────────────────────────
+
+   const siderWidth = collapsed ? (isMobile ? 56 : 72) : 240;
+@@ -605,10 +615,8 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
+           <Button
+             type="text"
+             icon={<SparkExitFullscreenLine size={16} />}
+-            onClick={() => {
+-              clearAuthToken();
+-              window.location.href = "/login";
+-            }}
++            onClick={() => void handleLogout()}
++            loading={logoutLoading}
+             block
+             className={`${styles.authBtn} ${
+               collapsed ? styles.authBtnCollapsed : ""
+diff --git a/src/pages/Chat/index.tsx b/src/pages/Chat/index.tsx
+index 6f83b89..4c7cdee 100644
+--- a/src/pages/Chat/index.tsx
++++ b/src/pages/Chat/index.tsx
+@@ -317,7 +317,7 @@ async function startBackgroundQueue(
+       // and the foreground SDK's reconnect will pick it up.
+       let fetchStarted = false;
+       try {
+-        const authHeaders = buildMutationHeaders("POST");
++        const authHeaders = await buildMutationHeaders("POST");
+         // Use the agent ID captured at enqueue time to prevent cross-agent
+         // delivery when the user switches agents after queueing.
+         if (item.agentId) {
+@@ -2235,7 +2235,7 @@ export default function ChatPage() {
+     }): Promise<Response> => {
+       const headers: Record<string, string> = {
+         "Content-Type": "application/json",
+-        ...buildMutationHeaders("POST"),
++        ...await buildMutationHeaders("POST"),
+       };
+
+       try {
+@@ -2939,7 +2939,7 @@ export default function ChatPage() {
+         async reconnect(data: { session_id: string; signal?: AbortSignal }) {
+           const headers: Record<string, string> = {
+             "Content-Type": "application/json",
+-            ...buildMutationHeaders("POST"),
++            ...await buildMutationHeaders("POST"),
+           };
+
+           const reconnectIdentity = sessionApi.getSessionIdentity();
+diff --git a/src/plugins/hostSdk/fetch.ts b/src/plugins/hostSdk/fetch.ts
+index 41648e5..e3b3bc9 100644
+--- a/src/plugins/hostSdk/fetch.ts
++++ b/src/plugins/hostSdk/fetch.ts
+@@ -13,7 +13,7 @@ export async function hostFetch(
+   init?: RequestInit,
+ ): Promise<Response> {
+   const headers: Record<string, string> = {
+-    ...buildMutationHeaders(init?.method ?? "GET"),
++    ...await buildMutationHeaders(init?.method ?? "GET"),
+     ...((init?.headers as Record<string, string>) ?? {}),
+   };
+   return fetch(getApiUrl(path), { ...init, headers });
