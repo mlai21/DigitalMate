@@ -13,6 +13,7 @@ import {
 } from "@/server/admin/compat/types";
 import { readTrustedOriginalRequestPath } from "@/server/admin/compat/original-uri";
 import type { AgentScope } from "@/server/agents/types";
+import { isStableCapabilityCode } from "@/server/capabilities";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
 const METHODS = [
@@ -29,14 +30,6 @@ const SAFE_HANDLER_RESPONSE_HEADERS = new Set([
   "content-language",
   "content-type",
 ]);
-const SENSITIVE_DETAIL_VALUES = [
-  /(?:token|secret|password|credential|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+/iu,
-  /(?:authorization\s*:\s*)?(?:bearer|basic)\s+\S+/iu,
-  /(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/\S+/iu,
-  /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b/u,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
-] as const;
-
 type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
 
@@ -577,9 +570,8 @@ function sanitizeDetails(
   const details = value as Record<string, unknown>;
   const sanitized: Record<string, unknown> = {};
   if (errorCode === "capability_disabled") {
-    const capability = sanitizeCapability(details.capability);
-    if (capability !== undefined) {
-      sanitized.capability = capability;
+    if (isStableCapabilityCode(details.capability)) {
+      sanitized.capability = details.capability;
     }
   }
   if (
@@ -598,17 +590,6 @@ function sanitizeDetails(
   return Object.keys(sanitized).length > 0
     ? sanitized
     : undefined;
-}
-
-function sanitizeCapability(value: unknown): string | undefined {
-  if (
-    typeof value !== "string" ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value) ||
-    SENSITIVE_DETAIL_VALUES.some((pattern) => pattern.test(value))
-  ) {
-    return undefined;
-  }
-  return value;
 }
 
 function errorResponse(

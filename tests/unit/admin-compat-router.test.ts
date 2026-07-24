@@ -1095,14 +1095,19 @@ describe("admin compatibility exact router", () => {
       },
     });
 
-    const secretValues = [
+    const disallowedCapabilityValues = [
       "token=top-secret-value",
       "postgres://admin:password@db/private",
       "Authorization: Bearer abc.def.ghi",
       "Bearer abcdefghijklmnop",
       "sk-proj-1234567890abcdef",
+      "sk_live_1234567890abcdef",
+      "AIzaSyA1234567890abcdefghijklmnop",
+      "innocuous_unknown_capability",
     ];
-    for (const [index, secret] of secretValues.entries()) {
+    for (
+      const [index, secret] of disallowedCapabilityValues.entries()
+    ) {
       const path = `/secret-details-${index}`;
       router.get(path, async () => {
         throw new AdminCompatError(
@@ -1128,6 +1133,42 @@ describe("admin compatibility exact router", () => {
       );
       expect(serialized).not.toContain(secret);
     }
+  });
+
+  it.each([
+    "p2_sandbox",
+    "multi_agent",
+    "multi_agent_create",
+    "multi_agent_clone",
+    "multi_agent_import",
+    "multi_agent_delete",
+  ])("exposes the approved stable capability code %s", async (capability) => {
+    const router = new AdminCompatRouter();
+    router.get("/disabled", async () => {
+      throw new AdminCompatError(
+        501,
+        "capability_disabled",
+        "capability_disabled",
+        { capability },
+      );
+    });
+    const fixture = await authenticatedRouterRequest(
+      "GET",
+      "/disabled",
+    );
+    const response = await router.dispatch(
+      fixture.request,
+      fixture.runtime,
+    );
+
+    expect(response.status).toBe(501);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "capability_disabled",
+        message: "capability_disabled",
+        details: { capability },
+      },
+    });
   });
 
   it("removes handler-controlled sensitive headers from successful responses", async () => {

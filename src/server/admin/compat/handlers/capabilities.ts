@@ -2,9 +2,10 @@ import {
   AdminCompatError,
   type AdminCompatHandler,
 } from "@/server/admin/compat/types";
+import type { StableCapabilityCode } from "@/server/capabilities";
 
 export function createCapabilityDisabledHandler(
-  capability: string,
+  capability: StableCapabilityCode,
 ): AdminCompatHandler {
   return async () => {
     throw new AdminCompatError(

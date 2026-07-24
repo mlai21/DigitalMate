@@ -25,6 +25,7 @@ import {
 } from "@/server/admin/compat/router";
 import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
+import { STABLE_CAPABILITY_CODES } from "@/server/capabilities";
 import { readEnv } from "@/server/config/env";
 import { createRepositories } from "@/server/db/repositories";
 
@@ -72,11 +73,15 @@ export function createCoreAdminCompatRouter(
 
   router.post(
     "/capabilities/p2-sandbox",
-    createCapabilityDisabledHandler("p2_sandbox"),
+    createCapabilityDisabledHandler(
+      STABLE_CAPABILITY_CODES.p2Sandbox,
+    ),
   );
   router.post(
     "/capabilities/multi-agent",
-    createCapabilityDisabledHandler("multi_agent"),
+    createCapabilityDisabledHandler(
+      STABLE_CAPABILITY_CODES.multiAgent,
+    ),
   );
   return router;
 }
