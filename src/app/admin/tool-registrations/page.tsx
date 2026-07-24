@@ -1,6 +1,6 @@
 import { ToolRegistrationStatusActions } from "@/components/admin/status-actions";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,8 @@ export default async function ToolRegistrationsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后管理工具注册。</section>;
 
-  const tools = await createRepositories().toolRegistrations.list(user.id);
+  const tools = await withFreshUserDataLease(user.id, (repositories) =>
+    repositories.toolRegistrations.list(user.id));
 
   return (
     <section className="admin-list">

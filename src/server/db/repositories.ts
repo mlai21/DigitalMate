@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import {
   formatPgVector,
   lexicalRelevanceScore,
@@ -18,7 +18,7 @@ import type { ToolRegistrationDraft } from "@/server/tasks/tools";
 import { defaultSettings } from "@/server/settings/defaults";
 import { DEFAULT_GOAL_BUDGET_USED, type GoalBudgetUsed, type GoalContract } from "@/server/goals/contract";
 import type { GoalStatus } from "@/server/goals/state-machine";
-import { getPool, getTurnLockPool } from "@/server/db/client";
+import { getPool, getTurnLockPool, getUserDataLockPool } from "@/server/db/client";
 import {
   ATTACHMENT_LIMITS,
   type AttachmentKind,
@@ -294,57 +294,117 @@ export type DbProactiveTask = {
   metadata: Record<string, unknown>;
 };
 
-export function createRepositories(providedPool?: Pool, providedTurnLockPool?: Pool) {
+export type UserDataRequestFence = Readonly<{
+  userId: string;
+  epoch: string;
+}>;
+
+export type UserDataLease = Readonly<{
+  userId: string;
+  epoch: string;
+  mode: "shared" | "exclusive";
+  release(): Promise<void>;
+}>;
+
+export function createRepositories(
+  providedPool?: Pool,
+  providedTurnLockPool?: Pool,
+  providedUserDataLockPool?: Pool,
+) {
   const pool = providedPool ?? getPool();
   const turnLockPool = providedTurnLockPool ?? (providedPool ? pool : getTurnLockPool());
+  const userDataLockPool = providedUserDataLockPool
+    ?? (providedPool ? turnLockPool : getUserDataLockPool());
   const agents = createAgentRepository(pool);
 
-  async function acquireUserDataMutationLock(userId: string): Promise<() => Promise<void>> {
-    const lockKey = `user-data-mutation:${userId}`;
-    while (true) {
-      const client = await turnLockPool.connect();
-      let locked = false;
-      try {
-        const result = await client.query<{ locked: boolean }>(
-          "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
-          [lockKey],
-        );
-        locked = result.rows[0]?.locked === true;
-      } catch (error) {
-        client.release(true);
-        throw error;
-      }
-      if (!locked) {
-        client.release();
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        continue;
-      }
+  async function ensureUserDataEpoch(userId: string): Promise<void> {
+    await pool.query(
+      `INSERT INTO user_data_epochs (user_id)
+       VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+  }
 
-      let released = false;
-      return async () => {
-        if (released) return;
-        released = true;
-        try {
-          const result = await client.query<{ unlocked: boolean }>(
-            "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
-            [lockKey],
-          );
-          if (result.rows[0]?.unlocked !== true) {
-            throw new Error("user_data_mutation_lock_not_held");
-          }
-          client.release();
-        } catch (error) {
-          client.release(true);
-          throw error;
-        }
-      };
+  async function beginUserDataRequest(userId: string): Promise<UserDataRequestFence> {
+    await ensureUserDataEpoch(userId);
+    const result = await pool.query<{ epoch: string }>(
+      "SELECT epoch::text AS epoch FROM user_data_epochs WHERE user_id = $1",
+      [userId],
+    );
+    const epoch = result.rows[0]?.epoch;
+    if (epoch === undefined) throw new Error("user_data_epoch_missing");
+    return { userId, epoch };
+  }
+
+  async function acquireSharedUserDataLease(
+    fence: UserDataRequestFence,
+  ): Promise<UserDataLease> {
+    const lockKey = `user-data-quiescence:${fence.userId}`;
+    const client = await userDataLockPool.connect();
+    let locked = false;
+    try {
+      await client.query(
+        "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+        [lockKey],
+      );
+      locked = true;
+      const current = await client.query<{ epoch: string }>(
+        "SELECT epoch::text AS epoch FROM user_data_epochs WHERE user_id = $1",
+        [fence.userId],
+      );
+      if (current.rows[0]?.epoch !== fence.epoch) {
+        throw new Error("user_data_epoch_changed");
+      }
+    } catch (error) {
+      if (locked) {
+        await releaseAdvisoryLease(client, lockKey, "shared").catch(() => undefined);
+      } else {
+        client.release(true);
+      }
+      throw error;
+    }
+    return createAdvisoryLease(client, lockKey, fence.userId, fence.epoch, "shared");
+  }
+
+  async function acquireExclusiveClearLease(userId: string): Promise<UserDataLease> {
+    await ensureUserDataEpoch(userId);
+    const lockKey = `user-data-quiescence:${userId}`;
+    const client = await userDataLockPool.connect();
+    let locked = false;
+    try {
+      await client.query(
+        "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+        [lockKey],
+      );
+      locked = true;
+      const result = await client.query<{ epoch: string }>(
+        `UPDATE user_data_epochs
+         SET epoch = epoch + 1,
+             updated_at = now()
+         WHERE user_id = $1
+         RETURNING epoch::text AS epoch`,
+        [userId],
+      );
+      const epoch = result.rows[0]?.epoch;
+      if (epoch === undefined) throw new Error("user_data_epoch_missing");
+      return createAdvisoryLease(client, lockKey, userId, epoch, "exclusive");
+    } catch (error) {
+      if (locked) {
+        await releaseAdvisoryLease(client, lockKey, "exclusive").catch(() => undefined);
+      } else {
+        client.release(true);
+      }
+      throw error;
     }
   }
 
   return {
     agents,
     userDataMutations: {
-      acquireLock: acquireUserDataMutationLock,
+      beginRequest: beginUserDataRequest,
+      acquireSharedLease: acquireSharedUserDataLease,
+      acquireExclusiveClearLease,
     },
     agentSettings: createAgentSettingsRepository(pool),
     users: {
@@ -816,44 +876,35 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         clientTurnId: string,
       ): Promise<() => Promise<void>> {
         const lockKey = `${scope.userId}:${scope.agentId}:${clientTurnId}`;
-        while (true) {
-          const client = await turnLockPool.connect();
-          let locked = false;
+        const client = await turnLockPool.connect();
+        try {
+          await client.query(
+            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+            [lockKey],
+          );
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+
+        let released = false;
+        return async () => {
+          if (released) return;
+          released = true;
           try {
-            const result = await client.query<{ locked: boolean }>(
-              "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+            const result = await client.query<{ unlocked: boolean }>(
+              "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
               [lockKey],
             );
-            locked = result.rows[0]?.locked === true;
+            if (result.rows[0]?.unlocked !== true) {
+              throw new Error("client_turn_lock_not_held");
+            }
+            client.release();
           } catch (error) {
             client.release(true);
             throw error;
           }
-          if (!locked) {
-            client.release();
-            await new Promise((resolve) => setTimeout(resolve, 25));
-            continue;
-          }
-
-          let released = false;
-          return async () => {
-            if (released) return;
-            released = true;
-            try {
-              const result = await client.query<{ unlocked: boolean }>(
-                "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked",
-                [lockKey],
-              );
-              if (result.rows[0]?.unlocked !== true) {
-                throw new Error("client_turn_lock_not_held");
-              }
-              client.release();
-            } catch (error) {
-              client.release(true);
-              throw error;
-            }
-          };
-        }
+        };
       },
       async claimClientTurnExecution(scope: AgentScope, clientTurnId: string): Promise<boolean> {
         const result = await pool.query(
@@ -2103,8 +2154,8 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         metadata?: unknown;
       }): Promise<string> {
         const result = await pool.query(
-          `INSERT INTO task_artifacts (user_id, agent_id, task_run_id, file_name, mime_type, storage_path, metadata)
-           SELECT $1, $2, task_run.id, $4, $5, $6, $7
+          `INSERT INTO task_artifacts (user_id, agent_id, task_run_id, file_name, mime_type, storage_path, status, metadata)
+           SELECT $1, $2, task_run.id, $4, $5, $6, 'ready', $7
            FROM task_runs AS task_run
            WHERE task_run.user_id = $1 AND task_run.agent_id = $2 AND task_run.id = $3
            RETURNING id`,
@@ -2121,19 +2172,93 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
         if (!result.rows[0]) throw new Error("task_run_not_found");
         return result.rows[0].id;
       },
+      async createPending(scope: AgentScope, input: {
+        taskRunId: string;
+        fileName: string;
+        mimeType: string;
+        storagePath: string;
+        temporaryStoragePath: string;
+        metadata?: unknown;
+      }): Promise<string> {
+        const result = await pool.query(
+          `INSERT INTO task_artifacts (
+             user_id, agent_id, task_run_id, file_name, mime_type,
+             storage_path, temporary_storage_path, status, metadata
+           )
+           SELECT $1, $2, task_run.id, $4, $5, $6, $7, 'pending', $8
+           FROM task_runs AS task_run
+           WHERE task_run.user_id = $1 AND task_run.agent_id = $2 AND task_run.id = $3
+           RETURNING id`,
+          [
+            scope.userId,
+            scope.agentId,
+            input.taskRunId,
+            input.fileName,
+            input.mimeType,
+            input.storagePath,
+            input.temporaryStoragePath,
+            JSON.stringify(input.metadata ?? {}),
+          ],
+        );
+        if (!result.rows[0]) throw new Error("task_run_not_found");
+        return result.rows[0].id;
+      },
+      async markReady(scope: AgentScope, artifactId: string): Promise<boolean> {
+        const result = await pool.query(
+          `UPDATE task_artifacts
+           SET status = 'ready', temporary_storage_path = NULL, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'pending'
+           RETURNING id`,
+          [scope.userId, scope.agentId, artifactId],
+        );
+        return Boolean(result.rows[0]);
+      },
+      async markPendingForCleanup(scope: AgentScope, artifactId: string): Promise<boolean> {
+        const result = await pool.query(
+          `UPDATE task_artifacts
+           SET status = 'pending', temporary_storage_path = NULL, updated_at = now()
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'ready'
+           RETURNING id`,
+          [scope.userId, scope.agentId, artifactId],
+        );
+        return Boolean(result.rows[0]);
+      },
+      async delete(scope: AgentScope, artifactId: string): Promise<boolean> {
+        const result = await pool.query(
+          "DELETE FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 AND id = $3 RETURNING id",
+          [scope.userId, scope.agentId, artifactId],
+        );
+        return Boolean(result.rows[0]);
+      },
       async list(scope: AgentScope) {
         const result = await pool.query(
-          "SELECT * FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 ORDER BY created_at DESC LIMIT 200",
+          `SELECT * FROM task_artifacts
+           WHERE user_id = $1 AND agent_id = $2 AND status = 'ready'
+           ORDER BY created_at DESC LIMIT 200`,
           [scope.userId, scope.agentId],
         );
         return result.rows;
       },
       async get(scope: AgentScope, artifactId: string) {
         const result = await pool.query(
-          "SELECT * FROM task_artifacts WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          `SELECT * FROM task_artifacts
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3 AND status = 'ready'`,
           [scope.userId, scope.agentId, artifactId],
         );
         return result.rows[0] ?? null;
+      },
+      async listExpiredPending(scope: AgentScope, hours: number, limit = 100) {
+        const result = await pool.query(
+          `SELECT * FROM task_artifacts
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND status = 'pending'
+             AND updated_at < now() - ($3 * interval '1 hour')
+           ORDER BY updated_at
+           LIMIT $4`,
+          [scope.userId, scope.agentId, hours, limit],
+        );
+        return result.rows;
       },
     },
     toolRegistrations: {
@@ -2237,8 +2362,9 @@ export function createRepositories(providedPool?: Pool, providedTurnLockPool?: P
       async export(userId: string) {
         const exported: Record<string, unknown[]> = {};
         for (const [table, columns] of Object.entries(PERSONAL_DATA_EXPORT_COLUMNS)) {
+          const visibilityFilter = table === "task_artifacts" ? " AND status = 'ready'" : "";
           const result = await pool.query(
-            `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1`,
+            `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = $1${visibilityFilter}`,
             [userId],
           );
           exported[table] = result.rows.map((row) => pickExportRow(row, columns));
@@ -2671,6 +2797,46 @@ function isInternalExportKey(key: string): boolean {
   const concept = segments.join("");
   return SENSITIVE_EXPORT_KEY_CONCEPTS.has(concept)
     || segments.some((segment) => SENSITIVE_EXPORT_KEY_SEGMENTS.has(segment));
+}
+
+function createAdvisoryLease(
+  client: PoolClient,
+  lockKey: string,
+  userId: string,
+  epoch: string,
+  mode: UserDataLease["mode"],
+): UserDataLease {
+  let released = false;
+  return {
+    userId,
+    epoch,
+    mode,
+    async release() {
+      if (released) return;
+      released = true;
+      await releaseAdvisoryLease(client, lockKey, mode);
+    },
+  };
+}
+
+async function releaseAdvisoryLease(
+  client: PoolClient,
+  lockKey: string,
+  mode: UserDataLease["mode"],
+): Promise<void> {
+  const sql = mode === "shared"
+    ? "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked"
+    : "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked";
+  try {
+    const result = await client.query<{ unlocked: boolean }>(sql, [lockKey]);
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error("user_data_lease_not_held");
+    }
+    client.release();
+  } catch (error) {
+    client.release(true);
+    throw error;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

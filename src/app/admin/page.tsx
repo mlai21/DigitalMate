@@ -1,6 +1,6 @@
 import Link from "next/link";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -9,8 +9,6 @@ export default async function AdminPage() {
   const user = await getCurrentUser();
   if (!user) return <AdminEmpty message="需要登录后查看后台。" />;
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const [
     conversations,
     memories,
@@ -22,18 +20,21 @@ export default async function AdminPage() {
     skills,
     taskRuns,
     toolRegistrations,
-  ] = await Promise.all([
-    repositories.conversations.list(scope),
-    repositories.memories.list(scope),
-    repositories.toolLogs.list(scope),
-    repositories.llmUsage.list(scope),
-    repositories.proactiveTasks.list(scope),
-    repositories.channels.listDecisions(scope),
-    repositories.reflections.list(scope),
-    repositories.skills.list(user.id),
-    repositories.taskRuns.list(scope),
-    repositories.toolRegistrations.list(user.id),
-  ]);
+  ] = await withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    return Promise.all([
+      repositories.conversations.list(scope),
+      repositories.memories.list(scope),
+      repositories.toolLogs.list(scope),
+      repositories.llmUsage.list(scope),
+      repositories.proactiveTasks.list(scope),
+      repositories.channels.listDecisions(scope),
+      repositories.reflections.list(scope),
+      repositories.skills.list(user.id),
+      repositories.taskRuns.list(scope),
+      repositories.toolRegistrations.list(user.id),
+    ]);
+  });
 
   return (
     <section className="admin-grid">

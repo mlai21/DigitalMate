@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { requireCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
@@ -21,26 +21,26 @@ export async function PATCH(request: Request, context: RouteContext) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const { projectId } = await context.params;
-  const body = updateSchema.safeParse(await request.json().catch(() => ({})));
-  if (!body.success) {
-    return NextResponse.json({ error: "invalid_request" }, { status: 400 });
-  }
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { projectId } = await context.params;
+    const body = updateSchema.safeParse(await request.json().catch(() => ({})));
+    if (!body.success) {
+      return NextResponse.json({ error: "invalid_request" }, { status: 400 });
+    }
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const project = await repositories.projects.update(scope, projectId, body.data);
+    if (!project) {
+      return NextResponse.json({ error: "project_not_found" }, { status: 404 });
+    }
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const project = await repositories.projects.update(scope, projectId, body.data);
-  if (!project) {
-    return NextResponse.json({ error: "project_not_found" }, { status: 404 });
-  }
-
-  return NextResponse.json({
-    project: {
-      id: project.id,
-      name: project.name,
-      description: project.description,
-      updatedAt: project.updatedAt.toISOString(),
-    },
+    return NextResponse.json({
+      project: {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        updatedAt: project.updatedAt.toISOString(),
+      },
+    });
   });
 }
 
@@ -52,14 +52,15 @@ export async function DELETE(_request: Request, context: RouteContext) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const { projectId } = await context.params;
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const project = await repositories.projects.get(scope, projectId);
-  if (!project) {
-    return NextResponse.json({ error: "project_not_found" }, { status: 404 });
-  }
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { projectId } = await context.params;
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const project = await repositories.projects.get(scope, projectId);
+    if (!project) {
+      return NextResponse.json({ error: "project_not_found" }, { status: 404 });
+    }
 
-  await repositories.projects.delete(scope, projectId);
-  return NextResponse.json({ ok: true });
+    await repositories.projects.delete(scope, projectId);
+    return NextResponse.json({ ok: true });
+  });
 }

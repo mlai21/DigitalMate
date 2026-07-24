@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { createActiveAgentTickRunner } from "@/agent-service/active-agent-tick";
+import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { buildConversationSummary, shouldCompactConversation } from "@/server/agent/compaction";
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
 import { processDueProactiveTasks } from "@/server/agent/proactive-delivery";
@@ -20,6 +21,8 @@ import { executeGoalStep } from "@/server/goals/executor";
 import { processGoalLoops } from "@/server/goals/orchestrator";
 import { verifyGoalStep } from "@/server/goals/verifier";
 import { getLlmClient } from "@/server/llm/router";
+import { cleanupStaleTaskArtifacts } from "@/server/tasks/artifact-cleanup";
+import { defaultArtifactRoot } from "@/server/tasks/artifacts";
 import type { AgentScope } from "@/server/agents/types";
 import { assertAuthorizedModelRoutes } from "@/server/agents/service";
 
@@ -30,8 +33,10 @@ const lastSkillImprovementAt = new Map<string, number>();
 async function main() {
   const repositories = createRepositories();
   const user = await repositories.users.ensureDefault();
-  const defaultAgent = await repositories.agents.ensureDefault(user.id);
-  await repositories.agentSettings.ensure({ userId: user.id, agentId: defaultAgent.id });
+  await withUserDataLease(repositories, user.id, async () => {
+    const defaultAgent = await repositories.agents.ensureDefault(user.id);
+    await repositories.agentSettings.ensure({ userId: user.id, agentId: defaultAgent.id });
+  });
 
   const env = readEnv();
   const cleanupScheduler = startAttachmentCleanupScheduler({
@@ -41,13 +46,26 @@ async function main() {
         scopes: agents.map((agent) => ({ userId: agent.userId, agentId: agent.id })),
         repositories,
         storageDirectory: env.attachmentStorageDir,
+        withScope: (scope, work) => withUserDataLease(repositories, scope.userId, async () => {
+          const attachmentResult = await work();
+          await cleanupStaleTaskArtifacts({
+            scope,
+            repositories,
+            root: defaultArtifactRoot(),
+          });
+          return attachmentResult;
+        }),
       });
     },
   });
   const shutdown = new AbortController();
   const runActiveAgentTick = createActiveAgentTickRunner({
     listActiveAgents: () => repositories.agents.listActive(),
-    execute: (scope) => processAgentTick(repositories, scope),
+    execute: (scope) => withUserDataLease(
+      repositories,
+      scope.userId,
+      () => processAgentTick(repositories, scope),
+    ),
     onError: (error, scope) => {
       console.error("agent_tick_failed", {
         userId: scope.userId,

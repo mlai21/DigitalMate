@@ -1,5 +1,5 @@
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -8,9 +8,10 @@ export default async function InterjectionsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看插话决策。</section>;
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const decisions = await repositories.channels.listDecisions(scope);
+  const decisions = await withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    return repositories.channels.listDecisions(scope);
+  });
 
   return (
     <section className="admin-list">

@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
   getLlmClient: vi.fn(),
   handleChannelMessage: vi.fn(),
   readEnv: vi.fn(),
+  beginUserDataRequest: vi.fn(),
+  acquireSharedUserDataLease: vi.fn(),
+  releaseUserDataLease: vi.fn(),
   sendChannelMessage: vi.fn(),
 }));
 
@@ -37,6 +40,13 @@ describe("channel webhook routes", () => {
     vi.useRealTimers();
     vi.clearAllMocks();
     mocks.readEnv.mockReturnValue({});
+    mocks.beginUserDataRequest.mockImplementation(async (userId: string) => ({ userId, epoch: "1" }));
+    mocks.acquireSharedUserDataLease.mockImplementation(async (fence: { userId: string; epoch: string }) => ({
+      ...fence,
+      mode: "shared",
+      release: mocks.releaseUserDataLease,
+    }));
+    mocks.releaseUserDataLease.mockResolvedValue(undefined);
     mocks.createRepositories.mockReturnValue(fakeRepositories());
     mocks.getLlmClient.mockReturnValue({ client: {}, model: "mock-main" });
     mocks.handleChannelMessage.mockResolvedValue(undefined);
@@ -182,6 +192,37 @@ describe("channel webhook routes", () => {
     expect(mocks.getLlmClient).toHaveBeenCalledWith("main", expect.any(Object), { main: "mock-main", light: "mock-light" });
     expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the channel shared lease until handler persistence and outbound work settle", async () => {
+    vi.useFakeTimers();
+    let finishHandling: (() => void) | undefined;
+    mocks.handleChannelMessage.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        finishHandling = resolve;
+      }),
+    );
+
+    await postTelegramWebhook(
+      jsonRequest("http://localhost/api/webhooks/telegram", {
+        message: {
+          message_id: 2,
+          date: 1783185600,
+          chat: { id: 123, type: "private" },
+          from: { id: 456, is_bot: false },
+          text: "等整段渠道处理完成",
+        },
+      }),
+    );
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(mocks.handleChannelMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserDataLease).not.toHaveBeenCalled();
+
+    finishHandling?.();
+    await vi.waitFor(() => {
+      expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 function jsonRequest(url: string, body: unknown): Request {
@@ -194,6 +235,10 @@ function jsonRequest(url: string, body: unknown): Request {
 
 function fakeRepositories() {
   return {
+    userDataMutations: {
+      beginRequest: mocks.beginUserDataRequest,
+      acquireSharedLease: mocks.acquireSharedUserDataLease,
+    },
     users: {
       ensureDefault: vi.fn(async () => ({ id: "user-1" })),
     },

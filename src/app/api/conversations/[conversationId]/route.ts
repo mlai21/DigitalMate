@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { requireCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
@@ -22,31 +22,31 @@ export async function PATCH(request: Request, context: RouteContext) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const { conversationId } = await context.params;
-  const body = updateSchema.safeParse(await request.json().catch(() => ({})));
-  if (!body.success) {
-    return NextResponse.json({ error: "invalid_request" }, { status: 400 });
-  }
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { conversationId } = await context.params;
+    const body = updateSchema.safeParse(await request.json().catch(() => ({})));
+    if (!body.success) {
+      return NextResponse.json({ error: "invalid_request" }, { status: 400 });
+    }
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    if (body.data.projectId) {
+      const project = await repositories.projects.get(scope, body.data.projectId);
+      if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
+    }
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  if (body.data.projectId) {
-    const project = await repositories.projects.get(scope, body.data.projectId);
-    if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
-  }
+    const conversation = await repositories.conversations.update(scope, conversationId, body.data);
+    if (!conversation) {
+      return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
+    }
 
-  const conversation = await repositories.conversations.update(scope, conversationId, body.data);
-  if (!conversation) {
-    return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
-  }
-
-  return NextResponse.json({
-    conversation: {
-      id: conversation.id,
-      title: conversation.title,
-      projectId: conversation.projectId,
-      pinned: conversation.pinned,
-    },
+    return NextResponse.json({
+      conversation: {
+        id: conversation.id,
+        title: conversation.title,
+        projectId: conversation.projectId,
+        pinned: conversation.pinned,
+      },
+    });
   });
 }
 
@@ -58,14 +58,15 @@ export async function DELETE(_request: Request, context: RouteContext) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const { conversationId } = await context.params;
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const conversation = await repositories.conversations.get(scope, conversationId);
-  if (!conversation) {
-    return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
-  }
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { conversationId } = await context.params;
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const conversation = await repositories.conversations.get(scope, conversationId);
+    if (!conversation) {
+      return NextResponse.json({ error: "conversation_not_found" }, { status: 404 });
+    }
 
-  await repositories.conversations.delete(scope, conversationId);
-  return NextResponse.json({ ok: true });
+    await repositories.conversations.delete(scope, conversationId);
+    return NextResponse.json({ ok: true });
+  });
 }

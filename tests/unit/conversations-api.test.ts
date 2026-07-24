@@ -67,6 +67,14 @@ const mocks = vi.hoisted(() => {
   };
   const listAttachmentsForMessages = vi.fn(async () => [boundAttachment]);
   const repositories = {
+    userDataMutations: {
+      beginRequest: vi.fn(async (userId: string) => ({ userId, epoch: "1" })),
+      acquireSharedLease: vi.fn(async (fence: { userId: string; epoch: string }) => ({
+        ...fence,
+        mode: "shared" as const,
+        release: vi.fn(async () => undefined),
+      })),
+    },
     agents: {
       getDefault: vi.fn(async () => defaultAgent),
     },

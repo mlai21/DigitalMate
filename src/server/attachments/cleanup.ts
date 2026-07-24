@@ -161,17 +161,19 @@ export async function runAttachmentCleanupRound(options: {
   deleteFile?: typeof deleteAttachment;
   now?: () => Date;
   logger?: CleanupLogger;
+  withScope?: <T>(scope: AgentScope, work: () => Promise<T>) => Promise<T>;
 }): Promise<{
   scopes: AttachmentCleanupResult[];
   storage: Pick<AttachmentCleanupResult, "temporaryFiles" | "orphanedFiles">;
 }> {
   const scopes: AttachmentCleanupResult[] = [];
   for (const scope of options.scopes) {
-    scopes.push(await cleanupStaleAttachments({
+    const cleanup = () => cleanupStaleAttachments({
       ...options,
       scope,
       includeStorageCleanup: false,
-    }));
+    });
+    scopes.push(await (options.withScope ? options.withScope(scope, cleanup) : cleanup()));
   }
   const storage = await cleanupAttachmentStorage(options);
   return { scopes, storage };

@@ -1,8 +1,8 @@
 import { ChatShell, type ChatMessage } from "@/components/chat/chat-shell";
 import type { ConversationItem, ProjectItem } from "@/components/chat/chat-sidebar";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { serializeChatMessages } from "@/server/attachments/presentation";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -42,7 +42,7 @@ async function loadChatPageData(): Promise<{
       };
     }
 
-    const repositories = createRepositories();
+    return await withFreshUserDataLease(user.id, async (repositories) => {
     const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
     const [conversations, projects] = await Promise.all([
       repositories.conversations.listWithStats(scope),
@@ -103,6 +103,7 @@ async function loadChatPageData(): Promise<{
     }
 
     return { conversationId: active.id, initialMessages, initialConversations, initialProjects };
+    });
   } catch {
     return {
       initialMessages: [],

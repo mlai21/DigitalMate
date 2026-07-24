@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { extractAttachmentText } from "@/server/attachments/extraction";
 import {
   parseAttachmentMultipart,
@@ -12,7 +13,7 @@ import {
 import { validateAttachmentFile } from "@/server/attachments/validation";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
+import type { DbMessageAttachment } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 import type { AgentScope } from "@/server/agents/types";
 
@@ -87,75 +88,68 @@ export async function POST(request: Request) {
     return errorResponse("unauthorized", 401);
   }
 
-  const repositories = createRepositories();
-  let scope: AgentScope;
   try {
-    scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  } catch {
-    return errorResponse("attachment_upload_failed", 500);
-  }
-  let releaseMutationLock: (() => Promise<void>) | undefined;
-  try {
-    releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
-  } catch {
-    return errorResponse("attachment_upload_failed", 500);
-  }
-
-  try {
-    let upload: ParsedAttachmentUpload;
-    try {
-      upload = await parseAttachmentMultipart(request);
-    } catch (error) {
-      const mapped = statusForUploadError(error);
-      return errorResponse(mapped.error, mapped.status);
-    }
-
-    const validated = validateAttachmentFile({
-      fileName: upload.fileName,
-      declaredMime: upload.declaredMime,
-      bytes: upload.bytes,
-    });
-    if (validated.kind !== upload.declaredKind) {
-      throw new Error("attachment_kind_mismatch");
-    }
-
-    const extracted = validated.kind === "document"
-      ? await extractAttachmentText({ mimeType: validated.mimeType, bytes: upload.bytes })
-      : null;
-    const storageKey = createAttachmentStorageKey();
-    const storageRoot = readEnv().attachmentStorageDir;
-    const attachments = repositories.messageAttachments;
-    const draft = await attachments.createDraft(scope, {
-      kind: validated.kind,
-      fileName: validated.fileName,
-      mimeType: validated.mimeType,
-      sizeBytes: validated.sizeBytes,
-      storageKey,
-      extractedText: extracted?.text ?? null,
-      textTruncated: extracted?.truncated ?? false,
-    });
-
-    try {
-      await saveAttachment(storageRoot, storageKey, upload.bytes);
-      const attachment = await attachments.markReady(scope, draft.id);
-      if (!attachment) throw new Error("attachment_ready_transition_failed");
-      return NextResponse.json({ attachment: publicAttachment(attachment) }, { status: 201 });
-    } catch (error) {
-      await attachments.markFailed(scope, draft.id, "attachment_upload_failed").catch(() => undefined);
-      const isExistingTarget = error instanceof Error && "code" in error && error.code === "EEXIST";
-      if (!isExistingTarget) {
-        await deleteAttachment(storageRoot, storageKey).catch(() => undefined);
+    return await withFreshUserDataLease(user.id, async (repositories) => {
+      let scope: AgentScope;
+      try {
+        scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+      } catch {
+        return errorResponse("attachment_upload_failed", 500);
       }
-      return errorResponse("attachment_upload_failed", 500);
-    }
-  } catch (error) {
-    const mapped = statusForUploadError(error);
-    return errorResponse(mapped.error, mapped.status);
-  } finally {
-    if (releaseMutationLock) {
-      await releaseMutationLock().catch(() => {
-        console.error("user_data_mutation_lock_release_failed", { code: "user_data_mutation_lock_release_failed" });
-      });
-    }
+
+      try {
+        let upload: ParsedAttachmentUpload;
+        try {
+          upload = await parseAttachmentMultipart(request);
+        } catch (error) {
+          const mapped = statusForUploadError(error);
+          return errorResponse(mapped.error, mapped.status);
+        }
+
+        const validated = validateAttachmentFile({
+          fileName: upload.fileName,
+          declaredMime: upload.declaredMime,
+          bytes: upload.bytes,
+        });
+        if (validated.kind !== upload.declaredKind) {
+          throw new Error("attachment_kind_mismatch");
+        }
+
+        const extracted = validated.kind === "document"
+          ? await extractAttachmentText({ mimeType: validated.mimeType, bytes: upload.bytes })
+          : null;
+        const storageKey = createAttachmentStorageKey();
+        const storageRoot = readEnv().attachmentStorageDir;
+        const attachments = repositories.messageAttachments;
+        const draft = await attachments.createDraft(scope, {
+          kind: validated.kind,
+          fileName: validated.fileName,
+          mimeType: validated.mimeType,
+          sizeBytes: validated.sizeBytes,
+          storageKey,
+          extractedText: extracted?.text ?? null,
+          textTruncated: extracted?.truncated ?? false,
+        });
+
+        try {
+          await saveAttachment(storageRoot, storageKey, upload.bytes);
+          const attachment = await attachments.markReady(scope, draft.id);
+          if (!attachment) throw new Error("attachment_ready_transition_failed");
+          return NextResponse.json({ attachment: publicAttachment(attachment) }, { status: 201 });
+        } catch (error) {
+          await attachments.markFailed(scope, draft.id, "attachment_upload_failed").catch(() => undefined);
+          const isExistingTarget = error instanceof Error && "code" in error && error.code === "EEXIST";
+          if (!isExistingTarget) {
+            await deleteAttachment(storageRoot, storageKey).catch(() => undefined);
+          }
+          return errorResponse("attachment_upload_failed", 500);
+        }
+      } catch (error) {
+        const mapped = statusForUploadError(error);
+        return errorResponse(mapped.error, mapped.status);
+      }
+    });
+  } catch {
+    return errorResponse("attachment_upload_failed", 500);
   }
 }

@@ -3,7 +3,7 @@ import { deleteAttachment } from "@/server/attachments/storage";
 import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories } from "@/server/db/repositories";
+import { createRepositories, type UserDataLease } from "@/server/db/repositories";
 import { redirectUrl } from "@/server/http/redirect";
 import { defaultArtifactRoot, deleteArtifactTree } from "@/server/tasks/artifacts";
 
@@ -12,10 +12,10 @@ export const runtime = "nodejs";
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
   const repositories = createRepositories();
-  let releaseMutationLock: (() => Promise<void>) | undefined;
+  let clearLease: UserDataLease | undefined;
   let releaseConnectionDrain: (() => void) | undefined;
   try {
-    releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
+    clearLease = await repositories.userDataMutations.acquireExclusiveClearLease(user.id);
     releaseConnectionDrain = await userConnectionDisconnector.disconnectUser(user.id);
     const storageKeys = await repositories.personalData.listAttachmentStorageKeys(user.id);
     const storageRoot = readEnv().attachmentStorageDir;
@@ -34,9 +34,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "personal_data_clear_failed" }, { status: 500 });
   } finally {
     releaseConnectionDrain?.();
-    if (releaseMutationLock) {
-      await releaseMutationLock().catch(() => {
-        console.error("user_data_mutation_lock_release_failed", { code: "user_data_mutation_lock_release_failed" });
+    if (clearLease) {
+      await clearLease.release().catch(() => {
+        console.error("user_data_clear_lease_release_failed", { code: "user_data_clear_lease_release_failed" });
       });
     }
   }

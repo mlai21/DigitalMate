@@ -1,6 +1,6 @@
 import Link from "next/link";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -13,22 +13,25 @@ export default async function ConversationDetailPage({
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看会话。</section>;
 
-  const { conversationId } = await params;
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const conversation = await repositories.conversations.get(scope, conversationId);
-  if (!conversation) {
+  const data = await withFreshUserDataLease(user.id, async (repositories) => {
+    const { conversationId } = await params;
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const conversation = await repositories.conversations.get(scope, conversationId);
+    if (!conversation) return null;
+    const [messages, toolLogs] = await Promise.all([
+      repositories.messages.listAllForAudit(scope, conversationId),
+      repositories.toolLogs.listByConversation(scope, conversationId),
+    ]);
+    return { conversation, messages, toolLogs };
+  });
+  if (!data) {
     return (
       <section className="admin-card">
         会话不存在或已删除。<Link href="/admin/conversations">返回会话列表</Link>
       </section>
     );
   }
-
-  const [messages, toolLogs] = await Promise.all([
-    repositories.messages.listAllForAudit(scope, conversationId),
-    repositories.toolLogs.listByConversation(scope, conversationId),
-  ]);
+  const { conversation, messages, toolLogs } = data;
 
   const timeline = [
     ...messages.map((message) => ({

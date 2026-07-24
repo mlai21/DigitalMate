@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { ConfirmSubmitButton } from "@/components/admin/confirm-submit-button";
 import { SkillStatusActions } from "@/components/admin/status-actions";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { buildLineDiff } from "@/server/skills/diff";
 
 export const dynamic = "force-dynamic";
@@ -18,11 +18,11 @@ export default async function SkillsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后管理 Skills。</section>;
 
-  const repositories = createRepositories();
-  const [skills, pendingRevisions] = await Promise.all([
-    repositories.skills.list(user.id),
-    repositories.skillRevisions.listPending(user.id),
-  ]);
+  const [skills, pendingRevisions] = await withFreshUserDataLease(user.id, (repositories) =>
+    Promise.all([
+      repositories.skills.list(user.id),
+      repositories.skillRevisions.listPending(user.id),
+    ]));
 
   return (
     <section className="admin-list">

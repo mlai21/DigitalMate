@@ -5,19 +5,22 @@ import { POST as postPresentationTask } from "@/app/api/tasks/presentation/route
 const routeMocks = vi.hoisted(() => ({
   callOrder: [] as string[],
   requireCurrentUser: vi.fn(async () => ({ id: "user-1" })),
-  acquireLock: vi.fn(async () => {
+  acquireLock: vi.fn(async (userId: string) => {
     routeMocks.callOrder.push("lock");
-    return routeMocks.releaseLock;
+    return { userId, epoch: "1" };
   }),
   releaseLock: vi.fn(async () => {
     routeMocks.callOrder.push("unlock");
   }),
-  taskArtifactsCreate: vi.fn(async () => {
+  taskArtifactsCreate: vi.fn<(...args: unknown[]) => Promise<string>>(async () => {
     routeMocks.callOrder.push("locator");
     return "artifact-id";
   }),
   taskRunsComplete: vi.fn(async () => {
     routeMocks.callOrder.push("complete");
+  }),
+  taskRunsFail: vi.fn(async () => {
+    routeMocks.callOrder.push("fail");
   }),
   taskRunsCreate: vi.fn(async () => {
     routeMocks.callOrder.push("task");
@@ -25,6 +28,9 @@ const routeMocks = vi.hoisted(() => ({
   }),
   skillsCreate: vi.fn(async () => undefined),
   storedBuffers: [] as Buffer[],
+  discardPublishedArtifacts: vi.fn(async () => {
+    routeMocks.callOrder.push("discard");
+  }),
 }));
 
 vi.mock("@/server/auth/current-user", () => ({
@@ -34,7 +40,12 @@ vi.mock("@/server/auth/current-user", () => ({
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
     userDataMutations: {
-      acquireLock: routeMocks.acquireLock,
+      beginRequest: routeMocks.acquireLock,
+      acquireSharedLease: vi.fn(async (fence: { userId: string; epoch: string }) => ({
+        ...fence,
+        mode: "shared",
+        release: routeMocks.releaseLock,
+      })),
     },
     agents: {
       getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
@@ -42,7 +53,7 @@ vi.mock("@/server/db/repositories", () => ({
     taskRuns: {
       create: routeMocks.taskRunsCreate,
       complete: routeMocks.taskRunsComplete,
-      fail: vi.fn(async () => undefined),
+      fail: routeMocks.taskRunsFail,
     },
     taskArtifacts: {
       create: routeMocks.taskArtifactsCreate,
@@ -58,22 +69,31 @@ vi.mock("@/server/tasks/artifacts", async (importOriginal) => {
   return {
     ...actual,
     defaultArtifactRoot: vi.fn(() => "/tmp/digitalmate-test-artifacts"),
-    createArtifactFileLocator: vi.fn((input: { fileName: string; mimeType: string }) => ({
-      fileName: input.fileName,
-      mimeType: input.mimeType,
-      storagePath: `user-1/task-1/${input.fileName}`,
-    })),
-    writeArtifactFile: vi.fn(async (input: { fileName: string; mimeType: string; buffer: Buffer }) => {
-      routeMocks.callOrder.push("file");
-      routeMocks.storedBuffers.push(input.buffer);
-      return {
-        fileName: input.fileName,
-        mimeType: input.mimeType,
-        storagePath: `user-1/task-1/${input.fileName}`,
-      };
-    }),
   };
 });
+
+vi.mock("@/server/tasks/artifact-publisher", () => ({
+  publishTaskArtifact: vi.fn(async (input: {
+    scope: { userId: string; agentId: string };
+    repositories: { taskArtifacts: { create: typeof routeMocks.taskArtifactsCreate } };
+    taskRunId: string;
+    file: { fileName: string; mimeType: string; buffer: Buffer };
+  }) => {
+    const stored = {
+      fileName: input.file.fileName,
+      mimeType: input.file.mimeType,
+      storagePath: `user-1/task-1/${input.file.fileName}`,
+    };
+    const artifactId = await input.repositories.taskArtifacts.create(input.scope, {
+      taskRunId: input.taskRunId,
+      ...stored,
+    });
+    routeMocks.callOrder.push("file");
+    routeMocks.storedBuffers.push(input.file.buffer);
+    return { artifactId, ...stored };
+  }),
+  discardPublishedTaskArtifacts: routeMocks.discardPublishedArtifacts,
+}));
 
 describe("presentation task route", () => {
   it("includes uploaded spreadsheet data in the generated pptx artifact", async () => {
@@ -98,6 +118,45 @@ describe("presentation task route", () => {
       "locator",
       "file",
       "complete",
+      "unlock",
+    ]);
+  });
+
+  it("discards ready artifacts and fails the task when completion fails", async () => {
+    routeMocks.storedBuffers.length = 0;
+    routeMocks.callOrder.length = 0;
+    routeMocks.taskRunsComplete.mockImplementationOnce(async () => {
+      routeMocks.callOrder.push("complete");
+      throw new Error("complete_failed");
+    });
+    const form = new FormData();
+    form.set("title", "失败补偿");
+    form.set("outline", "结论\n- 需要补偿");
+
+    const response = await postPresentationTask({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/presentation",
+    } as Request);
+
+    expect(response.status).toBe(303);
+    expect(routeMocks.discardPublishedArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        artifacts: [expect.objectContaining({ artifactId: "artifact-id" })],
+      }),
+    );
+    expect(routeMocks.taskRunsFail).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      "task-1",
+      "complete_failed",
+    );
+    expect(routeMocks.callOrder).toEqual([
+      "lock",
+      "task",
+      "locator",
+      "file",
+      "complete",
+      "discard",
+      "fail",
       "unlock",
     ]);
   });

@@ -5,6 +5,7 @@ import path from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import { cleanupStaleAttachments } from "@/server/attachments/cleanup";
 import { createRepositories } from "@/server/db/repositories";
@@ -573,6 +574,11 @@ describe("message attachment PostgreSQL concurrency", () => {
       CREATE TABLE users (
         id uuid PRIMARY KEY
       );
+      CREATE TABLE user_data_epochs (
+        user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        epoch bigint NOT NULL DEFAULT 0,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
       CREATE TABLE digital_agents (
         id uuid PRIMARY KEY,
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -878,69 +884,191 @@ describe("message attachment PostgreSQL concurrency", () => {
     await releaseSecond();
   });
 
-  it("serializes user data mutations across independent repository processes in both directions", async () => {
+  it("allows shared user-data leases concurrently across independent repository processes", async () => {
     const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
     const firstLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
     const secondLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
     const firstRepositories = createRepositories(databasePool, firstLockPool);
     const secondRepositories = createRepositories(databasePool, secondLockPool);
     const userId = "50000000-0000-4000-8000-000000000010";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
     try {
-      const releaseUpload = await firstRepositories.userDataMutations.acquireLock(userId);
-      let clearLockAcquired = false;
-      const clearLock = secondRepositories.userDataMutations.acquireLock(userId).then((release) => {
-        clearLockAcquired = true;
-        return release;
-      });
+      const firstFence = await firstRepositories.userDataMutations.beginRequest(userId);
+      const secondFence = await secondRepositories.userDataMutations.beginRequest(userId);
+      const firstLease = await firstRepositories.userDataMutations.acquireSharedLease(firstFence);
+      const secondLease = await secondRepositories.userDataMutations.acquireSharedLease(secondFence);
 
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(clearLockAcquired).toBe(false);
-      await releaseUpload();
-      const releaseClear = await clearLock;
-      expect(clearLockAcquired).toBe(true);
-      await releaseClear();
-
-      const releaseClearFirst = await secondRepositories.userDataMutations.acquireLock(userId);
-      let uploadLockAcquired = false;
-      const uploadLock = firstRepositories.userDataMutations.acquireLock(userId).then((release) => {
-        uploadLockAcquired = true;
-        return release;
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(uploadLockAcquired).toBe(false);
-      await releaseClearFirst();
-      const releaseUploadSecond = await uploadLock;
-      expect(uploadLockAcquired).toBe(true);
-      await releaseUploadSecond();
+      await firstLease.release();
+      await secondLease.release();
     } finally {
       await firstLockPool.end();
       await secondLockPool.end();
     }
   });
 
-  it("keeps the business pool available while many copies wait for one turn lock", async () => {
+  it.each([
+    ["chat", "50000000-0000-4000-8000-000000000013"],
+    ["channel", "50000000-0000-4000-8000-000000000014"],
+    ["agent-tick", "50000000-0000-4000-8000-000000000015"],
+  ])("keeps clear behind the complete %s user-data operation", async (operation, userId) => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const operationLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const clearLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const operationRepositories = createRepositories(databasePool, operationLockPool);
+    const clearRepositories = createRepositories(databasePool, clearLockPool);
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+    let enterOperation: (() => void) | undefined;
+    let finishOperation: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => {
+      enterOperation = resolve;
+    });
+    const finish = new Promise<void>((resolve) => {
+      finishOperation = resolve;
+    });
+    const order: string[] = [];
+
+    try {
+      const operationPromise = withUserDataLease(operationRepositories, userId, async () => {
+        order.push(`${operation}:entered`);
+        enterOperation?.();
+        await finish;
+        order.push(`${operation}:persisted-and-sent`);
+      });
+      await entered;
+
+      let clearAcquired = false;
+      const clearPromise = clearRepositories.userDataMutations.acquireExclusiveClearLease(userId)
+        .then((lease) => {
+          clearAcquired = true;
+          order.push("clear");
+          return lease;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(clearAcquired).toBe(false);
+
+      finishOperation?.();
+      await operationPromise;
+      const clearLease = await clearPromise;
+      expect(order).toEqual([
+        `${operation}:entered`,
+        `${operation}:persisted-and-sent`,
+        "clear",
+      ]);
+      await clearLease.release();
+    } finally {
+      await operationLockPool.end();
+      await clearLockPool.end();
+    }
+  });
+
+  it("queues an exclusive clear behind shared leases and does not let a newer shared request barge", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const sharedLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 3 });
+    const clearLockPool = new Pool({ connectionString: databaseUrl, options: poolOptions, max: 2 });
+    const sharedRepositories = createRepositories(databasePool, sharedLockPool);
+    const clearRepositories = createRepositories(databasePool, clearLockPool);
+    const userId = "50000000-0000-4000-8000-000000000011";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+    try {
+      const firstFence = await sharedRepositories.userDataMutations.beginRequest(userId);
+      const firstShared = await sharedRepositories.userDataMutations.acquireSharedLease(firstFence);
+      const order: string[] = [];
+      const exclusivePromise = clearRepositories.userDataMutations.acquireExclusiveClearLease(userId)
+        .then((lease) => {
+          order.push("exclusive");
+          return lease;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const newerFence = await sharedRepositories.userDataMutations.beginRequest(userId);
+      const newerSharedPromise = sharedRepositories.userDataMutations.acquireSharedLease(newerFence)
+        .then((lease) => {
+          order.push("newer-shared");
+          return lease;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(order).toEqual([]);
+
+      await firstShared.release();
+      const exclusive = await exclusivePromise;
+      expect(order).toEqual(["exclusive"]);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(order).toEqual(["exclusive"]);
+
+      await exclusive.release();
+      await expect(newerSharedPromise).rejects.toThrow("user_data_epoch_changed");
+      expect(order).toEqual(["exclusive"]);
+    } finally {
+      await sharedLockPool.end();
+      await clearLockPool.end();
+    }
+  });
+
+  it("rejects a request fence created before a completed clear instead of writing afterward", async () => {
     const repositories = createRepositories(databasePool);
+    const userId = "50000000-0000-4000-8000-000000000012";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+    const staleFence = await repositories.userDataMutations.beginRequest(userId);
+    const exclusive = await repositories.userDataMutations.acquireExclusiveClearLease(userId);
+    await exclusive.release();
+
+    await expect(
+      repositories.userDataMutations.acquireSharedLease(staleFence),
+    ).rejects.toThrow("user_data_epoch_changed");
+  });
+
+  it("releases a real shared lease after an operation error so clear can proceed", async () => {
+    const operationRepositories = createRepositories(databasePool);
+    const clearRepositories = createRepositories(databasePool);
+    const userId = "50000000-0000-4000-8000-000000000016";
+    await databasePool.query("INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
+
+    await expect(withUserDataLease(operationRepositories, userId, async () => {
+      throw new Error("operation_failed");
+    })).rejects.toThrow("operation_failed");
+
+    const clearLease = await clearRepositories.userDataMutations.acquireExclusiveClearLease(userId);
+    await clearLease.release();
+  });
+
+  it("keeps the business pool available while many copies wait for one turn lock", async () => {
+    const poolOptions = `-c search_path=${schemaName} -c statement_timeout=5000 -c lock_timeout=3000`;
+    const dedicatedLockPool = new Pool({
+      connectionString: databaseUrl,
+      options: poolOptions,
+      max: 2,
+    });
+    const repositories = createRepositories(databasePool, dedicatedLockPool);
     const userId = "50000000-0000-4000-8000-000000000006";
     const clientTurnId = "52000000-0000-4000-8000-000000000006";
-    const releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId);
-    const waiters = Array.from({ length: 12 }, () =>
-      repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId).then(async (release) => {
-        await release();
-      }),
-    );
+    let releaseOwner: (() => Promise<void>) | undefined;
+    try {
+      releaseOwner = await repositories.messages.acquireClientTurnExecutionLock(
+        scopeForUser(userId),
+        clientTurnId,
+      );
+      const waiters = Array.from({ length: 12 }, () =>
+        repositories.messages.acquireClientTurnExecutionLock(scopeForUser(userId), clientTurnId).then(async (release) => {
+          await release();
+        }),
+      );
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    let businessQueryCompleted = false;
-    const businessQuery = databasePool.query("SELECT 1").then(() => {
-      businessQueryCompleted = true;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const completedBeforeOwnerRelease = businessQueryCompleted;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      let businessQueryCompleted = false;
+      const businessQuery = databasePool.query("SELECT 1").then(() => {
+        businessQueryCompleted = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const completedBeforeOwnerRelease = businessQueryCompleted;
 
-    await releaseOwner();
-    await Promise.all([...waiters, businessQuery]);
-    expect(completedBeforeOwnerRelease).toBe(true);
+      await releaseOwner();
+      releaseOwner = undefined;
+      await Promise.all([...waiters, businessQuery]);
+      expect(completedBeforeOwnerRelease).toBe(true);
+    } finally {
+      await releaseOwner?.();
+      await dedicatedLockPool.end();
+    }
   });
 
   it("isolates different turn owners from a small business connection pool", async () => {

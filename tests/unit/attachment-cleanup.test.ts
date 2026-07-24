@@ -82,6 +82,29 @@ describe("stale attachment cleanup", () => {
     expect(await readdir(root)).not.toContain(orphan);
   });
 
+  it("runs each scoped cleanup inside the caller-provided user-data boundary", async () => {
+    const root = await createTemporaryRoot();
+    const repositories = createRepositories([]);
+    const activeScopes = [
+      scope,
+      { userId: "00000000-0000-4000-8000-000000000002", agentId: "10000000-0000-4000-8000-000000000002" },
+    ];
+    const entered: string[] = [];
+    const withScope = async <T,>(activeScope: typeof scope, work: () => Promise<T>): Promise<T> => {
+      entered.push(activeScope.userId);
+      return work();
+    };
+
+    await runAttachmentCleanupRound({
+      scopes: activeScopes,
+      repositories,
+      storageDirectory: root,
+      withScope,
+    });
+
+    expect(entered).toEqual(activeScopes.map((activeScope) => activeScope.userId));
+  });
+
   it("deletes every claimed file and row with the same deletion token", async () => {
     const first = claimedAttachment(
       "10000000-0000-4000-8000-000000000001",

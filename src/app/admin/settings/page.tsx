@@ -1,6 +1,6 @@
 import { ConfirmSubmitButton } from "@/components/admin/confirm-submit-button";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { ProactivityPresetForm } from "@/components/admin/proactivity-preset-form";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
@@ -10,9 +10,10 @@ export default async function SettingsPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后修改设置。</section>;
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const settings = await repositories.settings.get(scope);
+  const settings = await withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    return repositories.settings.get(scope);
+  });
 
   return (
     <>

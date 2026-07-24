@@ -5,7 +5,8 @@ import { parsePresentationOutline } from "@/server/tasks/presentation";
 
 const routeMocks = vi.hoisted(() => ({
   requireCurrentUser: vi.fn(async () => ({ id: "user-1" })),
-  taskArtifactsCreate: vi.fn(async () => "artifact-id"),
+  taskArtifactsCreate: vi.fn<(...args: unknown[]) => Promise<string>>(async () => "artifact-id"),
+  releaseLease: vi.fn(async () => undefined),
   taskRunsComplete: vi.fn(async () => undefined),
   taskRunsCreate: vi.fn(async () => "task-1"),
   skillsCreate: vi.fn(async () => undefined),
@@ -18,7 +19,12 @@ vi.mock("@/server/auth/current-user", () => ({
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
     userDataMutations: {
-      acquireLock: vi.fn(async () => vi.fn(async () => undefined)),
+      beginRequest: vi.fn(async (userId: string) => ({ userId, epoch: "1" })),
+      acquireSharedLease: vi.fn(async (fence: { userId: string; epoch: string }) => ({
+        ...fence,
+        mode: "shared",
+        release: routeMocks.releaseLease,
+      })),
     },
     agents: {
       getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
@@ -42,13 +48,29 @@ vi.mock("@/server/tasks/artifacts", async (importOriginal) => {
   return {
     ...actual,
     defaultArtifactRoot: vi.fn(() => "/tmp/digitalmate-test-artifacts"),
-    writeArtifactFile: vi.fn(async (input: { fileName: string; mimeType: string }) => ({
-      fileName: input.fileName,
-      mimeType: input.mimeType,
-      storagePath: `user-1/task-1/${input.fileName}`,
-    })),
   };
 });
+
+vi.mock("@/server/tasks/artifact-publisher", () => ({
+  publishTaskArtifact: vi.fn(async (input: {
+    scope: { userId: string; agentId: string };
+    repositories: { taskArtifacts: { create: typeof routeMocks.taskArtifactsCreate } };
+    taskRunId: string;
+    file: { fileName: string; mimeType: string };
+  }) => {
+    const stored = {
+      fileName: input.file.fileName,
+      mimeType: input.file.mimeType,
+      storagePath: `user-1/task-1/${input.file.fileName}`,
+    };
+    const artifactId = await input.repositories.taskArtifacts.create(input.scope, {
+      taskRunId: input.taskRunId,
+      ...stored,
+    });
+    return { artifactId, ...stored };
+  }),
+  discardPublishedTaskArtifacts: vi.fn(async () => undefined),
+}));
 
 describe("buildCsvSummaryReport", () => {
   it("creates a markdown report with row count and totals", () => {

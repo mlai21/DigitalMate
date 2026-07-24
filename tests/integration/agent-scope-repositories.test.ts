@@ -277,6 +277,38 @@ describe("agent-scoped repositories on PostgreSQL", () => {
     await expect(repositories.taskRuns.list(scopeB))
       .resolves.toEqual([expect.objectContaining({ output_summary: "B complete" })]);
 
+    const pendingArtifact = await repositories.taskArtifacts.createPending(scopeA, {
+      taskRunId: taskA,
+      fileName: "pending.txt",
+      mimeType: "text/plain",
+      storagePath: `${USER_ID}/${taskA}/pending.txt`,
+      temporaryStoragePath: `${USER_ID}/${taskA}/.pending.txt.test.tmp`,
+    });
+    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
+    await expect(repositories.taskArtifacts.list(scopeA))
+      .resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ id: pendingArtifact })]));
+    await expect(repositories.taskArtifacts.markReady(scopeA, pendingArtifact)).resolves.toBe(true);
+    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact))
+      .resolves.toMatchObject({ id: pendingArtifact, status: "ready" });
+    await expect(repositories.taskArtifacts.markPendingForCleanup(scopeA, pendingArtifact))
+      .resolves.toBe(true);
+    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
+    await expect(repositories.taskArtifacts.delete(scopeA, pendingArtifact)).resolves.toBe(true);
+    await expect(repositories.taskArtifacts.get(scopeA, pendingArtifact)).resolves.toBeNull();
+    const expiredPending = await repositories.taskArtifacts.createPending(scopeA, {
+      taskRunId: taskA,
+      fileName: "expired.txt",
+      mimeType: "text/plain",
+      storagePath: `${USER_ID}/${taskA}/expired.txt`,
+      temporaryStoragePath: `${USER_ID}/${taskA}/.expired.txt.test.tmp`,
+    });
+    await pool.query(
+      "UPDATE task_artifacts SET updated_at = now() - interval '25 hours' WHERE id = $1",
+      [expiredPending],
+    );
+    await expect(repositories.taskArtifacts.listExpiredPending(scopeA, 24, 100))
+      .resolves.toEqual([expect.objectContaining({ id: expiredPending, status: "pending" })]);
+
     await repositories.toolLogs.create({
       ...scopeA,
       conversationId: conversationA.id,

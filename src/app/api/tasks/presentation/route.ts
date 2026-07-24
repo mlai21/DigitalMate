@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { requireCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
+import type { createRepositories } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { redirectUrl } from "@/server/http/redirect";
+import { defaultArtifactRoot } from "@/server/tasks/artifacts";
 import {
-  createArtifactFileLocator,
-  defaultArtifactRoot,
-  writeArtifactFile,
-} from "@/server/tasks/artifacts";
+  discardPublishedTaskArtifacts,
+  publishTaskArtifact,
+  type PublishedTaskArtifact,
+} from "@/server/tasks/artifact-publisher";
 import { summarizeSpreadsheetFile } from "@/server/tasks/csv";
 import { buildPresentation, parsePresentationOutline } from "@/server/tasks/presentation";
 import { completeTaskWithSkillDraft } from "@/server/tasks/skill-drafts";
@@ -17,6 +19,15 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const user = await requireCurrentUser();
+  return withFreshUserDataLease(user.id, (repositories) =>
+    processPresentationTask(request, user.id, repositories));
+}
+
+async function processPresentationTask(
+  request: Request,
+  userId: string,
+  repositories: ReturnType<typeof createRepositories>,
+) {
   const form = await request.formData();
   const title = String(form.get("title") ?? "DigitalMate 汇报");
   const outline = String(form.get("outline") ?? "");
@@ -26,63 +37,57 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "missing_outline" }, { status: 400 });
   }
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+  const scope = await resolveDefaultAgentScope(userId, repositories.agents);
   const inputSummary = `PPT 生成：${title}`;
-  const releaseMutationLock = await repositories.userDataMutations.acquireLock(user.id);
 
+  const taskRunId = await repositories.taskRuns.create(scope, {
+    kind: "presentation",
+    inputSummary,
+    metadata: {
+      slideCount: slides.length,
+      ...(isUploadedFile(dataFile) ? { dataFileName: dataFile.name, dataFileSize: dataFile.size } : {}),
+    },
+  });
+  const artifactRoot = defaultArtifactRoot();
+  const publishedArtifacts: PublishedTaskArtifact[] = [];
   try {
-    const taskRunId = await repositories.taskRuns.create(scope, {
+    const dataSummary = isUploadedFile(dataFile)
+      ? await summarizeSpreadsheetFile({
+          fileName: dataFile.name,
+          mimeType: dataFile.type,
+          buffer: Buffer.from(await dataFile.arrayBuffer()),
+        })
+      : undefined;
+    const pptx = await buildPresentation({ title, slides, dataSummary });
+    publishedArtifacts.push(await publishTaskArtifact({
+      scope,
+      repositories,
+      root: artifactRoot,
+      taskRunId,
+      file: pptx,
+    }));
+    await completeTaskWithSkillDraft(repositories, {
+      scope,
+      taskRunId,
       kind: "presentation",
       inputSummary,
-      metadata: {
-        slideCount: slides.length,
-        ...(isUploadedFile(dataFile) ? { dataFileName: dataFile.name, dataFileSize: dataFile.size } : {}),
-      },
+      outputSummary: "PPT 文件已生成。",
     });
-    try {
-      const dataSummary = isUploadedFile(dataFile)
-        ? await summarizeSpreadsheetFile({
-            fileName: dataFile.name,
-            mimeType: dataFile.type,
-            buffer: Buffer.from(await dataFile.arrayBuffer()),
-          })
-        : undefined;
-      const pptx = await buildPresentation({ title, slides, dataSummary });
-      const stored = createArtifactFileLocator({
-        userId: user.id,
-        taskRunId,
-        fileName: pptx.fileName,
-        mimeType: pptx.mimeType,
-      });
-      await repositories.taskArtifacts.create(scope, { taskRunId, ...stored });
-      await writeArtifactFile({
-        root: defaultArtifactRoot(),
-        userId: user.id,
-        taskRunId,
-        fileName: pptx.fileName,
-        mimeType: pptx.mimeType,
-        buffer: pptx.buffer,
-      });
-      await completeTaskWithSkillDraft(repositories, {
-        scope,
-        taskRunId,
-        kind: "presentation",
-        inputSummary,
-        outputSummary: "PPT 文件已生成。",
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await repositories.taskRuns.fail(scope, taskRunId, message);
-      await recordEventReflection(repositories, {
-        scope,
-        event: "task_failure",
-        summary: `${inputSummary} 失败：${message}`,
-        source: { taskRunId, taskKind: "presentation" },
-      }).catch(() => undefined);
-    }
-  } finally {
-    await releaseMutationLock();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await discardPublishedTaskArtifacts({
+      scope,
+      repositories,
+      root: artifactRoot,
+      artifacts: publishedArtifacts,
+    });
+    await repositories.taskRuns.fail(scope, taskRunId, message);
+    await recordEventReflection(repositories, {
+      scope,
+      event: "task_failure",
+      summary: `${inputSummary} 失败：${message}`,
+      source: { taskRunId, taskKind: "presentation" },
+    }).catch(() => undefined);
   }
 
   return NextResponse.redirect(redirectUrl(request, "/admin/tasks"), { status: 303 });

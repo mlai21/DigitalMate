@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/admin/data/clear/route";
 import { readAttachment, saveAttachment } from "@/server/attachments/storage";
+import type { UserDataLease } from "@/server/db/repositories";
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const OWNED_KEY = "10000000-0000-4000-8000-000000000001";
@@ -17,7 +18,7 @@ const mocks = vi.hoisted(() => ({
   releaseConnectionDrain: vi.fn(),
   listAttachmentStorageKeys: vi.fn(async () => [OWNED_KEY]),
   clear: vi.fn(async () => undefined),
-  acquireUserMutationLock: vi.fn(async () => vi.fn(async () => undefined)),
+  acquireUserMutationLock: vi.fn<(userId: string) => Promise<UserDataLease>>(),
   releaseUserMutationLock: vi.fn(async () => undefined),
   deleteArtifactTree: vi.fn(async () => undefined),
   createRepositories: vi.fn(),
@@ -56,7 +57,12 @@ describe("admin personal data clear route", () => {
     mocks.clear.mockImplementation(async () => {
       mocks.callOrder.push("database");
     });
-    mocks.acquireUserMutationLock.mockImplementation(async () => mocks.releaseUserMutationLock);
+    mocks.acquireUserMutationLock.mockImplementation(async () => ({
+      userId: USER_ID,
+      epoch: "1",
+      mode: "exclusive",
+      release: mocks.releaseUserMutationLock,
+    }));
     mocks.releaseUserMutationLock.mockResolvedValue(undefined);
     mocks.deleteArtifactTree.mockImplementation(async () => {
       mocks.callOrder.push("artifacts");
@@ -69,7 +75,7 @@ describe("admin personal data clear route", () => {
     mocks.releaseConnectionDrain.mockReset();
     mocks.createRepositories.mockReturnValue({
       userDataMutations: {
-        acquireLock: mocks.acquireUserMutationLock,
+        acquireExclusiveClearLease: mocks.acquireUserMutationLock,
       },
       personalData: {
         listAttachmentStorageKeys: mocks.listAttachmentStorageKeys,
@@ -133,10 +139,15 @@ describe("admin personal data clear route", () => {
       if (mutationLockHeld) throw new Error("mutation_lock_still_held");
       mutationLockHeld = true;
       successfulAcquisitions += 1;
-      return vi.fn(async () => {
-        mutationLockHeld = false;
-        await mocks.releaseUserMutationLock();
-      });
+      return {
+        userId: USER_ID,
+        epoch: String(successfulAcquisitions),
+        mode: "exclusive",
+        release: vi.fn(async () => {
+          mutationLockHeld = false;
+          await mocks.releaseUserMutationLock();
+        }),
+      };
     });
     mocks.disconnectUser
       .mockImplementationOnce(async () => {

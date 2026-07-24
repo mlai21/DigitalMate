@@ -49,7 +49,8 @@ const mocks = vi.hoisted(() => {
     releaseDeletionClaim: vi.fn(async () => undefined),
     saveAttachment: vi.fn(async () => undefined),
     deleteStoredAttachment: vi.fn(async () => undefined),
-    acquireUserMutationLock: vi.fn(async () => vi.fn(async () => undefined)),
+    beginUserDataRequest: vi.fn(async (userId: string) => ({ userId, epoch: "1" })),
+    acquireSharedUserDataLease: vi.fn(),
     releaseUserMutationLock: vi.fn(async () => undefined),
     readAttachment: vi.fn(async () => Buffer.from("hello world\n")),
   };
@@ -66,7 +67,8 @@ vi.mock("@/server/config/env", () => ({
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: vi.fn(() => ({
     userDataMutations: {
-      acquireLock: mocks.acquireUserMutationLock,
+      beginRequest: mocks.beginUserDataRequest,
+      acquireSharedLease: mocks.acquireSharedUserDataLease,
     },
     agents: {
       getDefault: vi.fn(async () => ({
@@ -183,7 +185,8 @@ describe("chat attachment upload route", () => {
     mocks.markFailed.mockReset();
     mocks.saveAttachment.mockReset();
     mocks.deleteStoredAttachment.mockReset();
-    mocks.acquireUserMutationLock.mockReset();
+    mocks.beginUserDataRequest.mockReset();
+    mocks.acquireSharedUserDataLease.mockReset();
     mocks.releaseUserMutationLock.mockReset();
     mocks.requireCurrentUser.mockResolvedValue({ id: mocks.draft.userId });
     mocks.createDraft.mockResolvedValue({ ...mocks.draft, status: "pending" });
@@ -191,7 +194,12 @@ describe("chat attachment upload route", () => {
     mocks.markFailed.mockResolvedValue(undefined);
     mocks.saveAttachment.mockResolvedValue(undefined);
     mocks.deleteStoredAttachment.mockResolvedValue(undefined);
-    mocks.acquireUserMutationLock.mockImplementation(async () => mocks.releaseUserMutationLock);
+    mocks.beginUserDataRequest.mockImplementation(async (userId) => ({ userId, epoch: "1" }));
+    mocks.acquireSharedUserDataLease.mockImplementation(async (fence) => ({
+      ...fence,
+      mode: "shared",
+      release: mocks.releaseUserMutationLock,
+    }));
     mocks.releaseUserMutationLock.mockResolvedValue(undefined);
   });
 
@@ -215,7 +223,8 @@ describe("chat attachment upload route", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "attachment_file_required" });
     expect(mocks.saveAttachment).not.toHaveBeenCalled();
-    expect(mocks.acquireUserMutationLock).toHaveBeenCalledWith(mocks.draft.userId);
+    expect(mocks.beginUserDataRequest).toHaveBeenCalledWith(mocks.draft.userId);
+    expect(mocks.acquireSharedUserDataLease).toHaveBeenCalledTimes(1);
     expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
   });
 

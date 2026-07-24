@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { readAttachment } from "@/server/attachments/storage";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
@@ -35,43 +35,43 @@ export async function GET(
     return errorResponse("unauthorized", 401);
   }
 
-  const { attachmentId } = await context.params;
-  if (!UUID_PATTERN.test(attachmentId)) {
-    return errorResponse("attachment_not_found", 404);
-  }
-
-  let attachment;
-  try {
-    const repositories = createRepositories();
-    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-    attachment = await repositories.messageAttachments.get(scope, attachmentId);
-  } catch {
-    return errorResponse("attachment_download_failed", 500);
-  }
-  if (!attachment || (attachment.status !== "ready" && attachment.status !== "bound")) {
-    return errorResponse("attachment_not_found", 404);
-  }
-
-  let bytes: Buffer;
-  try {
-    bytes = await readAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
-  } catch (error) {
-    if (isMissingFile(error)) {
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { attachmentId } = await context.params;
+    if (!UUID_PATTERN.test(attachmentId)) {
       return errorResponse("attachment_not_found", 404);
     }
-    return errorResponse("attachment_download_failed", 500);
-  }
+    let attachment;
+    try {
+      const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+      attachment = await repositories.messageAttachments.get(scope, attachmentId);
+    } catch {
+      return errorResponse("attachment_download_failed", 500);
+    }
+    if (!attachment || (attachment.status !== "ready" && attachment.status !== "bound")) {
+      return errorResponse("attachment_not_found", 404);
+    }
 
-  const disposition = attachment.kind === "image" && INLINE_IMAGE_MIME_TYPES.has(attachment.mimeType)
-    ? "inline"
-    : "attachment";
-  return new Response(new Uint8Array(bytes), {
-    headers: {
-      "content-type": attachment.mimeType,
-      "content-length": String(bytes.byteLength),
-      "content-disposition": `${disposition}; filename*=UTF-8''${encodeRfc5987FileName(attachment.fileName)}`,
-      "cache-control": "private, no-store",
-      "x-content-type-options": "nosniff",
-    },
+    let bytes: Buffer;
+    try {
+      bytes = await readAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return errorResponse("attachment_not_found", 404);
+      }
+      return errorResponse("attachment_download_failed", 500);
+    }
+
+    const disposition = attachment.kind === "image" && INLINE_IMAGE_MIME_TYPES.has(attachment.mimeType)
+      ? "inline"
+      : "attachment";
+    return new Response(new Uint8Array(bytes), {
+      headers: {
+        "content-type": attachment.mimeType,
+        "content-length": String(bytes.byteLength),
+        "content-disposition": `${disposition}; filename*=UTF-8''${encodeRfc5987FileName(attachment.fileName)}`,
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
   });
 }

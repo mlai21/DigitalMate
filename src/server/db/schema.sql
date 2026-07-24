@@ -7,6 +7,16 @@ CREATE TABLE IF NOT EXISTS users (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS user_data_epochs (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  epoch bigint NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO user_data_epochs (user_id)
+SELECT id FROM users
+ON CONFLICT (user_id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS projects (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -306,8 +316,11 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
   file_name text NOT NULL,
   mime_type text NOT NULL,
   storage_path text NOT NULL,
+  temporary_storage_path text,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ready')),
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS tool_registrations (
@@ -497,6 +510,13 @@ ALTER TABLE reflections ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE skill_usage_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ready';
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS temporary_storage_path text;
+ALTER TABLE task_artifacts DROP CONSTRAINT IF EXISTS task_artifacts_status_check;
+ALTER TABLE task_artifacts
+  ADD CONSTRAINT task_artifacts_status_check CHECK (status IN ('pending', 'ready'));
+ALTER TABLE task_artifacts ALTER COLUMN status SET DEFAULT 'pending';
 ALTER TABLE llm_usage_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE goals ADD COLUMN IF NOT EXISTS agent_id uuid;
@@ -932,6 +952,7 @@ CREATE INDEX IF NOT EXISTS idx_skill_revisions_user_status ON skill_revisions(us
 CREATE INDEX IF NOT EXISTS idx_skill_usage_logs_skill_created ON skill_usage_logs(skill_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_runs_user_status ON task_runs(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_artifacts_run ON task_artifacts(task_run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_pending ON task_artifacts(agent_id, updated_at) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_tool_registrations_user_status ON tool_registrations(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_logs_user_created ON llm_usage_logs(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_goals_due ON goals(next_run_at) WHERE status = 'running';

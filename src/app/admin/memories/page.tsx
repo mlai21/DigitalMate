@@ -1,6 +1,6 @@
 import { ConfirmSubmitButton } from "@/components/admin/confirm-submit-button";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -9,9 +9,10 @@ export default async function MemoriesPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看记忆。</section>;
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const memories = await repositories.memories.list(scope);
+  const memories = await withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    return repositories.memories.list(scope);
+  });
 
   return (
     <section className="admin-list">

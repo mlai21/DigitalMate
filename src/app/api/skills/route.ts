@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { requireCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 
 export const runtime = "nodejs";
 
@@ -13,8 +13,10 @@ export async function GET() {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const skills = await createRepositories().skills.listEnabled(user.id);
-  return NextResponse.json({
-    skills: skills.map((skill) => ({ id: skill.id, name: skill.name, trigger: skill.trigger })),
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const skills = await repositories.skills.listEnabled(user.id);
+    return NextResponse.json({
+      skills: skills.map((skill) => ({ id: skill.id, name: skill.name, trigger: skill.trigger })),
+    });
   });
 }

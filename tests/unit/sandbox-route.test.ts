@@ -1,0 +1,120 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { POST } from "@/app/api/tasks/sandbox/route";
+
+const mocks = vi.hoisted(() => ({
+  releaseLease: vi.fn(async () => undefined),
+  publishTaskArtifact: vi.fn(),
+  discardPublishedTaskArtifacts: vi.fn(async () => undefined),
+  taskRunComplete: vi.fn(async () => undefined),
+  taskRunFail: vi.fn(async () => undefined),
+  runSandboxTask: vi.fn(async () => ({ stdout: "ok\n", stderr: "" })),
+}));
+
+vi.mock("@/server/auth/current-user", () => ({
+  requireCurrentUser: vi.fn(async () => ({ id: "user-1" })),
+}));
+
+vi.mock("@/server/db/repositories", () => ({
+  createRepositories: vi.fn(() => ({
+    userDataMutations: {
+      beginRequest: vi.fn(async (userId: string) => ({ userId, epoch: "1" })),
+      acquireSharedLease: vi.fn(async (fence: { userId: string; epoch: string }) => ({
+        ...fence,
+        mode: "shared",
+        release: mocks.releaseLease,
+      })),
+    },
+    agents: {
+      getDefault: vi.fn(async () => ({ id: "agent-1", userId: "user-1", status: "active" })),
+    },
+    taskRuns: {
+      create: vi.fn(async () => "task-1"),
+      complete: mocks.taskRunComplete,
+      fail: mocks.taskRunFail,
+    },
+    taskArtifacts: {},
+    skills: {
+      create: vi.fn(async () => undefined),
+    },
+  })),
+}));
+
+vi.mock("@/server/tasks/artifacts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/server/tasks/artifacts")>();
+  return {
+    ...actual,
+    defaultArtifactRoot: vi.fn(() => "/private/artifacts"),
+  };
+});
+
+vi.mock("@/server/tasks/artifact-publisher", () => ({
+  publishTaskArtifact: mocks.publishTaskArtifact,
+  discardPublishedTaskArtifacts: mocks.discardPublishedTaskArtifacts,
+}));
+
+vi.mock("@/server/tasks/sandbox", () => ({
+  runSandboxTask: mocks.runSandboxTask,
+}));
+
+vi.mock("@/server/evolution/event-reflection", () => ({
+  recordEventReflection: vi.fn(async () => undefined),
+}));
+
+describe("sandbox task route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.publishTaskArtifact.mockResolvedValue({
+      artifactId: "artifact-1",
+      fileName: "sandbox-output.txt",
+      mimeType: "text/plain; charset=utf-8",
+      storagePath: "user-1/task-1/sandbox-output.txt",
+    });
+  });
+
+  it("publishes the sandbox output before completing and releases the shared lease", async () => {
+    const form = new FormData();
+    form.set("script", "node -e \"console.log('ok')\"");
+
+    const response = await POST({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/sandbox",
+    } as Request);
+
+    expect(response.status).toBe(303);
+    expect(mocks.publishTaskArtifact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: { userId: "user-1", agentId: "agent-1" },
+        root: "/private/artifacts",
+        taskRunId: "task-1",
+        file: expect.objectContaining({
+          fileName: "sandbox-output.txt",
+          buffer: Buffer.from("stdout:\nok\n\n\nstderr:\n(empty)"),
+        }),
+      }),
+    );
+    expect(mocks.taskRunComplete).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails the task when publication fails without leaving a published locator", async () => {
+    mocks.publishTaskArtifact.mockRejectedValueOnce(new Error("rename_failed"));
+    const form = new FormData();
+    form.set("script", "node -e \"console.log('ok')\"");
+
+    const response = await POST({
+      formData: async () => form,
+      url: "http://localhost/api/tasks/sandbox",
+    } as Request);
+
+    expect(response.status).toBe(303);
+    expect(mocks.discardPublishedTaskArtifacts).toHaveBeenCalledWith(
+      expect.objectContaining({ artifacts: [] }),
+    );
+    expect(mocks.taskRunFail).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      "task-1",
+      "rename_failed",
+    );
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
+  });
+});

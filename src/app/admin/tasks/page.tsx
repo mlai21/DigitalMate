@@ -1,5 +1,5 @@
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { getCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const dynamic = "force-dynamic";
@@ -8,12 +8,13 @@ export default async function TasksPage() {
   const user = await getCurrentUser();
   if (!user) return <section className="admin-card">需要登录后查看任务。</section>;
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const [taskRuns, artifacts] = await Promise.all([
-    repositories.taskRuns.list(scope),
-    repositories.taskArtifacts.list(scope),
-  ]);
+  const [taskRuns, artifacts] = await withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    return Promise.all([
+      repositories.taskRuns.list(scope),
+      repositories.taskArtifacts.list(scope),
+    ]);
+  });
   const artifactsByTask = new Map<string, typeof artifacts>();
   for (const artifact of artifacts) {
     const list = artifactsByTask.get(artifact.task_run_id) ?? [];

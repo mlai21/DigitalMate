@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { acquireUserDataLease } from "@/server/admin/user-data-lease";
 import { generateConversationTitle } from "@/server/agent/conversation-title";
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
@@ -13,7 +14,11 @@ import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
+import {
+  createRepositories,
+  type DbMessageAttachment,
+  type UserDataLease,
+} from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
 import { recordTurnReview } from "@/server/evolution/turn-review";
 import { supportsImageInput } from "@/server/llm/catalog";
@@ -50,12 +55,34 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
+  const repositories = createRepositories();
+  let userDataLease: UserDataLease;
+  try {
+    userDataLease = await acquireUserDataLease(repositories, user.id);
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "user_data_lease_failed";
+    return NextResponse.json(
+      { error: code === "user_data_epoch_changed" ? code : "user_data_lease_failed" },
+      { status: code === "user_data_epoch_changed" ? 409 : 503 },
+    );
+  }
+
+  return handleLeasedChatRequest(request, user, repositories, userDataLease);
+}
+
+async function handleLeasedChatRequest(
+  request: Request,
+  user: { id: string },
+  repositories: ReturnType<typeof createRepositories>,
+  userDataLease: UserDataLease,
+): Promise<Response> {
+  let leaseTransferredToStream = false;
+  try {
   const body = requestSchema.safeParse(await request.json());
   if (!body.success) {
     return NextResponse.json({ error: "invalid_request" }, { status: 400 });
   }
 
-  const repositories = createRepositories();
   const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
   const conversation = body.data.conversationId
     ? await repositories.conversations.get(scope, body.data.conversationId)
@@ -249,7 +276,10 @@ export async function POST(request: Request) {
     userEnabled: body.data.searchEnabled === true,
   });
 
-  const stream = new ReadableStream({
+  leaseTransferredToStream = true;
+  let stream: ReadableStream<Uint8Array>;
+  try {
+    stream = new ReadableStream({
     async start(controller) {
       let assistantText = "";
       let executionAccepted = false;
@@ -260,6 +290,7 @@ export async function POST(request: Request) {
       } catch {
         safeEnqueue(controller, encoder, { type: "error", message: "个人数据正在清理，请稍后重试。" });
         safeClose(controller);
+        await releaseChatUserDataLease(userDataLease);
         return;
       }
       try {
@@ -269,6 +300,7 @@ export async function POST(request: Request) {
         safeEnqueue(controller, encoder, { type: "error", message: "消息暂时没有受理，请重试。" });
         safeClose(controller);
         releaseUserConnection();
+        await releaseChatUserDataLease(userDataLease);
         return;
       }
       try {
@@ -406,11 +438,10 @@ export async function POST(request: Request) {
         });
         safeClose(controller);
 
-        // Post-turn background work on the light model: auto-title new
-        // conversations and run the Hermes-style per-turn review. Neither may
-        // block or fail the reply.
-        if (assistantTurn.created) setTimeout(() => {
-          void runPostTurnTasks({
+        // The client has its complete response, but the same shared lease stays
+        // alive until all derived writes from this turn have settled.
+        if (assistantTurn.created) {
+          await runPostTurnTasks({
             repositories,
             scope,
             conversationId,
@@ -420,7 +451,7 @@ export async function POST(request: Request) {
             llm: light.client,
             model: light.model,
           });
-        }, 0);
+        }
       } catch (error) {
         if (!executionAccepted) {
           console.error("chat_turn_admission_failed", {
@@ -482,9 +513,14 @@ export async function POST(request: Request) {
           });
         }
         releaseUserConnection?.();
+        await releaseChatUserDataLease(userDataLease);
       }
     },
-  });
+    });
+  } catch (error) {
+    leaseTransferredToStream = false;
+    throw error;
+  }
 
   return new Response(stream, {
     headers: {
@@ -492,6 +528,17 @@ export async function POST(request: Request) {
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",
     },
+  });
+  } finally {
+    if (!leaseTransferredToStream) {
+      await releaseChatUserDataLease(userDataLease);
+    }
+  }
+}
+
+async function releaseChatUserDataLease(lease: UserDataLease): Promise<void> {
+  await lease.release().catch(() => {
+    console.error("chat_user_data_lease_release_failed", { code: "user_data_lease_release_failed" });
   });
 }
 

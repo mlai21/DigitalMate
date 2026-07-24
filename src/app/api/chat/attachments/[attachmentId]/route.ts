@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { deleteAttachment } from "@/server/attachments/storage";
 import { requireCurrentUser } from "@/server/auth/current-user";
 import { readEnv } from "@/server/config/env";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
@@ -28,62 +28,62 @@ export async function DELETE(
     return errorResponse("unauthorized", 401);
   }
 
-  const { attachmentId } = await context.params;
-  if (!UUID_PATTERN.test(attachmentId)) {
-    return deletedResponse();
-  }
-
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const attachments = repositories.messageAttachments;
-  let attachment;
-  try {
-    attachment = await attachments.claimDraftForDeletion(scope, attachmentId);
-  } catch {
-    return errorResponse("attachment_delete_failed", 500);
-  }
-  if (!attachment) {
-    return deletedResponse();
-  }
-  if (!attachment.deletionClaimToken) {
-    return errorResponse("attachment_delete_failed", 500);
-  }
-  const deletionClaimToken = attachment.deletionClaimToken;
-
-  const releaseClaim = async () => {
-    try {
-      return await attachments.releaseDeletionClaim(
-        scope,
-        attachment.id,
-        deletionClaimToken,
-        "attachment_delete_failed",
-      );
-    } catch {
-      return false;
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const { attachmentId } = await context.params;
+    if (!UUID_PATTERN.test(attachmentId)) {
+      return deletedResponse();
     }
-  };
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const attachments = repositories.messageAttachments;
+    let attachment;
+    try {
+      attachment = await attachments.claimDraftForDeletion(scope, attachmentId);
+    } catch {
+      return errorResponse("attachment_delete_failed", 500);
+    }
+    if (!attachment) {
+      return deletedResponse();
+    }
+    if (!attachment.deletionClaimToken) {
+      return errorResponse("attachment_delete_failed", 500);
+    }
+    const deletionClaimToken = attachment.deletionClaimToken;
 
-  try {
-    await deleteAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
-  } catch {
-    await releaseClaim();
-    return errorResponse("attachment_delete_failed", 500);
-  }
+    const releaseClaim = async () => {
+      try {
+        return await attachments.releaseDeletionClaim(
+          scope,
+          attachment.id,
+          deletionClaimToken,
+          "attachment_delete_failed",
+        );
+      } catch {
+        return false;
+      }
+    };
 
-  try {
-    const deleted = await attachments.deleteDraft(
-      scope,
-      attachment.id,
-      deletionClaimToken,
-    );
-    if (!deleted) {
+    try {
+      await deleteAttachment(readEnv().attachmentStorageDir, attachment.storageKey);
+    } catch {
       await releaseClaim();
       return errorResponse("attachment_delete_failed", 500);
     }
-  } catch {
-    await releaseClaim();
-    return errorResponse("attachment_delete_failed", 500);
-  }
 
-  return deletedResponse();
+    try {
+      const deleted = await attachments.deleteDraft(
+        scope,
+        attachment.id,
+        deletionClaimToken,
+      );
+      if (!deleted) {
+        await releaseClaim();
+        return errorResponse("attachment_delete_failed", 500);
+      }
+    } catch {
+      await releaseClaim();
+      return errorResponse("attachment_delete_failed", 500);
+    }
+
+    return deletedResponse();
+  });
 }

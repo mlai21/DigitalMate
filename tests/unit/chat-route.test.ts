@@ -113,6 +113,15 @@ const mocks = vi.hoisted(() => {
   const listMessages = vi.fn(async () => [] as HistoryRow[]);
   const listMessagesAfter = vi.fn(async () => [] as HistoryRow[]);
   const readAttachment = vi.fn(async () => Buffer.from("private-image"));
+  const generateConversationTitle = vi.fn(async () => "新的标题");
+  const recordTurnReview = vi.fn<() => Promise<void>>(async () => undefined);
+  const releaseUserDataLease = vi.fn(async () => undefined);
+  const beginUserDataRequest = vi.fn(async (userId: string) => ({ userId, epoch: "1" }));
+  const acquireSharedUserDataLease = vi.fn(async (fence: { userId: string; epoch: string }) => ({
+    ...fence,
+    mode: "shared" as const,
+    release: releaseUserDataLease,
+  }));
 
   return {
     agentScope,
@@ -134,6 +143,11 @@ const mocks = vi.hoisted(() => {
     listMessages,
     listMessagesAfter,
     readAttachment,
+    generateConversationTitle,
+    recordTurnReview,
+    releaseUserDataLease,
+    beginUserDataRequest,
+    acquireSharedUserDataLease,
     createRepositories: vi.fn<() => Record<string, unknown>>(() => ({
       agents: {
         getDefault: vi.fn(async () => defaultAgent),
@@ -199,7 +213,13 @@ vi.mock("@/server/auth/current-user", () => ({
 }));
 
 vi.mock("@/server/db/repositories", () => ({
-  createRepositories: mocks.createRepositories,
+  createRepositories: () => ({
+    userDataMutations: {
+      beginRequest: mocks.beginUserDataRequest,
+      acquireSharedLease: mocks.acquireSharedUserDataLease,
+    },
+    ...mocks.createRepositories(),
+  }),
 }));
 
 vi.mock("@/server/evolution/event-reflection", () => ({
@@ -220,6 +240,14 @@ vi.mock("@/server/attachments/storage", () => ({
 
 vi.mock("@/server/agent/run-agent", () => ({
   runAgent: mocks.runAgent,
+}));
+
+vi.mock("@/server/agent/conversation-title", () => ({
+  generateConversationTitle: mocks.generateConversationTitle,
+}));
+
+vi.mock("@/server/evolution/turn-review", () => ({
+  recordTurnReview: mocks.recordTurnReview,
 }));
 
 vi.mock("@/server/agent/tools/web-search", () => ({
@@ -243,6 +271,15 @@ describe("chat route", () => {
     mocks.listAttachmentsForMessages.mockReset().mockResolvedValue([]);
     mocks.listMessages.mockReset().mockResolvedValue([]);
     mocks.listMessagesAfter.mockReset().mockResolvedValue([]);
+    mocks.releaseUserDataLease.mockReset().mockResolvedValue(undefined);
+    mocks.beginUserDataRequest.mockReset().mockImplementation(async (userId) => ({ userId, epoch: "1" }));
+    mocks.acquireSharedUserDataLease.mockReset().mockImplementation(async (fence) => ({
+      ...fence,
+      mode: "shared" as const,
+      release: mocks.releaseUserDataLease,
+    }));
+    mocks.generateConversationTitle.mockReset().mockResolvedValue("新的标题");
+    mocks.recordTurnReview.mockReset().mockResolvedValue(undefined);
     mocks.messagesCreateIdempotentUserTurn.mockReset().mockImplementation(async (_scope, input) => {
       if (input.attachmentIds.length > 0) {
         const result = await mocks.messagesCreateWithAttachments({
@@ -633,6 +670,35 @@ describe("chat route", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "invalid_request" });
     expect(mocks.messagesCreateIdempotentUserTurn).not.toHaveBeenCalled();
+    expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the visible stream before post-turn work settles but keeps the shared lease", async () => {
+    let finishPostTurn: (() => void) | undefined;
+    mocks.recordTurnReview.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        finishPostTurn = resolve;
+      }),
+    );
+
+    const response = await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(withClientTurn({ message: "先回复，再复盘" })),
+    }));
+    const visibleBody = response.text();
+
+    await expect(Promise.race([
+      visibleBody.then(() => "closed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 50)),
+    ])).resolves.toBe("closed");
+    expect(mocks.recordTurnReview).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserDataLease).not.toHaveBeenCalled();
+
+    finishPostTurn?.();
+    await vi.waitFor(() => {
+      expect(mocks.releaseUserDataLease).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("replays an existing assistant without running the agent again", async () => {

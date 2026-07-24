@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { requireCurrentUser } from "@/server/auth/current-user";
-import { createRepositories } from "@/server/db/repositories";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 
 export const runtime = "nodejs";
@@ -19,21 +19,22 @@ export async function GET() {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  const [conversations, projects] = await Promise.all([
-    repositories.conversations.listWithStats(scope),
-    repositories.projects.list(scope),
-  ]);
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    const [conversations, projects] = await Promise.all([
+      repositories.conversations.listWithStats(scope),
+      repositories.projects.list(scope),
+    ]);
 
-  return NextResponse.json({
-    conversations: conversations.map(serializeConversation),
-    projects: projects.map((project) => ({
-      id: project.id,
-      name: project.name,
-      description: project.description,
-      updatedAt: project.updatedAt.toISOString(),
-    })),
+    return NextResponse.json({
+      conversations: conversations.map(serializeConversation),
+      projects: projects.map((project) => ({
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        updatedAt: project.updatedAt.toISOString(),
+      })),
+    });
   });
 }
 
@@ -45,23 +46,23 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const body = createSchema.safeParse(await request.json().catch(() => ({})));
-  if (!body.success) {
-    return NextResponse.json({ error: "invalid_request" }, { status: 400 });
-  }
+  return withFreshUserDataLease(user.id, async (repositories) => {
+    const body = createSchema.safeParse(await request.json().catch(() => ({})));
+    if (!body.success) {
+      return NextResponse.json({ error: "invalid_request" }, { status: 400 });
+    }
+    const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
+    if (body.data.projectId) {
+      const project = await repositories.projects.get(scope, body.data.projectId);
+      if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
+    }
 
-  const repositories = createRepositories();
-  const scope = await resolveDefaultAgentScope(user.id, repositories.agents);
-  if (body.data.projectId) {
-    const project = await repositories.projects.get(scope, body.data.projectId);
-    if (!project) return NextResponse.json({ error: "project_not_found" }, { status: 404 });
-  }
-
-  const conversation = await repositories.conversations.create(scope, {
-    title: body.data.title,
-    projectId: body.data.projectId ?? null,
+    const conversation = await repositories.conversations.create(scope, {
+      title: body.data.title,
+      projectId: body.data.projectId ?? null,
+    });
+    return NextResponse.json({ conversation: serializeConversation({ ...conversation, messageCount: 0, lastMessageAt: null }) });
   });
-  return NextResponse.json({ conversation: serializeConversation({ ...conversation, messageCount: 0, lastMessageAt: null }) });
 }
 
 function serializeConversation(conversation: {
