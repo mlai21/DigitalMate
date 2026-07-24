@@ -38,11 +38,21 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ error: "personal_data_clear_failed" }, { status: 500 });
   } finally {
-    releaseConnectionDrain?.();
+    if (releaseConnectionDrain) {
+      try {
+        releaseConnectionDrain();
+      } catch {
+        console.error("user_connection_drain_release_failed", {
+          code: "user_connection_drain_release_failed",
+        });
+      }
+    }
     if (clearLease) {
-      await clearLease.release().catch(() => {
+      try {
+        await clearLease.release();
+      } catch {
         console.error("user_data_clear_lease_release_failed", { code: "user_data_clear_lease_release_failed" });
-      });
+      }
     }
   }
 }

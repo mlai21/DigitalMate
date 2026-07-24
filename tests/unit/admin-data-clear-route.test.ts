@@ -324,4 +324,132 @@ describe("admin personal data clear route", () => {
     await expect(readAttachment(root, OWNED_KEY)).rejects.toMatchObject({ code: "ENOENT" });
     consoleError.mockRestore();
   });
+
+  it("keeps the successful response and releases the lease when drain release throws", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+    mocks.releaseConnectionDrain.mockImplementationOnce(() => {
+      mocks.callOrder.push("release-drain");
+      throw new Error("SENTINEL_DRAIN_RELEASE_SECRET");
+    });
+    const consoleError = vi.spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let response: Response | undefined;
+    let caught: unknown;
+
+    try {
+      response = await POST(
+        new Request(
+          "http://localhost/api/admin/data/clear",
+          { method: "POST" },
+        ),
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeUndefined();
+    expect(response?.status).toBe(303);
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      "user_connection_drain_release_failed",
+      { code: "user_connection_drain_release_failed" },
+    );
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+      "SENTINEL_DRAIN_RELEASE_SECRET",
+    );
+    consoleError.mockRestore();
+  });
+
+  it("keeps the original failure response and releases the lease when drain release throws", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+    mocks.deleteArtifactTree.mockRejectedValueOnce(
+      new Error("SENTINEL_PRIMARY_FAILURE_SECRET"),
+    );
+    mocks.releaseConnectionDrain.mockImplementationOnce(() => {
+      mocks.callOrder.push("release-drain");
+      throw new Error("SENTINEL_DRAIN_RELEASE_SECRET");
+    });
+    const consoleError = vi.spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let response: Response | undefined;
+    let caught: unknown;
+
+    try {
+      response = await POST(
+        new Request(
+          "http://localhost/api/admin/data/clear",
+          { method: "POST" },
+        ),
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeUndefined();
+    expect(response?.status).toBe(500);
+    await expect(response?.json()).resolves.toEqual({
+      error: "personal_data_clear_failed",
+    });
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      "user_connection_drain_release_failed",
+      { code: "user_connection_drain_release_failed" },
+    );
+    expect(JSON.stringify(consoleError.mock.calls)).not.toMatch(
+      /SENTINEL_PRIMARY_FAILURE_SECRET|SENTINEL_DRAIN_RELEASE_SECRET/,
+    );
+    consoleError.mockRestore();
+  });
+
+  it("does not let either release failure escape or suppress the other release", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-clear-"));
+    roots.push(root);
+    mocks.attachmentStorageDir = root;
+    mocks.releaseConnectionDrain.mockImplementationOnce(() => {
+      mocks.callOrder.push("release-drain");
+      throw new Error("SENTINEL_DRAIN_RELEASE_SECRET");
+    });
+    mocks.releaseUserMutationLock.mockImplementationOnce(async () => {
+      mocks.callOrder.push("release-lease");
+      throw new Error("SENTINEL_LEASE_RELEASE_SECRET");
+    });
+    const consoleError = vi.spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let response: Response | undefined;
+    let caught: unknown;
+
+    try {
+      response = await POST(
+        new Request(
+          "http://localhost/api/admin/data/clear",
+          { method: "POST" },
+        ),
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeUndefined();
+    expect(response?.status).toBe(303);
+    expect(mocks.releaseConnectionDrain).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseUserMutationLock).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      "user_connection_drain_release_failed",
+      { code: "user_connection_drain_release_failed" },
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      "user_data_clear_lease_release_failed",
+      { code: "user_data_clear_lease_release_failed" },
+    );
+    expect(JSON.stringify(consoleError.mock.calls)).not.toMatch(
+      /SENTINEL_DRAIN_RELEASE_SECRET|SENTINEL_LEASE_RELEASE_SECRET/,
+    );
+    consoleError.mockRestore();
+  });
 });
