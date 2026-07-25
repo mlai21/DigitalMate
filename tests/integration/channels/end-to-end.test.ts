@@ -28,6 +28,9 @@ import {
   createChannelEventRepository,
 } from "@/server/channels/runtime/event-repository";
 import {
+  createChannelNodeRepository,
+} from "@/server/channels/nodes/repository";
+import {
   ChannelProcessCrashError,
   createChannelEventWorker,
 } from "@/server/channels/runtime/event-worker";
@@ -562,6 +565,160 @@ describe("channel runtime end-to-end recovery", () => {
       previousResult: null,
     });
   });
+
+  it("serializes node outbox enqueue and keeps a single waiting delivery", async () => {
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "Test node",
+      certificateFingerprint: Buffer.alloc(32, 7),
+      supportedChannelTypes: ["telegram"],
+    });
+    await nodes.bindConnection(
+      scope,
+      node.id,
+      CONNECTION_ID,
+    );
+    await nodes.recordHeartbeat(USER_ID, node.id, 1, now);
+    await expect(
+      nodes.recordHeartbeat(USER_ID, node.id, 1, now),
+    ).rejects.toThrow("node_sequence_replayed");
+    const delivery = await seedNodeDelivery("node-event-1");
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        nodes.enqueueSend(
+          {
+            scope,
+            nodeId: node.id,
+            connectionId: CONNECTION_ID,
+            deliveryId: delivery.id,
+            expiresAt: new Date(
+              now.getTime() + 5 * 60_000,
+            ),
+            payload: {
+              body: "single persisted reply",
+              recipient: {
+                externalConversationId: "conversation-1",
+              },
+            },
+          },
+          now,
+        )
+      ),
+    );
+
+    expect(results.every(
+      (result) => result.action === "enqueued",
+    )).toBe(true);
+    expect(results.filter(
+      (result) =>
+        result.action === "enqueued" && result.created
+    )).toHaveLength(1);
+    await expect(
+      countRows("channel_node_outbox", "status = 'pending'"),
+    ).resolves.toBe(1);
+    await expect(
+      countRows(
+        "channel_deliveries",
+        "status = 'waiting_node'",
+      ),
+    ).resolves.toBe(1);
+    await expect(
+      countRows("messages", "role = 'assistant'"),
+    ).resolves.toBe(1);
+  });
+
+  it("retains a delivery without adding outbox rows for a long-offline node", async () => {
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "Offline node",
+      certificateFingerprint: Buffer.alloc(32, 9),
+      supportedChannelTypes: ["telegram"],
+    });
+    const delivery = await seedNodeDelivery("node-event-offline");
+    await expect(nodes.enqueueSend(
+      {
+        scope,
+        nodeId: node.id,
+        connectionId: CONNECTION_ID,
+        deliveryId: delivery.id,
+        expiresAt: new Date(now.getTime() + 5 * 60_000),
+        payload: {
+          body: "retained reply",
+          recipient: {
+            externalConversationId: "conversation-1",
+          },
+        },
+      },
+      now,
+    )).rejects.toThrow("node_connection_not_bound");
+    await nodes.bindConnection(
+      scope,
+      node.id,
+      CONNECTION_ID,
+    );
+
+    await expect(nodes.enqueueSend(
+      {
+        scope,
+        nodeId: node.id,
+        connectionId: CONNECTION_ID,
+        deliveryId: delivery.id,
+        expiresAt: new Date(now.getTime() + 5 * 60_000),
+        payload: {
+          body: "retained reply",
+          recipient: {
+            externalConversationId: "conversation-1",
+          },
+        },
+      },
+      now,
+    )).resolves.toEqual({
+      action: "waiting",
+      reason: "node_offline_too_long",
+    });
+    await expect(
+      countRows("channel_node_outbox", "true"),
+    ).resolves.toBe(0);
+    await expect(
+      countRows(
+        "channel_deliveries",
+        "status = 'waiting_node'",
+      ),
+    ).resolves.toBe(1);
+  });
+
+  async function seedNodeDelivery(
+    externalEventId: string,
+  ) {
+    const repositories = createRepositories(pool);
+    const events = createChannelEventRepository(pool);
+    const deliveries = createChannelDeliveryRepository(pool);
+    const event = await events.accept(
+      scope,
+      normalizedEvent(externalEventId),
+    );
+    const message = await repositories.messages.create(scope, {
+      conversationId: CONVERSATION_ID,
+      role: "assistant",
+      content: "single persisted reply",
+    });
+    const enqueued = await deliveries.enqueue({
+      scope,
+      eventId: event.event.id,
+      connectionId: CONNECTION_ID,
+      assistantMessageId: message.id,
+      body: message.content,
+      recipient: {
+        externalConversationId: "conversation-1",
+      },
+    });
+    return enqueued.delivery;
+  }
 
   function worker(input: {
     owner: string;
