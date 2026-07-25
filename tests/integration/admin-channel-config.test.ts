@@ -26,6 +26,9 @@ import {
   createChannelSecretsKey,
   encryptedSecretFromStorage,
 } from "@/server/security/encrypted-secret";
+import {
+  createPostgresChannelConnectionRuntimeStore,
+} from "@/server/channels/runtime/connection-manager";
 import { getChannelManifest } from "@/server/channels/manifests/catalog";
 import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
 import {
@@ -164,8 +167,8 @@ describe("admin channel configuration service", () => {
         filter_tool_messages: true,
         filter_thinking: true,
       },
-      health_status: "blocked",
-      health_detail: { code: "runtime_not_implemented" },
+      health_status: "starting",
+      health_detail: {},
     });
     const audit = await primary.query<{
       action: string;
@@ -190,6 +193,85 @@ describe("admin channel configuration service", () => {
       },
     });
     expect(JSON.stringify(audit.rows[0])).not.toContain(TOKEN);
+  });
+
+  it("notifies the runtime after commit and returns persisted health to Console", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    const store = createPostgresChannelConnectionRuntimeStore(
+      primary,
+      key.key,
+    );
+    let resolveNotification!: (value: {
+      connectionId: string;
+      revision: number;
+    }) => void;
+    const notification = new Promise<{
+      connectionId: string;
+      revision: number;
+    }>((resolve) => {
+      resolveNotification = resolve;
+    });
+    const unsubscribe = await store.subscribe(
+      resolveNotification,
+    );
+
+    try {
+      const snapshot = await service.update(
+        createInput(OPERATION_ID),
+      );
+      await expect(notification).resolves.toEqual({
+        connectionId: expect.any(String),
+        revision: 1,
+      });
+      const connections = await store.listEnabled();
+      expect(connections).toHaveLength(1);
+      expect(connections[0]).toMatchObject({
+        id: expect.any(String),
+        revision: 1,
+        config: {
+          enabled: true,
+          bot_token: TOKEN,
+        },
+      });
+      expect(connections[0]?.runtimeError).toBeUndefined();
+
+      await store.updateHealth(connections[0]!, {
+        status: "connected",
+        detail: {
+          checkedAt: "2026-07-26T00:00:00.000Z",
+          reconnectAttempts: 0,
+        },
+        lastConnectedAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      });
+      const readBack = await service.read({
+        userId: USER_ID,
+        agentId: AGENT_ID,
+      });
+      expect(readBack.telegram.health).toEqual({
+        status: "connected",
+        detail: {
+          checkedAt: "2026-07-26T00:00:00.000Z",
+          reconnectAttempts: 0,
+        },
+        lastConnectedAt: "2026-07-26T00:00:00.000Z",
+      });
+      expect(snapshot.health.status).toBe("starting");
+    } finally {
+      await unsubscribe();
+    }
+
+    const blockedStore =
+      createPostgresChannelConnectionRuntimeStore(
+        primary,
+        null,
+      );
+    const blocked = await blockedStore.listEnabled();
+    expect(blocked[0]?.runtimeError).toMatchObject({
+      code: "runtime_prerequisite_missing",
+    });
+    expect(blocked[0]?.config).not.toHaveProperty("bot_token");
   });
 
   it.each([

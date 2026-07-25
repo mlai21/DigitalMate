@@ -61,7 +61,7 @@ import {
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-24.1";
+export const adminCompatApiRevision = "2026-07-26.1";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;

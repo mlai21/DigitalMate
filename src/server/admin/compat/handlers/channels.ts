@@ -34,8 +34,17 @@ export type AdminChannelSecretStatus = Readonly<{
 }>;
 
 export type AdminChannelHealth = Readonly<{
-  status: "blocked" | "disabled";
+  status:
+    | "blocked"
+    | "disabled"
+    | "starting"
+    | "connected"
+    | "degraded"
+    | "disconnected";
   detail: Readonly<Record<string, unknown>>;
+  lastConnectedAt?: string;
+  lastDisconnectedAt?: string;
+  lastEventAt?: string;
 }>;
 
 export type AdminChannelConfigSnapshot = Readonly<{

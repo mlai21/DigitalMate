@@ -53,8 +53,17 @@ type ConnectionRow = {
   enabled: boolean;
   config: Record<string, unknown>;
   revision: number;
-  health_status: "blocked" | "disabled";
+  health_status:
+    | "blocked"
+    | "disabled"
+    | "starting"
+    | "connected"
+    | "degraded"
+    | "disconnected";
   health_detail: Record<string, unknown>;
+  last_connected_at?: Date | string | null;
+  last_disconnected_at?: Date | string | null;
+  last_event_at?: Date | string | null;
 };
 
 type ConnectionSecretRow = ConnectionRow & {
@@ -235,6 +244,7 @@ export function createAdminChannelConfigService(
           snapshot,
           action,
         );
+        await notifyConfigChanged(client, updated);
         lifecycle.signal.throwIfAborted();
         transactionState = "committing";
         try {
@@ -433,6 +443,7 @@ export function createAdminChannelConfigService(
               ? "channel_connection.update"
               : "channel_connection.create",
           );
+          await notifyConfigChanged(client, updated);
           snapshots.set(item.type, snapshot);
           lifecycle.signal.throwIfAborted();
         }
@@ -600,7 +611,9 @@ async function readAllRows(
      SELECT connection.id, connection.user_id, connection.agent_id,
             connection.channel_type, connection.enabled, connection.config,
             connection.revision, connection.health_status,
-            connection.health_detail, secret.field_name, secret.rotated_at
+            connection.health_detail, connection.last_connected_at,
+            connection.last_disconnected_at, connection.last_event_at,
+            secret.field_name, secret.rotated_at
      FROM bounded_connections AS connection
      LEFT JOIN channel_secrets AS secret
        ON secret.connection_id = connection.id
@@ -683,6 +696,9 @@ function snapshotFromRow(
     enabled: row.enabled,
   });
   const config = { ...parsed };
+  const lastConnectedAt = toIso(row.last_connected_at ?? null);
+  const lastDisconnectedAt = toIso(row.last_disconnected_at ?? null);
+  const lastEventAt = toIso(row.last_event_at ?? null);
   delete config.enabled;
   for (const secretField of manifest.secretFields) delete config[secretField];
   return {
@@ -700,10 +716,11 @@ function snapshotFromRow(
       ]),
     ),
     health: {
-      status: row.enabled ? "blocked" : "disabled",
-      detail: row.enabled
-        ? { code: "runtime_not_implemented" }
-        : {},
+      status: row.health_status,
+      detail: row.health_detail,
+      ...(lastConnectedAt ? { lastConnectedAt } : {}),
+      ...(lastDisconnectedAt ? { lastDisconnectedAt } : {}),
+      ...(lastEventAt ? { lastEventAt } : {}),
     },
   };
 }
@@ -1161,15 +1178,30 @@ async function rollbackChannelTransaction(
 }
 
 function intendedHealth(enabled: boolean): {
-  status: "blocked" | "disabled";
+  status: "starting" | "disabled";
   detail: Record<string, unknown>;
 } {
   return enabled
     ? {
-        status: "blocked",
-        detail: { code: "runtime_not_implemented" },
+        status: "starting",
+        detail: {},
       }
     : { status: "disabled", detail: {} };
+}
+
+async function notifyConfigChanged(
+  client: PoolClient,
+  connection: ConnectionRow,
+): Promise<void> {
+  await client.query(
+    "SELECT pg_notify('channel_config_changed', $1)",
+    [
+      JSON.stringify({
+        connection_id: connection.id,
+        revision: Number(connection.revision),
+      }),
+    ],
+  );
 }
 
 function stableJson(value: unknown): string {
