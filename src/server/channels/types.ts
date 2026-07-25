@@ -1,6 +1,34 @@
-export type ChannelName = "telegram" | "slack" | "feishu" | "dingtalk" | "web";
+import type { ChatType } from "./runtime/types";
 
-export type ChatType = "direct" | "group";
+export type {
+  AdapterDependencies,
+  ChannelDelivery,
+  ChannelHealth,
+  ChannelHealthErrorCode,
+  ChannelHealthStatus,
+  ChannelRecipient,
+  ChannelRuntimeContext,
+  InboundAttachmentDescriptor,
+  InboundContext,
+  IngressResult,
+  NormalizedChannelEvent,
+  PermissionEnvelope,
+  PlatformAcknowledgement,
+  ResolvedRecipient,
+  SendContext,
+  SendResult,
+  StreamingState,
+  UnsealedReplyHandle,
+} from "./runtime/types";
+export type { ChannelAdapter } from "./runtime/adapter";
+export type { ChatType };
+
+export type ChannelName =
+  | "telegram"
+  | "slack"
+  | "feishu"
+  | "dingtalk"
+  | "web";
 
 export type NormalizedChannelMessage = {
   channel: ChannelName;
