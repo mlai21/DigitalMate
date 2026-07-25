@@ -5,6 +5,7 @@ import {
 
 import type { ChannelAdapter } from "./adapter";
 import type { AdapterDependencies } from "./types";
+import { createDingTalkAdapter } from "../adapters/dingtalk";
 import { createDiscordAdapter } from "../adapters/discord";
 import { createFeishuAdapter } from "../adapters/feishu";
 import { createMattermostAdapter } from "../adapters/mattermost";
@@ -168,6 +169,36 @@ export function registerFeishuChannelAdapter(
       ...(dependencies.scope ? { scope: dependencies.scope } : {}),
       ...(dependencies.acceptInbound
         ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
+export function registerDingTalkChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("dingtalk", (dependencies) =>
+    createDingTalkAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope ? { scope: dependencies.scope } : {}),
+      ...(dependencies.acceptInbound
+        ? {
+            acceptInbound: async (
+              payload,
+              context,
+              scope,
+              acknowledge,
+            ) => {
+              const result =
+                await dependencies.acceptInbound!(
+                  payload,
+                  context,
+                  scope,
+                );
+              await acknowledge();
+              return result;
+            },
+          }
         : {}),
     })
   );

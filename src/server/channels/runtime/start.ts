@@ -16,6 +16,15 @@ import {
   createDiscordAttachmentFetcher,
 } from "@/server/channels/adapters/discord/transport";
 import {
+  createDingTalkAdapter,
+} from "@/server/channels/adapters/dingtalk";
+import {
+  parseDingTalkConfig,
+} from "@/server/channels/adapters/dingtalk/config";
+import {
+  createDingTalkAttachmentFetcher,
+} from "@/server/channels/adapters/dingtalk/transport";
+import {
   createFeishuAdapter,
 } from "@/server/channels/adapters/feishu";
 import {
@@ -49,7 +58,6 @@ import {
 import {
   createTelegramTransport,
 } from "@/server/channels/adapters/telegram/transport";
-import { createDingTalkWebhookAdapter } from "@/server/channels/adapters/webhook/dingtalk";
 import { createSlackWebhookAdapter } from "@/server/channels/adapters/webhook/slack";
 import { createChannelAccessControl } from "@/server/channels/runtime/access";
 import {
@@ -384,47 +392,17 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
   const connectionId = connection.rows[0]?.id;
   if (!connectionId) return { queued: false };
 
-  let replyHandleId: string | undefined;
-  if (input.target.channel === "dingtalk") {
-    const handle = await pool.query<{ id: string }>(
-      `SELECT handle.id
-       FROM channel_reply_handles AS handle
-       JOIN channel_inbound_events AS event
-         ON event.id = handle.event_id
-        AND event.user_id = handle.user_id
-        AND event.agent_id = handle.agent_id
-       WHERE handle.user_id = $1
-         AND handle.agent_id = $2
-         AND event.connection_id = $3
-         AND event.external_conversation_id = $4
-         AND (
-           handle.expires_at IS NULL
-           OR handle.expires_at > now()
-         )
-       ORDER BY event.received_at DESC
-       LIMIT 1`,
-      [
-        input.scope.userId,
-        input.scope.agentId,
-        connectionId,
-        input.target.externalConversationId,
-      ],
-    );
-    replyHandleId = handle.rows[0]?.id;
-    if (!replyHandleId) return { queued: false };
-  }
-
   await input.repositories.channelDeliveries.enqueueProactive({
     scope: input.scope,
     sourceTaskId: input.taskId,
     connectionId,
     assistantMessageId: input.assistantMessageId,
-    ...(replyHandleId ? { replyHandleId } : {}),
     body: input.content,
     recipient: {
       externalConversationId:
         input.target.externalConversationId,
       externalUserId: input.target.senderId,
+      chatType: input.target.chatType,
     },
   });
   return { queued: true };
@@ -453,6 +431,18 @@ export function createChannelDeliveryTransport(input: Readonly<{
       );
       return resolved.adapter.streaming
         && resolved.config.streaming_enabled === true
+        && (
+          (
+            delivery.eventId === null
+              ? resolved.config.cron_message_type
+              : resolved.config.message_type
+          ) === undefined
+          || (
+            delivery.eventId === null
+              ? resolved.config.cron_message_type
+              : resolved.config.message_type
+          ) === "card"
+        )
         ? "streaming"
         : "segmented";
     },
@@ -602,10 +592,132 @@ function createManagedAdapter(
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
     case "dingtalk":
-      return createDingTalkWebhookAdapter();
+      return createManagedDingTalkAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedDingTalkAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createDingTalkAdapter({
+    scope: connection.scope,
+    acceptInbound: (
+      payload,
+      context,
+      scope,
+      acknowledge,
+    ) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          let acknowledged = false;
+          const acknowledgeOnce = async () => {
+            if (acknowledged) return;
+            await acknowledge();
+            acknowledged = true;
+          };
+          const result = await acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterDurablePersist: acknowledgeOnce,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const fetcher = createDingTalkAttachmentFetcher(
+                parseDingTalkConfig(connection.config),
+              );
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (!persisted) continue;
+                await downloadInboundAttachment({
+                  scope: event.scope,
+                  descriptor,
+                  fetcher,
+                  storageRoot:
+                    dependencies.attachmentStorageDir,
+                  repository:
+                    dependencies.repositories.messageAttachments,
+                  bindPrivateAttachment: async (
+                    attachmentId,
+                  ) => {
+                    const bound =
+                      await locators.bindPrivateAttachment(
+                        event.scope,
+                        event.id,
+                        descriptor.externalAttachmentId,
+                        attachmentId,
+                        new Date(),
+                      );
+                    if (!bound) {
+                      throw new Error(
+                        "attachment_bind_transition_failed",
+                      );
+                    }
+                  },
+                  signal,
+                });
+              }
+            },
+          });
+          await acknowledgeOnce();
+          return result;
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedFeishuAdapter(

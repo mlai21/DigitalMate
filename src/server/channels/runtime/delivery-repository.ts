@@ -800,5 +800,10 @@ function sameRecipient(
     left.externalConversationId === right.externalConversationId
     && left.externalThreadId === right.externalThreadId
     && left.externalUserId === right.externalUserId
+    && (
+      left.chatType === right.chatType
+      || left.chatType === undefined
+      || right.chatType === undefined
+    )
   );
 }

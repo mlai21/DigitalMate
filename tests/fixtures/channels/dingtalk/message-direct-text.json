@@ -1,0 +1,9 @@
+{
+  "specVersion": "1.0",
+  "type": "CALLBACK",
+  "headers": {
+    "messageId": "stream-ack-1001",
+    "topic": "/v1.0/im/bot/messages/get"
+  },
+  "data": "{\"msgId\":\"msg-1001\",\"conversationId\":\"cid-direct-1\",\"conversationType\":\"1\",\"senderStaffId\":\"staff-1\",\"senderId\":\"ding-user-1\",\"senderNick\":\"小唐\",\"msgtype\":\"text\",\"text\":{\"content\":\"你好\"},\"sessionWebhook\":\"https://oapi.dingtalk.com/robot/sendBySession?session=secret-session-1\",\"sessionWebhookExpiredTime\":1785031200000,\"createAt\":1785024000000,\"robotCode\":\"robot-1\",\"isInAtList\":true}"
+}

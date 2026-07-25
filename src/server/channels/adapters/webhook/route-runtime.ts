@@ -107,6 +107,7 @@ export async function acceptWebhookEvent(input: Readonly<{
           && candidate.scope.userId === fence.userId
           && candidate.scope.agentId === agent.id
           && input.channelType !== "feishu"
+          && input.channelType !== "dingtalk"
           && (
             input.channelType !== "telegram"
             || hasConfiguredString(

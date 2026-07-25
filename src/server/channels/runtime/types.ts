@@ -54,6 +54,7 @@ export type ChannelRecipient = Readonly<{
   externalConversationId: string;
   externalThreadId?: string;
   externalUserId?: string;
+  chatType?: ChatType;
 }>;
 
 export type ResolvedRecipient = Readonly<{

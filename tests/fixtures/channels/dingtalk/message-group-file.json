@@ -1,0 +1,9 @@
+{
+  "specVersion": "1.0",
+  "type": "CALLBACK",
+  "headers": {
+    "messageId": "stream-ack-1002",
+    "topic": "/v1.0/im/bot/messages/get"
+  },
+  "data": "{\"msgId\":\"msg-1002\",\"conversationId\":\"cid-group-1\",\"conversationType\":\"2\",\"senderStaffId\":\"staff-2\",\"senderId\":\"ding-user-2\",\"senderNick\":\"同事\",\"msgtype\":\"file\",\"content\":{\"downloadCode\":\"download-code-1\",\"fileName\":\"notes.txt\"},\"sessionWebhook\":\"https://oapi.dingtalk.com/robot/sendBySession?session=secret-session-2\",\"sessionWebhookExpiredTime\":1785031200000,\"createAt\":1785024001000,\"robotCode\":\"robot-1\",\"isInAtList\":true}"
+}

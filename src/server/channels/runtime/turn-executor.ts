@@ -425,6 +425,7 @@ async function persist(
   const recipient: ChannelRecipient = {
     externalConversationId:
       claim.normalizedEvent.externalConversationId,
+    chatType: claim.normalizedEvent.chatType,
     ...(threadId ? { externalThreadId: threadId } : {}),
     ...(claim.normalizedEvent.chatType === "direct"
       ? {
