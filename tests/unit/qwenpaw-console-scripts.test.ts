@@ -1871,6 +1871,8 @@ describe("QwenPaw Console patch preparation", () => {
         appSource,
         indexHtml,
         routesSource,
+        homeRedirectSource,
+        codingCapabilityRouteSource,
         sidebarSource,
         mainLayoutSource,
         configSource,
@@ -1910,6 +1912,12 @@ describe("QwenPaw Console patch preparation", () => {
         readPrepared("src/App.tsx"),
         readPrepared("index.html"),
         readPrepared("src/layouts/registry/builtinRoutes.tsx"),
+        readPrepared(
+          "src/layouts/registry/DigitalMateHomeRedirect.tsx",
+        ),
+        readPrepared(
+          "src/layouts/registry/CodingCapabilityRoute.tsx",
+        ),
         readPrepared("src/layouts/Sidebar.tsx"),
         readPrepared("src/layouts/MainLayout/index.tsx"),
         readPrepared("src/api/config.ts"),
@@ -2003,7 +2011,17 @@ describe("QwenPaw Console patch preparation", () => {
       expect(appSource).toContain(
         'returnTo.startsWith("/") && !returnTo.startsWith("//")',
       );
-      expect(routesSource).toContain('window.location.assign("/")');
+      expect(routesSource).toContain(
+        'import DigitalMateHomeRedirect from "./DigitalMateHomeRedirect"',
+      );
+      expect(routesSource).toContain(
+        'path: "/chat/*", component: DigitalMateHomeRedirect',
+      );
+      expect(homeRedirectSource).toContain(
+        "export default function DigitalMateHomeRedirect()",
+      );
+      expect(homeRedirectSource).toContain('window.location.assign("/")');
+      expect(homeRedirectSource).toContain("useEffect(() => {");
       expect(sidebarSource).toContain(
         "function getCollapsedNavAriaLabel(item: FlatMenuEntry): string",
       );
@@ -2030,6 +2048,18 @@ describe("QwenPaw Console patch preparation", () => {
       expect
         .soft(routesSource)
         .toContain('path: "/coding/*", component: CodingCapabilityRoute');
+      expect(routesSource).toContain(
+        'import CodingCapabilityRoute from "./CodingCapabilityRoute"',
+      );
+      expect(codingCapabilityRouteSource).toContain(
+        'const CODING_CAPABILITY = "unsupported" as const',
+      );
+      expect(codingCapabilityRouteSource).toContain(
+        "export default function CodingCapabilityRoute()",
+      );
+      expect(codingCapabilityRouteSource).toContain(
+        't("codingMode.unavailableDigitalMate")',
+      );
       expect
         .soft(codingToggleSource)
         .toContain('const CODING_CAPABILITY = "unsupported"');
