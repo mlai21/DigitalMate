@@ -52,6 +52,9 @@ import {
 import type {
   SecretExposureFingerprint,
 } from "@/server/admin/secret-content";
+import {
+  MAX_USER_SECRET_EXPOSURE_FINGERPRINTS,
+} from "@/server/admin/secret-exposure-store";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -548,18 +551,12 @@ export function createRepositories(
       options.signal?.throwIfAborted();
       throw error;
     } finally {
-      clientGuard.dispose();
-      if (!clientGuard.destroyed) {
-        if (locked) {
-          await releaseAdvisoryLease(
-            client,
-            lockKey,
-            "shared",
-          );
-        } else {
-          client.release();
-        }
-      }
+      await finishUserDataAdmission(
+        client,
+        clientGuard,
+        locked ? lockKey : undefined,
+        options.signal,
+      );
     }
   }
 
@@ -620,18 +617,12 @@ export function createRepositories(
       options.signal?.throwIfAborted();
       throw error;
     } finally {
-      clientGuard.dispose();
-      if (!clientGuard.destroyed) {
-        if (locked && lockKey) {
-          await releaseAdvisoryLease(
-            client,
-            lockKey,
-            "shared",
-          );
-        } else {
-          client.release();
-        }
-      }
+      await finishUserDataAdmission(
+        client,
+        clientGuard,
+        locked ? lockKey : undefined,
+        options.signal,
+      );
     }
   }
 
@@ -2965,8 +2956,36 @@ export function createRepositories(
           };
           const credentialFingerprints:
             SecretExposureFingerprint[] = [];
+          const fingerprintCountResult = await client.query<{
+            count: string;
+          }>(
+            `/* personal_data_export_fingerprint_count */
+             SELECT count(*)::text AS count
+             FROM channel_secret_exposure_fingerprints
+             WHERE user_id = $1`,
+            [userId],
+          );
+          signal?.throwIfAborted();
+          const fingerprintCountText =
+            fingerprintCountResult.rows.length === 1
+              ? fingerprintCountResult.rows[0]?.count
+              : undefined;
+          if (
+            fingerprintCountText === undefined
+            || !/^\d+$/.test(fingerprintCountText)
+          ) {
+            throw new PersonalDataExportError();
+          }
+          const fingerprintCount = Number(fingerprintCountText);
+          if (
+            !Number.isSafeInteger(fingerprintCount)
+            || fingerprintCount >
+              MAX_USER_SECRET_EXPOSURE_FINGERPRINTS
+          ) {
+            throw new PersonalDataExportError();
+          }
           let fingerprintOffset = 0;
-          while (true) {
+          while (fingerprintOffset < fingerprintCount) {
             signal?.throwIfAborted();
             const fingerprintBatch = await client.query<
               SecretExposureFingerprintExportRow
@@ -2978,10 +2997,8 @@ export function createRepositories(
                  channel_secret_exposure_fingerprints.utf8_bytes,
                  channel_secret_exposure_fingerprints.character_length
                FROM channel_secret_exposure_fingerprints
-               JOIN channel_connections
-                 ON channel_connections.id =
-                    channel_secret_exposure_fingerprints.connection_id
-               WHERE channel_connections.user_id = $1
+               WHERE
+                 channel_secret_exposure_fingerprints.user_id = $1
                ORDER BY
                  channel_secret_exposure_fingerprints.connection_id ASC,
                  channel_secret_exposure_fingerprints.field_name ASC,
@@ -2993,8 +3010,12 @@ export function createRepositories(
             );
             signal?.throwIfAborted();
             if (
-              fingerprintBatch.rows.length
-              > PERSONAL_DATA_EXPORT_BATCH_SIZE
+              fingerprintBatch.rows.length === 0
+              || fingerprintBatch.rows.length >
+                Math.min(
+                  PERSONAL_DATA_EXPORT_BATCH_SIZE,
+                  fingerprintCount - fingerprintOffset,
+                )
             ) {
               throw new PersonalDataExportError();
             }
@@ -3010,12 +3031,6 @@ export function createRepositories(
                 characterLength: row.character_length,
               })),
             );
-            if (
-              fingerprintBatch.rows.length
-              < PERSONAL_DATA_EXPORT_BATCH_SIZE
-            ) {
-              break;
-            }
             fingerprintOffset += fingerprintBatch.rows.length;
           }
           if (
@@ -3141,11 +3156,7 @@ export function createRepositories(
 
           await client.query(
             `DELETE FROM channel_secret_exposure_fingerprints
-             WHERE connection_id IN (
-               SELECT id
-               FROM channel_connections
-               WHERE user_id = $1
-             )`,
+             WHERE user_id = $1`,
             [userId],
           );
           await client.query(
@@ -3722,10 +3733,7 @@ function buildPersonalDataExportPreflightSql(): string {
          channel_secret_exposure_fingerprints.utf8_bytes,
          channel_secret_exposure_fingerprints.character_length
        FROM channel_secret_exposure_fingerprints
-       JOIN channel_connections
-         ON channel_connections.id =
-            channel_secret_exposure_fingerprints.connection_id
-       WHERE channel_connections.user_id = $1`,
+       WHERE channel_secret_exposure_fingerprints.user_id = $1`,
     ),
   );
   return `/* personal_data_export_preflight */
@@ -3809,10 +3817,7 @@ async function verifyPersonalDataClear(
          NOT EXISTS (
            SELECT 1
            FROM channel_secret_exposure_fingerprints
-           JOIN channel_connections
-             ON channel_connections.id =
-                channel_secret_exposure_fingerprints.connection_id
-           WHERE channel_connections.user_id = $1
+           WHERE user_id = $1
          )
          AND NOT EXISTS (
            SELECT 1
@@ -3919,6 +3924,39 @@ function createAdvisoryLease(
       await releaseAdvisoryLease(client, lockKey, mode);
     },
   };
+}
+
+async function finishUserDataAdmission(
+  client: PoolClient,
+  clientGuard: AbortablePoolClientGuard,
+  lockKey: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    if (clientGuard.destroyed) return;
+    if (lockKey !== undefined) {
+      const result = await client.query<{ unlocked: boolean }>(
+        `SELECT pg_advisory_unlock_shared(
+           hashtextextended($1, 0)
+         ) AS unlocked`,
+        [lockKey],
+      );
+      signal?.throwIfAborted();
+      if (result.rows[0]?.unlocked !== true) {
+        throw new Error("user_data_lease_not_held");
+      }
+    } else {
+      signal?.throwIfAborted();
+    }
+    client.release();
+    signal?.throwIfAborted();
+  } catch (error) {
+    clientGuard.destroy();
+    signal?.throwIfAborted();
+    throw error;
+  } finally {
+    clientGuard.dispose();
+  }
 }
 
 async function releaseAdvisoryLease(

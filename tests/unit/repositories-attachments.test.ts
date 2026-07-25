@@ -128,6 +128,152 @@ function createCommitAmbiguityPool(input: {
   };
 }
 
+describe("user-data admission cancellation", () => {
+  it.each(["default", "explicit"] as const)(
+    "keeps the abort guard through a pending %s-user unlock and recovers",
+    async (kind) => {
+      let rejectUnlock!: (error: unknown) => void;
+      const pendingUnlock = new Promise<never>((_resolve, reject) => {
+        rejectUnlock = reject;
+      });
+      let unlockPending = false;
+      const firstRelease = vi.fn((destroy?: boolean) => {
+        if (destroy && unlockPending) {
+          unlockPending = false;
+          rejectUnlock(new Error("connection_destroyed"));
+        }
+      });
+      const firstQuery = vi.fn((sql: unknown) => {
+        const text = String(sql);
+        if (text.includes("FROM users")) {
+          return Promise.resolve({ rows: [{ id: USER_1 }] });
+        }
+        if (text.includes("pg_try_advisory_lock_shared")) {
+          return Promise.resolve({ rows: [{ locked: true }] });
+        }
+        if (text.includes("INSERT INTO user_data_epochs")) {
+          return Promise.resolve({ rows: [] });
+        }
+        if (text.includes("SELECT epoch::text AS epoch")) {
+          return Promise.resolve({ rows: [{ epoch: "4" }] });
+        }
+        if (text.includes("pg_advisory_unlock_shared")) {
+          unlockPending = true;
+          return pendingUnlock;
+        }
+        throw new Error(`unexpected first admission query: ${text}`);
+      });
+      const secondRelease = vi.fn();
+      const secondQuery = vi.fn(async (sql: unknown) => {
+        const text = String(sql);
+        if (text.includes("FROM users")) {
+          return { rows: [{ id: USER_1 }] };
+        }
+        if (text.includes("pg_try_advisory_lock_shared")) {
+          return { rows: [{ locked: true }] };
+        }
+        if (text.includes("INSERT INTO user_data_epochs")) {
+          return { rows: [] };
+        }
+        if (text.includes("SELECT epoch::text AS epoch")) {
+          return { rows: [{ epoch: "4" }] };
+        }
+        if (text.includes("pg_advisory_unlock_shared")) {
+          return { rows: [{ unlocked: true }] };
+        }
+        throw new Error(`unexpected second admission query: ${text}`);
+      });
+      const lockPool = {
+        connect: vi.fn<() => Promise<PoolClient>>()
+          .mockResolvedValueOnce({
+            query: firstQuery,
+            release: firstRelease,
+          } as unknown as PoolClient)
+          .mockResolvedValueOnce({
+            query: secondQuery,
+            release: secondRelease,
+          } as unknown as PoolClient),
+      } as unknown as Pool;
+      const repositories = createRepositories(
+        { query: vi.fn() } as unknown as Pool,
+        lockPool,
+        lockPool,
+      );
+      const controller = new AbortController();
+      const pending = kind === "default"
+        ? repositories.userDataMutations.tryAdmitDefaultUserRequest({
+            signal: controller.signal,
+          })
+        : repositories.userDataMutations.tryAdmitRequest(
+            USER_1,
+            { signal: controller.signal },
+          );
+      await vi.waitFor(() => expect(unlockPending).toBe(true));
+
+      controller.abort(new Error("channel_webhook_admission_timeout"));
+      await expect(Promise.race([
+        pending.then(
+          () => "resolved",
+          (error: unknown) =>
+            error instanceof Error ? error.message : "rejected",
+        ),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("still-waiting"), 100)
+        ),
+      ])).resolves.toBe("channel_webhook_admission_timeout");
+      expect(firstRelease).toHaveBeenCalledTimes(1);
+      expect(firstRelease).toHaveBeenCalledWith(true);
+
+      const recovered = kind === "default"
+        ? repositories.userDataMutations.tryAdmitDefaultUserRequest()
+        : repositories.userDataMutations.tryAdmitRequest(USER_1);
+      await expect(recovered).resolves.toEqual({
+        userId: USER_1,
+        epoch: "4",
+      });
+      expect(secondRelease).toHaveBeenCalledTimes(1);
+      expect(secondRelease).toHaveBeenCalledWith();
+    },
+  );
+
+  it("destroys a client once when admission reports that no lock was released", async () => {
+    const release = vi.fn();
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text.includes("pg_try_advisory_lock_shared")) {
+        return { rows: [{ locked: true }] };
+      }
+      if (text.includes("INSERT INTO user_data_epochs")) {
+        return { rows: [] };
+      }
+      if (text.includes("SELECT epoch::text AS epoch")) {
+        return { rows: [{ epoch: "1" }] };
+      }
+      if (text.includes("pg_advisory_unlock_shared")) {
+        return { rows: [{ unlocked: false }] };
+      }
+      throw new Error(`unexpected admission query: ${text}`);
+    });
+    const lockPool = {
+      connect: vi.fn(async () => ({
+        query,
+        release,
+      } as unknown as PoolClient)),
+    } as unknown as Pool;
+    const repositories = createRepositories(
+      { query: vi.fn() } as unknown as Pool,
+      lockPool,
+      lockPool,
+    );
+
+    await expect(
+      repositories.userDataMutations.tryAdmitRequest(USER_1),
+    ).rejects.toThrow("user_data_lease_not_held");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
+});
+
 describe("task completion repository", () => {
   it("commits artifact visibility and task success in one transaction", async () => {
     const query = vi.fn(async (sql: unknown) => {

@@ -4,10 +4,10 @@ import type { AgentScope } from "@/server/agents/types";
 import {
   containsSecretExposure,
   containsSecretFingerprintExposure,
-  type SecretExposureFingerprint,
 } from "@/server/admin/secret-content";
 import {
-  readSecretExposureFingerprints,
+  lockUserCredentialExposure,
+  readUserCredentialExposureState,
   rememberSecretExposureFingerprint,
 } from "@/server/admin/secret-exposure-store";
 import {
@@ -16,7 +16,6 @@ import {
   type AbortablePoolClientGuard,
 } from "@/server/db/abortable-client";
 import {
-  encryptedSecretFromStorage,
   validateSecretPlaintext,
   type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
@@ -28,6 +27,7 @@ const MAX_LIFECYCLE_TIMEOUT_MS = COMPATIBILITY_TIMEOUT_MS - 1;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 30_000;
 const TRANSACTION_LOCK_TIMEOUT_MS = 10_000;
 const TRANSACTION_STATEMENT_TIMEOUT_MS = 110_000;
+const COMMIT_RECOVERY_TIMEOUT_MS = 3_000;
 
 export type ChannelSecretChange =
   | Readonly<{
@@ -83,6 +83,7 @@ type PreparedUpdate = {
   secretChanges: readonly PreparedSecretChange[];
   auditConfigFields: readonly string[];
   confirmationSource?: ChannelConfigConfirmationSource;
+  operationFingerprint: string;
 };
 
 type PreparedSecretChange =
@@ -98,8 +99,6 @@ type PreparedSecretChange =
 
 type DeclaredSecretState = Readonly<{
   configuredFields: ReadonlySet<string>;
-  plaintextValues: readonly string[];
-  fingerprints: readonly SecretExposureFingerprint[];
 }>;
 
 export class AdminAuditError extends Error {
@@ -148,19 +147,55 @@ export function createChannelConnectionAuditService(
       );
       let client: PoolClient | undefined;
       let clientGuard: AbortablePoolClientGuard | undefined;
+      let transactionState:
+        | "none"
+        | "starting"
+        | "active"
+        | "committing"
+        | "finished" = "none";
       try {
         lifecycle.signal.throwIfAborted();
-        const prepared = prepareUpdate(input);
+        const prepared = prepareUpdate(input, secretKey);
         client = await connectPoolClient(pool, lifecycle.signal);
         clientGuard = guardPoolClientWithAbort(
           client,
           lifecycle.signal,
         );
         lifecycle.signal.throwIfAborted();
+        transactionState = "starting";
         await client.query("BEGIN");
+        transactionState = "active";
         lifecycle.signal.throwIfAborted();
         await setTransactionTimeouts(client);
         lifecycle.signal.throwIfAborted();
+        await lockUserCredentialExposure(
+          client,
+          input.scope.userId,
+        );
+        lifecycle.signal.throwIfAborted();
+        const recovered = await recoverInTransaction(
+          client,
+          input,
+          prepared,
+        );
+        lifecycle.signal.throwIfAborted();
+        if (recovered !== null) {
+          transactionState = "committing";
+          try {
+            await client.query("COMMIT");
+            transactionState = "finished";
+            lifecycle.signal.throwIfAborted();
+            return recovered;
+          } catch {
+            clientGuard.destroy();
+            if (lifecycle.signal.aborted) throw updateFailed();
+            return await recoverCommittedUpdate(
+              pool,
+              input,
+              prepared,
+            );
+          }
+        }
         const before = await lockConnection(client, input);
         lifecycle.signal.throwIfAborted();
         if (
@@ -174,18 +209,30 @@ export function createChannelConnectionAuditService(
           client,
           before,
           prepared.secretFieldNames,
+        );
+        lifecycle.signal.throwIfAborted();
+        const exposure = await readUserCredentialExposureState(
+          client,
+          input.scope.userId,
           secretKey,
         );
         lifecycle.signal.throwIfAborted();
+        const newPlaintextValues = prepared.secretChanges.flatMap(
+          (change) =>
+            change.operation === "set" ? [change.plaintext] : [],
+        );
         if (
           containsSecretExposure(
             prepared.config,
-            beforeSecrets.plaintextValues,
+            [
+              ...exposure.plaintextValues,
+              ...newPlaintextValues,
+            ],
             prepared.auditConfigFields,
           )
           || containsSecretFingerprintExposure(
             prepared.config,
-            beforeSecrets.fingerprints,
+            exposure.fingerprints,
             secretKey,
             prepared.auditConfigFields,
           )
@@ -217,12 +264,36 @@ export function createChannelConnectionAuditService(
           afterConfiguredSecrets,
         });
         lifecycle.signal.throwIfAborted();
-        await client.query("COMMIT");
+        transactionState = "committing";
+        try {
+          await client.query("COMMIT");
+        } catch {
+          clientGuard.destroy();
+          if (lifecycle.signal.aborted) throw updateFailed();
+          return await recoverCommittedUpdate(
+            pool,
+            input,
+            prepared,
+          );
+        }
+        transactionState = "finished";
         lifecycle.signal.throwIfAborted();
         return { revision: updated.revision };
       } catch (caught) {
-        if (client !== undefined && clientGuard?.destroyed !== true) {
-          await rollbackPreservingOriginalError(client);
+        if (
+          client !== undefined
+          && clientGuard !== undefined
+          && !clientGuard.destroyed
+        ) {
+          if (transactionState === "active") {
+            const rolledBack = await rollbackTransaction(client);
+            if (!rolledBack) clientGuard.destroy();
+          } else if (
+            transactionState === "starting"
+            || transactionState === "committing"
+          ) {
+            clientGuard.destroy();
+          }
         }
         if (
           lifecycle.signal.aborted ||
@@ -275,6 +346,112 @@ async function lockConnection(
   return result.rows[0] ?? null;
 }
 
+async function recoverInTransaction(
+  client: PoolClient,
+  input: ChannelConnectionConfigUpdate,
+  prepared: PreparedUpdate,
+): Promise<ChannelConnectionConfigUpdateResult | null> {
+  if (!prepared.confirmationSource?.requestId) return null;
+  return readCommittedOperation(client, input, prepared);
+}
+
+async function readCommittedOperation(
+  client: PoolClient,
+  input: ChannelConnectionConfigUpdate,
+  prepared: PreparedUpdate,
+): Promise<ChannelConnectionConfigUpdateResult | null> {
+  const requestId = prepared.confirmationSource?.requestId;
+  if (!requestId) return null;
+  const audit = await client.query<{
+    resource_id: string;
+    input_fingerprint: string | null;
+    revision: string;
+  }>(
+    `SELECT resource_id,
+            confirmation_source->>'inputFingerprint'
+              AS input_fingerprint,
+            after_summary->>'revision' AS revision
+     FROM admin_audit_logs
+     WHERE user_id = $1
+       AND agent_id = $2
+       AND resource_type = 'channel_connection'
+       AND status = 'success'
+       AND confirmation_source->>'type' = 'console'
+       AND confirmation_source->>'requestId' = $3
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [
+      input.scope.userId,
+      input.scope.agentId,
+      requestId,
+    ],
+  );
+  const row = audit.rows[0];
+  if (!row) return null;
+  if (
+    row.resource_id !== input.connectionId
+    || row.input_fingerprint !== prepared.operationFingerprint
+    || Number(row.revision) !== input.expectedRevision + 1
+  ) {
+    throw operationIdReused();
+  }
+  const connection = await client.query<{ revision: number }>(
+    `SELECT revision
+     FROM channel_connections
+     WHERE id = $1
+       AND user_id = $2
+       AND agent_id = $3
+       AND deleted_at IS NULL`,
+    [
+      input.connectionId,
+      input.scope.userId,
+      input.scope.agentId,
+    ],
+  );
+  const revision = connection.rows[0]?.revision;
+  if (revision === undefined) throw updateFailed();
+  if (revision !== input.expectedRevision + 1) {
+    throw revisionConflict();
+  }
+  return { revision };
+}
+
+async function recoverCommittedUpdate(
+  pool: Pool,
+  input: ChannelConnectionConfigUpdate,
+  prepared: PreparedUpdate,
+): Promise<ChannelConnectionConfigUpdateResult> {
+  if (!prepared.confirmationSource?.requestId) throw updateFailed();
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error("channel_config_recovery_timeout"));
+  }, COMMIT_RECOVERY_TIMEOUT_MS);
+  timer.unref?.();
+  let client: PoolClient | undefined;
+  let guard: AbortablePoolClientGuard | undefined;
+  try {
+    client = await connectPoolClient(pool, controller.signal);
+    guard = guardPoolClientWithAbort(client, controller.signal);
+    controller.signal.throwIfAborted();
+    const recovered = await readCommittedOperation(
+      client,
+      input,
+      prepared,
+    );
+    controller.signal.throwIfAborted();
+    if (recovered === null) throw updateFailed();
+    return recovered;
+  } catch (error) {
+    if (error instanceof AdminAuditError) throw error;
+    guard?.destroy();
+    throw updateFailed();
+  } finally {
+    clearTimeout(timer);
+    guard?.dispose();
+    if (client && guard?.destroyed !== true) client.release();
+  }
+}
+
 async function updateConnection(
   client: PoolClient,
   input: ChannelConnectionConfigUpdate,
@@ -307,65 +484,26 @@ async function readDeclaredSecrets(
   client: PoolClient,
   connection: ChannelConnectionRow,
   secretFieldNames: readonly string[],
-  secretKey: ChannelSecretsKey,
 ): Promise<DeclaredSecretState> {
   if (secretFieldNames.length === 0) {
     return {
       configuredFields: new Set(),
-      plaintextValues: [],
-      fingerprints: [],
     };
   }
   // Task 7 manifests are the authority for the complete secret-field list.
   // Never probe undeclared rows because that would weaken manifest isolation.
   const result = await client.query<{
     field_name: string;
-    ciphertext: Buffer;
-    nonce: Buffer;
-    auth_tag: Buffer;
-    key_version: number;
   }>(
-    `SELECT field_name, ciphertext, nonce, auth_tag, key_version
+    `SELECT field_name
      FROM channel_secrets
      WHERE connection_id = $1
        AND field_name = ANY($2::text[])`,
     [connection.id, secretFieldNames],
   );
-  const plaintextValues = result.rows.map((row) => ({
-    fieldName: row.field_name,
-    value: secretKey.decrypt(
-      encryptedSecretFromStorage({
-        ciphertext: row.ciphertext,
-        nonce: row.nonce,
-        authTag: row.auth_tag,
-        keyVersion: row.key_version,
-      }),
-      {
-        userId: connection.user_id,
-        agentId: connection.agent_id,
-        connectionId: connection.id,
-        fieldName: row.field_name,
-      },
-    ),
-  }));
-  for (const secret of plaintextValues) {
-    await rememberSecretExposureFingerprint(
-      client,
-      connection.id,
-      secret.fieldName,
-      secret.value,
-      secretKey,
-    );
-  }
   return {
     configuredFields: new Set(
       result.rows.map((row) => row.field_name),
-    ),
-    plaintextValues: plaintextValues.map((secret) => secret.value),
-    fingerprints: await readSecretExposureFingerprints(
-      client,
-      connection.id,
-      secretFieldNames,
     ),
   };
 }
@@ -397,6 +535,7 @@ async function applySecretChanges(
     const storage = encrypted.toStorageRecord();
     await rememberSecretExposureFingerprint(
       client,
+      connection.user_id,
       connection.id,
       change.fieldName,
       change.plaintext,
@@ -465,7 +604,12 @@ async function insertSuccessAudit(
         prepared.secretFieldNames,
         state.afterConfiguredSecrets,
       ),
-      prepared.confirmationSource ?? null,
+      prepared.confirmationSource?.requestId
+        ? {
+            ...prepared.confirmationSource,
+            inputFingerprint: prepared.operationFingerprint,
+          }
+        : prepared.confirmationSource ?? null,
     ],
   );
 }
@@ -493,6 +637,7 @@ function buildAuditSummary(
 
 function prepareUpdate(
   input: ChannelConnectionConfigUpdate,
+  key: ChannelSecretsKey,
 ): PreparedUpdate {
   if (
     !Number.isSafeInteger(input.expectedRevision) ||
@@ -565,14 +710,35 @@ function prepareUpdate(
   ) {
     throw new AdminAuditError(400, "secret_in_public_config");
   }
+  const confirmationSource = validateConfirmationSource(
+    input.confirmationSource,
+  );
+  const operationFingerprint = key.channelConfigAuditFingerprint(
+    stableJson({
+      scope: input.scope,
+      connectionId: input.connectionId,
+      expectedRevision: input.expectedRevision,
+      config,
+      secretFieldNames,
+      secretChanges: secretChanges.map((change) =>
+        change.operation === "set"
+          ? {
+              fieldName: change.fieldName,
+              operation: change.operation,
+              value: change.plaintext,
+            }
+          : change
+      ),
+      auditConfigFields,
+    }),
+  );
   return {
     config,
     secretFieldNames,
     secretChanges,
     auditConfigFields,
-    confirmationSource: validateConfirmationSource(
-      input.confirmationSource,
-    ),
+    confirmationSource,
+    operationFingerprint,
   };
 }
 
@@ -690,18 +856,39 @@ function revisionConflict(): AdminAuditError {
   return new AdminAuditError(409, "config_revision_conflict");
 }
 
+function operationIdReused(): AdminAuditError {
+  return new AdminAuditError(409, "operation_id_reused");
+}
+
 function updateFailed(): AdminAuditError {
   return new AdminAuditError(500, "channel_config_update_failed");
 }
 
-async function rollbackPreservingOriginalError(
+async function rollbackTransaction(
   client: PoolClient,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await client.query("ROLLBACK");
+    return true;
   } catch {
-    // The original operation error is the useful and safely classified error.
+    return false;
   }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((name) =>
+        `${JSON.stringify(name)}:${stableJson(record[name])}`
+      )
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function isUuid(value: string): boolean {

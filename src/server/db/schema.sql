@@ -998,7 +998,8 @@ CREATE TABLE IF NOT EXISTS channel_secrets (
 );
 
 CREATE TABLE IF NOT EXISTS channel_secret_exposure_fingerprints (
-  connection_id uuid NOT NULL,
+  user_id uuid NOT NULL,
+  connection_id uuid,
   field_name text NOT NULL
     CONSTRAINT channel_secret_exposure_fingerprints_field_name_check
     CHECK (
@@ -1018,12 +1019,125 @@ CREATE TABLE IF NOT EXISTS channel_secret_exposure_fingerprints (
     CONSTRAINT channel_secret_exposure_fingerprints_character_length_check
     CHECK (character_length > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (connection_id, field_name, key_version, digest),
+  PRIMARY KEY (user_id, key_version, digest),
+  CONSTRAINT channel_secret_exposure_fingerprints_user_id_fkey
+    FOREIGN KEY (user_id)
+    REFERENCES users(id)
+    ON DELETE CASCADE,
   CONSTRAINT channel_secret_exposure_fingerprints_connection_id_fkey
     FOREIGN KEY (connection_id)
     REFERENCES channel_connections(id)
-    ON DELETE CASCADE
+    ON DELETE SET NULL
 );
+
+ALTER TABLE IF EXISTS channel_secret_exposure_fingerprints
+  ADD COLUMN IF NOT EXISTS user_id uuid;
+
+UPDATE channel_secret_exposure_fingerprints AS fingerprint
+SET user_id = connection.user_id
+FROM channel_connections AS connection
+WHERE fingerprint.user_id IS NULL
+  AND connection.id = fingerprint.connection_id;
+
+DELETE FROM channel_secret_exposure_fingerprints
+WHERE user_id IS NULL;
+
+ALTER TABLE IF EXISTS channel_secret_exposure_fingerprints
+  ALTER COLUMN user_id SET NOT NULL;
+
+DO $channel_secret_exposure_fingerprint_keys$
+DECLARE
+  primary_definition text;
+  connection_delete_action "char";
+BEGIN
+  SELECT pg_get_constraintdef(oid)
+  INTO primary_definition
+  FROM pg_constraint
+  WHERE conrelid =
+      'channel_secret_exposure_fingerprints'::regclass
+    AND contype = 'p';
+
+  IF primary_definition IS NOT NULL
+     AND primary_definition <>
+       'PRIMARY KEY (user_id, key_version, digest)' THEN
+    ALTER TABLE channel_secret_exposure_fingerprints
+      DROP CONSTRAINT channel_secret_exposure_fingerprints_pkey;
+  END IF;
+
+  SELECT confdeltype
+  INTO connection_delete_action
+  FROM pg_constraint
+  WHERE conrelid =
+      'channel_secret_exposure_fingerprints'::regclass
+    AND conname =
+      'channel_secret_exposure_fingerprints_connection_id_fkey';
+
+  IF connection_delete_action IS NOT NULL
+     AND connection_delete_action <> 'n' THEN
+    ALTER TABLE channel_secret_exposure_fingerprints
+      DROP CONSTRAINT
+        channel_secret_exposure_fingerprints_connection_id_fkey;
+  END IF;
+END
+$channel_secret_exposure_fingerprint_keys$;
+
+ALTER TABLE IF EXISTS channel_secret_exposure_fingerprints
+  ALTER COLUMN connection_id DROP NOT NULL;
+
+DELETE FROM channel_secret_exposure_fingerprints AS duplicate
+USING channel_secret_exposure_fingerprints AS retained
+WHERE duplicate.user_id = retained.user_id
+  AND duplicate.key_version = retained.key_version
+  AND duplicate.digest = retained.digest
+  AND duplicate.ctid > retained.ctid;
+
+DO $channel_secret_exposure_fingerprint_constraints$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid =
+        'channel_secret_exposure_fingerprints'::regclass
+      AND contype = 'p'
+  ) THEN
+    ALTER TABLE channel_secret_exposure_fingerprints
+      ADD CONSTRAINT channel_secret_exposure_fingerprints_pkey
+      PRIMARY KEY (user_id, key_version, digest);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid =
+        'channel_secret_exposure_fingerprints'::regclass
+      AND conname =
+        'channel_secret_exposure_fingerprints_user_id_fkey'
+  ) THEN
+    ALTER TABLE channel_secret_exposure_fingerprints
+      ADD CONSTRAINT
+        channel_secret_exposure_fingerprints_user_id_fkey
+      FOREIGN KEY (user_id)
+      REFERENCES users(id)
+      ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid =
+        'channel_secret_exposure_fingerprints'::regclass
+      AND conname =
+        'channel_secret_exposure_fingerprints_connection_id_fkey'
+  ) THEN
+    ALTER TABLE channel_secret_exposure_fingerprints
+      ADD CONSTRAINT
+        channel_secret_exposure_fingerprints_connection_id_fkey
+      FOREIGN KEY (connection_id)
+      REFERENCES channel_connections(id)
+      ON DELETE SET NULL;
+  END IF;
+END
+$channel_secret_exposure_fingerprint_constraints$;
 
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

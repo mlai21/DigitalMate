@@ -495,6 +495,108 @@ describe("admin channel configuration service", () => {
     })).resolves.toMatchObject({ revision: 2 });
   });
 
+  it("rejects a Telegram credential copied into a Discord public config", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+
+    await expect(service.update({
+      scope: { userId: USER_ID, agentId: AGENT_ID },
+      type: "discord",
+      operationId: "30000000-0000-4000-8000-000000000038",
+      expectedRevision: 0,
+      enabled: false,
+      config: {
+        bot_prefix: `Bearer ${TOKEN}`,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    const discord = await primary.query<{ count: string }>(
+      `SELECT count(*) AS count
+       FROM channel_connections
+       WHERE user_id = $1 AND channel_type = 'discord'`,
+      [USER_ID],
+    );
+    expect(discord.rows[0].count).toBe("0");
+  });
+
+  it("rejects a bulk secret copied from one channel into another before any write", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    const inputs = CHANNEL_TYPES.map((type, index) => ({
+      scope: { userId: USER_ID, agentId: AGENT_ID },
+      type,
+      operationId:
+        `30000000-0000-4000-8001-${String(index + 1).padStart(12, "0")}`,
+      expectedRevision: 0,
+      enabled: false,
+      config: type === "discord"
+        ? {
+            bot_prefix: `Bearer ${TOKEN}`,
+            filter_tool_messages: true,
+            filter_thinking: true,
+          }
+        : {},
+      secretChanges: type === "telegram"
+        ? [{
+            fieldName: "bot_token",
+            operation: "set" as const,
+            value: TOKEN,
+          }]
+        : [],
+    }));
+
+    await expect(service.updateMany(inputs)).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    await expect(readChannelWriteCounts(primary)).resolves.toEqual({
+      connections: "0",
+      secrets: "0",
+      audits: "0",
+    });
+  });
+
+  it("retains historical credentials after a source connection is hard-deleted", async () => {
+    if (key.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createAdminChannelConfigService(primary, key.key);
+    await service.update(createInput(OPERATION_ID));
+    await primary.query(
+      `DELETE FROM channel_connections
+       WHERE user_id = $1 AND channel_type = 'telegram'`,
+      [USER_ID],
+    );
+
+    await expect(service.update({
+      scope: { userId: USER_ID, agentId: AGENT_ID },
+      type: "discord",
+      operationId: "30000000-0000-4000-8000-000000000039",
+      expectedRevision: 0,
+      enabled: false,
+      config: {
+        bot_prefix: TOKEN,
+        filter_tool_messages: true,
+        filter_thinking: true,
+      },
+      secretChanges: [],
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    const fingerprints = await primary.query<{ count: string }>(
+      `SELECT count(*) AS count
+       FROM channel_secret_exposure_fingerprints
+       WHERE user_id = $1`,
+      [USER_ID],
+    );
+    expect(fingerprints.rows[0].count).toBe("1");
+  });
+
   it("rejects a secret exposure in the second bulk item before the first item writes", async () => {
     if (key.status !== "ready") throw new Error("test_key_not_ready");
     const service = createAdminChannelConfigService(primary, key.key);

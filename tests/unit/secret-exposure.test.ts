@@ -94,4 +94,81 @@ describe("historical channel secret exposure fingerprints", () => {
       keyState.key,
     )).toBe(true);
   });
+
+  it("charges byte-mismatched Unicode windows before slicing and hashing", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprint = createSecretExposureFingerprint(
+      keyState.key,
+      "🔐🔐",
+    );
+
+    expect(containsSecretFingerprintExposure(
+      { value: "abcdefghijklmnopqrstuvwxyz" },
+      [fingerprint],
+      keyState.key,
+      [],
+      { maxWorkUnits: 12 },
+    )).toBe(true);
+  });
+
+  it("fails closed before grouping more fingerprints than the work budget", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprints = ["alpha-key", "bravo-key", "charlie-k"]
+      .map((value) =>
+        createSecretExposureFingerprint(keyState.key, value)
+      );
+
+    expect(containsSecretFingerprintExposure(
+      { value: "safe" },
+      fingerprints,
+      keyState.key,
+      [],
+      { maxWorkUnits: 4 },
+    )).toBe(true);
+  });
+
+  it("fails closed on oversized safe export text without scanning every window", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprint = createSecretExposureFingerprint(
+      keyState.key,
+      "historical-secret",
+    );
+
+    expect(containsSecretFingerprintExposure(
+      { value: "x".repeat(100_001) },
+      [fingerprint],
+      keyState.key,
+    )).toBe(true);
+  });
+
+  it("retains short and long matching when the bounded budget is sufficient", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const short = createSecretExposureFingerprint(
+      keyState.key,
+      "abc",
+    );
+    const sameLengthOther = createSecretExposureFingerprint(
+      keyState.key,
+      "def",
+    );
+    const long = createSecretExposureFingerprint(
+      keyState.key,
+      "abcdefgh",
+    );
+
+    expect(containsSecretFingerprintExposure(
+      { value: "def" },
+      [short, sameLengthOther],
+      keyState.key,
+      [],
+      { maxWorkUnits: 100 },
+    )).toBe(true);
+    expect(containsSecretFingerprintExposure(
+      { value: "xabcdefghx" },
+      [long],
+      keyState.key,
+      [],
+      { maxWorkUnits: 100 },
+    )).toBe(true);
+  });
 });

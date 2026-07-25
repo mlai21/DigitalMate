@@ -10,11 +10,12 @@ import type {
 import {
   containsSecretExposure,
   containsSecretFingerprintExposure,
-  type SecretExposureFingerprint,
 } from "@/server/admin/secret-content";
 import {
-  readSecretExposureFingerprints,
+  lockUserCredentialExposure,
+  readUserCredentialExposureState,
   rememberSecretExposureFingerprint,
+  type UserCredentialExposureState,
 } from "@/server/admin/secret-exposure-store";
 import {
   CHANNEL_TYPES,
@@ -27,7 +28,6 @@ import {
   type AbortablePoolClientGuard,
 } from "@/server/db/abortable-client";
 import {
-  encryptedSecretFromStorage,
   validateSecretPlaintext,
   type ChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
@@ -60,14 +60,6 @@ type ConnectionRow = {
 type ConnectionSecretRow = ConnectionRow & {
   field_name: string | null;
   rotated_at: Date | string | null;
-};
-
-type StoredSecretRow = {
-  field_name: string;
-  ciphertext: Buffer;
-  nonce: Buffer;
-  auth_tag: Buffer;
-  key_version: number;
 };
 
 type PreparedWrite = AdminChannelConfigWrite & {
@@ -105,20 +97,39 @@ export function createAdminChannelConfigService(
       const lifecycle = createLifecycle(timeoutMs, outerSignal);
       let client: PoolClient | undefined;
       let guard: AbortablePoolClientGuard | undefined;
+      let transactionState:
+        | "none"
+        | "starting"
+        | "active"
+        | "committing"
+        | "finished" = "none";
       try {
         lifecycle.signal.throwIfAborted();
         client = await connectPoolClient(pool, lifecycle.signal);
         guard = guardPoolClientWithAbort(client, lifecycle.signal);
+        transactionState = "starting";
         await client.query("BEGIN");
+        transactionState = "active";
         await setTimeouts(client, timeoutMs);
         const rows = await readAllRows(client, scope);
         lifecycle.signal.throwIfAborted();
         const result = collectionFromRows(rows);
+        transactionState = "committing";
         await client.query("COMMIT");
+        transactionState = "finished";
         return result;
       } catch (error) {
-        if (client && guard?.destroyed !== true) {
-          await client.query("ROLLBACK").catch(() => undefined);
+        if (client && guard && !guard.destroyed) {
+          if (transactionState === "active") {
+            if (!await rollbackChannelTransaction(client)) {
+              guard.destroy();
+            }
+          } else if (
+            transactionState === "starting"
+            || transactionState === "committing"
+          ) {
+            guard.destroy();
+          }
         }
         throw classifyFailure(error, "channel_config_read_failed", lifecycle.signal);
       } finally {
@@ -142,28 +153,56 @@ export function createAdminChannelConfigService(
       const lifecycle = createLifecycle(timeoutMs, outerSignal);
       let client: PoolClient | undefined;
       let guard: AbortablePoolClientGuard | undefined;
-      let commitUnknown = false;
+      let transactionState:
+        | "none"
+        | "starting"
+        | "active"
+        | "committing"
+        | "finished" = "none";
       try {
         lifecycle.signal.throwIfAborted();
         client = await connectPoolClient(pool, lifecycle.signal);
         guard = guardPoolClientWithAbort(client, lifecycle.signal);
+        transactionState = "starting";
         await client.query("BEGIN");
+        transactionState = "active";
         await setTimeouts(client, timeoutMs);
+        await lockUserCredentialExposure(
+          client,
+          prepared.scope.userId,
+        );
         await lockCanonicalType(client, prepared);
         lifecycle.signal.throwIfAborted();
         const recovered = await recoverInTransaction(client, prepared);
         if (recovered) {
-          await client.query("COMMIT");
-          return recovered;
+          transactionState = "committing";
+          try {
+            await client.query("COMMIT");
+            transactionState = "finished";
+            return recovered;
+          } catch {
+            guard.destroy();
+            const committed = await recoverCommittedUpdate(
+              pool,
+              prepared,
+            );
+            if (committed) return committed;
+            throw updateFailed();
+          }
         }
 
         const active = await lockActiveConnections(client, prepared);
         if (active.length > 1) throw ambiguousConnection();
         validateLockedRevision(prepared, active);
-        await validatePublicConfigSecrets(
+        const exposure = await readUserCredentialExposureState(
           client,
+          prepared.scope.userId,
+          secretKey,
+        );
+        await validatePublicConfigSecrets(
           prepared,
-          active[0],
+          exposure,
+          preparedSecretValues([prepared]),
           secretKey,
         );
         let updated: ConnectionRow;
@@ -197,11 +236,12 @@ export function createAdminChannelConfigService(
           action,
         );
         lifecycle.signal.throwIfAborted();
+        transactionState = "committing";
         try {
           await client.query("COMMIT");
+          transactionState = "finished";
           return snapshot;
         } catch {
-          commitUnknown = true;
           guard.destroy();
           const recovered = await recoverCommittedUpdate(
             pool,
@@ -212,11 +252,20 @@ export function createAdminChannelConfigService(
         }
       } catch (error) {
         if (
-          !commitUnknown &&
           client &&
-          guard?.destroyed !== true
+          guard &&
+          !guard.destroyed
         ) {
-          await client.query("ROLLBACK").catch(() => undefined);
+          if (transactionState === "active") {
+            if (!await rollbackChannelTransaction(client)) {
+              guard.destroy();
+            }
+          } else if (
+            transactionState === "starting"
+            || transactionState === "committing"
+          ) {
+            guard.destroy();
+          }
         }
         throw classifyFailure(error, "channel_config_update_failed", lifecycle.signal);
       } finally {
@@ -245,6 +294,10 @@ export function createAdminChannelConfigService(
         ) ||
         new Set(inputs.map((input) => input.operationId)).size !==
           inputs.length
+        || inputs.some((input) =>
+          input.scope.userId !== inputs[0]?.scope.userId
+          || input.scope.agentId !== inputs[0]?.scope.agentId
+        )
       ) {
         throw new AdminChannelConfigError(
           400,
@@ -270,13 +323,24 @@ export function createAdminChannelConfigService(
       const lifecycle = createLifecycle(timeoutMs, outerSignal);
       let client: PoolClient | undefined;
       let guard: AbortablePoolClientGuard | undefined;
-      let commitUnknown = false;
+      let transactionState:
+        | "none"
+        | "starting"
+        | "active"
+        | "committing"
+        | "finished" = "none";
       try {
         lifecycle.signal.throwIfAborted();
         client = await connectPoolClient(pool, lifecycle.signal);
         guard = guardPoolClientWithAbort(client, lifecycle.signal);
+        transactionState = "starting";
         await client.query("BEGIN");
+        transactionState = "active";
         await setTimeouts(client, timeoutMs);
+        await lockUserCredentialExposure(
+          client,
+          prepared[0]!.scope.userId,
+        );
         for (const item of prepared) {
           await lockCanonicalType(client, item);
           lifecycle.signal.throwIfAborted();
@@ -297,8 +361,20 @@ export function createAdminChannelConfigService(
               "bulk_operation_incomplete",
             );
           }
-          await client.query("COMMIT");
-          return collectionFromSnapshots(recovered);
+          transactionState = "committing";
+          try {
+            await client.query("COMMIT");
+            transactionState = "finished";
+            return collectionFromSnapshots(recovered);
+          } catch {
+            guard.destroy();
+            const committed = await recoverCommittedBatch(
+              pool,
+              prepared,
+            );
+            if (committed) return committed;
+            throw updateFailed();
+          }
         }
 
         const locked = new Map<
@@ -310,11 +386,17 @@ export function createAdminChannelConfigService(
           validateLockedRevision(item, active);
           locked.set(item.type, active);
         }
+        const exposure = await readUserCredentialExposureState(
+          client,
+          prepared[0]!.scope.userId,
+          secretKey,
+        );
+        const newPlaintextValues = preparedSecretValues(prepared);
         for (const item of prepared) {
           await validatePublicConfigSecrets(
-            client,
             item,
-            locked.get(item.type)?.[0],
+            exposure,
+            newPlaintextValues,
             secretKey,
           );
           lifecycle.signal.throwIfAborted();
@@ -354,11 +436,12 @@ export function createAdminChannelConfigService(
           snapshots.set(item.type, snapshot);
           lifecycle.signal.throwIfAborted();
         }
+        transactionState = "committing";
         try {
           await client.query("COMMIT");
+          transactionState = "finished";
           return collectionFromSnapshots(snapshots);
         } catch {
-          commitUnknown = true;
           guard.destroy();
           const recovered = await recoverCommittedBatch(
             pool,
@@ -369,11 +452,20 @@ export function createAdminChannelConfigService(
         }
       } catch (error) {
         if (
-          !commitUnknown &&
           client &&
-          guard?.destroyed !== true
+          guard &&
+          !guard.destroyed
         ) {
-          await client.query("ROLLBACK").catch(() => undefined);
+          if (transactionState === "active") {
+            if (!await rollbackChannelTransaction(client)) {
+              guard.destroy();
+            }
+          } else if (
+            transactionState === "starting"
+            || transactionState === "committing"
+          ) {
+            guard.destroy();
+          }
         }
         throw classifyFailure(
           error,
@@ -649,57 +741,19 @@ async function lockActiveConnections(
 }
 
 async function validatePublicConfigSecrets(
-  client: PoolClient,
   input: PreparedWrite,
-  connection: ConnectionRow | undefined,
+  exposure: UserCredentialExposureState,
+  newPlaintextValues: readonly string[],
   key: ChannelSecretsKey,
 ): Promise<void> {
-  const plaintextValues = input.secretChanges.flatMap((change) =>
-    change.operation === "set" ? [change.value] : []
-  );
-  const fingerprints: SecretExposureFingerprint[] = [];
-  if (connection) {
-    const manifest = getChannelManifest(input.type);
-    const result = await client.query<StoredSecretRow>(
-      `SELECT field_name, ciphertext, nonce, auth_tag, key_version
-       FROM channel_secrets
-       WHERE connection_id = $1
-         AND field_name = ANY($2::text[])`,
-      [connection.id, manifest.secretFields],
-    );
-    for (const row of result.rows) {
-      const encrypted = encryptedSecretFromStorage({
-        ciphertext: row.ciphertext,
-        nonce: row.nonce,
-        authTag: row.auth_tag,
-        keyVersion: row.key_version,
-      });
-      const plaintext = key.decrypt(encrypted, {
-        userId: input.scope.userId,
-        agentId: input.scope.agentId,
-        connectionId: connection.id,
-        fieldName: row.field_name,
-      });
-      plaintextValues.push(plaintext);
-      await rememberSecretExposureFingerprint(
-        client,
-        connection.id,
-        row.field_name,
-        plaintext,
-        key,
-      );
-    }
-    fingerprints.push(...await readSecretExposureFingerprints(
-      client,
-      connection.id,
-      manifest.secretFields,
-    ));
-  }
   if (
-    containsSecretExposure(input.config, plaintextValues)
+    containsSecretExposure(input.config, [
+      ...exposure.plaintextValues,
+      ...newPlaintextValues,
+    ])
     || containsSecretFingerprintExposure(
       input.config,
-      fingerprints,
+      exposure.fingerprints,
       key,
     )
   ) {
@@ -793,6 +847,7 @@ async function applySecrets(
     } else {
       await rememberSecretExposureFingerprint(
         client,
+        input.scope.userId,
         connection.id,
         change.fieldName,
         change.value,
@@ -830,6 +885,16 @@ async function applySecrets(
     }
     signal.throwIfAborted();
   }
+}
+
+function preparedSecretValues(
+  inputs: readonly PreparedWrite[],
+): string[] {
+  return inputs.flatMap((input) =>
+    input.secretChanges.flatMap((change) =>
+      change.operation === "set" ? [change.value] : []
+    )
+  );
 }
 
 async function readSnapshot(
@@ -979,17 +1044,34 @@ async function recoverCommittedUpdate(
   const lifecycle = createLifecycle(RECOVERY_TIMEOUT_MS);
   let client: PoolClient | undefined;
   let guard: AbortablePoolClientGuard | undefined;
+  let transactionState:
+    | "none"
+    | "starting"
+    | "active"
+    | "committing"
+    | "finished" = "none";
   try {
     client = await connectPoolClient(pool, lifecycle.signal);
     guard = guardPoolClientWithAbort(client, lifecycle.signal);
+    transactionState = "starting";
     await client.query("BEGIN");
+    transactionState = "active";
     await setTimeouts(client, RECOVERY_TIMEOUT_MS);
     const recovered = await recoverInTransaction(client, input);
+    transactionState = "committing";
     await client.query("COMMIT");
+    transactionState = "finished";
     return recovered;
   } catch {
-    if (client && guard?.destroyed !== true) {
-      await client.query("ROLLBACK").catch(() => guard?.destroy());
+    if (client && guard && !guard.destroyed) {
+      if (transactionState === "active") {
+        if (!await rollbackChannelTransaction(client)) guard.destroy();
+      } else if (
+        transactionState === "starting"
+        || transactionState === "committing"
+      ) {
+        guard.destroy();
+      }
     }
     return null;
   } finally {
@@ -1006,10 +1088,18 @@ async function recoverCommittedBatch(
   const lifecycle = createLifecycle(RECOVERY_TIMEOUT_MS);
   let client: PoolClient | undefined;
   let guard: AbortablePoolClientGuard | undefined;
+  let transactionState:
+    | "none"
+    | "starting"
+    | "active"
+    | "committing"
+    | "finished" = "none";
   try {
     client = await connectPoolClient(pool, lifecycle.signal);
     guard = guardPoolClientWithAbort(client, lifecycle.signal);
+    transactionState = "starting";
     await client.query("BEGIN");
+    transactionState = "active";
     await setTimeouts(client, RECOVERY_TIMEOUT_MS);
     const snapshots = new Map<
       ChannelType,
@@ -1018,16 +1108,28 @@ async function recoverCommittedBatch(
     for (const input of inputs) {
       const recovered = await recoverInTransaction(client, input);
       if (!recovered) {
-        await client.query("ROLLBACK");
+        if (!await rollbackChannelTransaction(client)) {
+          guard.destroy();
+        }
+        transactionState = "finished";
         return null;
       }
       snapshots.set(input.type, recovered);
     }
+    transactionState = "committing";
     await client.query("COMMIT");
+    transactionState = "finished";
     return collectionFromSnapshots(snapshots);
   } catch {
-    if (client && guard?.destroyed !== true) {
-      await client.query("ROLLBACK").catch(() => guard?.destroy());
+    if (client && guard && !guard.destroyed) {
+      if (transactionState === "active") {
+        if (!await rollbackChannelTransaction(client)) guard.destroy();
+      } else if (
+        transactionState === "starting"
+        || transactionState === "committing"
+      ) {
+        guard.destroy();
+      }
     }
     return null;
   } finally {
@@ -1045,6 +1147,17 @@ async function setTimeouts(
   const lock = Math.min(10_000, statement);
   await client.query(`SET LOCAL lock_timeout = '${lock}ms'`);
   await client.query(`SET LOCAL statement_timeout = '${statement}ms'`);
+}
+
+async function rollbackChannelTransaction(
+  client: PoolClient,
+): Promise<boolean> {
+  try {
+    await client.query("ROLLBACK");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function intendedHealth(enabled: boolean): {

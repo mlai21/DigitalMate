@@ -7,6 +7,9 @@ import { buildPersonalDataExport } from "@/server/admin/personal-data";
 import {
   createSecretExposureFingerprint,
 } from "@/server/admin/secret-content";
+import {
+  MAX_USER_SECRET_EXPOSURE_FINGERPRINTS,
+} from "@/server/admin/secret-exposure-store";
 import { createRepositories } from "@/server/db/repositories";
 import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 import { deleteArtifactTree, writeArtifactFile } from "@/server/tasks/artifacts";
@@ -210,6 +213,9 @@ describe("personal data helpers", () => {
       if (sql.includes("personal_data_export_preflight")) {
         return emptyExportPreflight();
       }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
+      }
       if (
         sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
         || sql === "COMMIT"
@@ -324,6 +330,9 @@ describe("personal data helpers", () => {
       void params;
       if (sql.includes("personal_data_export_preflight")) {
         return emptyExportPreflight();
+      }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
       }
       return { rows: [] };
     });
@@ -456,6 +465,9 @@ describe("personal data helpers", () => {
         }
         return exportPreflight("1", "16");
       }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
+      }
       if (
         sql.includes("FROM digital_agents")
         && !sql.includes("JOIN digital_agents")
@@ -498,6 +510,9 @@ describe("personal data helpers", () => {
             estimated_bytes: "12000",
           }],
         };
+      }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
       }
       if (
         sql.includes("personal_data_export_batch")
@@ -599,6 +614,9 @@ describe("personal data helpers", () => {
       if (sql.includes("$1")) expect(params).toEqual([USER_ID]);
       if (sql.includes("personal_data_export_preflight")) {
         return exportPreflight("2", "512");
+      }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
       }
       if (
         sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
@@ -738,6 +756,9 @@ describe("personal data helpers", () => {
       if (sql.includes("personal_data_export_preflight")) {
         return exportPreflight("2", "512");
       }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
+      }
       if (sql.includes("FROM channel_connections") && !sql.includes("JOIN channel_connections")) {
         return {
           rows: [{
@@ -813,6 +834,9 @@ describe("personal data helpers", () => {
       if (sql.includes("personal_data_export_preflight")) {
         return exportPreflight("3", "768");
       }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return { rows: [{ count: "1" }] };
+      }
       if (
         sql.includes("FROM channel_connections")
         && !sql.includes("JOIN channel_connections")
@@ -877,17 +901,62 @@ describe("personal data helpers", () => {
     ).rejects.toThrow("personal_data_export_failed");
 
     const fingerprintQuery = query.mock.calls.find(([sql]) =>
+      String(sql).includes("personal_data_export_batch")
+      &&
       String(sql).includes(
         "FROM channel_secret_exposure_fingerprints",
       ),
     );
-    expect(String(fingerprintQuery?.[0])).toContain(
+    expect(String(fingerprintQuery?.[0])).not.toContain(
       "JOIN channel_connections",
     );
-    expect(String(fingerprintQuery?.[0])).toContain(
-      "channel_connections.user_id = $1",
-    );
+    expect(String(fingerprintQuery?.[0])).toContain("user_id = $1");
     expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects oversized credential history before fetching export fingerprint rows", async () => {
+    if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("personal_data_export_preflight")) {
+        return exportPreflight("1", "128");
+      }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return {
+          rows: [{
+            count:
+              String(MAX_USER_SECRET_EXPOSURE_FINGERPRINTS + 1),
+          }],
+        };
+      }
+      if (
+        sql.includes(
+          "FROM channel_secret_exposure_fingerprints",
+        )
+      ) {
+        throw new Error("fingerprint_rows_must_not_be_fetched");
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.export(USER_ID, KEY_STATE.key),
+    ).rejects.toThrow("personal_data_export_failed");
+    expect(query.mock.calls.some(([sql]) =>
+      String(sql).includes(
+        "personal_data_export_fingerprint_count",
+      )
+    )).toBe(true);
+    expect(query.mock.calls.some(([sql]) =>
+      String(sql).includes("personal_data_export_batch")
+      && String(sql).includes(
+        "FROM channel_secret_exposure_fingerprints",
+      )
+    )).toBe(false);
   });
 
   it("clears and normalizes agent identity inside one database transaction", async () => {
@@ -911,7 +980,6 @@ describe("personal data helpers", () => {
       statement.includes(
         "DELETE FROM channel_secret_exposure_fingerprints",
       )
-      && statement.includes("channel_connections")
       && statement.includes("user_id = $1"),
     );
     const secretDelete = sql.findIndex((statement) =>
@@ -977,6 +1045,9 @@ describe("personal data helpers", () => {
       if (sql.includes("personal_data_export_preflight")) {
         return emptyExportPreflight();
       }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
+      }
       if (sql.includes("FROM digital_agents")) {
         throw new Error("SENTINEL_EXPORT_QUERY_SECRET");
       }
@@ -1002,6 +1073,9 @@ describe("personal data helpers", () => {
     const query = vi.fn(async (sql: string) => {
       if (sql.includes("personal_data_export_preflight")) {
         return emptyExportPreflight();
+      }
+      if (sql.includes("personal_data_export_fingerprint_count")) {
+        return emptyFingerprintCount();
       }
       if (sql === "COMMIT") {
         throw new Error("SENTINEL_EXPORT_COMMIT_SECRET");
@@ -1233,4 +1307,8 @@ function exportPreflight(
 
 function emptyExportPreflight() {
   return exportPreflight("0", "0");
+}
+
+function emptyFingerprintCount() {
+  return { rows: [{ count: "0" }] };
 }

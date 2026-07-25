@@ -6,7 +6,7 @@ import path from "node:path";
 import { inspect } from "node:util";
 
 import EmbeddedPostgres from "embedded-postgres";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import {
   afterAll,
   beforeAll,
@@ -40,6 +40,7 @@ const REQUEST_ID = "10000000-0000-4000-8000-000000000031";
 const TEST_SECRET = "task5-database-super-secret";
 const OTHER_SECRET = "task5-second-super-secret";
 const ENCODED_KEY = Buffer.alloc(32, 17).toString("base64");
+let requestSequence = 0;
 
 describe("channel config revision, secret and audit transaction", () => {
   let embeddedPostgres: EmbeddedPostgres;
@@ -89,6 +90,7 @@ describe("channel config revision, secret and audit transaction", () => {
   }, 60_000);
 
   beforeEach(async () => {
+    requestSequence = 0;
     await primaryPool.query(`
       TRUNCATE admin_audit_logs, channel_secrets, channel_connections,
         digital_agents, users CASCADE
@@ -175,6 +177,116 @@ describe("channel config revision, secret and audit transaction", () => {
         "channel_secret_exposure_fingerprints",
         "admin_audit_logs",
       ]);
+
+      await firstPool.query(`
+        ALTER TABLE channel_secret_exposure_fingerprints
+          DROP CONSTRAINT
+            channel_secret_exposure_fingerprints_user_id_fkey,
+          DROP CONSTRAINT
+            channel_secret_exposure_fingerprints_connection_id_fkey,
+          DROP CONSTRAINT
+            channel_secret_exposure_fingerprints_pkey,
+          DROP COLUMN user_id;
+        ALTER TABLE channel_secret_exposure_fingerprints
+          ALTER COLUMN connection_id SET NOT NULL,
+          ADD CONSTRAINT channel_secret_exposure_fingerprints_pkey
+            PRIMARY KEY (
+              connection_id, field_name, key_version, digest
+            ),
+          ADD CONSTRAINT
+            channel_secret_exposure_fingerprints_connection_id_fkey
+            FOREIGN KEY (connection_id)
+            REFERENCES channel_connections(id)
+            ON DELETE CASCADE;
+      `);
+      const migrationUserId =
+        "90000000-0000-4000-8000-000000000001";
+      const migrationAgentId =
+        "90000000-0000-4000-8000-000000000011";
+      const migrationConnectionId =
+        "90000000-0000-4000-8000-000000000021";
+      await firstPool.query(
+        "INSERT INTO users (id, display_name) VALUES ($1, 'Migration user')",
+        [migrationUserId],
+      );
+      await firstPool.query(
+        `INSERT INTO digital_agents (
+           id, user_id, slug, display_name, is_default
+         )
+         VALUES ($1, $2, 'default', 'Migration agent', true)`,
+        [migrationAgentId, migrationUserId],
+      );
+      await firstPool.query(
+        `INSERT INTO channel_connections (
+           id, user_id, agent_id, channel_type, display_name
+         )
+         VALUES ($1, $2, $3, 'telegram', 'Migration channel')`,
+        [
+          migrationConnectionId,
+          migrationUserId,
+          migrationAgentId,
+        ],
+      );
+      await firstPool.query(
+        `INSERT INTO channel_secret_exposure_fingerprints (
+           connection_id, field_name, key_version, digest,
+           utf8_bytes, character_length
+         )
+         VALUES ($1, 'bot_token', 1, $2, 16, 16)`,
+        [
+          migrationConnectionId,
+          Buffer.alloc(32, 7),
+        ],
+      );
+
+      await migrateSchema(firstPool, schema);
+      const migrated = await firstPool.query<{
+        user_id: string;
+        connection_id: string | null;
+        primary_definition: string;
+        delete_action: string;
+      }>(
+        `SELECT fingerprint.user_id,
+                fingerprint.connection_id,
+                (
+                  SELECT pg_get_constraintdef(oid)
+                  FROM pg_constraint
+                  WHERE conrelid =
+                    'channel_secret_exposure_fingerprints'::regclass
+                    AND contype = 'p'
+                ) AS primary_definition,
+                (
+                  SELECT confdeltype::text
+                  FROM pg_constraint
+                  WHERE conrelid =
+                    'channel_secret_exposure_fingerprints'::regclass
+                    AND conname =
+                      'channel_secret_exposure_fingerprints_connection_id_fkey'
+                ) AS delete_action
+         FROM channel_secret_exposure_fingerprints AS fingerprint`,
+      );
+      expect(migrated.rows[0]).toMatchObject({
+        user_id: migrationUserId,
+        connection_id: migrationConnectionId,
+        primary_definition:
+          "PRIMARY KEY (user_id, key_version, digest)",
+        delete_action: "n",
+      });
+      await firstPool.query(
+        "DELETE FROM channel_connections WHERE id = $1",
+        [migrationConnectionId],
+      );
+      const retained = await firstPool.query<{
+        user_id: string;
+        connection_id: string | null;
+      }>(
+        `SELECT user_id, connection_id
+         FROM channel_secret_exposure_fingerprints`,
+      );
+      expect(retained.rows).toEqual([{
+        user_id: migrationUserId,
+        connection_id: null,
+      }]);
     } finally {
       await firstPool.end();
       await secondPool.end();
@@ -281,6 +393,168 @@ describe("channel config revision, secret and audit transaction", () => {
     expect(connection.rows[0].config.endpoint).toBe(
       decrypted === TEST_SECRET ? "winner-one" : "winner-two",
     );
+  });
+
+  it("recovers a committed update after COMMIT loses its response", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const harness = createAuditCommitHarness(primaryPool, "committed");
+    const service = createChannelConnectionAuditService(
+      harness.pool,
+      keyState.key,
+    );
+
+    await expect(
+      service.update(updateInput({ secret: TEST_SECRET })),
+    ).resolves.toEqual({ revision: 2 });
+    expect(harness.releases[0]).toEqual([true]);
+    expect(harness.releases[1]).toEqual([]);
+    const persisted = await primaryPool.query<{
+      revision: number;
+      audits: string;
+      audit_text: string;
+    }>(
+      `SELECT revision,
+              (SELECT count(*) FROM admin_audit_logs) AS audits,
+              (
+                SELECT concat(
+                  before_summary::text,
+                  after_summary::text,
+                  confirmation_source::text
+                )
+                FROM admin_audit_logs
+                WHERE resource_id = $1::text
+              ) AS audit_text
+       FROM channel_connections WHERE id = $1::uuid`,
+      [CONNECTION_A],
+    );
+    expect(persisted.rows[0]).toMatchObject({
+      revision: 2,
+      audits: "1",
+    });
+    expect(persisted.rows[0].audit_text).not.toContain(TEST_SECRET);
+  });
+
+  it("does not report success for an ambiguous COMMIT without a request id", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const harness = createAuditCommitHarness(primaryPool, "committed");
+    const service = createChannelConnectionAuditService(
+      harness.pool,
+      keyState.key,
+    );
+
+    await expect(
+      service.update({
+        ...updateInput({ secret: TEST_SECRET }),
+        confirmationSource: { type: "console" },
+      }),
+    ).rejects.toMatchObject({
+      code: "channel_config_update_failed",
+    });
+    expect(harness.releases[0]).toEqual([true]);
+    const persisted = await primaryPool.query<{
+      revision: number;
+      audits: string;
+    }>(
+      `SELECT revision,
+              (SELECT count(*) FROM admin_audit_logs) AS audits
+       FROM channel_connections WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    expect(persisted.rows[0]).toEqual({
+      revision: 2,
+      audits: "1",
+    });
+  });
+
+  it.each([
+    ["not_committed", "channel_config_update_failed"],
+    ["mismatch", "operation_id_reused"],
+    ["unknown", "channel_config_update_failed"],
+  ] as const)(
+    "fails safely when COMMIT recovery is %s",
+    async (outcome, expectedCode) => {
+      if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+      const harness = createAuditCommitHarness(primaryPool, outcome);
+      const service = createChannelConnectionAuditService(
+        harness.pool,
+        keyState.key,
+      );
+
+      await expect(
+        service.update(updateInput({ secret: TEST_SECRET })),
+      ).rejects.toMatchObject({ code: expectedCode });
+      expect(harness.releases[0]).toEqual([true]);
+      if (outcome !== "unknown") {
+        expect(harness.releases[1]).toEqual([]);
+      }
+    },
+  );
+
+  it("retries an already committed request exactly once and rejects request-id reuse", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    );
+    const input = updateInput({ secret: TEST_SECRET });
+    await expect(service.update(input)).resolves.toEqual({ revision: 2 });
+    await expect(service.update(input)).resolves.toEqual({ revision: 2 });
+    await expect(service.update({
+      ...input,
+      config: { endpoint: "different" },
+      secretChanges: [{
+        fieldName: "bot_token",
+        operation: "set",
+        value: OTHER_SECRET,
+      }],
+    })).rejects.toMatchObject({
+      status: 409,
+      code: "operation_id_reused",
+    });
+    const counts = await primaryPool.query<{
+      revision: number;
+      audits: string;
+    }>(
+      `SELECT revision,
+              (SELECT count(*) FROM admin_audit_logs) AS audits
+       FROM channel_connections WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    expect(counts.rows[0]).toEqual({
+      revision: 2,
+      audits: "1",
+    });
+  });
+
+  it("recovers an exact retry when its read-only COMMIT response is lost", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const input = updateInput({ secret: TEST_SECRET });
+    await createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    ).update(input);
+    const harness = createAuditCommitHarness(primaryPool, "committed");
+    const service = createChannelConnectionAuditService(
+      harness.pool,
+      keyState.key,
+    );
+
+    await expect(service.update(input)).resolves.toEqual({ revision: 2 });
+    expect(harness.releases[0]).toEqual([true]);
+    expect(harness.releases[1]).toEqual([]);
+    const counts = await primaryPool.query<{
+      revision: number;
+      audits: string;
+    }>(
+      `SELECT revision,
+              (SELECT count(*) FROM admin_audit_logs) AS audits
+       FROM channel_connections WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    expect(counts.rows[0]).toEqual({
+      revision: 2,
+      audits: "1",
+    });
   });
 
   it("aborts a real row-lock wait promptly and leaves the connection reusable", async () => {
@@ -432,6 +706,59 @@ describe("channel config revision, secret and audit transaction", () => {
       revision: 3,
       fingerprints: "2",
     });
+  });
+
+  it("rejects a credential from another connection owned by the same user", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    );
+    await service.update(updateInput({ secret: TEST_SECRET }));
+
+    await expect(service.update({
+      ...updateInput({ secret: OTHER_SECRET }),
+      scope: { userId: USER_A, agentId: AGENT_A2 },
+      connectionId: CONNECTION_A2,
+      config: { endpoint: `Bearer ${TEST_SECRET}` },
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "secret_in_public_config",
+    });
+    const second = await primaryPool.query<{
+      revision: number;
+      audits: string;
+    }>(
+      `SELECT revision,
+              (
+                SELECT count(*)
+                FROM admin_audit_logs
+                WHERE resource_id = $1::text
+              ) AS audits
+       FROM channel_connections
+       WHERE id = $1::uuid`,
+      [CONNECTION_A2],
+    );
+    expect(second.rows[0]).toEqual({
+      revision: 1,
+      audits: "0",
+    });
+  });
+
+  it("does not apply another user's credential history", async () => {
+    if (keyState.status !== "ready") throw new Error("test_key_not_ready");
+    const service = createChannelConnectionAuditService(
+      primaryPool,
+      keyState.key,
+    );
+    await service.update(updateInput({ secret: TEST_SECRET }));
+
+    await expect(service.update({
+      ...updateInput({ secret: OTHER_SECRET }),
+      scope: { userId: USER_B, agentId: AGENT_B },
+      connectionId: CONNECTION_B,
+      config: { endpoint: `Bearer ${TEST_SECRET}` },
+    })).resolves.toEqual({ revision: 2 });
   });
 
   it.each([
@@ -848,7 +1175,12 @@ function updateInput(options: {
   expectedRevision?: number;
   config?: Record<string, unknown>;
   secret: string;
+  requestId?: string;
 }) {
+  const requestId = options.requestId
+    ?? `10000000-0000-4000-8000-${String(
+      31 + requestSequence++,
+    ).padStart(12, "0")}`;
   return {
     scope: { userId: USER_A, agentId: AGENT_A },
     connectionId: CONNECTION_A,
@@ -865,8 +1197,77 @@ function updateInput(options: {
     auditConfigFields: ["endpoint"],
     confirmationSource: {
       type: "console" as const,
-      requestId: REQUEST_ID,
+      requestId,
     },
+  };
+}
+
+function createAuditCommitHarness(
+  pool: Pool,
+  outcome: "committed" | "not_committed" | "mismatch" | "unknown",
+) {
+  let connectionIndex = 0;
+  const releases: unknown[][] = [];
+  return {
+    releases,
+    pool: {
+      connect: async () => {
+        const index = connectionIndex;
+        connectionIndex += 1;
+        if (index > 0 && outcome === "unknown") {
+          throw new Error("recovery_connection_unavailable");
+        }
+        const client = await pool.connect();
+        return new Proxy(client, {
+          get(target, property) {
+            if (property === "query" && index === 0) {
+              return async (
+                queryText: string,
+                values?: readonly unknown[],
+              ) => {
+                if (queryText === "COMMIT") {
+                  if (
+                    outcome === "committed"
+                    || outcome === "mismatch"
+                  ) {
+                    await target.query("COMMIT");
+                    if (outcome === "mismatch") {
+                      await target.query(
+                        `UPDATE admin_audit_logs
+                         SET confirmation_source = jsonb_set(
+                           confirmation_source,
+                           '{inputFingerprint}',
+                           '"mismatch"'::jsonb,
+                           true
+                         )
+                         WHERE confirmation_source->>'requestId' = $1`,
+                        [REQUEST_ID],
+                      );
+                    }
+                  } else {
+                    await target.query("ROLLBACK");
+                  }
+                  throw new Error("commit_response_lost");
+                }
+                return values === undefined
+                  ? target.query(queryText)
+                  : target.query(queryText, [...values]);
+              };
+            }
+            if (property === "release") {
+              return (...args: unknown[]) => {
+                releases[index] = args;
+                return target.release(...args as [boolean?]);
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function"
+              ? value.bind(target)
+              : value;
+          },
+        }) as PoolClient;
+      },
+    } as Pool,
   };
 }
 

@@ -15,6 +15,7 @@ type DatabaseStage =
   | "BEGIN"
   | "lock_timeout"
   | "statement_timeout"
+  | "user_lock"
   | "connection_lock"
   | "secret_read"
   | "connection_update"
@@ -81,6 +82,7 @@ describe("bounded cancellable channel config audit", () => {
     "BEGIN",
     "lock_timeout",
     "statement_timeout",
+    "user_lock",
     "connection_lock",
     "secret_read",
     "connection_update",
@@ -108,7 +110,10 @@ describe("bounded cancellable channel config audit", () => {
             queryPending = true;
             return pendingQuery.promise;
           }
-          return Promise.resolve(databaseStageResult(stage));
+          return Promise.resolve(databaseStageResult(
+            stage,
+            String(sql),
+          ));
         }),
         release,
       } as unknown as PoolClient;
@@ -137,6 +142,73 @@ describe("bounded cancellable channel config audit", () => {
       }
     },
   );
+
+  it.each(["synchronous", "asynchronous"] as const)(
+    "destroys the client when BEGIN has an %s unknown outcome",
+    async (failureKind) => {
+      if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+      const query = failureKind === "synchronous"
+        ? vi.fn((sql: unknown) => {
+            if (String(sql) === "BEGIN") {
+              throw new Error("begin_response_lost");
+            }
+            return Promise.resolve({ rows: [] });
+          })
+        : vi.fn(async (sql: unknown) => {
+            if (String(sql) === "BEGIN") {
+              throw new Error("begin_response_lost");
+            }
+            return { rows: [] };
+          });
+      const release = vi.fn();
+      const service = createChannelConnectionAuditService(
+        {
+          connect: vi.fn(async () => ({
+            query,
+            release,
+          } as unknown as PoolClient)),
+        } as unknown as Pool,
+        KEY_STATE.key,
+      );
+
+      await expect(service.update(updateInput())).rejects.toThrow();
+      expect(query.mock.calls.map(([sql]) => String(sql)))
+        .not.toContain("ROLLBACK");
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledWith(true);
+    },
+  );
+
+  it("destroys the client when rollback fails and preserves the primary conflict", async () => {
+    if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
+    const query = vi.fn(async (sql: unknown) => {
+      const text = String(sql);
+      if (text === "ROLLBACK") {
+        throw new Error("rollback_response_lost");
+      }
+      if (text.includes("FROM channel_connections")) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const service = createChannelConnectionAuditService(
+      {
+        connect: vi.fn(async () => ({
+          query,
+          release,
+        } as unknown as PoolClient)),
+      } as unknown as Pool,
+      KEY_STATE.key,
+    );
+
+    await expect(service.update(updateInput())).rejects.toMatchObject({
+      status: 409,
+      code: "config_revision_conflict",
+    });
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(true);
+  });
 
   it("applies an unavoidable hard timeout to a pending pool checkout", async () => {
     if (KEY_STATE.status !== "ready") throw new Error("test_key_not_ready");
@@ -223,6 +295,14 @@ describe("bounded cancellable channel config audit", () => {
             rows: [connectionRow(2, { endpoint: "safe" })],
           });
         }
+        if (
+          text.includes(
+            "FROM channel_secret_exposure_fingerprints",
+          )
+          && text.includes("count(*)")
+        ) {
+          return Promise.resolve({ rows: [{ count: "0" }] });
+        }
         return Promise.resolve({ rows: [] });
       }),
       release,
@@ -291,6 +371,9 @@ function classifyDatabaseStage(sql: string): DatabaseStage {
   if (sql.startsWith("SET LOCAL statement_timeout")) {
     return "statement_timeout";
   }
+  if (sql.includes("pg_advisory_xact_lock")) {
+    return "user_lock";
+  }
   if (sql.includes("FROM channel_connections")) {
     return "connection_lock";
   }
@@ -319,7 +402,16 @@ function classifyDatabaseStage(sql: string): DatabaseStage {
   throw new Error(`unexpected audit query: ${sql}`);
 }
 
-function databaseStageResult(stage: DatabaseStage) {
+function databaseStageResult(
+  stage: DatabaseStage,
+  sql: string,
+) {
+  if (
+    stage === "secret_read"
+    && sql.includes("count(*)")
+  ) {
+    return { rows: [{ count: "0" }] };
+  }
   if (stage === "connection_lock") {
     return { rows: [connectionRow(1, { endpoint: "old" })] };
   }

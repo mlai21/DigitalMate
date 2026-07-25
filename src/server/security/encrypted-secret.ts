@@ -181,6 +181,16 @@ export class ChannelSecretsKey {
       .digest();
   }
 
+  channelConfigAuditFingerprint(value: string): string {
+    return createHmac("sha256", this.#material)
+      .update(
+        "digitalmate.channel-config-audit-operation\0",
+        "utf8",
+      )
+      .update(value, "utf8")
+      .digest("hex");
+  }
+
   toJSON(): Readonly<{
     configured: true;
     keyVersion: number;

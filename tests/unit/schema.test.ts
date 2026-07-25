@@ -104,7 +104,13 @@ describe("database schema", () => {
       "channel_secret_exposure_fingerprints_connection_id_fkey",
     );
     expect(schema).toContain(
+      "channel_secret_exposure_fingerprints_user_id_fkey",
+    );
+    expect(schema).toContain(
       "channel_secret_exposure_fingerprints_digest_length_check",
+    );
+    expect(schema).toMatch(
+      /channel_secret_exposure_fingerprints_connection_id_fkey[\s\S]*?ON DELETE SET NULL/,
     );
     expect(schema).toContain("admin_audit_logs_user_agent_fkey");
     expect(schema).toContain("idx_admin_audit_logs_scope_created");
