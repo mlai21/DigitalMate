@@ -61,6 +61,12 @@ export type ValidateAttachmentFileInput = {
   bytes: Buffer;
 };
 
+export type ValidateAttachmentMetadataInput = {
+  fileName: string;
+  declaredMime: string;
+  sizeBytes: number;
+};
+
 function stableError(code: string, cause?: unknown) {
   return new Error(code, cause === undefined ? undefined : { cause });
 }
@@ -122,6 +128,30 @@ export function validateAttachmentFile({
   declaredMime,
   bytes,
 }: ValidateAttachmentFileInput): ValidatedAttachmentFile {
+  const metadata = validateAttachmentMetadata({
+    fileName,
+    declaredMime,
+    sizeBytes: bytes.length,
+  });
+  const { mimeType } = metadata;
+
+  const signatureMatches = BINARY_SIGNATURES[mimeType];
+  if (signatureMatches && !signatureMatches(bytes)) {
+    throw stableError("attachment_signature_mismatch");
+  }
+
+  if (TEXT_MIME_TYPES.has(mimeType)) {
+    validateTextContent(mimeType, bytes);
+  }
+
+  return metadata;
+}
+
+export function validateAttachmentMetadata({
+  fileName,
+  declaredMime,
+  sizeBytes,
+}: ValidateAttachmentMetadataInput): ValidatedAttachmentFile {
   const safeFileName = sanitizeAttachmentFileName(fileName);
   const mimeType = declaredMime.trim().toLowerCase();
 
@@ -134,23 +164,18 @@ export function validateAttachmentFile({
     throw stableError("attachment_type_not_allowed");
   }
 
-  if (bytes.length > ATTACHMENT_LIMITS.maxFileBytes) {
+  if (
+    !Number.isSafeInteger(sizeBytes)
+    || sizeBytes < 0
+    || sizeBytes > ATTACHMENT_LIMITS.maxFileBytes
+  ) {
     throw stableError("attachment_file_too_large");
-  }
-
-  const signatureMatches = BINARY_SIGNATURES[mimeType];
-  if (signatureMatches && !signatureMatches(bytes)) {
-    throw stableError("attachment_signature_mismatch");
-  }
-
-  if (TEXT_MIME_TYPES.has(mimeType)) {
-    validateTextContent(mimeType, bytes);
   }
 
   return {
     fileName: safeFileName,
     kind,
     mimeType,
-    sizeBytes: bytes.length,
+    sizeBytes,
   };
 }

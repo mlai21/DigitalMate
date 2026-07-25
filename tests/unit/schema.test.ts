@@ -58,6 +58,12 @@ describe("database schema", () => {
     );
     expect(schema).toContain("channel_inbound_events_connection_scope_fkey");
     expect(schema).toContain("channel_execution_steps_event_scope_fkey");
+    expect(schema).toContain(
+      "channel_event_attachments_locator_state_check",
+    );
+    expect(schema).toContain(
+      "channel_event_attachments_connection_scope_fkey",
+    );
     expect(schema).toContain("channel_deliveries_event_scope_fkey");
     expect(schema).toContain("channel_deliveries_message_scope_fkey");
     expect(schema).toContain("channel_connections_runtime_node_id_fkey");

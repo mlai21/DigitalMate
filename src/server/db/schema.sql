@@ -1361,6 +1361,7 @@ CREATE TABLE IF NOT EXISTS channel_event_attachments (
   user_id uuid NOT NULL,
   agent_id uuid NOT NULL,
   event_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
   external_attachment_id text NOT NULL
     CONSTRAINT channel_event_attachments_external_id_check
     CHECK (btrim(external_attachment_id) <> ''),
@@ -1369,22 +1370,39 @@ CREATE TABLE IF NOT EXISTS channel_event_attachments (
   declared_size_bytes bigint
     CONSTRAINT channel_event_attachments_declared_size_check
     CHECK (declared_size_bytes IS NULL OR declared_size_bytes > 0),
-  source_locator_ciphertext bytea NOT NULL
+  source_locator_ciphertext bytea
     CONSTRAINT channel_event_attachments_locator_ciphertext_check
     CHECK (octet_length(source_locator_ciphertext) > 0),
-  source_locator_nonce bytea NOT NULL
+  source_locator_nonce bytea
     CONSTRAINT channel_event_attachments_locator_nonce_check
     CHECK (octet_length(source_locator_nonce) = 12),
-  source_locator_auth_tag bytea NOT NULL
+  source_locator_auth_tag bytea
     CONSTRAINT channel_event_attachments_locator_auth_tag_check
     CHECK (octet_length(source_locator_auth_tag) = 16),
-  source_locator_key_version integer NOT NULL
+  source_locator_key_version integer
     CONSTRAINT channel_event_attachments_locator_key_version_check
     CHECK (source_locator_key_version > 0),
   locator_expires_at timestamptz NOT NULL,
   locator_cleared_at timestamptz,
   private_attachment_id uuid,
   created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_event_attachments_locator_state_check
+    CHECK (
+      (
+        locator_cleared_at IS NULL
+        AND source_locator_ciphertext IS NOT NULL
+        AND source_locator_nonce IS NOT NULL
+        AND source_locator_auth_tag IS NOT NULL
+        AND source_locator_key_version IS NOT NULL
+      )
+      OR (
+        locator_cleared_at IS NOT NULL
+        AND source_locator_ciphertext IS NULL
+        AND source_locator_nonce IS NULL
+        AND source_locator_auth_tag IS NULL
+        AND source_locator_key_version IS NULL
+      )
+    ),
   CONSTRAINT channel_event_attachments_user_agent_fkey
     FOREIGN KEY (user_id, agent_id)
     REFERENCES digital_agents(user_id, id)
@@ -1393,12 +1411,90 @@ CREATE TABLE IF NOT EXISTS channel_event_attachments (
     FOREIGN KEY (event_id, user_id, agent_id)
     REFERENCES channel_inbound_events(id, user_id, agent_id)
     ON DELETE CASCADE,
+  CONSTRAINT channel_event_attachments_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
   CONSTRAINT channel_event_attachments_private_scope_fkey
     FOREIGN KEY (private_attachment_id, user_id, agent_id)
     REFERENCES message_attachments(id, user_id, agent_id)
     ON DELETE SET NULL (private_attachment_id),
   UNIQUE (event_id, external_attachment_id)
 );
+
+ALTER TABLE IF EXISTS channel_event_attachments
+  ADD COLUMN IF NOT EXISTS connection_id uuid;
+
+UPDATE channel_event_attachments AS attachment
+SET connection_id = event.connection_id
+FROM channel_inbound_events AS event
+WHERE attachment.connection_id IS NULL
+  AND event.id = attachment.event_id
+  AND event.user_id = attachment.user_id
+  AND event.agent_id = attachment.agent_id;
+
+DO $channel_event_attachment_locator_migration$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM channel_event_attachments
+    WHERE connection_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'channel_attachment_connection_backfill_failed'
+      USING ERRCODE = '23502';
+  END IF;
+
+  ALTER TABLE channel_event_attachments
+    ALTER COLUMN connection_id SET NOT NULL,
+    ALTER COLUMN source_locator_ciphertext DROP NOT NULL,
+    ALTER COLUMN source_locator_nonce DROP NOT NULL,
+    ALTER COLUMN source_locator_auth_tag DROP NOT NULL,
+    ALTER COLUMN source_locator_key_version DROP NOT NULL;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_event_attachments'::regclass
+      AND conname =
+        'channel_event_attachments_locator_state_check'
+  ) THEN
+    ALTER TABLE channel_event_attachments
+      ADD CONSTRAINT
+        channel_event_attachments_locator_state_check
+      CHECK (
+        (
+          locator_cleared_at IS NULL
+          AND source_locator_ciphertext IS NOT NULL
+          AND source_locator_nonce IS NOT NULL
+          AND source_locator_auth_tag IS NOT NULL
+          AND source_locator_key_version IS NOT NULL
+        )
+        OR (
+          locator_cleared_at IS NOT NULL
+          AND source_locator_ciphertext IS NULL
+          AND source_locator_nonce IS NULL
+          AND source_locator_auth_tag IS NULL
+          AND source_locator_key_version IS NULL
+        )
+      );
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_event_attachments'::regclass
+      AND conname =
+        'channel_event_attachments_connection_scope_fkey'
+  ) THEN
+    ALTER TABLE channel_event_attachments
+      ADD CONSTRAINT
+        channel_event_attachments_connection_scope_fkey
+      FOREIGN KEY (connection_id, user_id, agent_id)
+      REFERENCES channel_connections(id, user_id, agent_id)
+      ON DELETE CASCADE;
+  END IF;
+END
+$channel_event_attachment_locator_migration$;
 
 CREATE TABLE IF NOT EXISTS channel_reply_handles (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

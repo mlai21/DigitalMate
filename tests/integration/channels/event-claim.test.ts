@@ -20,11 +20,15 @@ import {
   createChannelAccessControl,
 } from "@/server/channels/runtime/access";
 import {
+  createChannelAttachmentLocatorRepository,
+} from "@/server/channels/runtime/attachment-ingress";
+import {
   channelClientTurnId,
   createChannelEventRepository,
 } from "@/server/channels/runtime/event-repository";
 import { createChannelDeliveryRepository } from "@/server/channels/runtime/delivery-repository";
 import type { NormalizedChannelEvent } from "@/server/channels/runtime/types";
+import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
 import {
   trackEmbeddedPostgresPool,
   type EmbeddedPostgresLifecycle,
@@ -36,6 +40,8 @@ const CONNECTION_A = "20000000-0000-4000-8000-000000000001";
 const CONNECTION_B = "20000000-0000-4000-8000-000000000002";
 const CONVERSATION_ID = "30000000-0000-4000-8000-000000000001";
 const ASSISTANT_MESSAGE_ID = "40000000-0000-4000-8000-000000000001";
+const PRIVATE_ATTACHMENT_ID =
+  "50000000-0000-4000-8000-000000000001";
 const scope = { userId: USER_ID, agentId: AGENT_ID } satisfies AgentScope;
 
 describe("channel event transaction ledger", () => {
@@ -204,6 +210,107 @@ describe("channel event transaction ledger", () => {
     expect(serialized).not.toContain(secretReply);
     expect(serialized).not.toContain("replyHandle");
     expect(serialized).not.toContain("\"source\"");
+  });
+
+  it("encrypts a short-lived locator and erases it after binding", async () => {
+    const keyState = createChannelSecretsKey(
+      Buffer.alloc(32, 37).toString("base64"),
+    );
+    if (keyState.status !== "ready") {
+      throw new Error("test_channel_key_invalid");
+    }
+    const events = createChannelEventRepository(pool);
+    const accepted = await events.accept(
+      scope,
+      normalizedEvent(CONNECTION_A, "event-locator"),
+    );
+    const locators = createChannelAttachmentLocatorRepository(
+      pool,
+      keyState.key,
+    );
+    const secret = "temporary-platform-token";
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    const descriptor = {
+      externalAttachmentId: "attachment-locator-1",
+      fileName: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      source: { token: secret, opaqueId: "file-1" },
+    } as const;
+
+    await expect(locators.persist(
+      scope,
+      accepted.event.id,
+      CONNECTION_A,
+      descriptor,
+      new Date(now.getTime() + 60_000),
+      now,
+    )).resolves.toBe(true);
+    const stored = await pool.query<{
+      encrypted: string;
+    }>(
+      `SELECT concat(
+         encode(source_locator_ciphertext, 'hex'),
+         encode(source_locator_nonce, 'hex'),
+         encode(source_locator_auth_tag, 'hex')
+       ) AS encrypted
+       FROM channel_event_attachments
+       WHERE event_id = $1`,
+      [accepted.event.id],
+    );
+    expect(stored.rows[0]?.encrypted).not.toContain(secret);
+    await expect(locators.loadSource(
+      scope,
+      accepted.event.id,
+      descriptor.externalAttachmentId,
+      now,
+    )).resolves.toEqual(descriptor.source);
+
+    await pool.query(
+      `INSERT INTO message_attachments (
+         id, user_id, agent_id, kind, file_name, mime_type,
+         size_bytes, storage_key, status
+       )
+       VALUES (
+         $1, $2, $3, 'document', 'notes.txt', 'text/plain',
+         5, '60000000-0000-4000-8000-000000000001', 'ready'
+       )`,
+      [PRIVATE_ATTACHMENT_ID, USER_ID, AGENT_ID],
+    );
+    await expect(locators.bindPrivateAttachment(
+      scope,
+      accepted.event.id,
+      descriptor.externalAttachmentId,
+      PRIVATE_ATTACHMENT_ID,
+      new Date(now.getTime() + 1_000),
+    )).resolves.toBe(true);
+    await expect(locators.loadSource(
+      scope,
+      accepted.event.id,
+      descriptor.externalAttachmentId,
+      new Date(now.getTime() + 2_000),
+    )).resolves.toBeNull();
+    const cleared = await pool.query<{
+      private_attachment_id: string;
+      source_locator_ciphertext: Buffer | null;
+      source_locator_nonce: Buffer | null;
+      source_locator_auth_tag: Buffer | null;
+      source_locator_key_version: number | null;
+    }>(
+      `SELECT private_attachment_id, source_locator_ciphertext,
+              source_locator_nonce, source_locator_auth_tag,
+              source_locator_key_version
+       FROM channel_event_attachments
+       WHERE event_id = $1`,
+      [accepted.event.id],
+    );
+    expect(cleared.rows[0]).toEqual({
+      private_attachment_id: PRIVATE_ATTACHMENT_ID,
+      source_locator_ciphertext: null,
+      source_locator_nonce: null,
+      source_locator_auth_tag: null,
+      source_locator_key_version: null,
+    });
   });
 
   it("allows only one of eight workers to claim an event", async () => {

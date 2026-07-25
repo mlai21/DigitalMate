@@ -129,7 +129,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "error_code", "started_at", "completed_at",
   ],
   channel_event_attachments: [
-    "id", "user_id", "agent_id", "event_id", "external_attachment_id",
+    "id", "user_id", "agent_id", "event_id", "connection_id",
+    "external_attachment_id",
     "file_name", "declared_mime_type", "declared_size_bytes",
     "locator_expires_at", "locator_cleared_at", "private_attachment_id",
     "created_at",
