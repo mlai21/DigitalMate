@@ -12,6 +12,7 @@ import type {
   InboundContext,
   IngressResult,
   NormalizedChannelEvent,
+  PlatformAcknowledgement,
 } from "./types";
 
 type IngressEventRepository = Readonly<{
@@ -47,19 +48,35 @@ export type AcceptInboundInput = Readonly<{
     eventId: string,
     error: unknown,
   ) => Promise<void>;
+  afterPersist?: (
+    event: ChannelEventRecord,
+    normalized: NormalizedChannelEvent,
+  ) => Promise<void>;
 }>;
 
 export async function acceptInbound(
   input: AcceptInboundInput,
 ): Promise<IngressResult> {
+  return (await acceptInboundWithAcknowledgement(input)).result;
+}
+
+export async function acceptInboundWithAcknowledgement(
+  input: AcceptInboundInput,
+): Promise<Readonly<{
+  result: IngressResult;
+  acknowledgement: PlatformAcknowledgement;
+}>> {
   const normalized = await input.adapter.normalizeInbound(
     input.payload,
     input.context,
   );
   if (!normalized) {
     const ignored: IngressResult = { kind: "ignored" };
-    await input.adapter.acknowledge(input.payload, ignored);
-    return ignored;
+    const acknowledgement = await input.adapter.acknowledge(
+      input.payload,
+      ignored,
+    );
+    return { result: ignored, acknowledgement };
   }
   assertNormalizedScope(normalized, input);
 
@@ -75,6 +92,9 @@ export async function acceptInbound(
       accepted.event,
     );
   }
+  if (accepted.event.status === "accepted") {
+    await input.afterPersist?.(accepted.event, normalized);
+  }
 
   const result: IngressResult = !accepted.created
     ? { kind: "duplicate", eventId: accepted.event.id }
@@ -82,7 +102,11 @@ export async function acceptInbound(
       ? { kind: "accepted", eventId: accepted.event.id }
       : { kind: "rejected", eventId: accepted.event.id };
   try {
-    await input.adapter.acknowledge(input.payload, result);
+    const acknowledgement = await input.adapter.acknowledge(
+      input.payload,
+      result,
+    );
+    return { result, acknowledgement };
   } catch (error) {
     await input.onAcknowledgementFailure?.(
       accepted.event.id,
@@ -90,7 +114,6 @@ export async function acceptInbound(
     ).catch(() => undefined);
     throw error;
   }
-  return result;
 }
 
 function accessOptions(

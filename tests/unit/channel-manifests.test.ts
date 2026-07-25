@@ -70,6 +70,7 @@ const PLATFORM_FIELDS = {
   ],
   telegram: [
     "bot_token",
+    "webhook_secret",
     "base_url",
     "http_proxy",
     "http_proxy_auth",
@@ -117,6 +118,7 @@ const PLATFORM_FIELDS = {
   slack: [
     "bot_token",
     "app_token",
+    "signing_secret",
     "proxy",
     "streaming_enabled",
     "media_dir",
@@ -200,11 +202,15 @@ const SECRET_FIELDS = {
     "verification_token",
   ],
   qq: ["client_secret"],
-  telegram: ["bot_token", "http_proxy_auth"],
+  telegram: [
+    "bot_token",
+    "webhook_secret",
+    "http_proxy_auth",
+  ],
   mattermost: ["bot_token"],
   mqtt: ["password", "tls_keyfile"],
   matrix: ["access_token", "password"],
-  slack: ["bot_token", "app_token"],
+  slack: ["bot_token", "app_token", "signing_secret"],
   voice: ["twilio_auth_token"],
   sip: [
     "sip_password",
@@ -243,7 +249,7 @@ describe("QwenPaw channel manifest catalog", () => {
   });
 
   it.each(CHANNEL_TYPES)(
-    "%s preserves the upstream config field order and secret inventory",
+    "%s preserves the approved config field order and secret inventory",
     (type) => {
       const manifest = getChannelManifest(type);
 
@@ -409,11 +415,11 @@ describe("QwenPaw channel manifest catalog", () => {
         'dingtalk|钉钉|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,client_id="",client_secret="",message_type="markdown",cron_message_type="markdown",card_template_id="",card_template_key="content",robot_code="",media_dir=null,card_auto_layout=false,at_sender_on_reply=false,streaming_enabled=false,endpoint=""',
         'feishu|飞书|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,app_id="",app_secret="",encrypt_key="",verification_token="",media_dir=null,domain="feishu",streaming_enabled=false,share_session_in_group=false',
         'qq|QQ|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,app_id="",client_secret="",markdown_enabled=true,max_reconnect_attempts=100,ack_message=""',
-        'telegram|Telegram|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,bot_token="",base_url="",http_proxy="",http_proxy_auth="",show_typing=null,streaming_enabled=false',
+        'telegram|Telegram|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,bot_token="",webhook_secret="",base_url="",http_proxy="",http_proxy_auth="",show_typing=null,streaming_enabled=false',
         'mattermost|Mattermost|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,url="",bot_token="",media_dir=null,show_typing=null,thread_follow_without_mention=false',
         'mqtt|MQTT|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,host="",port=null,transport="",clean_session=true,qos=2,username=null,password=null,subscribe_topic="",publish_topic="",tls_enabled=false,tls_ca_certs=null,tls_certfile=null,tls_keyfile=null',
         'matrix|Matrix|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,homeserver="",user_id="",access_token="",group_allow_from=[],groups={},encryption=false,vision_enabled=true,history_limit=50,password="",device_name="qwenpaw-worker",sync_timeout_ms=30000,mention_pill_in_body=false,outbound_structured_mentions=true,streaming_enabled=false',
-        'slack|Slack|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=null,deny_message="",require_mention=true,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,bot_token="",app_token="",proxy=null,streaming_enabled=false,media_dir=null',
+        'slack|Slack|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=null,deny_message="",require_mention=true,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,bot_token="",app_token="",signing_secret="",proxy=null,streaming_enabled=false,media_dir=null',
         'voice|Voice|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,twilio_account_sid="",twilio_auth_token="",phone_number="",phone_number_sid="",tts_provider="google",tts_voice="en-US-Journey-D",stt_provider="deepgram",language="en-US",welcome_greeting="Hi! This is DigitalMate. How can I help you?"',
         'sip|SIP|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,sip_mode="dev",sip_host="0.0.0.0",sip_port=5061,sip_username="",sip_password="",sip_server="",sip_transport="UDP",rtp_port_low=10000,rtp_port_high=20000,dashscope_api_key="",tts_provider="aliyun",tts_voice="",stt_provider="aliyun",language="zh-CN",welcome_greeting="你好，我是DigitalMate",call_timeout=120,livekit_url="",livekit_api_key="",livekit_api_secret="",livekit_sip_trunk_id="",livekit_room_name="sip-inbound",livekit_output_sample_rate=24000,max_concurrent_calls=5',
         'wecom|企业微信|enabled=false,bot_prefix="",filter_tool_messages=true,filter_thinking=true,dm_policy="open",group_policy="open",allow_from=[],deny_message="",require_mention=false,no_text_debounce=true,access_control_dm=false,access_control_group=false,dm_disabled=false,group_disabled=false,bot_id="",secret="",media_dir=null,welcome_text="",share_session_in_group=true,max_reconnect_attempts=-1,streaming_enabled=false',

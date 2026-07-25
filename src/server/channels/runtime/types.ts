@@ -62,7 +62,7 @@ export type ResolvedRecipient = Readonly<{
 
 export type ChannelDelivery = Readonly<{
   id: string;
-  eventId: string;
+  eventId: string | null;
   connectionId: string;
   assistantMessageId: string;
   body: string;

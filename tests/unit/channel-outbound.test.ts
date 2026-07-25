@@ -1,46 +1,63 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { sendChannelMessage } from "@/server/channels/outbound";
-import { readEnv } from "@/server/config/env";
-import type { NormalizedChannelMessage } from "@/server/channels/types";
 
-const feishuMessage: NormalizedChannelMessage = {
-  channel: "feishu",
-  externalConversationId: "oc_1",
-  externalMessageId: "om_1",
-  senderId: "ou_1",
-  chatType: "direct",
-  text: "你好",
-  occurredAt: new Date("2026-07-05T10:00:00+08:00"),
-  raw: {},
-};
+import { createDingTalkWebhookAdapter } from "@/server/channels/adapters/webhook/dingtalk";
+import { createFeishuWebhookAdapter } from "@/server/channels/adapters/webhook/feishu";
+import type {
+  ChannelDelivery,
+} from "@/server/channels/runtime/types";
 
-describe("sendChannelMessage", () => {
+const now = new Date("2026-07-26T00:00:00.000Z");
+
+describe("webhook adapter outbound delivery", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("sends Feishu text messages with a tenant access token", async () => {
+  it("sends Feishu text with in-memory credentials and returns a sanitized result", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ code: 0, tenant_access_token: "tenant-token", expire: 7200 }), { status: 200 }),
-      )
-      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, msg: "ok" }), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        tenant_access_token: "tenant-token",
+        expire: 7_200,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        msg: "ok",
+        data: { message_id: "om_reply" },
+      }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
+    const adapter = createFeishuWebhookAdapter();
+    const controller = new AbortController();
 
-    await sendChannelMessage(readEnv({ FEISHU_APP_ID: "app-id", FEISHU_APP_SECRET: "app-secret" }), feishuMessage, "我在。");
+    const result = await adapter.send(
+      delivery(),
+      {
+        config: adapter.validateConfig({
+          enabled: true,
+          app_id: "app-id",
+          app_secret: "app-secret",
+        }),
+        signal: controller.signal,
+        now: () => now,
+      },
+    );
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ app_id: "app-id", app_secret: "app-secret" }),
+        body: JSON.stringify({
+          app_id: "app-id",
+          app_secret: "app-secret",
+        }),
       }),
     );
-
     const [, sendOptions] = fetchMock.mock.calls[1];
-    expect(fetchMock.mock.calls[1][0]).toBe("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id");
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+    );
     expect(sendOptions.headers).toMatchObject({
       authorization: "Bearer tenant-token",
       "content-type": "application/json",
@@ -50,5 +67,65 @@ describe("sendChannelMessage", () => {
       msg_type: "text",
       content: JSON.stringify({ text: "我在。" }),
     });
+    expect(result).toEqual({
+      externalMessageId: "om_reply",
+      sentAt: now,
+      rawSummary: { code: 0 },
+    });
+    expect(JSON.stringify(result)).not.toContain("tenant-token");
+  });
+
+  it("uses an unsealed DingTalk reply handle without putting it in the result", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response("{}", { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = createDingTalkWebhookAdapter();
+    const sessionWebhook =
+      "https://oapi.dingtalk.com/robot/send?access_token=secret";
+
+    const result = await adapter.send(
+      {
+        ...delivery(),
+        replyHandle: {
+          publicFields: { conversationId: "cid-1" },
+          secretFields: { sessionWebhook },
+          expiresAt: new Date(now.getTime() + 60_000),
+        },
+      },
+      {
+        config: adapter.validateConfig({ enabled: true }),
+        signal: new AbortController().signal,
+        now: () => now,
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      sessionWebhook,
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          msgtype: "text",
+          text: { content: "我在。" },
+        }),
+      }),
+    );
+    expect(JSON.stringify(result)).not.toContain("access_token");
+    expect(JSON.stringify(result)).not.toContain("secret");
   });
 });
+
+function delivery(): ChannelDelivery {
+  return {
+    id: "40000000-0000-4000-8000-000000000001",
+    eventId: "50000000-0000-4000-8000-000000000001",
+    connectionId:
+      "20000000-0000-4000-8000-000000000001",
+    assistantMessageId:
+      "60000000-0000-4000-8000-000000000001",
+    body: "我在。",
+    recipient: {
+      externalConversationId: "oc_1",
+    },
+  };
+}

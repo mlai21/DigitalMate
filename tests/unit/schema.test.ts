@@ -65,6 +65,12 @@ describe("database schema", () => {
       "channel_event_attachments_connection_scope_fkey",
     );
     expect(schema).toContain("channel_deliveries_event_scope_fkey");
+    expect(schema).toContain(
+      "channel_deliveries_source_task_scope_fkey",
+    );
+    expect(schema).toContain(
+      "CHECK (num_nonnulls(event_id, source_task_id) = 1)",
+    );
     expect(schema).toContain("channel_deliveries_message_scope_fkey");
     expect(schema).toContain("channel_connections_runtime_node_id_fkey");
     expect(schema).toContain("channel_runtime_node_binding_invalid");

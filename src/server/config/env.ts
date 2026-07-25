@@ -50,6 +50,10 @@ const envSchema = z.object({
   FEISHU_APP_SECRET: z.string().optional(),
   FEISHU_VERIFICATION_TOKEN: z.string().optional(),
   DINGTALK_ROBOT_CODE: z.string().optional(),
+  CHANNEL_IMPORT_LEGACY_ENABLED: z
+    .enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   ATTACHMENT_STORAGE_DIR: z.string().optional(),
 });
 
@@ -94,6 +98,8 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     feishuAppSecret: parsed.FEISHU_APP_SECRET,
     feishuVerificationToken: parsed.FEISHU_VERIFICATION_TOKEN,
     dingTalkRobotCode: parsed.DINGTALK_ROBOT_CODE,
+    channelImportLegacyEnabled:
+      parsed.CHANNEL_IMPORT_LEGACY_ENABLED,
     attachmentStorageDir:
       attachmentStorageDir || path.join(process.cwd(), "data", "attachments"),
   };

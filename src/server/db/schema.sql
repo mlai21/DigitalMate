@@ -1271,6 +1271,7 @@ CREATE TABLE IF NOT EXISTS channel_inbound_events (
   permission_envelope jsonb NOT NULL
     CONSTRAINT channel_inbound_events_permission_object_check
     CHECK (jsonb_typeof(permission_envelope) = 'object'),
+  reply_handle_required boolean NOT NULL DEFAULT false,
   client_turn_id uuid NOT NULL,
   payload_hash text NOT NULL
     CONSTRAINT channel_inbound_events_payload_hash_check
@@ -1313,6 +1314,10 @@ CREATE TABLE IF NOT EXISTS channel_inbound_events (
   UNIQUE (connection_id, external_event_id),
   UNIQUE (user_id, agent_id, client_turn_id)
 );
+
+ALTER TABLE IF EXISTS channel_inbound_events
+  ADD COLUMN IF NOT EXISTS
+    reply_handle_required boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS channel_execution_steps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1537,7 +1542,8 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,
   agent_id uuid NOT NULL,
-  event_id uuid NOT NULL,
+  event_id uuid,
+  source_task_id uuid,
   connection_id uuid NOT NULL,
   assistant_message_id uuid NOT NULL,
   reply_handle_id uuid,
@@ -1581,6 +1587,8 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
         AND claim_expires_at IS NOT NULL)
       OR status <> 'running'
     ),
+  CONSTRAINT channel_deliveries_source_check
+    CHECK (num_nonnulls(event_id, source_task_id) = 1),
   CONSTRAINT channel_deliveries_user_agent_fkey
     FOREIGN KEY (user_id, agent_id)
     REFERENCES digital_agents(user_id, id)
@@ -1588,6 +1596,10 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
   CONSTRAINT channel_deliveries_event_scope_fkey
     FOREIGN KEY (event_id, user_id, agent_id)
     REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_deliveries_source_task_scope_fkey
+    FOREIGN KEY (source_task_id, user_id, agent_id)
+    REFERENCES proactive_tasks(id, user_id, agent_id)
     ON DELETE CASCADE,
   CONSTRAINT channel_deliveries_connection_scope_fkey
     FOREIGN KEY (connection_id, user_id, agent_id)
@@ -1609,6 +1621,45 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
 ALTER TABLE IF EXISTS channel_deliveries
   ADD COLUMN IF NOT EXISTS
     attempt_cycle_baseline integer NOT NULL DEFAULT 0;
+
+ALTER TABLE IF EXISTS channel_deliveries
+  ADD COLUMN IF NOT EXISTS source_task_id uuid;
+
+ALTER TABLE IF EXISTS channel_deliveries
+  ALTER COLUMN event_id DROP NOT NULL;
+
+DO $channel_delivery_source_constraints$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_deliveries'::regclass
+      AND conname = 'channel_deliveries_source_check'
+  ) THEN
+    ALTER TABLE channel_deliveries
+      ADD CONSTRAINT channel_deliveries_source_check
+      CHECK (num_nonnulls(event_id, source_task_id) = 1);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_deliveries'::regclass
+      AND conname = 'channel_deliveries_source_task_scope_fkey'
+  ) THEN
+    ALTER TABLE channel_deliveries
+      ADD CONSTRAINT channel_deliveries_source_task_scope_fkey
+      FOREIGN KEY (source_task_id, user_id, agent_id)
+      REFERENCES proactive_tasks(id, user_id, agent_id)
+      ON DELETE CASCADE;
+  END IF;
+END
+$channel_delivery_source_constraints$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+  idx_channel_deliveries_source_task
+  ON channel_deliveries(source_task_id)
+  WHERE source_task_id IS NOT NULL;
 
 DO $channel_delivery_attempt_cycle_constraint$
 BEGIN

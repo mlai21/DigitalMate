@@ -1,5 +1,4 @@
 import { canSendProactiveMessage } from "@/server/agent/reminders";
-import { splitAssistantText } from "@/server/agent/streaming";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import type { DbProactiveTask } from "@/server/db/repositories";
 import type { AgentScope } from "@/server/agents/types";
@@ -27,7 +26,10 @@ type ProactiveDeliveryRepositories = {
       taskId: string;
       conversationId: string;
       content: string;
-    }): Promise<boolean> | boolean;
+    }): Promise<{
+      id: string;
+      created: boolean;
+    }>;
   };
   channels: {
     latestDirectTarget(scope: AgentScope): Promise<NormalizedChannelMessage | null>;
@@ -37,11 +39,13 @@ type ProactiveDeliveryRepositories = {
 export async function processDueProactiveTasks(input: {
   scope: AgentScope;
   repositories: ProactiveDeliveryRepositories;
-  sendChannel?: (
-    target: NormalizedChannelMessage,
-    text: string,
-    signal?: AbortSignal,
-  ) => Promise<unknown> | unknown;
+  enqueueChannel?: (input: {
+    scope: AgentScope;
+    taskId: string;
+    assistantMessageId: string;
+    target: NormalizedChannelMessage;
+    content: string;
+  }) => Promise<unknown> | unknown;
   signal?: AbortSignal;
   now?: Date;
 }): Promise<void> {
@@ -72,31 +76,31 @@ export async function processDueProactiveTasks(input: {
     if (!canSend) continue;
 
     const content = proactiveTaskContent(task);
-    const inserted = await input.repositories.messages.createFromProactiveTask(input.scope, {
+    const message = await input.repositories.messages.createFromProactiveTask(input.scope, {
       taskId: task.id,
       conversationId: task.conversationId,
       content,
     });
     input.signal?.throwIfAborted();
 
-    if (inserted) {
-      const target = await input.repositories.channels.latestDirectTarget(input.scope);
-      if (target && input.sendChannel) {
-        try {
-          for (const segment of splitAssistantText(content)) {
-            input.signal?.throwIfAborted();
-            if (input.signal) {
-              await input.sendChannel(target, segment, input.signal);
-            } else {
-              await input.sendChannel(target, segment);
-            }
-            input.signal?.throwIfAborted();
-          }
-        } catch {
-          input.signal?.throwIfAborted();
-          await input.repositories.proactiveTasks.markFailed(input.scope, task.id);
-          continue;
+    const target = await input.repositories.channels.latestDirectTarget(
+      input.scope,
+    );
+    if (target) {
+      try {
+        if (input.enqueueChannel) {
+          await input.enqueueChannel({
+            scope: input.scope,
+            taskId: task.id,
+            assistantMessageId: message.id,
+            target,
+            content,
+          });
         }
+      } catch {
+        input.signal?.throwIfAborted();
+        await input.repositories.proactiveTasks.markFailed(input.scope, task.id);
+        continue;
       }
     }
 

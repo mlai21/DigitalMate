@@ -26,6 +26,7 @@ type ChannelEventRow = {
   connection_id: string;
   normalized_payload: StoredNormalizedEvent;
   permission_envelope: PermissionEnvelope;
+  reply_handle_required: boolean;
   client_turn_id: string;
   payload_hash: string;
   status: ChannelEventStatus;
@@ -129,23 +130,26 @@ export function createChannelEventRepository(
         event.externalEventId,
       );
       const stored = toStoredNormalizedEvent(event);
+      const replyHandleRequired = event.replyHandle !== undefined;
       const payloadHash = hashCanonical({
         normalizedEvent: stored,
         permission: event.permission,
+        replyHandleRequired,
       });
       const inserted = await pool.query<ChannelEventRow>(
         `INSERT INTO channel_inbound_events (
            user_id, agent_id, connection_id, channel_type,
            external_event_id, external_conversation_id,
            external_sender_id, chat_type, normalized_payload,
-           permission_envelope, client_turn_id, payload_hash,
+           permission_envelope, reply_handle_required,
+           client_turn_id, payload_hash,
            status, failure_code, occurred_at, received_at,
            completed_at
          )
          VALUES (
            $1, $2, $3, $4, $5, $6, $7, $8,
            $9::jsonb, $10::jsonb, $11, $12, $13, $14,
-           $15, $16, $17
+           $15, $16, $17, $18
          )
          ON CONFLICT (connection_id, external_event_id) DO NOTHING
          RETURNING *`,
@@ -160,6 +164,7 @@ export function createChannelEventRepository(
           event.chatType,
           JSON.stringify(stored),
           JSON.stringify(event.permission),
+          replyHandleRequired,
           clientTurnId,
           payloadHash,
           acceptOptions.initialStatus,
@@ -199,6 +204,7 @@ export function createChannelEventRepository(
       if (
         row.payload_hash !== payloadHash
         || row.client_turn_id !== clientTurnId
+        || row.reply_handle_required !== replyHandleRequired
       ) {
         throw new Error("channel_event_payload_conflict");
       }
@@ -218,11 +224,22 @@ export function createChannelEventRepository(
         `WITH candidate AS (
            SELECT id
            FROM channel_inbound_events
-           WHERE status = 'accepted'
-              OR (
+           WHERE (
+             status = 'accepted'
+             OR (
                 status = 'running'
                 AND claim_expires_at <= $1
               )
+           )
+             AND (
+               reply_handle_required = false
+               OR EXISTS (
+                 SELECT 1
+                 FROM channel_reply_handles AS handle
+                 WHERE handle.event_id =
+                   channel_inbound_events.id
+               )
+             )
            ORDER BY received_at, id
            FOR UPDATE SKIP LOCKED
            LIMIT 1

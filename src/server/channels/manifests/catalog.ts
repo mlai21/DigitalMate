@@ -387,6 +387,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     capabilities: ["attachments", "groups", "streaming", "typing"],
     platformFields: [
       secretField("bot_token", "Bot Token", false, true),
+      secretField("webhook_secret", "Webhook Secret"),
       urlField("base_url", "API Base URL"),
       urlField("http_proxy", "HTTP 代理"),
       secretField("http_proxy_auth", "HTTP 代理认证"),
@@ -489,6 +490,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     platformFields: [
       secretField("bot_token", "Bot Token", false, true),
       secretField("app_token", "App Token", false, true),
+      secretField("signing_secret", "Signing Secret"),
       nullableUrlField("proxy", "代理 URL"),
       booleanField("streaming_enabled", "流式回复", false),
       nullableStringField("media_dir", "媒体目录"),

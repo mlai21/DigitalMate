@@ -36,6 +36,7 @@ type MessageRepository = Readonly<{
       payloadHash: string;
       content: string;
       attachmentIds: string[];
+      memoryProcessed?: boolean;
     },
   ): Promise<{
     message: Pick<DbMessage, "id">;
@@ -83,11 +84,24 @@ export type ChannelTurnResult = PersistChannelReplyResult & Readonly<{
   degraded: boolean;
 }>;
 
+export type ChannelTurnDecision =
+  | Readonly<{ kind: "proceed" }>
+  | Readonly<{ kind: "skip"; reason: string }>;
+
+export type SkippedChannelTurnResult = Readonly<{
+  skipped: true;
+  reason: string;
+  assistantMessageId: null;
+  deliveryId: null;
+  created: false;
+  degraded: false;
+}>;
+
 export type ChannelTurnExecutor = Readonly<{
   execute(
     claim: ClaimedChannelEvent,
     options?: Readonly<{ signal?: AbortSignal }>,
-  ): Promise<ChannelTurnResult>;
+  ): Promise<ChannelTurnResult | SkippedChannelTurnResult>;
 }>;
 
 export function createChannelTurnExecutor(input: Readonly<{
@@ -102,18 +116,29 @@ export function createChannelTurnExecutor(input: Readonly<{
     claim: ClaimedChannelEvent,
   ): Promise<string | null>;
   createJournal(claim: ClaimedChannelEvent): ExecutionJournal;
+  decideTurn?(
+    context: ChannelAgentTurnContext,
+  ): MaybePromise<ChannelTurnDecision>;
   runAgentTurn(
     context: ChannelAgentTurnContext,
   ): MaybePromise<string | AsyncIterable<string>>;
   persistReply(
     input: PersistChannelReplyInput,
   ): Promise<PersistChannelReplyResult>;
+  completeWithoutReply?(
+    claim: ClaimedChannelEvent,
+    conversationId: string,
+    reason: string,
+  ): Promise<void>;
   faultInjector?(
     point: ChannelTurnFaultPoint,
   ): MaybePromise<void>;
 }>): ChannelTurnExecutor {
   return {
-    async execute(claim, options = {}): Promise<ChannelTurnResult> {
+    async execute(
+      claim,
+      options = {},
+    ): Promise<ChannelTurnResult | SkippedChannelTurnResult> {
       options.signal?.throwIfAborted();
       const conversationId = await input.resolveConversationId(claim);
       const attachmentIds = await input.resolveAttachmentIds(claim);
@@ -125,6 +150,8 @@ export function createChannelTurnExecutor(input: Readonly<{
         payloadHash: claim.payloadHash,
         content: claim.normalizedEvent.text,
         attachmentIds,
+        memoryProcessed:
+          claim.normalizedEvent.chatType === "group",
       });
       options.signal?.throwIfAborted();
 
@@ -155,6 +182,34 @@ export function createChannelTurnExecutor(input: Readonly<{
           };
         }
 
+        const journal = input.createJournal(claim);
+        const decision = await input.decideTurn?.({
+          claim,
+          conversationId,
+          journal,
+          signal: options.signal,
+        }) ?? { kind: "proceed" as const };
+        if (decision.kind === "skip") {
+          if (!input.completeWithoutReply) {
+            throw new Error(
+              "channel_turn_skip_persister_missing",
+            );
+          }
+          await input.completeWithoutReply(
+            claim,
+            conversationId,
+            decision.reason,
+          );
+          return {
+            skipped: true,
+            reason: decision.reason,
+            assistantMessageId: null,
+            deliveryId: null,
+            created: false,
+            degraded: false,
+          };
+        }
+
         const executionClaimed =
           await input.messages.claimClientTurnExecution(
             claim.scope,
@@ -182,7 +237,7 @@ export function createChannelTurnExecutor(input: Readonly<{
             await collectReply(input.runAgentTurn({
               claim,
               conversationId,
-              journal: input.createJournal(claim),
+              journal,
               signal: options.signal,
             })),
             CHANNEL_AGENT_FAILED_REPLY,
@@ -285,6 +340,72 @@ export function createAtomicChannelReplyPersister(
         deliveryId: delivery.id,
         created: assistant.created,
       };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+}
+
+export function createAtomicChannelNoReplyPersister(
+  pool: QueryablePool,
+) {
+  return async (
+    claim: ClaimedChannelEvent,
+    conversationId: string,
+    reason: string,
+  ): Promise<void> => {
+    if (
+      !/^[a-z0-9_:-]{1,128}$/.test(reason)
+    ) {
+      throw new Error("channel_turn_skip_reason_invalid");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const completed = await client.query(
+        `UPDATE channel_inbound_events
+         SET status = 'completed',
+             assistant_message_id = NULL,
+             failure_code = $6,
+             claim_owner = NULL,
+             claim_expires_at = NULL,
+             completed_at = now(),
+             updated_at = now()
+         WHERE id = $1
+           AND claim_owner = $2
+           AND status = 'running'
+           AND user_id = $3
+           AND agent_id = $4
+           AND connection_id = $5
+           AND claim_expires_at > now()`,
+        [
+          claim.id,
+          claim.claimOwner,
+          claim.scope.userId,
+          claim.scope.agentId,
+          claim.connectionId,
+          reason,
+        ],
+      );
+      if (completed.rowCount !== 1) {
+        throw new Error("channel_event_claim_lost");
+      }
+      await client.query(
+        `UPDATE conversations
+         SET updated_at = now()
+         WHERE id = $1
+           AND user_id = $2
+           AND agent_id = $3`,
+        [
+          conversationId,
+          claim.scope.userId,
+          claim.scope.agentId,
+        ],
+      );
+      await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;

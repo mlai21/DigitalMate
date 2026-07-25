@@ -79,6 +79,7 @@ export type AdminChannelConfigWrite = Readonly<{
   enabled: boolean;
   config: Readonly<Record<string, unknown>>;
   secretChanges: readonly AdminChannelSecretChange[];
+  confirmationSource?: "console" | "legacy_env_import";
 }>;
 
 export type AdminChannelConfigReader = (

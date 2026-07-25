@@ -965,7 +965,7 @@ async function insertAudit(
       auditSummary(beforeSnapshot),
       auditSummary(snapshot),
       {
-        type: "console",
+        type: input.confirmationSource ?? "console",
         requestId: input.operationId,
         inputFingerprint: input.fingerprint,
       },
@@ -990,7 +990,7 @@ async function recoverInTransaction(
        AND agent_id = $2
        AND resource_type = 'channel_connection'
        AND status = 'success'
-       AND confirmation_source->>'type' = 'console'
+       AND confirmation_source->>'type' = $5
        AND confirmation_source->>'requestId' = $3
        AND after_summary->>'channel_type' = $4
      ORDER BY created_at DESC
@@ -1000,6 +1000,7 @@ async function recoverInTransaction(
       input.scope.agentId,
       input.operationId,
       input.type,
+      input.confirmationSource ?? "console",
     ],
   );
   const row = audit.rows[0];

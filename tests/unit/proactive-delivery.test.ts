@@ -24,7 +24,6 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -56,7 +55,6 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent: vi.fn(),
@@ -87,7 +85,6 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -112,15 +109,15 @@ describe("processDueProactiveTasks", () => {
     expect(markSent).toHaveBeenCalledWith(scope, "authorized-share");
   });
 
-  it("does not push the same proactive task twice when its message already exists", async () => {
+  it("消息已存在时仍幂等补入 Delivery 队列", async () => {
     const messagesCreate = vi.fn();
     const markSent = vi.fn();
-    const sendChannel = vi.fn();
+    const enqueueChannel = vi.fn();
 
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel,
+      enqueueChannel,
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -130,8 +127,32 @@ describe("processDueProactiveTasks", () => {
     });
 
     expect(messagesCreate).toHaveBeenCalledTimes(1);
-    expect(sendChannel).not.toHaveBeenCalled();
+    expect(enqueueChannel).toHaveBeenCalledTimes(1);
     expect(markSent).toHaveBeenCalledWith(scope, "task-1");
+  });
+
+  it("把主动消息交给统一 Delivery 队列而不是直接调用平台", async () => {
+    const enqueueChannel = vi.fn();
+    const repositories = fakeRepositories({
+      messagesCreate: vi.fn(),
+      markSent: vi.fn(),
+      latestDirectTarget: telegramTarget,
+    });
+
+    await processDueProactiveTasks({
+      scope,
+      now: new Date("2026-07-05T10:00:00+08:00"),
+      enqueueChannel,
+      repositories,
+    });
+
+    expect(enqueueChannel).toHaveBeenCalledWith({
+      scope,
+      taskId: "task-1",
+      assistantMessageId: "proactive-message-1",
+      target: telegramTarget,
+      content: "提醒一下：提交报销",
+    });
   });
 
   it("marks a task failed when its only channel push attempt fails", async () => {
@@ -141,7 +162,7 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(async () => {
+      enqueueChannel: vi.fn(async () => {
         throw new Error("channel unavailable");
       }),
       repositories: fakeRepositories({
@@ -157,14 +178,14 @@ describe("processDueProactiveTasks", () => {
   });
 
   it("persists due reminders to web chat and pushes to the latest direct IM channel", async () => {
-    const sendChannel = vi.fn();
+    const enqueueChannel = vi.fn();
     const messagesCreate = vi.fn();
     const markSent = vi.fn();
 
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel,
+      enqueueChannel,
       repositories: fakeRepositories({ messagesCreate, markSent, latestDirectTarget: telegramTarget }),
     });
 
@@ -175,7 +196,13 @@ describe("processDueProactiveTasks", () => {
       role: "assistant",
       content: "提醒一下：提交报销",
     });
-    expect(sendChannel).toHaveBeenCalledWith(telegramTarget, "提醒一下：提交报销");
+    expect(enqueueChannel).toHaveBeenCalledWith({
+      scope,
+      taskId: "task-1",
+      assistantMessageId: "proactive-message-1",
+      target: telegramTarget,
+      content: "提醒一下：提交报销",
+    });
     expect(markSent).toHaveBeenCalledWith(scope, "task-1");
   });
 
@@ -186,7 +213,7 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T23:30:00+08:00"),
-      sendChannel: vi.fn(),
+      enqueueChannel: vi.fn(),
       repositories: fakeRepositories({ messagesCreate, markSent, latestDirectTarget: telegramTarget }),
     });
 
@@ -201,7 +228,7 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T23:30:00+08:00"),
-      sendChannel: vi.fn(),
+      enqueueChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -236,7 +263,7 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(),
+      enqueueChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -267,7 +294,7 @@ describe("processDueProactiveTasks", () => {
     await processDueProactiveTasks({
       scope,
       now: new Date("2026-07-05T10:00:00+08:00"),
-      sendChannel: vi.fn(),
+      enqueueChannel: vi.fn(),
       repositories: fakeRepositories({
         messagesCreate,
         markSent,
@@ -336,7 +363,10 @@ function fakeRepositories(input: {
           role: "assistant",
           content: payload.content,
         });
-        return input.messageInserted ?? true;
+        return {
+          id: "proactive-message-1",
+          created: input.messageInserted ?? true,
+        };
       }),
     },
     channels: {

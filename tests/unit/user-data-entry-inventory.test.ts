@@ -71,7 +71,16 @@ describe("user data entry inventory", () => {
   });
 
   it("holds one shared lease around the complete channel dispatch", () => {
-    expect(holdsSharedLease("src/server/channels/dispatch.ts")).toBe(true);
+    expect(
+      holdsSharedLease(
+        "src/server/channels/runtime/start.ts",
+      ),
+    ).toBe(true);
+    expect(
+      holdsSharedLease(
+        "src/server/channels/adapters/webhook/route-runtime.ts",
+      ),
+    ).toBe(true);
   });
 
   it("holds shared leases around agent startup, each tick, and attachment cleanup scope", () => {

@@ -24,7 +24,8 @@ type DeliveryRow = {
   id: string;
   user_id: string;
   agent_id: string;
-  event_id: string;
+  event_id: string | null;
+  source_task_id: string | null;
   connection_id: string;
   assistant_message_id: string;
   reply_handle_id: string | null;
@@ -43,7 +44,8 @@ type DeliveryRow = {
 export type ChannelDeliveryRecord = Readonly<{
   id: string;
   scope: AgentScope;
-  eventId: string;
+  eventId: string | null;
+  sourceTaskId: string | null;
   connectionId: string;
   assistantMessageId: string;
   replyHandleId: string | null;
@@ -68,6 +70,16 @@ export type ClaimedChannelDelivery = ChannelDeliveryRecord & Readonly<{
 export type EnqueueChannelDeliveryInput = Readonly<{
   scope: AgentScope;
   eventId: string;
+  connectionId: string;
+  assistantMessageId: string;
+  replyHandleId?: string;
+  body: string;
+  recipient: ChannelRecipient;
+}>;
+
+export type EnqueueProactiveChannelDeliveryInput = Readonly<{
+  scope: AgentScope;
+  sourceTaskId: string;
   connectionId: string;
   assistantMessageId: string;
   replyHandleId?: string;
@@ -158,6 +170,73 @@ export function createChannelDeliveryRepository(
       }
       if (
         row.event_id !== input.eventId
+        || row.source_task_id !== null
+        || row.reply_handle_id !== (input.replyHandleId ?? null)
+        || row.body !== input.body
+        || !sameRecipient(row.recipient, input.recipient)
+      ) {
+        throw new Error("channel_delivery_payload_conflict");
+      }
+      return {
+        created: false,
+        delivery: mapDeliveryRow(row),
+      };
+    },
+
+    async enqueueProactive(
+      input: EnqueueProactiveChannelDeliveryInput,
+    ): Promise<{
+      created: boolean;
+      delivery: ChannelDeliveryRecord;
+    }> {
+      const inserted = await pool.query<DeliveryRow>(
+        `INSERT INTO channel_deliveries (
+           user_id, agent_id, source_task_id, connection_id,
+           assistant_message_id, reply_handle_id, body, recipient
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+         ON CONFLICT DO NOTHING
+         RETURNING *`,
+        [
+          input.scope.userId,
+          input.scope.agentId,
+          input.sourceTaskId,
+          input.connectionId,
+          input.assistantMessageId,
+          input.replyHandleId ?? null,
+          input.body,
+          JSON.stringify(input.recipient),
+        ],
+      );
+      if (inserted.rows[0]) {
+        return {
+          created: true,
+          delivery: mapDeliveryRow(inserted.rows[0]),
+        };
+      }
+
+      const existing = await pool.query<DeliveryRow>(
+        `SELECT *
+         FROM channel_deliveries
+         WHERE connection_id = $1
+           AND assistant_message_id = $2`,
+        [input.connectionId, input.assistantMessageId],
+      );
+      const row = existing.rows[0];
+      if (!row) {
+        throw new Error(
+          "channel_delivery_conflict_not_visible",
+        );
+      }
+      if (
+        row.user_id !== input.scope.userId
+        || row.agent_id !== input.scope.agentId
+      ) {
+        throw new Error("channel_delivery_scope_mismatch");
+      }
+      if (
+        row.event_id !== null
+        || row.source_task_id !== input.sourceTaskId
         || row.reply_handle_id !== (input.replyHandleId ?? null)
         || row.body !== input.body
         || !sameRecipient(row.recipient, input.recipient)
@@ -538,6 +617,7 @@ function mapDeliveryRow(row: DeliveryRow): ChannelDeliveryRecord {
       agentId: row.agent_id,
     },
     eventId: row.event_id,
+    sourceTaskId: row.source_task_id,
     connectionId: row.connection_id,
     assistantMessageId: row.assistant_message_id,
     replyHandleId: row.reply_handle_id,

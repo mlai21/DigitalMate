@@ -247,6 +247,36 @@ describe("channel turn execution contract", () => {
       }),
     );
   });
+
+  it("completes a deterministic group skip before claiming Agent execution", async () => {
+    const harness = turnHarness({ skipReason: "conversation_busy" });
+    const claim = claimedEvent();
+
+    const result = await harness.executor.execute({
+      ...claim,
+      normalizedEvent: {
+        ...claim.normalizedEvent,
+        chatType: "group",
+      },
+    });
+
+    expect(result).toMatchObject({
+      skipped: true,
+      reason: "conversation_busy",
+      assistantMessageId: null,
+      deliveryId: null,
+    });
+    expect(harness.messages.createIdempotentUserTurn)
+      .toHaveBeenCalledWith(
+        scope,
+        expect.objectContaining({ memoryProcessed: true }),
+      );
+    expect(harness.messages.claimClientTurnExecution)
+      .not.toHaveBeenCalled();
+    expect(harness.runAgentTurn).not.toHaveBeenCalled();
+    expect(harness.persistReply).not.toHaveBeenCalled();
+    expect(harness.completeWithoutReply).toHaveBeenCalledOnce();
+  });
 });
 
 describe("runAgent execution journal", () => {
@@ -430,6 +460,7 @@ function claimedEvent(): ClaimedChannelEvent {
 
 function turnHarness(options: {
   executionClaimed?: boolean;
+  skipReason?: string;
 } = {}) {
   const releaseLock = vi.fn(async () => undefined);
   const messages = {
@@ -450,19 +481,28 @@ function turnHarness(options: {
     deliveryId: "delivery-1",
     created: true,
   }));
+  const completeWithoutReply = vi.fn(async () => undefined);
   const executor = createChannelTurnExecutor({
     messages,
     resolveConversationId: vi.fn(async () => "conversation-1"),
     resolveAttachmentIds: vi.fn(async () => []),
     createJournal: vi.fn(() => memoryJournal()),
+    decideTurn: options.skipReason
+      ? vi.fn(async () => ({
+          kind: "skip" as const,
+          reason: options.skipReason!,
+        }))
+      : undefined,
     runAgentTurn,
     persistReply,
+    completeWithoutReply,
   });
   return {
     executor,
     messages,
     runAgentTurn,
     persistReply,
+    completeWithoutReply,
     releaseLock,
   };
 }

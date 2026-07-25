@@ -56,6 +56,11 @@ Gemini 与 Claude 接口**共用同一个 API Key**，无需为每个模型单�
 | `FEISHU_APP_SECRET` | 飞书启用时必填 | 飞书自建应用 App Secret，用于换取 `tenant_access_token` |
 | `FEISHU_VERIFICATION_TOKEN` | 飞书生产环境建议必填 | 飞书事件订阅的 Verification Token；配置后 webhook 载荷中的 `header.token` 或旧版 `token` 必须匹配 |
 | `DINGTALK_ROBOT_CODE` | 钉钉生产环境建议必填 | 钉钉企业 Bot 的 `robotCode`；配置后 webhook 载荷中的 `robotCode` 必须匹配 |
+| `CHANNEL_IMPORT_LEGACY_ENABLED` | 否 | 仅控制旧环境变量首次导入后的连接是否立即启用，默认 `0`。启动时会把尚无后台连接的四渠道配置一次性导入加密存储；默认导入为禁用，之后以 `/admin` 渠道配置为准，不再用环境变量覆盖 |
+
+旧环境变量只用于迁移已有部署。导入需要独立的
+`CHANNEL_SECRETS_KEY`；日志与审计只记录字段是否存在，不记录凭据值。
+迁移完成并在后台确认连接正常后，可删除上述渠道凭据环境变量。
 
 ## Web 应用与提醒时区
 

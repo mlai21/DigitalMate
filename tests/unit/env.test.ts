@@ -16,6 +16,7 @@ describe("readEnv", () => {
       status: "blocked",
       code: "channel_secrets_key_missing",
     });
+    expect(env.channelImportLegacyEnabled).toBe(false);
   });
 
   it("keeps channel secret encryption blocked without falling back to APP_SECRET", () => {
@@ -120,6 +121,15 @@ describe("readEnv", () => {
     expect(env.feishuAppSecret).toBe("feishu-secret");
     expect(env.feishuVerificationToken).toBe("feishu-token");
     expect(env.dingTalkRobotCode).toBe("ding-robot");
+  });
+
+  it("只有显式设置 1 才启用遗留渠道连接", () => {
+    expect(readEnv({
+      CHANNEL_IMPORT_LEGACY_ENABLED: "1",
+    }).channelImportLegacyEnabled).toBe(true);
+    expect(() => readEnv({
+      CHANNEL_IMPORT_LEGACY_ENABLED: "true",
+    })).toThrow();
   });
 
   it("reads aliyun iqs search credentials", () => {

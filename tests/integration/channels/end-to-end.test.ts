@@ -38,6 +38,12 @@ import {
   createExecutionJournal,
 } from "@/server/channels/runtime/execution-journal";
 import {
+  createChannelReplyHandleRepository,
+} from "@/server/channels/runtime/reply-handle";
+import {
+  enqueueProactiveChannelDelivery,
+} from "@/server/channels/runtime/start";
+import {
   createAtomicChannelReplyPersister,
   createChannelTurnExecutor,
   type ChannelAgentTurnContext,
@@ -47,6 +53,9 @@ import type {
   NormalizedChannelEvent,
 } from "@/server/channels/runtime/types";
 import { createRepositories } from "@/server/db/repositories";
+import {
+  ChannelSecretsKey,
+} from "@/server/security/encrypted-secret";
 import {
   trackEmbeddedPostgresPool,
   type EmbeddedPostgresLifecycle,
@@ -412,6 +421,151 @@ describe("channel runtime end-to-end recovery", () => {
     );
     expect(JSON.stringify(platformResult.rows[0]))
       .not.toContain("must-not-persist");
+  });
+
+  it("加密回复句柄不进入事件载荷且重复持久化保持一行", async () => {
+    const events = createChannelEventRepository(pool);
+    const sessionWebhook =
+      "https://oapi.dingtalk.com/robot/send?access_token=private-value";
+    const handle = {
+      publicFields: {
+        conversationId: "conversation-1",
+      },
+      secretFields: { sessionWebhook },
+      expiresAt: new Date(
+        Date.now() + 60 * 60_000,
+      ),
+    };
+    const accepted = await events.accept(
+      scope,
+      {
+        ...normalizedEvent("event-reply-handle"),
+        replyHandle: handle,
+      },
+    );
+    await expect(
+      events.claimNext("worker-before-reply-handle"),
+    ).resolves.toBeNull();
+    const key = ChannelSecretsKey.fromBase64(
+      Buffer.alloc(32, 7).toString("base64"),
+    );
+    const handles = createChannelReplyHandleRepository(
+      pool,
+      key,
+    );
+    const ids = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        handles.persist(
+          scope,
+          accepted.event.id,
+          CONNECTION_ID,
+          handle,
+        )
+      ),
+    );
+
+    expect(new Set(ids)).toHaveLength(1);
+    await expect(
+      events.claimNext("worker-after-reply-handle"),
+    ).resolves.toMatchObject({
+      id: accepted.event.id,
+    });
+    await expect(
+      countRows("channel_reply_handles", "true"),
+    ).resolves.toBe(1);
+    const stored = await pool.query<{
+      normalized_payload: unknown;
+      secret_ciphertext: Buffer;
+    }>(
+      `SELECT event.normalized_payload,
+              handle.secret_ciphertext
+       FROM channel_inbound_events AS event
+       JOIN channel_reply_handles AS handle
+         ON handle.event_id = event.id
+       WHERE event.id = $1`,
+      [accepted.event.id],
+    );
+    expect(JSON.stringify(stored.rows[0]?.normalized_payload))
+      .not.toContain("private-value");
+    expect(
+      stored.rows[0]?.secret_ciphertext.toString("utf8"),
+    ).not.toContain("private-value");
+    await expect(
+      handles.load(scope, ids[0]!),
+    ).resolves.toEqual(handle);
+    await expect(handles.persist(
+      scope,
+      accepted.event.id,
+      CONNECTION_ID,
+      {
+        ...handle,
+        secretFields: {
+          sessionWebhook:
+            "https://oapi.dingtalk.com/robot/send?access_token=different",
+        },
+      },
+    )).rejects.toThrow(
+      "channel_reply_handle_payload_conflict",
+    );
+  });
+
+  it("主动任务重复入队只创建一个 Delivery", async () => {
+    await pool.query(
+      `UPDATE channel_connections
+       SET enabled = true
+       WHERE id = $1`,
+      [CONNECTION_ID],
+    );
+    const taskId =
+      "50000000-0000-4000-8000-000000000001";
+    await pool.query(
+      `INSERT INTO proactive_tasks (
+         id, user_id, agent_id, conversation_id,
+         kind, content, scheduled_at
+       )
+       VALUES ($1, $2, $3, $4, 'reminder', '喝水', now())`,
+      [taskId, USER_ID, AGENT_ID, CONVERSATION_ID],
+    );
+    const repositories = createRepositories(pool);
+    const message =
+      await repositories.messages.createFromProactiveTask(
+        scope,
+        {
+          taskId,
+          conversationId: CONVERSATION_ID,
+          content: "提醒一下：喝水",
+        },
+      );
+    const enqueue = () => enqueueProactiveChannelDelivery({
+      pool,
+      repositories,
+      scope,
+      taskId,
+      assistantMessageId: message.id,
+      content: "提醒一下：喝水",
+      target: {
+        channel: "telegram",
+        externalConversationId: "conversation-1",
+        externalMessageId: "latest-direct-message",
+        senderId: "sender-1",
+        chatType: "direct",
+        text: "",
+        occurredAt: new Date(),
+      },
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, enqueue),
+    );
+
+    expect(results.every((result) => result.queued))
+      .toBe(true);
+    await expect(
+      countRows("channel_deliveries", "source_task_id IS NOT NULL"),
+    ).resolves.toBe(1);
+    await expect(
+      countRows("messages", "source_task_id IS NOT NULL"),
+    ).resolves.toBe(1);
   });
 
   it("requeues the same dead letter without creating another assistant", async () => {

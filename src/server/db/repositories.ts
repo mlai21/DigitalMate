@@ -1137,6 +1137,7 @@ export function createRepositories(
         payloadHash: string;
         content: string;
         attachmentIds: string[];
+        memoryProcessed?: boolean;
       }): Promise<{ message: DbMessage; attachments: DbMessageAttachment[]; created: boolean }> {
         const client = await pool.connect();
         try {
@@ -1154,15 +1155,46 @@ export function createRepositories(
           );
           if (!conversation.rows[0]) throw new Error("conversation_not_found");
 
-          const inserted = await client.query(
-            `INSERT INTO messages
-             (user_id, agent_id, conversation_id, role, content, client_turn_id, client_turn_payload_hash)
-             VALUES ($1, $2, $3, 'user', $4, $5, $6)
-             ON CONFLICT (user_id, agent_id, client_turn_id, role) WHERE client_turn_id IS NOT NULL
-             DO NOTHING
-             RETURNING *`,
-            [scope.userId, scope.agentId, input.conversationId, input.content, input.clientTurnId, input.payloadHash],
-          );
+          const inserted = input.memoryProcessed === true
+            ? await client.query(
+                `INSERT INTO messages
+                 (user_id, agent_id, conversation_id, role, content,
+                  client_turn_id, client_turn_payload_hash,
+                  memory_processed)
+                 VALUES ($1, $2, $3, 'user', $4, $5, $6, true)
+                 ON CONFLICT (
+                   user_id, agent_id, client_turn_id, role
+                 ) WHERE client_turn_id IS NOT NULL
+                 DO NOTHING
+                 RETURNING *`,
+                [
+                  scope.userId,
+                  scope.agentId,
+                  input.conversationId,
+                  input.content,
+                  input.clientTurnId,
+                  input.payloadHash,
+                ],
+              )
+            : await client.query(
+                `INSERT INTO messages
+                 (user_id, agent_id, conversation_id, role, content,
+                  client_turn_id, client_turn_payload_hash)
+                 VALUES ($1, $2, $3, 'user', $4, $5, $6)
+                 ON CONFLICT (
+                   user_id, agent_id, client_turn_id, role
+                 ) WHERE client_turn_id IS NOT NULL
+                 DO NOTHING
+                 RETURNING *`,
+                [
+                  scope.userId,
+                  scope.agentId,
+                  input.conversationId,
+                  input.content,
+                  input.clientTurnId,
+                  input.payloadHash,
+                ],
+              );
           const created = inserted.rows.length > 0;
           const storedRow = created
             ? inserted.rows[0]
@@ -1177,6 +1209,8 @@ export function createRepositories(
             || String(storedRow.conversation_id) !== input.conversationId
             || String(storedRow.content) !== input.content
             || String(storedRow.client_turn_payload_hash) !== input.payloadHash
+            || Boolean(storedRow.memory_processed)
+              !== (input.memoryProcessed ?? false)
           ) {
             throw new Error("client_turn_conflict");
           }
@@ -1366,8 +1400,8 @@ export function createRepositories(
         taskId: string;
         conversationId: string;
         content: string;
-      }): Promise<boolean> {
-        const result = await pool.query(
+      }): Promise<{ id: string; created: boolean }> {
+        const result = await pool.query<{ id: string }>(
           `INSERT INTO messages (user_id, agent_id, conversation_id, role, content, source_task_id)
            SELECT $1, $2, conversation.id, 'assistant', $4, proactive_task.id
            FROM conversations AS conversation
@@ -1378,12 +1412,28 @@ export function createRepositories(
            RETURNING id`,
           [scope.userId, scope.agentId, input.taskId, input.content, input.conversationId],
         );
-        if (result.rows.length === 0) return false;
-        await pool.query(
-          "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
-          [scope.userId, scope.agentId, input.conversationId],
+        const inserted = result.rows[0];
+        if (inserted) {
+          await pool.query(
+            "UPDATE conversations SET updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+            [scope.userId, scope.agentId, input.conversationId],
+          );
+          return { id: inserted.id, created: true };
+        }
+        const existing = await pool.query<{ id: string }>(
+          `SELECT id
+           FROM messages
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND source_task_id = $3
+             AND role = 'assistant'`,
+          [scope.userId, scope.agentId, input.taskId],
         );
-        return true;
+        const row = existing.rows[0];
+        if (!row) {
+          throw new Error("proactive_message_conflict_missing");
+        }
+        return { id: row.id, created: false };
       },
       async list(scope: AgentScope, conversationId: string): Promise<DbMessage[]> {
         const result = await pool.query(

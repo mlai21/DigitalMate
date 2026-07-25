@@ -241,6 +241,7 @@ function deliveryHarness(options: {
       agentId: "10000000-0000-4000-8000-000000000011",
     },
     eventId: "20000000-0000-4000-8000-000000000001",
+    sourceTaskId: null,
     connectionId: "30000000-0000-4000-8000-000000000001",
     assistantMessageId:
       "40000000-0000-4000-8000-000000000001",

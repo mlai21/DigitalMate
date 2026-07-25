@@ -9,7 +9,10 @@ import {
   runAttachmentCleanupRound,
   startAttachmentCleanupScheduler,
 } from "@/server/attachments/cleanup";
-import { sendChannelMessage } from "@/server/channels/outbound";
+import {
+  enqueueProactiveChannelDelivery,
+  startChannelRuntime,
+} from "@/server/channels/runtime/start";
 import { readEnv } from "@/server/config/env";
 import { closePool } from "@/server/db/client";
 import { createRepositories } from "@/server/db/repositories";
@@ -60,6 +63,10 @@ async function main() {
     },
   });
   const shutdown = new AbortController();
+  const channelRuntime = await startChannelRuntime({
+    repositories,
+    env,
+  });
   const runActiveAgentTick = createActiveAgentTickRunner({
     listActiveAgents: () => repositories.agents.listActive(),
     execute: (scope) => runAgentTickUnderLease(repositories, scope),
@@ -91,9 +98,13 @@ async function main() {
     process.removeListener("SIGINT", requestShutdown);
     process.removeListener("SIGTERM", requestShutdown);
     try {
-      await cleanupScheduler.stop();
+      await channelRuntime.stop();
     } finally {
-      await closePool();
+      try {
+        await cleanupScheduler.stop();
+      } finally {
+        await closePool();
+      }
     }
   }
 }
@@ -121,13 +132,15 @@ async function processAgentTick(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const env = readEnv();
   await processDueProactiveTasks({
     scope,
     repositories,
     signal,
-    sendChannel: (target, text, sendSignal) =>
-      sendChannelMessage(env, target, text, sendSignal),
+    enqueueChannel: (delivery) =>
+      enqueueProactiveChannelDelivery({
+        repositories,
+        ...delivery,
+      }),
   });
   signal.throwIfAborted();
   await processMemoryMessages(repositories, scope, signal);
