@@ -9,6 +9,7 @@ import { createDingTalkAdapter } from "../adapters/dingtalk";
 import { createDiscordAdapter } from "../adapters/discord";
 import { createFeishuAdapter } from "../adapters/feishu";
 import { createMattermostAdapter } from "../adapters/mattermost";
+import { createMqttAdapter } from "../adapters/mqtt";
 import { createQQAdapter } from "../adapters/qq";
 import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
@@ -216,6 +217,22 @@ export function registerQQChannelAdapter(
         ? {
             acceptInbound: dependencies.acceptInbound,
           }
+        : {}),
+    })
+  );
+}
+
+export function registerMqttChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("mqtt", (dependencies) =>
+    createMqttAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
         : {}),
     })
   );

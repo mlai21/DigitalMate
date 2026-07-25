@@ -1,0 +1,17 @@
+[
+  {
+    "reasonCode": 4,
+    "expectedCode": "credential_invalid",
+    "retryable": false
+  },
+  {
+    "reasonCode": 5,
+    "expectedCode": "permission_denied",
+    "retryable": false
+  },
+  {
+    "reasonCode": 151,
+    "expectedCode": "rate_limited",
+    "retryable": true
+  }
+]

@@ -1,0 +1,9 @@
+{
+  "topic": "devices/device-8/in",
+  "payload": "设备状态正常",
+  "packet": {
+    "qos": 0,
+    "dup": false,
+    "retain": false
+  }
+}

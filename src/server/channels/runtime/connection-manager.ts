@@ -18,10 +18,8 @@ import type {
 } from "./types";
 
 type MaybePromise<T> = T | Promise<T>;
-type ManagedAdapter = Pick<
-  ChannelAdapter<Record<string, unknown>>,
-  "health" | "start" | "stop" | "validateConfig"
->;
+type ManagedAdapter =
+  ChannelAdapter<Record<string, unknown>>;
 
 export type RuntimeChannelConnection = Readonly<{
   id: string;
@@ -196,6 +194,19 @@ export function createChannelConnectionManager(input: Readonly<{
           await handleFailure(state, error);
         }
       });
+    },
+
+    getAdapter(
+      connectionId: string,
+      revision: number,
+    ): ManagedAdapter | null {
+      if (closed) return null;
+      const state = states.get(connectionId);
+      return state
+        && state.revision === revision
+        && state.connection.enabled
+        ? state.adapter
+        : null;
     },
 
     shutdown(): Promise<void> {

@@ -43,6 +43,9 @@ import {
   createMattermostAttachmentFetcher,
 } from "@/server/channels/adapters/mattermost/transport";
 import {
+  createMqttAdapter,
+} from "@/server/channels/adapters/mqtt";
+import {
   createQQAdapter,
 } from "@/server/channels/adapters/qq";
 import {
@@ -253,7 +256,7 @@ export async function startChannelRuntime(input: Readonly<{
         {
           channel:
             claim.normalizedEvent
-              .channelType as "telegram" | "slack" | "feishu" | "dingtalk",
+              .channelType as NormalizedChannelMessage["channel"],
           externalConversationId:
             claim.normalizedEvent.externalConversationId,
           externalMessageId:
@@ -326,7 +329,10 @@ export async function startChannelRuntime(input: Readonly<{
     loadConnection: (connectionId) =>
       store.get(connectionId),
     createAdapter: (connection) =>
-      createManagedAdapter(
+      connectionManager.getAdapter(
+        connection.id,
+        connection.revision,
+      ) ?? createManagedAdapter(
         connection,
         managedAdapterDependencies,
       ),
@@ -384,6 +390,7 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
       "feishu",
       "dingtalk",
       "qq",
+      "mqtt",
     ]
       .includes(input.target.channel)
   ) {
@@ -592,6 +599,11 @@ function createManagedAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
+    case "mqtt":
+      return createManagedMqttAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     case "telegram":
       return createManagedTelegramAdapter(
         connection,
@@ -622,6 +634,56 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedMqttAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createMqttAdapter({
+    scope: connection.scope,
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (!normalized.replyHandle) return;
+              if (!dependencies.replyHandles) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              await dependencies.replyHandles.persist(
+                event.scope,
+                event.id,
+                event.connectionId,
+                normalized.replyHandle,
+                context.receivedAt,
+              );
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedQQAdapter(

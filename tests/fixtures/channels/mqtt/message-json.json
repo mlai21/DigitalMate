@@ -1,0 +1,10 @@
+{
+  "topic": "devices/device-7/in",
+  "payload": "{\"text\":\"设备温度 23°C\",\"redirect_client_id\":\"device-7\",\"event_id\":\"event-9001\"}",
+  "packet": {
+    "qos": 2,
+    "messageId": 41,
+    "dup": false,
+    "retain": false
+  }
+}

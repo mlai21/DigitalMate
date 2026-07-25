@@ -31,6 +31,7 @@ export type ChannelName =
   | "feishu"
   | "dingtalk"
   | "qq"
+  | "mqtt"
   | "web";
 
 export type NormalizedChannelMessage = {

@@ -74,6 +74,27 @@ describe("channel connection manager", () => {
     await harness.manager.shutdown();
   });
 
+  it("exposes only the active adapter at the exact revision", async () => {
+    const harness = managerHarness();
+    await harness.manager.startAll();
+    const adapter = harness.adapters.get(CONNECTION_A)!;
+
+    expect(
+      harness.manager.getAdapter(CONNECTION_A, 1),
+    ).toBe(adapter);
+    expect(
+      harness.manager.getAdapter(CONNECTION_A, 2),
+    ).toBeNull();
+    expect(
+      harness.manager.getAdapter("missing", 1),
+    ).toBeNull();
+
+    await harness.manager.shutdown();
+    expect(
+      harness.manager.getAdapter(CONNECTION_A, 1),
+    ).toBeNull();
+  });
+
   it("keeps the new revision and reports degraded when new credentials fail", async () => {
     vi.useFakeTimers();
     const harness = managerHarness();
