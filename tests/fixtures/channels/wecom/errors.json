@@ -1,0 +1,30 @@
+[
+  {
+    "name": "WSAuthFailureError",
+    "code": "WS_AUTH_FAILURE_EXHAUSTED",
+    "expectedCode": "credential_invalid",
+    "expectedDetail": "wecom_credentials_rejected",
+    "retryable": false
+  },
+  {
+    "name": "WeComEligibilityError",
+    "code": "WECOM_BOT_NOT_ELIGIBLE",
+    "expectedCode": "runtime_prerequisite_missing",
+    "expectedDetail": "wecom_bot_eligibility_required",
+    "retryable": false
+  },
+  {
+    "name": "WeComPermissionError",
+    "code": "WECOM_PERMISSION_DENIED",
+    "expectedCode": "permission_denied",
+    "expectedDetail": "wecom_permission_denied",
+    "retryable": false
+  },
+  {
+    "name": "WSReconnectExhaustedError",
+    "code": "WS_RECONNECT_EXHAUSTED",
+    "expectedCode": "network_unreachable",
+    "expectedDetail": "wecom_reconnect_exhausted",
+    "retryable": true
+  }
+]

@@ -1,0 +1,19 @@
+{
+  "cmd": "aibot_msg_callback",
+  "headers": {
+    "req_id": "req-direct-7001"
+  },
+  "body": {
+    "msgid": "msg-7001",
+    "aibotid": "bot-digitalmate",
+    "chattype": "single",
+    "from": {
+      "userid": "user-alice"
+    },
+    "create_time": 1785024000,
+    "msgtype": "text",
+    "text": {
+      "content": "你好，DigitalMate"
+    }
+  }
+}

@@ -14,6 +14,7 @@ import { createMqttAdapter } from "../adapters/mqtt";
 import { createQQAdapter } from "../adapters/qq";
 import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
+import { createWeComAdapter } from "../adapters/wecom";
 
 export type ChannelAdapterFactory = (
   dependencies: AdapterDependencies,
@@ -250,6 +251,33 @@ export function registerMatrixChannelAdapter(
         : {}),
       ...(dependencies.acceptInbound
         ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
+export function registerWeComChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("wecom", (dependencies) =>
+    createWeComAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? {
+            acceptInbound: (
+              payload,
+              context,
+              scope,
+              _attachmentFetcher,
+            ) => dependencies.acceptInbound!(
+              payload,
+              context,
+              scope,
+            ),
+          }
         : {}),
     })
   );

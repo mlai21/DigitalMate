@@ -563,6 +563,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     description: "连接企业微信智能机器人",
     runtime: "central",
     capabilities: ["attachments", "groups", "streaming"],
+    prerequisites: ["企业微信智能机器人接入资格"],
     platformFields: [
       stringField("bot_id", "Bot ID"),
       secretField("secret", "Secret", false, true),

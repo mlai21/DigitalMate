@@ -1,0 +1,19 @@
+{
+  "cmd": "aibot_event_callback",
+  "headers": {
+    "req_id": "req-welcome-7003"
+  },
+  "body": {
+    "msgid": "event-7003",
+    "create_time": 1785024120,
+    "aibotid": "bot-digitalmate",
+    "chattype": "single",
+    "from": {
+      "userid": "user-carol"
+    },
+    "msgtype": "event",
+    "event": {
+      "eventtype": "enter_chat"
+    }
+  }
+}

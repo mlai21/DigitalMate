@@ -1,0 +1,21 @@
+{
+  "cmd": "aibot_msg_callback",
+  "headers": {
+    "req_id": "req-group-7002"
+  },
+  "body": {
+    "msgid": "msg-7002",
+    "aibotid": "bot-digitalmate",
+    "chatid": "group-product",
+    "chattype": "group",
+    "from": {
+      "userid": "user-bob"
+    },
+    "create_time": 1785024060,
+    "msgtype": "file",
+    "file": {
+      "url": "https://wework.qpic.cn/wwpic/aibot/file-7002",
+      "aeskey": "fixture-aes-key"
+    }
+  }
+}

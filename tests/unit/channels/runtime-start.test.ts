@@ -243,6 +243,47 @@ describe("channel runtime start", () => {
     );
   });
 
+  it("允许企业微信已授权任务进入主动消息队列", async () => {
+    const enqueueProactive = vi.fn(async () => "delivery-wecom-1");
+    const result = await enqueueProactiveChannelDelivery({
+      pool: {
+        query: vi.fn(async () => ({
+          rowCount: 1,
+          rows: [{ id: "connection-wecom" }],
+        })),
+      } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-wecom-1",
+      assistantMessageId: "assistant-wecom-1",
+      content: "主动提醒",
+      target: {
+        channel: "wecom",
+        externalConversationId: "group-product",
+        externalMessageId: "message-wecom-1",
+        senderId: "user-alice",
+        chatType: "group",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: true });
+    expect(enqueueProactive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "connection-wecom",
+        recipient: {
+          externalConversationId: "group-product",
+          externalUserId: "user-alice",
+          chatType: "group",
+        },
+      }),
+    );
+  });
+
   it("清空数据删除已 claim 事件后不会复活旧消息", async () => {
     const execute = vi.fn();
     const release = vi.fn();

@@ -33,6 +33,7 @@ export type ChannelName =
   | "qq"
   | "mqtt"
   | "matrix"
+  | "wecom"
   | "web";
 
 export type NormalizedChannelMessage = {
