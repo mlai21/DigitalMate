@@ -34,6 +34,43 @@ const delivery = {
 } satisfies ClaimedChannelDelivery;
 
 describe("channel runtime start", () => {
+  it("仅在连接显式开启时选择累计流式发送", async () => {
+    const loadConnection = vi.fn(async () => ({
+      id: "connection-1",
+      scope: delivery.scope,
+      channelType: "feishu" as const,
+      enabled: true,
+      revision: 1,
+      config: { streaming_enabled: false },
+    }));
+    const transport = createChannelDeliveryTransport({
+      loadConnection,
+      createAdapter: () => ({
+        streaming: vi.fn(),
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send: vi.fn(),
+      }),
+      loadReplyHandle: vi.fn(),
+    });
+    const signal = new AbortController().signal;
+
+    await expect(
+      transport.mode(delivery, signal),
+    ).resolves.toBe("segmented");
+    loadConnection.mockResolvedValueOnce({
+      id: "connection-1",
+      scope: delivery.scope,
+      channelType: "feishu" as const,
+      enabled: true,
+      revision: 1,
+      config: { streaming_enabled: true },
+    });
+    await expect(
+      transport.mode(delivery, signal),
+    ).resolves.toBe("streaming");
+  });
+
   it("发送 Worker 从加密仓储加载配置和回复句柄", async () => {
     const send = vi.fn(async () => ({
       externalMessageId: "platform-1",

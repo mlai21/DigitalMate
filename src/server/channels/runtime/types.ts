@@ -156,7 +156,7 @@ export type AdapterDependencies = Readonly<{
   scope?: AgentScope;
   http?: Readonly<{
     request(input: Readonly<{
-      method: "GET" | "POST";
+      method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
       url: string;
       headers: Readonly<Record<string, string>>;
       body?: unknown;

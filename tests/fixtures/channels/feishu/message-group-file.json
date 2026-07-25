@@ -1,0 +1,33 @@
+{
+  "header": {
+    "event_id": "9f8e7e",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1785024001000",
+    "token": "verification-token"
+  },
+  "event": {
+    "sender": {
+      "sender_id": {
+        "open_id": "ou_user_2"
+      },
+      "sender_type": "user"
+    },
+    "message": {
+      "message_id": "om_message_2",
+      "chat_id": "oc_chat_2",
+      "chat_type": "group",
+      "message_type": "file",
+      "content": "{\"file_key\":\"file_v2_key\",\"file_name\":\"notes.txt\"}",
+      "create_time": "1785024001000",
+      "mentions": [
+        {
+          "key": "@_user_1",
+          "id": {
+            "open_id": "ou_bot"
+          },
+          "name": "DigitalMate"
+        }
+      ]
+    }
+  }
+}
