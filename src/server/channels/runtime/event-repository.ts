@@ -74,6 +74,11 @@ export type ChannelEventRepositoryOptions = Readonly<{
   leaseMs?: number;
 }>;
 
+export type AcceptChannelEventOptions = Readonly<{
+  initialStatus: "accepted" | "failed";
+  failureCode: string | null;
+}>;
+
 export function channelClientTurnId(
   connectionId: string,
   externalEventId: string,
@@ -104,6 +109,10 @@ export function createChannelEventRepository(
     async accept(
       scope: AgentScope,
       event: NormalizedChannelEvent,
+      acceptOptions: AcceptChannelEventOptions = {
+        initialStatus: "accepted",
+        failureCode: null,
+      },
     ): Promise<{
       created: boolean;
       event: ChannelEventRecord;
@@ -111,6 +120,7 @@ export function createChannelEventRepository(
       if (event.agentId !== scope.agentId) {
         throw new Error("channel_event_agent_scope_mismatch");
       }
+      assertAcceptOptions(acceptOptions);
 
       const clientTurnId = channelClientTurnId(
         event.connectionId,
@@ -127,11 +137,13 @@ export function createChannelEventRepository(
            external_event_id, external_conversation_id,
            external_sender_id, chat_type, normalized_payload,
            permission_envelope, client_turn_id, payload_hash,
-           occurred_at, received_at
+           status, failure_code, occurred_at, received_at,
+           completed_at
          )
          VALUES (
            $1, $2, $3, $4, $5, $6, $7, $8,
-           $9::jsonb, $10::jsonb, $11, $12, $13, $14
+           $9::jsonb, $10::jsonb, $11, $12, $13, $14,
+           $15, $16, $17
          )
          ON CONFLICT (connection_id, external_event_id) DO NOTHING
          RETURNING *`,
@@ -148,8 +160,13 @@ export function createChannelEventRepository(
           JSON.stringify(event.permission),
           clientTurnId,
           payloadHash,
+          acceptOptions.initialStatus,
+          acceptOptions.failureCode,
           event.occurredAt,
           event.receivedAt,
+          acceptOptions.initialStatus === "failed"
+            ? event.receivedAt
+            : null,
         ],
       );
 
@@ -397,5 +414,24 @@ function positiveLease(value: number): number {
 function assertOwner(owner: string): void {
   if (owner.trim().length === 0 || owner.length > 256) {
     throw new Error("channel_event_claim_owner_invalid");
+  }
+}
+
+function assertAcceptOptions(options: AcceptChannelEventOptions): void {
+  if (
+    options.initialStatus === "accepted"
+    && options.failureCode !== null
+  ) {
+    throw new Error("channel_event_failure_code_unexpected");
+  }
+  if (
+    options.initialStatus === "failed"
+    && (
+      options.failureCode === null
+      || options.failureCode.trim().length === 0
+      || options.failureCode.length > 256
+    )
+  ) {
+    throw new Error("channel_event_failure_code_invalid");
   }
 }

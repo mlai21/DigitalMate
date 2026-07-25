@@ -17,6 +17,9 @@ import {
 
 import type { AgentScope } from "@/server/agents/types";
 import {
+  createChannelAccessControl,
+} from "@/server/channels/runtime/access";
+import {
   channelClientTurnId,
   createChannelEventRepository,
 } from "@/server/channels/runtime/event-repository";
@@ -218,6 +221,43 @@ describe("channel event transaction ledger", () => {
       attempts: 1,
       status: "running",
     });
+  });
+
+  it("keeps pending approval terminal and creates one inbox request", async () => {
+    await pool.query(
+      `UPDATE channel_connections
+       SET enabled = true,
+           config = '{"access_control_dm":true}'::jsonb
+       WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    const access = createChannelAccessControl(pool);
+    const events = createChannelEventRepository(pool);
+    const input = normalizedEvent(CONNECTION_A, "event-pending");
+    const decision = await access.evaluate(scope, input);
+    expect(decision).toEqual({
+      kind: "pending",
+      allowed: false,
+      reason: "approval_required",
+    });
+
+    const accepted = await events.accept(scope, input, {
+      initialStatus: "failed",
+      failureCode: "approval_required",
+    });
+    await Promise.all([
+      access.recordPendingRequest(scope, accepted.event),
+      access.recordPendingRequest(scope, accepted.event),
+    ]);
+
+    await expect(events.claimNext("worker-pending")).resolves.toBeNull();
+    const requests = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM channel_access_requests
+       WHERE event_id = $1`,
+      [accepted.event.id],
+    );
+    expect(requests.rows[0]?.count).toBe("1");
   });
 
   it("prevents an expired owner from completing a reclaimed event", async () => {
