@@ -43,6 +43,15 @@ import {
   createMattermostAttachmentFetcher,
 } from "@/server/channels/adapters/mattermost/transport";
 import {
+  createQQAdapter,
+} from "@/server/channels/adapters/qq";
+import {
+  parseQQConfig,
+} from "@/server/channels/adapters/qq/config";
+import {
+  createQQAttachmentFetcher,
+} from "@/server/channels/adapters/qq/transport";
+import {
   createSlackAdapter,
 } from "@/server/channels/adapters/slack";
 import {
@@ -367,7 +376,15 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
   content: string;
 }>): Promise<Readonly<{ queued: boolean }>> {
   if (
-    !["telegram", "slack", "feishu", "dingtalk"]
+    ![
+      "telegram",
+      "discord",
+      "slack",
+      "mattermost",
+      "feishu",
+      "dingtalk",
+      "qq",
+    ]
       .includes(input.target.channel)
   ) {
     return { queued: false };
@@ -475,6 +492,7 @@ export function createChannelDeliveryTransport(input: Readonly<{
           connectionId: part.delivery.connectionId,
           assistantMessageId:
             part.delivery.assistantMessageId,
+          deliverySequence: part.state.sequence,
           body: part.body,
           recipient: part.delivery.recipient,
           ...(replyHandle ? { replyHandle } : {}),
@@ -596,9 +614,122 @@ function createManagedAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
+    case "qq":
+      return createManagedQQAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedQQAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createQQAdapter({
+    scope: connection.scope,
+    ...(connection.resumeState
+      ? { initialResumeState: connection.resumeState }
+      : {}),
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const fetcher = createQQAttachmentFetcher(
+                parseQQConfig(connection.config),
+              );
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (!persisted) continue;
+                await downloadInboundAttachment({
+                  scope: event.scope,
+                  descriptor,
+                  fetcher,
+                  storageRoot:
+                    dependencies.attachmentStorageDir,
+                  repository:
+                    dependencies.repositories.messageAttachments,
+                  bindPrivateAttachment: async (
+                    attachmentId,
+                  ) => {
+                    const bound =
+                      await locators.bindPrivateAttachment(
+                        event.scope,
+                        event.id,
+                        descriptor.externalAttachmentId,
+                        attachmentId,
+                        new Date(),
+                      );
+                    if (!bound) {
+                      throw new Error(
+                        "attachment_bind_transition_failed",
+                      );
+                    }
+                  },
+                  signal,
+                });
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedDingTalkAdapter(
@@ -1445,6 +1576,26 @@ function normalizeAdapterSendError(
 ): ChannelSendError {
   if (error instanceof ChannelSendError) return error;
   const code = stableRuntimeErrorCode(error);
+  if (
+    error
+    && typeof error === "object"
+    && "retryable" in error
+    && typeof error.retryable === "boolean"
+  ) {
+    const retryAfterMs = "retryAfterMs" in error
+      && typeof error.retryAfterMs === "number"
+      && Number.isFinite(error.retryAfterMs)
+      && error.retryAfterMs > 0
+      ? error.retryAfterMs
+      : undefined;
+    return new ChannelSendError({
+      code: code === "channel_runtime_failed"
+        ? "network_unreachable"
+        : code,
+      retryable: error.retryable,
+      ...(retryAfterMs ? { retryAfterMs } : {}),
+    });
+  }
   const httpStatus = /_http_(\d{3})$/.exec(code)?.[1];
   const status = httpStatus ? Number(httpStatus) : null;
   const nonRetryable = (

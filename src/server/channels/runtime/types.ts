@@ -67,6 +67,7 @@ export type ChannelDelivery = Readonly<{
   eventId: string | null;
   connectionId: string;
   assistantMessageId: string;
+  deliverySequence?: number;
   body: string;
   recipient: ChannelRecipient;
   replyHandle?: UnsealedReplyHandle;
@@ -95,6 +96,11 @@ export type ChannelHealth = Readonly<{
   lastEventAt?: Date;
   reconnectAttempts: number;
   nextAttemptAt?: Date;
+  retryExhausted?: boolean;
+  resumeState?: Readonly<{
+    sessionId: string;
+    sequence: number;
+  }>;
   error?: Readonly<{
     code: ChannelHealthErrorCode;
     detail: string;

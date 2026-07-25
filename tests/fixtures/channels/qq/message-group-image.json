@@ -1,0 +1,24 @@
+{
+  "op": 0,
+  "s": 502,
+  "t": "GROUP_AT_MESSAGE_CREATE",
+  "id": "event-group-89",
+  "d": {
+    "id": "message-89",
+    "content": "/describe",
+    "timestamp": "2026-07-26T08:01:00+08:00",
+    "group_openid": "group-open-1",
+    "author": {
+      "member_openid": "member-open-1"
+    },
+    "attachments": [
+      {
+        "id": "attachment-1",
+        "filename": "photo.png",
+        "content_type": "image/png",
+        "size": 5,
+        "url": "https://multimedia.nt.qq.com.cn/download/photo.png?token=private"
+      }
+    ]
+  }
+}

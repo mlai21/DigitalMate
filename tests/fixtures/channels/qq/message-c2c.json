@@ -1,0 +1,15 @@
+{
+  "op": 0,
+  "s": 501,
+  "t": "C2C_MESSAGE_CREATE",
+  "id": "READY-seq-501-message-88",
+  "d": {
+    "id": "message-88",
+    "content": "你好",
+    "timestamp": "2026-07-26T08:00:00+08:00",
+    "author": {
+      "user_openid": "user-open-1"
+    },
+    "attachments": []
+  }
+}

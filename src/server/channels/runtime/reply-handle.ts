@@ -223,8 +223,7 @@ function normalizeFields(
   }
   const entries = Object.entries(value);
   if (
-    (secret && entries.length === 0)
-    || entries.length > 32
+    entries.length > 32
     || entries.some(([name, nested]) =>
       !/^[a-zA-Z][a-zA-Z0-9_-]{0,127}$/.test(name)
       || (!secret

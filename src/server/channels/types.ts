@@ -25,9 +25,12 @@ export type { ChatType };
 
 export type ChannelName =
   | "telegram"
+  | "discord"
   | "slack"
+  | "mattermost"
   | "feishu"
   | "dingtalk"
+  | "qq"
   | "web";
 
 export type NormalizedChannelMessage = {

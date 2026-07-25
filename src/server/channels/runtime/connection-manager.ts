@@ -30,6 +30,10 @@ export type RuntimeChannelConnection = Readonly<{
   enabled: boolean;
   revision: number;
   config: Readonly<Record<string, unknown>>;
+  resumeState?: Readonly<{
+    sessionId: string;
+    sequence: number;
+  }>;
   runtimeError?: Readonly<{
     code: ChannelHealthErrorCode;
     detail: string;
@@ -57,6 +61,9 @@ export type RuntimeChannelHealthUpdate = Readonly<{
     code?: ChannelHealthErrorCode;
     message?: string;
     nextAttemptAt?: string;
+    retryExhausted?: boolean;
+    gatewaySessionId?: string;
+    gatewaySequence?: number;
   }>;
   lastConnectedAt?: Date;
   lastDisconnectedAt?: Date;
@@ -350,6 +357,12 @@ export function createChannelConnectionManager(input: Readonly<{
     health: ChannelHealth,
   ): Promise<void> {
     validateHealth(health);
+    if (health.resumeState) {
+      state.connection = {
+        ...state.connection,
+        resumeState: health.resumeState,
+      };
+    }
     const status = mapHealthStatus(
       health.status,
       state.connection.enabled,
@@ -383,6 +396,15 @@ export function createChannelConnectionManager(input: Readonly<{
               health.nextAttemptAt.toISOString(),
           }
         : {}),
+      ...(health.retryExhausted
+        ? { retryExhausted: true }
+        : {}),
+      ...(health.resumeState
+        ? {
+            gatewaySessionId: health.resumeState.sessionId,
+            gatewaySequence: health.resumeState.sequence,
+          }
+        : {}),
     };
     await updateHealth(state, {
       status,
@@ -397,7 +419,11 @@ export function createChannelConnectionManager(input: Readonly<{
         ? { lastDisconnectedAt: health.checkedAt }
         : {}),
     });
-    if (status === "connected" || status === "disabled") {
+    if (
+      status === "connected"
+      || status === "disabled"
+      || health.retryExhausted === true
+    ) {
       cancelRetry(state);
       return;
     }
@@ -609,6 +635,15 @@ function validateHealth(health: ChannelHealth): void {
       health.nextAttemptAt
       && !Number.isFinite(health.nextAttemptAt.getTime())
     )
+    || (
+      health.resumeState
+      && (
+        health.resumeState.sessionId.length === 0
+        || health.resumeState.sessionId.length > 16_384
+        || !Number.isSafeInteger(health.resumeState.sequence)
+        || health.resumeState.sequence < 0
+      )
+    )
   ) {
     throw new Error("channel_adapter_health_invalid");
   }
@@ -622,6 +657,7 @@ type RuntimeConnectionRow = {
   enabled: boolean;
   config: Record<string, unknown>;
   revision: number;
+  health_detail: Record<string, unknown>;
   field_name: string | null;
   ciphertext: Buffer | null;
   nonce: Buffer | null;
@@ -662,6 +698,14 @@ export function createPostgresChannelConnectionRuntimeStore(
       health,
     ): Promise<void> {
       const safeDetail = {
+        ...(connection.resumeState
+          ? {
+              gatewaySessionId:
+                connection.resumeState.sessionId,
+              gatewaySequence:
+                connection.resumeState.sequence,
+            }
+          : {}),
         ...health.detail,
         ...(health.detail.message
           ? {
@@ -760,7 +804,8 @@ async function readRuntimeConnections(
     `SELECT connection.id, connection.user_id,
             connection.agent_id, connection.channel_type,
             connection.enabled, connection.config,
-            connection.revision, secret.field_name,
+            connection.revision, connection.health_detail,
+            secret.field_name,
             secret.ciphertext, secret.nonce,
             secret.auth_tag, secret.key_version
      FROM channel_connections AS connection
@@ -806,6 +851,7 @@ function materializeRuntimeConnection(
     ...row.config,
     enabled: row.enabled,
   };
+  const resumeState = readGatewayResumeState(row.health_detail);
   let runtimeError:
     | RuntimeChannelConnection["runtimeError"]
     | undefined;
@@ -863,8 +909,30 @@ function materializeRuntimeConnection(
     enabled: row.enabled,
     revision: Number(row.revision),
     config,
+    ...(resumeState ? { resumeState } : {}),
     ...(runtimeError ? { runtimeError } : {}),
   };
+}
+
+function readGatewayResumeState(
+  value: unknown,
+): RuntimeChannelConnection["resumeState"] | undefined {
+  const detail = value && typeof value === "object"
+    && !Array.isArray(value)
+    ? value as Readonly<Record<string, unknown>>
+    : {};
+  const sessionId = detail.gatewaySessionId;
+  const sequence = Number(detail.gatewaySequence);
+  if (
+    typeof sessionId !== "string"
+    || sessionId.length === 0
+    || sessionId.length > 16_384
+    || !Number.isSafeInteger(sequence)
+    || sequence < 0
+  ) {
+    return undefined;
+  }
+  return { sessionId, sequence };
 }
 
 function parseConfigNotification(

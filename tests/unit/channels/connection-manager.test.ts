@@ -9,6 +9,7 @@ import {
 import {
   ChannelConnectionError,
   createChannelConnectionManager,
+  createPostgresChannelConnectionRuntimeStore,
   redactChannelHealthDetail,
   type ChannelConnectionRuntimeStore,
   type RuntimeChannelConnection,
@@ -241,6 +242,103 @@ describe("channel connection manager", () => {
     expect(JSON.stringify(health)).not.toContain("access_token");
     expect(JSON.stringify(health)).not.toContain("{secret}");
     await harness.manager.shutdown();
+  });
+
+  it("persists Gateway resume state in connection health detail", async () => {
+    const harness = managerHarness({
+      health: {
+        status: "healthy",
+        checkedAt: new Date("2026-07-26T00:00:00.000Z"),
+        reconnectAttempts: 0,
+        resumeState: {
+          sessionId: "qq-session-1",
+          sequence: 501,
+        },
+      },
+    });
+    await harness.manager.startAll();
+    await harness.manager.refreshHealth(CONNECTION_A);
+
+    expect(harness.healthUpdates.at(-1)).toMatchObject({
+      status: "connected",
+      detail: {
+        gatewaySessionId: "qq-session-1",
+        gatewaySequence: 501,
+      },
+    });
+    await harness.manager.shutdown();
+  });
+
+  it("does not restart a Gateway after its configured retry limit is exhausted", async () => {
+    vi.useFakeTimers();
+    const harness = managerHarness({
+      health: {
+        status: "disconnected",
+        checkedAt: new Date("2026-07-26T00:00:00.000Z"),
+        reconnectAttempts: 100,
+        retryExhausted: true,
+        error: {
+          code: "network_unreachable",
+          detail: "qq_reconnect_exhausted",
+        },
+      },
+    });
+    await harness.manager.startAll();
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(harness.adapters.get(CONNECTION_A)!.start)
+      .toHaveBeenCalledTimes(1);
+    expect(harness.healthUpdates.at(-1)).toMatchObject({
+      status: "disconnected",
+      detail: {
+        retryExhausted: true,
+        reconnectAttempts: 100,
+      },
+    });
+    await harness.manager.shutdown();
+  });
+
+  it("restores a valid Gateway session from persisted health detail", async () => {
+    const query = vi.fn(async (sql: string) => {
+      void sql;
+      return {
+        rowCount: 1,
+        rows: [{
+          id: CONNECTION_A,
+          user_id: USER_ID,
+          agent_id: AGENT_ID,
+          channel_type: "qq",
+          enabled: true,
+          config: {},
+          revision: 1,
+          health_detail: {
+            gatewaySessionId: "qq-session-1",
+            gatewaySequence: 501,
+          },
+          field_name: null,
+          ciphertext: null,
+          nonce: null,
+          auth_tag: null,
+          key_version: null,
+        }],
+      };
+    });
+    const store = createPostgresChannelConnectionRuntimeStore(
+      { query } as never,
+      null,
+    );
+
+    await expect(store.listEnabled()).resolves.toEqual([
+      expect.objectContaining({
+        id: CONNECTION_A,
+        resumeState: {
+          sessionId: "qq-session-1",
+          sequence: 501,
+        },
+      }),
+    ]);
+    expect(String(query.mock.calls[0]?.[0]))
+      .toContain("connection.health_detail");
   });
 
   it("waits for every adapter to stop during graceful shutdown", async () => {

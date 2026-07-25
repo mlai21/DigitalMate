@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createChannelDeliveryTransport,
   createLeasedChannelTurnExecutor,
+  enqueueProactiveChannelDelivery,
 } from "@/server/channels/runtime/start";
 import {
   ChannelSendError,
@@ -121,6 +122,7 @@ describe("channel runtime start", () => {
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         body: "分段回复",
+        deliverySequence: 1,
         replyHandle: expect.objectContaining({
           secretFields: expect.objectContaining({
             sessionWebhook: expect.stringContaining(
@@ -155,6 +157,90 @@ describe("channel runtime start", () => {
       code: "runtime_prerequisite_missing",
       retryable: false,
     } satisfies Partial<ChannelSendError>);
+  });
+
+  it("保留 Adapter 对平台错误的重试判定", async () => {
+    const platformError = Object.assign(
+      new Error("response_invalid"),
+      { retryable: false },
+    );
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "qq" as const,
+        enabled: true,
+        revision: 1,
+        config: {},
+      })),
+      createAdapter: () => ({
+        streaming: undefined,
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send: vi.fn(async () => {
+          throw platformError;
+        }),
+      }),
+      loadReplyHandle: vi.fn(async () => ({
+        publicFields: {},
+        secretFields: {},
+        expiresAt: null,
+      })),
+    });
+
+    await expect(transport.send({
+      delivery,
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "不应重试",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "response_invalid",
+      retryable: false,
+    });
+  });
+
+  it("为 QQ 主动任务保留明确的会话类型和 OpenID", async () => {
+    const enqueueProactive = vi.fn(async () => "delivery-qq-1");
+    const result = await enqueueProactiveChannelDelivery({
+      pool: {
+        query: vi.fn(async () => ({
+          rowCount: 1,
+          rows: [{ id: "connection-qq" }],
+        })),
+      } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-qq-1",
+      assistantMessageId: "assistant-qq-1",
+      content: "主动提醒",
+      target: {
+        channel: "qq",
+        externalConversationId: "c2c:user-open-1",
+        externalMessageId: "message-qq-1",
+        senderId: "user-open-1",
+        chatType: "direct",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: true });
+    expect(enqueueProactive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "connection-qq",
+        recipient: {
+          externalConversationId: "c2c:user-open-1",
+          externalUserId: "user-open-1",
+          chatType: "direct",
+        },
+      }),
+    );
   });
 
   it("清空数据删除已 claim 事件后不会复活旧消息", async () => {
