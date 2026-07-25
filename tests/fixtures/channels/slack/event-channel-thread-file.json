@@ -1,0 +1,24 @@
+{
+  "envelope_id": "env-2",
+  "event_id": "Ev124",
+  "event_time": 1712346,
+  "team_id": "T100",
+  "event": {
+    "type": "message",
+    "channel": "C200",
+    "channel_type": "channel",
+    "user": "U101",
+    "text": "<@U-BOT> 看一下附件",
+    "ts": "1712346.200",
+    "event_ts": "1712346.200",
+    "thread_ts": "1712300.000",
+    "files": [
+      {
+        "id": "F100",
+        "name": "notes.txt",
+        "mimetype": "text/plain",
+        "size": 128
+      }
+    ]
+  }
+}

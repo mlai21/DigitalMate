@@ -118,6 +118,9 @@ describe("channel ingress", () => {
       scope,
       access: fakeAccess({ kind: "allowed", allowed: true }),
       events,
+      afterDurablePersist: vi.fn(async () => {
+        order.push("protocol-ack");
+      }),
       afterPersist: vi.fn(async () => {
         order.push("bind-private-files");
       }),
@@ -141,6 +144,7 @@ describe("channel ingress", () => {
     );
     expect(order).toEqual([
       "persist-pending",
+      "protocol-ack",
       "bind-private-files",
       "ready",
       "ack",

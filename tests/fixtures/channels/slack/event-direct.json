@@ -1,0 +1,15 @@
+{
+  "envelope_id": "env-1",
+  "event_id": "Ev123",
+  "event_time": 1712345,
+  "team_id": "T100",
+  "event": {
+    "type": "message",
+    "channel": "D100",
+    "channel_type": "im",
+    "user": "U100",
+    "text": "你好",
+    "ts": "1712345.100",
+    "event_ts": "1712345.100"
+  }
+}

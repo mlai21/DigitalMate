@@ -16,6 +16,15 @@ import {
   createDiscordAttachmentFetcher,
 } from "@/server/channels/adapters/discord/transport";
 import {
+  createSlackAdapter,
+} from "@/server/channels/adapters/slack";
+import {
+  parseSlackConfig,
+} from "@/server/channels/adapters/slack/config";
+import {
+  createSlackAttachmentFetcher,
+} from "@/server/channels/adapters/slack/transport";
+import {
   createTelegramAdapter,
   parseTelegramConfig,
 } from "@/server/channels/adapters/telegram";
@@ -558,7 +567,12 @@ function createManagedAdapter(
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
     case "slack":
-      return createSlackWebhookAdapter();
+      return hasConfiguredString(connection.config.app_token)
+        ? createManagedSlackAdapter(
+            connection,
+            dependencies,
+          ) as ChannelAdapter<Record<string, unknown>>
+        : createSlackWebhookAdapter();
     case "feishu":
       return createFeishuWebhookAdapter();
     case "dingtalk":
@@ -566,6 +580,127 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedSlackAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createSlackAdapter({
+    scope: connection.scope,
+    acceptInbound: (
+      payload,
+      context,
+      scope,
+      acknowledge,
+    ) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          let acknowledged = false;
+          const acknowledgeOnce = async () => {
+            if (acknowledged) return;
+            await acknowledge();
+            acknowledged = true;
+          };
+          const result = await acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterDurablePersist: async () => {
+              await acknowledgeOnce();
+            },
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const fetcher = createSlackAttachmentFetcher(
+                parseSlackConfig(connection.config),
+              );
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (!persisted) continue;
+                await downloadInboundAttachment({
+                  scope: event.scope,
+                  descriptor,
+                  fetcher,
+                  storageRoot:
+                    dependencies.attachmentStorageDir,
+                  repository:
+                    dependencies.repositories.messageAttachments,
+                  bindPrivateAttachment: async (
+                    attachmentId,
+                  ) => {
+                    const bound =
+                      await locators.bindPrivateAttachment(
+                        event.scope,
+                        event.id,
+                        descriptor.externalAttachmentId,
+                        attachmentId,
+                        new Date(),
+                      );
+                    if (!bound) {
+                      throw new Error(
+                        "attachment_bind_transition_failed",
+                      );
+                    }
+                  },
+                  signal,
+                });
+              }
+            },
+          });
+          await acknowledgeOnce();
+          return result;
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedDiscordAdapter(
@@ -671,6 +806,11 @@ function createManagedDiscordAdapter(
       ),
   });
   return adapter;
+}
+
+function hasConfiguredString(value: unknown): boolean {
+  return typeof value === "string"
+    && value.trim().length > 0;
 }
 
 function createManagedTelegramAdapter(

@@ -56,6 +56,10 @@ export type AcceptInboundInput = Readonly<{
     event: ChannelEventRecord,
     normalized: NormalizedChannelEvent,
   ) => Promise<void>;
+  afterDurablePersist?: (
+    event: ChannelEventRecord,
+    normalized: NormalizedChannelEvent,
+  ) => Promise<void>;
 }>;
 
 export async function acceptInbound(
@@ -96,6 +100,10 @@ export async function acceptInboundWithAcknowledgement(
       accepted.event,
     );
   }
+  await input.afterDurablePersist?.(
+    accepted.event,
+    normalized,
+  );
   if (
     accepted.event.status === "accepted"
     || accepted.event.status === "pending_attachments"

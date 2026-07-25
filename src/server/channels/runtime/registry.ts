@@ -6,6 +6,7 @@ import {
 import type { ChannelAdapter } from "./adapter";
 import type { AdapterDependencies } from "./types";
 import { createDiscordAdapter } from "../adapters/discord";
+import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
 
 export type ChannelAdapterFactory = (
@@ -103,6 +104,38 @@ export function registerDiscordChannelAdapter(
         : {}),
       ...(dependencies.acceptInbound
         ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
+export function registerSlackChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("slack", (dependencies) =>
+    createSlackAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? {
+            acceptInbound: async (
+              payload,
+              context,
+              scope,
+              acknowledge,
+            ) => {
+              const result =
+                await dependencies.acceptInbound!(
+                  payload,
+                  context,
+                  scope,
+                );
+              await acknowledge();
+              return result;
+            },
+          }
         : {}),
     })
   );

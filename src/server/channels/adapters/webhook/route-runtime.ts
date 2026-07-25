@@ -112,6 +112,12 @@ export async function acceptWebhookEvent(input: Readonly<{
               candidate.config.webhook_secret,
             )
           )
+          && (
+            input.channelType !== "slack"
+            || !hasConfiguredString(
+              candidate.config.app_token,
+            )
+          )
         );
         if (!connection || connection.runtimeError) {
           return adapter.acknowledge(input.payload, {
