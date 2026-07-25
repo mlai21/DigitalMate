@@ -8,6 +8,12 @@ import type { LlmAttachment, LlmClient, LlmMessage, LlmPurpose, LlmTool, LlmTool
 import { estimateMessagesTokenUsage, estimateTokenCount, type LlmUsageLogInput } from "@/server/llm/usage";
 import { executeRegisteredTool, type RegisteredToolExecutionResult } from "@/server/tasks/tools";
 import type { AgentScope } from "@/server/agents/types";
+import {
+  canonicalJson,
+  hashExecutionRequest,
+  hashExecutionText,
+  type ExecutionJournal,
+} from "@/server/channels/runtime/execution-journal";
 
 export type ToolLogInput = AgentScope & {
   conversationId: string | null;
@@ -102,6 +108,8 @@ export type RunAgentInput = AgentScope & {
   searchGate?: SearchGate;
   /** Keeps every tool closed while a recent DB message still owns an attachment, even if its payload was cropped. */
   attachmentToolGuard?: boolean;
+  /** Durable per-event journal used by channel turns to avoid replaying external side effects. */
+  executionJournal?: ExecutionJournal;
   purpose?: LlmPurpose;
   signal?: AbortSignal;
 };
@@ -247,19 +255,19 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
   });
   let inputTokens = 0;
   let outputTokens = 0;
+  let llmRound = 0;
   const searchEvidence = new Set<string>();
   const collectModelTurn = async (messages: LlmMessage[], turnTools: LlmTool[]) => {
     throwIfAborted(input.signal);
     inputTokens += estimateMessagesTokenUsage(messages);
-    const turn = await collectTurn(
-      input.llm.stream({
-        messages,
-        model: input.model,
-        tools: turnTools,
-        signal: input.signal,
-      }),
-      input.signal,
-    );
+    const round = llmRound;
+    llmRound += 1;
+    const turn = await collectJournaledModelTurn({
+      input,
+      round,
+      messages,
+      tools: turnTools,
+    });
     throwIfAborted(input.signal);
     outputTokens += estimateTokenCount(turn.text);
     outputTokens += turn.toolCalls.reduce(
@@ -297,9 +305,16 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     }
 
     const toolMessages: LlmMessage[] = [];
-    for (const toolCall of toolCalls) {
+    for (const [toolIndex, toolCall] of toolCalls.entries()) {
       throwIfAborted(input.signal);
-      const result = await executeToolCall({ input, toolCall, enabledTools, searchEvidence });
+      const result = await executeJournaledToolCall({
+        input,
+        toolCall,
+        enabledTools,
+        searchEvidence,
+        round: iteration,
+        toolIndex,
+      });
       throwIfAborted(input.signal);
       toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }
@@ -365,6 +380,137 @@ async function collectTurn(
   }
   throwIfAborted(signal);
   return { text: chunks.join(""), toolCalls };
+}
+
+async function collectJournaledModelTurn(context: {
+  input: RunAgentInput;
+  round: number;
+  messages: LlmMessage[];
+  tools: LlmTool[];
+}): Promise<{ text: string; toolCalls: LlmToolCall[] }> {
+  const { input, round, messages, tools } = context;
+  const journal = input.executionJournal;
+  if (!journal) {
+    return collectTurn(
+      input.llm.stream({
+        messages,
+        model: input.model,
+        tools,
+        signal: input.signal,
+      }),
+      input.signal,
+    );
+  }
+
+  const stepKey = `llm:${round}`;
+  const action = await journal.begin({
+    key: stepKey,
+    kind: "llm",
+    requestHash: hashExecutionRequest({
+      model: input.model,
+      messages,
+      tools,
+    }),
+  });
+  if (action === "reuse") {
+    const stored = await journal.read<unknown>(stepKey);
+    if (!isStoredModelTurn(stored)) {
+      throw new Error("channel_execution_llm_output_invalid");
+    }
+    return stored;
+  }
+  if (action === "ambiguous") {
+    throw new AmbiguousExecutionStepError(stepKey);
+  }
+
+  try {
+    const turn = await collectTurn(
+      input.llm.stream({
+        messages,
+        model: input.model,
+        tools,
+        signal: input.signal,
+      }),
+      input.signal,
+    );
+    await journal.complete(stepKey, turn);
+    return turn;
+  } catch (error) {
+    await journal.fail(
+      stepKey,
+      stableExecutionErrorCode(error),
+    ).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function executeJournaledToolCall(context: {
+  input: RunAgentInput;
+  toolCall: LlmToolCall;
+  enabledTools: EnabledToolContext[];
+  searchEvidence: Set<string>;
+  round: number;
+  toolIndex: number;
+}): Promise<string> {
+  const journal = context.input.executionJournal;
+  if (!journal) return executeToolCall(context);
+
+  const args = safeParseArguments(context.toolCall.arguments);
+  const isSearch = context.toolCall.name === "web_search";
+  const query = typeof args.query === "string"
+    ? args.query.trim()
+    : "";
+  const digest = hashExecutionText(
+    isSearch
+      ? query
+      : `${context.toolCall.name}\0${canonicalJson(args)}`,
+  );
+  const stepKey = isSearch
+    ? `search:${context.round}:${digest}`
+    : `tool:${context.round}:${context.toolIndex}:${digest}`;
+  const action = await journal.begin({
+    key: stepKey,
+    kind: isSearch ? "search" : "tool",
+    requestHash: hashExecutionRequest({
+      name: context.toolCall.name,
+      arguments: args,
+    }),
+  });
+
+  if (action === "reuse") {
+    const stored = await journal.read<unknown>(stepKey);
+    if (!isStoredToolOutput(stored)) {
+      throw new Error("channel_execution_tool_output_invalid");
+    }
+    for (const fragment of stored.searchEvidence) {
+      context.searchEvidence.add(fragment);
+    }
+    return stored.result;
+  }
+  if (action === "ambiguous") {
+    return isSearch
+      ? "本次搜索的执行结果不确定，为避免重复联网，本轮不会再次搜索。请基于已有信息谨慎回答。"
+      : "本次工具执行结果不确定，为避免重复产生副作用，本轮不会再次调用该工具。";
+  }
+
+  const evidenceBefore = new Set(context.searchEvidence);
+  try {
+    const result = await executeToolCall(context);
+    const addedEvidence = [...context.searchEvidence].filter(
+      (fragment) => !evidenceBefore.has(fragment),
+    );
+    await journal.complete(stepKey, {
+      result,
+      searchEvidence: addedEvidence,
+    } satisfies StoredToolOutput);
+    return result;
+  } catch (error) {
+    await journal.fail(
+      stepKey,
+      stableExecutionErrorCode(error),
+    ).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function executeToolCall(context: {
@@ -570,6 +716,69 @@ function sanitizeSearchOutput(text: string, evidence: Set<string>): string {
 
 function normalizeSearchLeakText(text: string): string {
   return text.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+type StoredToolOutput = Readonly<{
+  result: string;
+  searchEvidence: string[];
+}>;
+
+export class AmbiguousExecutionStepError extends Error {
+  constructor(stepKey: string) {
+    super(`channel_execution_step_ambiguous:${stepKey}`);
+    this.name = "AmbiguousExecutionStepError";
+  }
+}
+
+function isStoredModelTurn(
+  value: unknown,
+): value is { text: string; toolCalls: LlmToolCall[] } {
+  if (
+    typeof value !== "object"
+    || value === null
+    || !("text" in value)
+    || typeof value.text !== "string"
+    || !("toolCalls" in value)
+    || !Array.isArray(value.toolCalls)
+  ) {
+    return false;
+  }
+  return value.toolCalls.every((call) =>
+    typeof call === "object"
+    && call !== null
+    && "id" in call
+    && typeof call.id === "string"
+    && "name" in call
+    && typeof call.name === "string"
+    && "arguments" in call
+    && typeof call.arguments === "string"
+  );
+}
+
+function isStoredToolOutput(
+  value: unknown,
+): value is StoredToolOutput {
+  return (
+    typeof value === "object"
+    && value !== null
+    && "result" in value
+    && typeof value.result === "string"
+    && "searchEvidence" in value
+    && Array.isArray(value.searchEvidence)
+    && value.searchEvidence.every(
+      (fragment) => typeof fragment === "string",
+    )
+  );
+}
+
+function stableExecutionErrorCode(error: unknown): string {
+  if (!(error instanceof Error)) return "execution_failed";
+  const normalized = error.name
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 128);
+  return normalized || "execution_failed";
 }
 
 async function saveSkillFromToolCall(context: {

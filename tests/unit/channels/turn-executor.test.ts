@@ -4,6 +4,10 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  runAgent,
+  type RunAgentInput,
+} from "@/server/agent/run-agent";
 import type { AgentScope } from "@/server/agents/types";
 import { ATTACHMENT_LIMITS } from "@/server/attachments/types";
 import {
@@ -14,6 +18,16 @@ import {
 import type {
   InboundAttachmentDescriptor,
 } from "@/server/channels/runtime/types";
+import type { ClaimedChannelEvent } from "@/server/channels/runtime/event-repository";
+import type {
+  ExecutionJournal,
+  ExecutionStep,
+} from "@/server/channels/runtime/execution-journal";
+import {
+  CHANNEL_INTERRUPTED_REPLY,
+  createChannelTurnExecutor,
+} from "@/server/channels/runtime/turn-executor";
+import type { LlmClient } from "@/server/llm/types";
 
 const scope = {
   userId: "10000000-0000-4000-8000-000000000001",
@@ -180,6 +194,135 @@ describe("channel turn attachment guard", () => {
   });
 });
 
+describe("channel turn execution contract", () => {
+  it("runs the Agent once and persists the generated reply", async () => {
+    const harness = turnHarness();
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result).toMatchObject({
+      assistantMessageId: "assistant-1",
+      created: true,
+      degraded: false,
+    });
+    expect(harness.messages.createIdempotentUserTurn).toHaveBeenCalledTimes(1);
+    expect(harness.messages.claimClientTurnExecution).toHaveBeenCalledTimes(1);
+    expect(harness.runAgentTurn).toHaveBeenCalledTimes(1);
+    expect(harness.persistReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: "正常回复",
+      }),
+    );
+    expect(harness.releaseLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rerun the Agent after execution was already claimed", async () => {
+    const harness = turnHarness({ executionClaimed: false });
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result.degraded).toBe(true);
+    expect(harness.runAgentTurn).not.toHaveBeenCalled();
+    expect(harness.persistReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: CHANNEL_INTERRUPTED_REPLY,
+      }),
+    );
+    expect(CHANNEL_INTERRUPTED_REPLY).toContain("没能完整回复");
+  });
+
+  it("persists one degraded reply when the Agent returns a handled error", async () => {
+    const harness = turnHarness();
+    harness.runAgentTurn.mockRejectedValueOnce(
+      new Error("provider_unavailable"),
+    );
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result.degraded).toBe(true);
+    expect(harness.runAgentTurn).toHaveBeenCalledTimes(1);
+    expect(harness.persistReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining("稍后再试"),
+      }),
+    );
+  });
+});
+
+describe("runAgent execution journal", () => {
+  it("reuses a completed LLM round without invoking the model again", async () => {
+    const journal = memoryJournal();
+    const firstStream = vi.fn(async function* () {
+      yield { type: "text" as const, text: "第一次回复" };
+    });
+    const first = await collectAgentReply({
+      journal,
+      stream: firstStream,
+    });
+    const recoveryStream = vi.fn(async function* () {
+      yield { type: "text" as const, text: "不应调用" };
+    });
+
+    const recovered = await collectAgentReply({
+      journal,
+      stream: recoveryStream,
+    });
+
+    expect(first).toBe("第一次回复");
+    expect(recovered).toBe("第一次回复");
+    expect(firstStream).toHaveBeenCalledTimes(1);
+    expect(recoveryStream).not.toHaveBeenCalled();
+    expect(journal.begin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: "llm:0",
+        kind: "llm",
+        requestHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+    );
+  });
+
+  it("does not replay an ambiguous search side effect", async () => {
+    const search = vi.fn(async () => ({
+      summary: "不会真的搜索",
+      results: [],
+    }));
+    const journal = memoryJournal({
+      ambiguous: (step) => step.kind === "search",
+    });
+    let turn = 0;
+    const stream = vi.fn(async function* () {
+      if (turn++ === 0) {
+        yield {
+          type: "tool_call" as const,
+          toolCall: {
+            id: "call-1",
+            name: "web_search",
+            arguments: '{"query":"今天新闻"}',
+          },
+        };
+        return;
+      }
+      yield { type: "text" as const, text: "稍后再试" };
+    });
+
+    await expect(collectAgentReply({
+      journal,
+      stream,
+      search,
+    })).resolves.toBe("稍后再试");
+
+    expect(search).not.toHaveBeenCalled();
+    expect(journal.begin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: expect.stringMatching(
+          /^search:0:[0-9a-f]{64}$/,
+        ),
+        kind: "search",
+      }),
+    );
+  });
+});
+
 async function downloadHarness(input: {
   fileName: string;
   mimeType: string;
@@ -243,4 +386,160 @@ async function* asAsyncIterable(
 async function readFileNames(directory: string): Promise<string[]> {
   const { readdir } = await import("node:fs/promises");
   return (await readdir(directory)).sort();
+}
+
+function claimedEvent(): ClaimedChannelEvent {
+  return {
+    id: "event-1",
+    scope,
+    connectionId: "20000000-0000-4000-8000-000000000001",
+    normalizedEvent: {
+      connectionId: "20000000-0000-4000-8000-000000000001",
+      agentId: scope.agentId,
+      channelType: "telegram",
+      externalEventId: "external-event-1",
+      externalConversationId: "external-conversation-1",
+      externalSenderId: "external-sender-1",
+      chatType: "direct",
+      mentioned: false,
+      text: "你好",
+      thread: {},
+      attachments: [],
+      occurredAt: new Date("2026-07-26T00:00:00.000Z"),
+      receivedAt: new Date("2026-07-26T00:00:01.000Z"),
+      permission: {
+        webSearch: false,
+        backgroundNetwork: false,
+        tools: false,
+        skills: "none",
+        attachmentsPresent: false,
+      },
+      rawSummary: { eventType: "message" },
+    },
+    clientTurnId: "30000000-0000-4000-8000-000000000001",
+    payloadHash: "a".repeat(64),
+    status: "running",
+    claimOwner: "worker-1",
+    claimExpiresAt: new Date("2026-07-26T00:01:00.000Z"),
+    attempts: 1,
+    failureCode: null,
+    assistantMessageId: null,
+    completedAt: null,
+  };
+}
+
+function turnHarness(options: {
+  executionClaimed?: boolean;
+} = {}) {
+  const releaseLock = vi.fn(async () => undefined);
+  const messages = {
+    createIdempotentUserTurn: vi.fn(async () => ({
+      message: { id: "user-message-1" },
+      attachments: [],
+      created: true,
+    })),
+    acquireClientTurnExecutionLock: vi.fn(async () => releaseLock),
+    findByClientTurn: vi.fn(async () => null),
+    claimClientTurnExecution: vi.fn(
+      async () => options.executionClaimed ?? true,
+    ),
+  };
+  const runAgentTurn = vi.fn(async () => "正常回复");
+  const persistReply = vi.fn(async () => ({
+    assistantMessageId: "assistant-1",
+    deliveryId: "delivery-1",
+    created: true,
+  }));
+  const executor = createChannelTurnExecutor({
+    messages,
+    resolveConversationId: vi.fn(async () => "conversation-1"),
+    resolveAttachmentIds: vi.fn(async () => []),
+    createJournal: vi.fn(() => memoryJournal()),
+    runAgentTurn,
+    persistReply,
+  });
+  return {
+    executor,
+    messages,
+    runAgentTurn,
+    persistReply,
+    releaseLock,
+  };
+}
+
+function memoryJournal(options: {
+  ambiguous?: (step: ExecutionStep) => boolean;
+} = {}): ExecutionJournal & {
+  begin: ReturnType<typeof vi.fn>;
+} {
+  const values = new Map<string, unknown>();
+  const states = new Map<
+    string,
+    "started" | "completed" | "failed" | "ambiguous"
+  >();
+  const begin = vi.fn(async (step: ExecutionStep) => {
+    if (options.ambiguous?.(step)) {
+      states.set(step.key, "ambiguous");
+      return "ambiguous" as const;
+    }
+    const state = states.get(step.key);
+    if (state === "completed") return "reuse" as const;
+    if (state) return "ambiguous" as const;
+    states.set(step.key, "started");
+    return "run" as const;
+  });
+  return {
+    begin,
+    complete: vi.fn(async (stepKey: string, output: unknown) => {
+      values.set(stepKey, output);
+      states.set(stepKey, "completed");
+    }),
+    fail: vi.fn(async (stepKey: string) => {
+      states.set(stepKey, "failed");
+    }),
+    read: async <T>(stepKey: string): Promise<T | null> =>
+      (values.get(stepKey) as T | undefined) ?? null,
+  };
+}
+
+async function collectAgentReply(input: {
+  journal: ExecutionJournal;
+  stream: LlmClient["stream"];
+  search?: RunAgentInput["search"]["run"];
+}): Promise<string> {
+  let reply = "";
+  for await (const chunk of runAgent({
+    userId: scope.userId,
+    agentId: scope.agentId,
+    conversationId: "conversation-1",
+    message: "请回答",
+    history: [],
+    persona: { name: "DigitalMate", style: "温暖、克制" },
+    llm: {
+      stream: input.stream,
+      completeText: vi.fn(async () => ""),
+    },
+    model: "mock-main",
+    repositories: {
+      memories: { findRelevant: vi.fn(async () => []) },
+      toolLogs: { create: vi.fn(async () => undefined) },
+    },
+    search: {
+      run: input.search ?? vi.fn(async () => ({
+        summary: "",
+        results: [],
+      })),
+    },
+    searchGate: {
+      evaluate: vi.fn(async () => ({
+        allowed: true as const,
+        method: "explicit" as const,
+        reason: "用户明确要求",
+      })),
+    },
+    executionJournal: input.journal,
+  })) {
+    reply += chunk;
+  }
+  return reply;
 }

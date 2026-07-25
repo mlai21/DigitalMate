@@ -106,6 +106,8 @@ export function createChannelEventRepository(
   const leaseMs = positiveLease(options.leaseMs ?? DEFAULT_EVENT_LEASE_MS);
 
   return {
+    leaseDurationMs: leaseMs,
+
     async accept(
       scope: AgentScope,
       event: NormalizedChannelEvent,
