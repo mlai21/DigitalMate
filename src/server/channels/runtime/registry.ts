@@ -5,6 +5,7 @@ import {
 
 import type { ChannelAdapter } from "./adapter";
 import type { AdapterDependencies } from "./types";
+import { createDiscordAdapter } from "../adapters/discord";
 import { createTelegramAdapter } from "../adapters/telegram";
 
 export type ChannelAdapterFactory = (
@@ -86,6 +87,22 @@ export function registerTelegramChannelAdapter(
                 : null;
             },
           }
+        : {}),
+    })
+  );
+}
+
+export function registerDiscordChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("discord", (dependencies) =>
+    createDiscordAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
         : {}),
     })
   );

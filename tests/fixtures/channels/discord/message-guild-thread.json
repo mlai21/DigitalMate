@@ -1,0 +1,37 @@
+{
+  "id": "1200457",
+  "content": "<@bot-42> 看一下附件",
+  "channel_id": "thread-300",
+  "guild_id": "guild-200",
+  "timestamp": "2026-07-26T00:00:01.000Z",
+  "author": {
+    "id": "user-101",
+    "username": "bob",
+    "bot": false
+  },
+  "mentions": [
+    {
+      "id": "bot-42"
+    }
+  ],
+  "mention_everyone": false,
+  "channel": {
+    "id": "thread-300",
+    "type": "thread",
+    "parent_id": "channel-200"
+  },
+  "message_reference": {
+    "message_id": "1200400",
+    "channel_id": "thread-300",
+    "guild_id": "guild-200"
+  },
+  "attachments": [
+    {
+      "id": "attachment-1",
+      "filename": "notes.txt",
+      "content_type": "text/plain",
+      "size": 128,
+      "url": "https://cdn.discordapp.com/attachments/channel/message/notes.txt"
+    }
+  ]
+}

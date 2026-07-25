@@ -1,0 +1,15 @@
+{
+  "id": "1200456",
+  "content": "你好",
+  "channel_id": "dm-100",
+  "guild_id": null,
+  "timestamp": "2026-07-26T00:00:00.000Z",
+  "author": {
+    "id": "user-100",
+    "username": "alice",
+    "bot": false
+  },
+  "mentions": [],
+  "mention_everyone": false,
+  "attachments": []
+}
