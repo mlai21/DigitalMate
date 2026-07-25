@@ -1563,6 +1563,12 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
   attempts integer NOT NULL DEFAULT 0
     CONSTRAINT channel_deliveries_attempts_check
     CHECK (attempts >= 0),
+  attempt_cycle_baseline integer NOT NULL DEFAULT 0
+    CONSTRAINT channel_deliveries_attempt_cycle_check
+    CHECK (
+      attempt_cycle_baseline >= 0
+      AND attempt_cycle_baseline <= attempts
+    ),
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
   last_error_code text,
   sent_at timestamptz,
@@ -1599,6 +1605,28 @@ CREATE TABLE IF NOT EXISTS channel_deliveries (
   UNIQUE (event_id),
   UNIQUE (connection_id, assistant_message_id)
 );
+
+ALTER TABLE IF EXISTS channel_deliveries
+  ADD COLUMN IF NOT EXISTS
+    attempt_cycle_baseline integer NOT NULL DEFAULT 0;
+
+DO $channel_delivery_attempt_cycle_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_deliveries'::regclass
+      AND conname = 'channel_deliveries_attempt_cycle_check'
+  ) THEN
+    ALTER TABLE channel_deliveries
+      ADD CONSTRAINT channel_deliveries_attempt_cycle_check
+      CHECK (
+        attempt_cycle_baseline >= 0
+        AND attempt_cycle_baseline <= attempts
+      );
+  END IF;
+END
+$channel_delivery_attempt_cycle_constraint$;
 
 CREATE TABLE IF NOT EXISTS channel_delivery_attempts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

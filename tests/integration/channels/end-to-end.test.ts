@@ -18,6 +18,13 @@ import {
 
 import type { AgentScope } from "@/server/agents/types";
 import {
+  createChannelDeliveryRepository,
+} from "@/server/channels/runtime/delivery-repository";
+import {
+  ChannelSendError,
+  createChannelDeliveryWorker,
+} from "@/server/channels/runtime/delivery-worker";
+import {
   createChannelEventRepository,
 } from "@/server/channels/runtime/event-repository";
 import {
@@ -320,6 +327,242 @@ describe("channel runtime end-to-end recovery", () => {
     },
   );
 
+  it("retries only the persisted delivery and never reruns the Agent", async () => {
+    const events = createChannelEventRepository(pool);
+    await events.accept(
+      scope,
+      normalizedEvent("event-send-retry"),
+    );
+    const runAgentTurn = vi.fn(async () => "已经生成的回复");
+    await worker({
+      owner: "event-worker-send-retry",
+      events,
+      runAgentTurn,
+    }).runOne();
+
+    const deliveries = createChannelDeliveryRepository(pool);
+    let clock = new Date(Date.now() + 1_000);
+    const send = vi.fn()
+      .mockRejectedValueOnce(new ChannelSendError({
+        code: "rate_limited",
+        retryable: true,
+        retryAfterMs: 2_000,
+      }))
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({
+        externalMessageId: "platform-message-1",
+        sentAt: clock,
+        rawSummary: {
+          status: "ok",
+          access_token: "must-not-persist",
+        },
+      });
+    const deliveryWorker = createChannelDeliveryWorker({
+      owner: "delivery-worker-send-retry",
+      deliveries,
+      transport: {
+        mode: async () => "segmented",
+        send,
+      },
+      loadCadence: async () => ({
+        responseDelayMs: 0,
+        segmentDelayMs: 0,
+        maxSegments: 5,
+      }),
+      now: () => clock,
+      random: () => 0.5,
+    });
+
+    await deliveryWorker.runOne();
+    clock = await nextDeliveryAttemptAt();
+    await deliveryWorker.runOne();
+    clock = await nextDeliveryAttemptAt();
+    await deliveryWorker.runOne();
+
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(runAgentTurn).toHaveBeenCalledTimes(1);
+    const delivery = await pool.query<{
+      status: string;
+      attempts: number;
+    }>(
+      `SELECT status, attempts
+       FROM channel_deliveries`,
+    );
+    expect(delivery.rows).toEqual([{
+      status: "sent",
+      attempts: 3,
+    }]);
+    await expect(countRows(
+      "messages",
+      "role = 'assistant'",
+    )).resolves.toBe(1);
+    await expect(countRows(
+      "channel_delivery_attempts",
+      "true",
+    )).resolves.toBe(3);
+    const platformResult = await pool.query<{
+      platform_result: unknown;
+    }>(
+      `SELECT platform_result
+       FROM channel_delivery_attempts
+       WHERE status = 'sent'`,
+    );
+    expect(JSON.stringify(platformResult.rows[0]))
+      .not.toContain("must-not-persist");
+  });
+
+  it("requeues the same dead letter without creating another assistant", async () => {
+    const events = createChannelEventRepository(pool);
+    await events.accept(
+      scope,
+      normalizedEvent("event-manual-requeue"),
+    );
+    const runAgentTurn = vi.fn(async () => "固定回复");
+    await worker({
+      owner: "event-worker-manual-requeue",
+      events,
+      runAgentTurn,
+    }).runOne();
+
+    const deliveries = createChannelDeliveryRepository(pool);
+    let clock = new Date(Date.now() + 1_000);
+    const send = vi.fn()
+      .mockRejectedValueOnce(new ChannelSendError({
+        code: "credential_invalid",
+        retryable: false,
+      }))
+      .mockResolvedValueOnce({
+        externalMessageId: "platform-after-requeue",
+        sentAt: clock,
+        rawSummary: {},
+      });
+    const deliveryWorker = createChannelDeliveryWorker({
+      owner: "delivery-worker-manual-requeue",
+      deliveries,
+      transport: {
+        mode: async () => "segmented",
+        send,
+      },
+      loadCadence: async () => ({
+        responseDelayMs: 0,
+        segmentDelayMs: 0,
+        maxSegments: 5,
+      }),
+      now: () => clock,
+      random: () => 0.5,
+    });
+
+    await deliveryWorker.runOne();
+    const deadLetter = await pool.query<{
+      id: string;
+      status: string;
+    }>(
+      `SELECT id, status
+       FROM channel_deliveries`,
+    );
+    expect(deadLetter.rows[0]?.status).toBe("dead_letter");
+
+    clock = new Date(clock.getTime() + 1_000);
+    await pool.query(
+      `UPDATE channel_deliveries
+       SET attempts = 8
+       WHERE id = $1`,
+      [deadLetter.rows[0]!.id],
+    );
+    await expect(deliveries.requeue(
+      scope,
+      deadLetter.rows[0]!.id,
+      clock,
+    )).resolves.toBe(true);
+    await deliveryWorker.runOne();
+
+    const finalDelivery = await pool.query<{
+      id: string;
+      status: string;
+    }>(
+      `SELECT id, status
+       FROM channel_deliveries`,
+    );
+    expect(finalDelivery.rows).toEqual([{
+      id: deadLetter.rows[0]!.id,
+      status: "sent",
+    }]);
+    expect(runAgentTurn).toHaveBeenCalledTimes(1);
+    await expect(countRows(
+      "messages",
+      "role = 'assistant'",
+    )).resolves.toBe(1);
+  });
+
+  it("marks an unfinished platform attempt ambiguous after lease recovery", async () => {
+    const events = createChannelEventRepository(pool);
+    await events.accept(
+      scope,
+      normalizedEvent("event-send-ambiguous"),
+    );
+    await worker({
+      owner: "event-worker-send-ambiguous",
+      events,
+      runAgentTurn: vi.fn(async () => "固定回复"),
+    }).runOne();
+
+    const deliveries = createChannelDeliveryRepository(
+      pool,
+      { leaseMs: 1_000 },
+    );
+    const start = new Date(Date.now() + 1_000);
+    const first = await deliveries.claimNext(
+      "delivery-worker-crash",
+      start,
+    );
+    expect(first).not.toBeNull();
+    await expect(deliveries.beginSegment(
+      first!,
+      1,
+      start,
+    )).resolves.toEqual({
+      action: "send",
+      previousResult: null,
+    });
+
+    const recoveredAt = new Date(start.getTime() + 1_001);
+    const recovered = await deliveries.claimNext(
+      "delivery-worker-recovery",
+      recoveredAt,
+    );
+    expect(recovered).not.toBeNull();
+    await expect(deliveries.beginSegment(
+      recovered!,
+      1,
+      recoveredAt,
+    )).resolves.toEqual({
+      action: "ambiguous",
+      previousResult: null,
+    });
+    await expect(deliveries.deadLetter(
+      recovered!,
+      "delivery_outcome_unknown",
+      recoveredAt,
+    )).resolves.toBe(true);
+    await expect(deliveries.requeue(
+      scope,
+      recovered!.id,
+      new Date(recoveredAt.getTime() + 1),
+    )).resolves.toBe(true);
+    const manualClaim = await deliveries.claimNext(
+      "delivery-worker-manual-override",
+      new Date(recoveredAt.getTime() + 2),
+    );
+    await expect(deliveries.beginSegment(
+      manualClaim!,
+      1,
+      new Date(recoveredAt.getTime() + 2),
+    )).resolves.toEqual({
+      action: "send",
+      previousResult: null,
+    });
+  });
+
   function worker(input: {
     owner: string;
     events: ReturnType<typeof createChannelEventRepository>;
@@ -378,6 +621,16 @@ describe("channel runtime end-to-end recovery", () => {
       `SELECT count(*)::text AS count FROM ${table} WHERE ${predicate}`,
     );
     return Number(result.rows[0]?.count ?? 0);
+  }
+
+  async function nextDeliveryAttemptAt(): Promise<Date> {
+    const result = await pool.query<{
+      next_attempt_at: Date;
+    }>(
+      `SELECT next_attempt_at
+       FROM channel_deliveries`,
+    );
+    return new Date(result.rows[0]!.next_attempt_at);
   }
 });
 

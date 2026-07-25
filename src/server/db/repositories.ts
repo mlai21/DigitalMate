@@ -141,8 +141,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   channel_deliveries: [
     "id", "user_id", "agent_id", "event_id", "connection_id",
     "assistant_message_id", "body", "recipient", "status", "attempts",
-    "next_attempt_at", "last_error_code", "sent_at", "created_at",
-    "updated_at",
+    "attempt_cycle_baseline", "next_attempt_at", "last_error_code",
+    "sent_at", "created_at", "updated_at",
   ],
   channel_delivery_attempts: [
     "id", "user_id", "agent_id", "delivery_id", "attempt_no",
