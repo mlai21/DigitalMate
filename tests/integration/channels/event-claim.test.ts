@@ -1,0 +1,374 @@
+import { once } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+import EmbeddedPostgres from "embedded-postgres";
+import { Pool } from "pg";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
+
+import type { AgentScope } from "@/server/agents/types";
+import {
+  channelClientTurnId,
+  createChannelEventRepository,
+} from "@/server/channels/runtime/event-repository";
+import { createChannelDeliveryRepository } from "@/server/channels/runtime/delivery-repository";
+import type { NormalizedChannelEvent } from "@/server/channels/runtime/types";
+import {
+  trackEmbeddedPostgresPool,
+  type EmbeddedPostgresLifecycle,
+} from "../embedded-postgres-lifecycle";
+
+const USER_ID = "10000000-0000-4000-8000-000000000001";
+const AGENT_ID = "10000000-0000-4000-8000-000000000011";
+const CONNECTION_A = "20000000-0000-4000-8000-000000000001";
+const CONNECTION_B = "20000000-0000-4000-8000-000000000002";
+const CONVERSATION_ID = "30000000-0000-4000-8000-000000000001";
+const ASSISTANT_MESSAGE_ID = "40000000-0000-4000-8000-000000000001";
+const scope = { userId: USER_ID, agentId: AGENT_ID } satisfies AgentScope;
+
+describe("channel event transaction ledger", () => {
+  let database: EmbeddedPostgres;
+  let directory: string;
+  let pool: Pool;
+  let lifecycle: EmbeddedPostgresLifecycle;
+
+  beforeAll(async () => {
+    const port = await reservePort();
+    directory = await mkdtemp(
+      path.join(os.tmpdir(), "digitalmate-channel-events-"),
+    );
+    database = new EmbeddedPostgres({
+      databaseDir: directory,
+      port,
+      user: "postgres",
+      password: "digitalmate-test",
+      persistent: false,
+      onLog: () => undefined,
+      onError: () => undefined,
+    });
+    await database.initialise();
+    await database.start();
+    pool = new Pool({
+      connectionString:
+        `postgresql://postgres:digitalmate-test@127.0.0.1:${port}/postgres`,
+      max: 12,
+      options: "-c statement_timeout=15000 -c lock_timeout=5000",
+    });
+    lifecycle = trackEmbeddedPostgresPool(pool);
+    await installVectorCompatibility(pool);
+    const schema = adaptSchemaForEmbeddedPostgres(
+      await readFile(
+        path.join(process.cwd(), "src/server/db/schema.sql"),
+        "utf8",
+      ),
+    );
+    await pool.query(schema);
+  }, 60_000);
+
+  beforeEach(async () => {
+    await pool.query(`
+      TRUNCATE channel_delivery_attempts, channel_deliveries,
+        channel_execution_steps, channel_event_attachments,
+        channel_reply_handles, channel_access_requests,
+        channel_access_rules, channel_node_outbox,
+        channel_node_bindings, channel_inbound_events,
+        channel_runtime_nodes, channel_connections,
+        messages, conversations, digital_agents, users CASCADE
+    `);
+    await pool.query(
+      `INSERT INTO users (id, display_name)
+       VALUES ($1, 'Channel User')`,
+      [USER_ID],
+    );
+    await pool.query(
+      `INSERT INTO digital_agents (
+         id, user_id, slug, display_name, is_default
+       )
+       VALUES ($1, $2, 'digitalmate', 'DigitalMate', true)`,
+      [AGENT_ID, USER_ID],
+    );
+    await pool.query(
+      `INSERT INTO channel_connections (
+         id, user_id, agent_id, channel_type, display_name
+       )
+       VALUES
+         ($1, $3, $4, 'telegram', 'Telegram A'),
+         ($2, $3, $4, 'telegram', 'Telegram B')`,
+      [CONNECTION_A, CONNECTION_B, USER_ID, AGENT_ID],
+    );
+  });
+
+  afterAll(async () => {
+    await lifecycle?.stop(database);
+    if (directory) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts the same external event concurrently only once", async () => {
+    const events = createChannelEventRepository(pool);
+    const input = normalizedEvent(CONNECTION_A, "event-1");
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => events.accept(scope, input)),
+    );
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(new Set(results.map((result) => result.event.id))).toHaveLength(1);
+    expect(results[0]?.event.clientTurnId).toBe(
+      channelClientTurnId(CONNECTION_A, "event-1"),
+    );
+  });
+
+  it("permits the same external event id on different connections", async () => {
+    const events = createChannelEventRepository(pool);
+    const first = await events.accept(
+      scope,
+      normalizedEvent(CONNECTION_A, "shared-event"),
+    );
+    const second = await events.accept(
+      scope,
+      normalizedEvent(CONNECTION_B, "shared-event"),
+    );
+
+    expect(first.event.id).not.toBe(second.event.id);
+    expect(first.event.clientTurnId).not.toBe(second.event.clientTurnId);
+  });
+
+  it("rejects a replay whose stable id carries a different payload", async () => {
+    const events = createChannelEventRepository(pool);
+    await events.accept(
+      scope,
+      normalizedEvent(CONNECTION_A, "event-conflict"),
+    );
+
+    await expect(
+      events.accept(scope, {
+        ...normalizedEvent(CONNECTION_A, "event-conflict"),
+        text: "tampered payload",
+      }),
+    ).rejects.toThrow("channel_event_payload_conflict");
+  });
+
+  it("never persists attachment locators or unsealed reply secrets", async () => {
+    const events = createChannelEventRepository(pool);
+    const secretLocator = "temporary-download-token";
+    const secretReply = "temporary-reply-token";
+    await events.accept(scope, {
+      ...normalizedEvent(CONNECTION_A, "event-secret"),
+      attachments: [{
+        externalAttachmentId: "attachment-1",
+        fileName: "note.txt",
+        mimeType: "text/plain",
+        sizeBytes: 12,
+        source: { token: secretLocator },
+      }],
+      replyHandle: {
+        publicFields: { conversationId: "conversation-1" },
+        secretFields: { token: secretReply },
+        expiresAt: new Date("2026-07-26T01:00:00.000Z"),
+      },
+      permission: {
+        webSearch: false,
+        backgroundNetwork: false,
+        tools: false,
+        skills: "none",
+        attachmentsPresent: true,
+      },
+    });
+
+    const stored = await pool.query<{
+      normalized_payload: unknown;
+      payload_hash: string;
+    }>(
+      `SELECT normalized_payload, payload_hash
+       FROM channel_inbound_events
+       WHERE connection_id = $1
+         AND external_event_id = 'event-secret'`,
+      [CONNECTION_A],
+    );
+    const serialized = JSON.stringify(stored.rows[0]);
+
+    expect(serialized).not.toContain(secretLocator);
+    expect(serialized).not.toContain(secretReply);
+    expect(serialized).not.toContain("replyHandle");
+    expect(serialized).not.toContain("\"source\"");
+  });
+
+  it("allows only one of eight workers to claim an event", async () => {
+    const events = createChannelEventRepository(pool, { leaseMs: 1_000 });
+    await events.accept(scope, normalizedEvent(CONNECTION_A, "event-claim"));
+
+    const claims = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        events.claimNext(`worker-${index}`),
+      ),
+    );
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect(claims.find(Boolean)).toMatchObject({
+      attempts: 1,
+      status: "running",
+    });
+  });
+
+  it("prevents an expired owner from completing a reclaimed event", async () => {
+    const start = new Date("2026-07-26T00:00:00.000Z");
+    const events = createChannelEventRepository(pool, { leaseMs: 100 });
+    await events.accept(scope, normalizedEvent(CONNECTION_A, "event-lease"));
+    const first = await events.claimNext("worker-old", start);
+    const second = await events.claimNext(
+      "worker-new",
+      new Date(start.getTime() + 101),
+    );
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    await expect(
+      events.complete(first!, null, new Date(start.getTime() + 102)),
+    ).resolves.toBe(false);
+    await expect(
+      events.complete(second!, null, new Date(start.getTime() + 102)),
+    ).resolves.toBe(true);
+  });
+
+  it("creates one delivery for one persisted assistant message", async () => {
+    const events = createChannelEventRepository(pool);
+    const deliveries = createChannelDeliveryRepository(pool);
+    const accepted = await events.accept(
+      scope,
+      normalizedEvent(CONNECTION_A, "event-delivery"),
+    );
+    await seedAssistantMessage();
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        deliveries.enqueue({
+          scope,
+          eventId: accepted.event.id,
+          connectionId: CONNECTION_A,
+          assistantMessageId: ASSISTANT_MESSAGE_ID,
+          body: "persisted reply",
+          recipient: {
+            externalConversationId: "conversation-1",
+          },
+        }),
+      ),
+    );
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(new Set(results.map((result) => result.delivery.id))).toHaveLength(1);
+  });
+
+  it("can reapply the additive schema without duplicating constraints", async () => {
+    const schema = adaptSchemaForEmbeddedPostgres(
+      await readFile(
+        path.join(process.cwd(), "src/server/db/schema.sql"),
+        "utf8",
+      ),
+    );
+
+    await expect(pool.query(schema)).resolves.toBeDefined();
+  });
+
+  async function seedAssistantMessage(): Promise<void> {
+    await pool.query(
+      `INSERT INTO conversations (
+         id, user_id, agent_id, channel, title
+       )
+       VALUES ($1, $2, $3, 'telegram', 'Channel conversation')`,
+      [CONVERSATION_ID, USER_ID, AGENT_ID],
+    );
+    await pool.query(
+      `INSERT INTO messages (
+         id, user_id, agent_id, conversation_id, role, content
+       )
+       VALUES ($1, $2, $3, $4, 'assistant', 'persisted reply')`,
+      [
+        ASSISTANT_MESSAGE_ID,
+        USER_ID,
+        AGENT_ID,
+        CONVERSATION_ID,
+      ],
+    );
+  }
+});
+
+function normalizedEvent(
+  connectionId: string,
+  externalEventId: string,
+): NormalizedChannelEvent {
+  return {
+    connectionId,
+    agentId: AGENT_ID,
+    channelType: "telegram",
+    externalEventId,
+    externalConversationId: "conversation-1",
+    externalSenderId: "sender-1",
+    chatType: "direct",
+    mentioned: false,
+    text: "hello",
+    thread: {},
+    attachments: [],
+    occurredAt: new Date("2026-07-26T00:00:00.000Z"),
+    receivedAt: new Date("2026-07-26T00:00:01.000Z"),
+    permission: {
+      webSearch: false,
+      backgroundNetwork: false,
+      tools: false,
+      skills: "none",
+      attachmentsPresent: false,
+    },
+    rawSummary: {
+      eventType: "message",
+      messageId: externalEventId,
+    },
+  };
+}
+
+function adaptSchemaForEmbeddedPostgres(source: string): string {
+  return source
+    .replace("CREATE EXTENSION IF NOT EXISTS vector;", "")
+    .replace("CREATE EXTENSION IF NOT EXISTS pgcrypto;", "")
+    .replaceAll("vector(1536)", "vector")
+    .replace(
+      /^CREATE INDEX IF NOT EXISTS idx_memory_entries_embedding.*$/m,
+      "",
+    );
+}
+
+async function installVectorCompatibility(databasePool: Pool): Promise<void> {
+  await databasePool.query(`
+    CREATE DOMAIN vector AS text;
+    CREATE FUNCTION vector_cosine_distance(vector, vector)
+      RETURNS double precision LANGUAGE sql IMMUTABLE AS $$ SELECT 1.0 $$;
+    CREATE OPERATOR <=> (
+      LEFTARG = vector,
+      RIGHTARG = vector,
+      PROCEDURE = vector_cosine_distance
+    );
+  `);
+}
+
+async function reservePort(): Promise<number> {
+  const server = net.createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("failed_to_reserve_port");
+  }
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return port;
+}

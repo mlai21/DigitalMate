@@ -11,6 +11,15 @@ import { embedText } from "@/server/llm/embeddings";
 import type { EnabledToolContext, SkillContext, ToolLogInput } from "@/server/agent/run-agent";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import {
+  createChannelDeliveryRepository,
+} from "@/server/channels/runtime/delivery-repository";
+import {
+  createChannelEventRepository,
+} from "@/server/channels/runtime/event-repository";
+import {
+  createChannelNodeRepository,
+} from "@/server/channels/nodes/repository";
+import {
   getChannelManifest,
   isChannelType,
 } from "@/server/channels/manifests/catalog";
@@ -100,6 +109,58 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "id", "user_id", "agent_id", "channel_type", "display_name", "enabled",
     "config", "revision", "health_status", "created_at", "updated_at",
   ],
+  channel_runtime_nodes: [
+    "id", "user_id", "display_name", "supported_channel_types", "status",
+    "last_heartbeat_at", "created_at", "updated_at",
+  ],
+  channel_node_bindings: [
+    "connection_id", "user_id", "agent_id", "node_id", "created_at",
+  ],
+  channel_inbound_events: [
+    "id", "user_id", "agent_id", "connection_id", "channel_type",
+    "external_event_id", "external_conversation_id", "external_sender_id",
+    "chat_type", "normalized_payload", "permission_envelope",
+    "client_turn_id", "status", "attempts", "failure_code",
+    "assistant_message_id", "occurred_at", "received_at", "completed_at",
+    "created_at", "updated_at",
+  ],
+  channel_execution_steps: [
+    "id", "user_id", "agent_id", "event_id", "step_key", "kind", "status",
+    "error_code", "started_at", "completed_at",
+  ],
+  channel_event_attachments: [
+    "id", "user_id", "agent_id", "event_id", "external_attachment_id",
+    "file_name", "declared_mime_type", "declared_size_bytes",
+    "locator_expires_at", "locator_cleared_at", "private_attachment_id",
+    "created_at",
+  ],
+  channel_reply_handles: [
+    "id", "user_id", "agent_id", "event_id", "expires_at", "created_at",
+  ],
+  channel_deliveries: [
+    "id", "user_id", "agent_id", "event_id", "connection_id",
+    "assistant_message_id", "body", "recipient", "status", "attempts",
+    "next_attempt_at", "last_error_code", "sent_at", "created_at",
+    "updated_at",
+  ],
+  channel_delivery_attempts: [
+    "id", "user_id", "agent_id", "delivery_id", "attempt_no",
+    "segment_no", "status", "error_code", "started_at", "completed_at",
+  ],
+  channel_access_rules: [
+    "id", "user_id", "agent_id", "connection_id", "chat_type",
+    "target_kind", "target_id", "effect", "created_at",
+  ],
+  channel_access_requests: [
+    "id", "user_id", "agent_id", "connection_id", "event_id", "chat_type",
+    "external_sender_id", "external_conversation_id", "status",
+    "created_at", "resolved_at",
+  ],
+  channel_node_outbox: [
+    "id", "user_id", "agent_id", "node_id", "connection_id",
+    "delivery_id", "sequence", "size_bytes", "status", "expires_at",
+    "created_at", "completed_at",
+  ],
   channel_messages: [
     "id", "user_id", "agent_id", "conversation_id", "channel", "external_conversation_id",
     "external_message_id", "sender_id", "chat_type", "text", "occurred_at", "created_at",
@@ -170,6 +231,17 @@ const PERSONAL_DATA_EXPORT_ORDER_BY: {
   proactive_tasks: "id ASC",
   channel_identities: "id ASC",
   channel_connections: "id ASC",
+  channel_runtime_nodes: "id ASC",
+  channel_node_bindings: "connection_id ASC",
+  channel_inbound_events: "id ASC",
+  channel_execution_steps: "id ASC",
+  channel_event_attachments: "id ASC",
+  channel_reply_handles: "id ASC",
+  channel_deliveries: "id ASC",
+  channel_delivery_attempts: "id ASC",
+  channel_access_rules: "id ASC",
+  channel_access_requests: "id ASC",
+  channel_node_outbox: "id ASC",
   channel_messages: "id ASC",
   interjection_decisions: "id ASC",
   reflections: "id ASC",
@@ -207,6 +279,17 @@ const PERSONAL_DATA_EXPORT_LIMITS = Object.freeze({
   maxSerializedBytes: 32 * 1024 * 1024,
 });
 const PERSONAL_DATA_CLEAR_TABLES = [
+  "channel_node_outbox",
+  "channel_delivery_attempts",
+  "channel_deliveries",
+  "channel_reply_handles",
+  "channel_event_attachments",
+  "channel_execution_steps",
+  "channel_access_requests",
+  "channel_access_rules",
+  "channel_inbound_events",
+  "channel_node_bindings",
+  "channel_runtime_nodes",
   "goals",
   "skill_usage_logs",
   "skill_revisions",
@@ -704,6 +787,9 @@ export function createRepositories(
 
   return {
     agents,
+    channelEvents: createChannelEventRepository(pool),
+    channelDeliveries: createChannelDeliveryRepository(pool),
+    channelNodes: createChannelNodeRepository(pool),
     userDataMutations: {
       beginRequest: beginUserDataRequest,
       tryAdmitRequest: tryAdmitUserDataRequest,

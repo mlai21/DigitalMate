@@ -1171,6 +1171,491 @@ BEGIN
 END
 $channel_secret_exposure_fingerprint_constraints$;
 
+CREATE TABLE IF NOT EXISTS channel_runtime_nodes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  display_name text NOT NULL
+    CONSTRAINT channel_runtime_nodes_display_name_check
+    CHECK (btrim(display_name) <> ''),
+  certificate_fingerprint bytea NOT NULL
+    CONSTRAINT channel_runtime_nodes_fingerprint_length_check
+    CHECK (octet_length(certificate_fingerprint) = 32),
+  supported_channel_types text[] NOT NULL DEFAULT '{}'::text[]
+    CONSTRAINT channel_runtime_nodes_supported_types_check
+    CHECK (cardinality(supported_channel_types) <= 17),
+  status text NOT NULL DEFAULT 'disconnected'
+    CONSTRAINT channel_runtime_nodes_status_check
+    CHECK (status IN ('disconnected', 'connected', 'revoked')),
+  last_sequence bigint NOT NULL DEFAULT 0
+    CONSTRAINT channel_runtime_nodes_last_sequence_check
+    CHECK (last_sequence >= 0),
+  last_heartbeat_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (id, user_id),
+  UNIQUE (user_id, certificate_fingerprint)
+);
+
+DO $channel_connections_runtime_node_constraint$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM channel_connections AS connection
+    WHERE connection.runtime_node_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM channel_runtime_nodes AS node
+        WHERE node.id = connection.runtime_node_id
+          AND node.user_id = connection.user_id
+      )
+  ) THEN
+    RAISE EXCEPTION 'channel_runtime_node_binding_invalid'
+      USING ERRCODE = '23503';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_connections'::regclass
+      AND conname = 'channel_connections_runtime_node_id_fkey'
+  ) THEN
+    ALTER TABLE channel_connections
+      ADD CONSTRAINT channel_connections_runtime_node_id_fkey
+      FOREIGN KEY (runtime_node_id, user_id)
+      REFERENCES channel_runtime_nodes(id, user_id)
+      ON DELETE SET NULL (runtime_node_id);
+  END IF;
+END
+$channel_connections_runtime_node_constraint$;
+
+CREATE TABLE IF NOT EXISTS channel_node_bindings (
+  connection_id uuid PRIMARY KEY,
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  node_id uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_node_bindings_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_bindings_node_scope_fkey
+    FOREIGN KEY (node_id, user_id)
+    REFERENCES channel_runtime_nodes(id, user_id)
+    ON DELETE CASCADE,
+  UNIQUE (node_id, connection_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_inbound_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  channel_type text NOT NULL
+    CONSTRAINT channel_inbound_events_channel_type_check
+    CHECK (btrim(channel_type) <> ''),
+  external_event_id text NOT NULL
+    CONSTRAINT channel_inbound_events_external_event_id_check
+    CHECK (btrim(external_event_id) <> ''),
+  external_conversation_id text NOT NULL
+    CONSTRAINT channel_inbound_events_external_conversation_id_check
+    CHECK (btrim(external_conversation_id) <> ''),
+  external_sender_id text NOT NULL
+    CONSTRAINT channel_inbound_events_external_sender_id_check
+    CHECK (btrim(external_sender_id) <> ''),
+  chat_type text NOT NULL
+    CONSTRAINT channel_inbound_events_chat_type_check
+    CHECK (chat_type IN ('direct', 'group')),
+  normalized_payload jsonb NOT NULL
+    CONSTRAINT channel_inbound_events_payload_object_check
+    CHECK (jsonb_typeof(normalized_payload) = 'object'),
+  permission_envelope jsonb NOT NULL
+    CONSTRAINT channel_inbound_events_permission_object_check
+    CHECK (jsonb_typeof(permission_envelope) = 'object'),
+  client_turn_id uuid NOT NULL,
+  payload_hash text NOT NULL
+    CONSTRAINT channel_inbound_events_payload_hash_check
+    CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
+  status text NOT NULL DEFAULT 'accepted'
+    CONSTRAINT channel_inbound_events_status_check
+    CHECK (status IN ('accepted', 'running', 'completed', 'failed')),
+  claim_owner text,
+  claim_expires_at timestamptz,
+  attempts integer NOT NULL DEFAULT 0
+    CONSTRAINT channel_inbound_events_attempts_check
+    CHECK (attempts >= 0),
+  failure_code text,
+  assistant_message_id uuid,
+  occurred_at timestamptz NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_inbound_events_claim_state_check
+    CHECK (
+      (status = 'running'
+        AND claim_owner IS NOT NULL
+        AND claim_expires_at IS NOT NULL)
+      OR status <> 'running'
+    ),
+  CONSTRAINT channel_inbound_events_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_inbound_events_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_inbound_events_message_scope_fkey
+    FOREIGN KEY (assistant_message_id, user_id, agent_id)
+    REFERENCES messages(id, user_id, agent_id)
+    ON DELETE SET NULL (assistant_message_id),
+  UNIQUE (id, user_id, agent_id),
+  UNIQUE (connection_id, external_event_id),
+  UNIQUE (user_id, agent_id, client_turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_execution_steps (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  step_key text NOT NULL
+    CONSTRAINT channel_execution_steps_step_key_check
+    CHECK (btrim(step_key) <> ''),
+  kind text NOT NULL
+    CONSTRAINT channel_execution_steps_kind_check
+    CHECK (
+      kind IN (
+        'llm', 'search', 'tool', 'persist_reply',
+        'schedule', 'delivery'
+      )
+    ),
+  request_hash text NOT NULL
+    CONSTRAINT channel_execution_steps_request_hash_check
+    CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  status text NOT NULL
+    CONSTRAINT channel_execution_steps_status_check
+    CHECK (status IN ('started', 'completed', 'failed', 'ambiguous')),
+  output jsonb
+    CONSTRAINT channel_execution_steps_output_size_check
+    CHECK (output IS NULL OR pg_column_size(output) <= 65536),
+  error_code text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  CONSTRAINT channel_execution_steps_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_execution_steps_event_scope_fkey
+    FOREIGN KEY (event_id, user_id, agent_id)
+    REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (event_id, step_key)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_attachments_scope_identity
+  ON message_attachments(id, user_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS channel_event_attachments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  external_attachment_id text NOT NULL
+    CONSTRAINT channel_event_attachments_external_id_check
+    CHECK (btrim(external_attachment_id) <> ''),
+  file_name text,
+  declared_mime_type text,
+  declared_size_bytes bigint
+    CONSTRAINT channel_event_attachments_declared_size_check
+    CHECK (declared_size_bytes IS NULL OR declared_size_bytes > 0),
+  source_locator_ciphertext bytea NOT NULL
+    CONSTRAINT channel_event_attachments_locator_ciphertext_check
+    CHECK (octet_length(source_locator_ciphertext) > 0),
+  source_locator_nonce bytea NOT NULL
+    CONSTRAINT channel_event_attachments_locator_nonce_check
+    CHECK (octet_length(source_locator_nonce) = 12),
+  source_locator_auth_tag bytea NOT NULL
+    CONSTRAINT channel_event_attachments_locator_auth_tag_check
+    CHECK (octet_length(source_locator_auth_tag) = 16),
+  source_locator_key_version integer NOT NULL
+    CONSTRAINT channel_event_attachments_locator_key_version_check
+    CHECK (source_locator_key_version > 0),
+  locator_expires_at timestamptz NOT NULL,
+  locator_cleared_at timestamptz,
+  private_attachment_id uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_event_attachments_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_event_attachments_event_scope_fkey
+    FOREIGN KEY (event_id, user_id, agent_id)
+    REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_event_attachments_private_scope_fkey
+    FOREIGN KEY (private_attachment_id, user_id, agent_id)
+    REFERENCES message_attachments(id, user_id, agent_id)
+    ON DELETE SET NULL (private_attachment_id),
+  UNIQUE (event_id, external_attachment_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_reply_handles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  public_fields jsonb NOT NULL DEFAULT '{}'::jsonb
+    CONSTRAINT channel_reply_handles_public_fields_check
+    CHECK (
+      jsonb_typeof(public_fields) = 'object'
+      AND pg_column_size(public_fields) <= 65536
+    ),
+  secret_ciphertext bytea NOT NULL
+    CONSTRAINT channel_reply_handles_secret_ciphertext_check
+    CHECK (octet_length(secret_ciphertext) > 0),
+  secret_nonce bytea NOT NULL
+    CONSTRAINT channel_reply_handles_secret_nonce_check
+    CHECK (octet_length(secret_nonce) = 12),
+  secret_auth_tag bytea NOT NULL
+    CONSTRAINT channel_reply_handles_secret_auth_tag_check
+    CHECK (octet_length(secret_auth_tag) = 16),
+  key_version integer NOT NULL
+    CONSTRAINT channel_reply_handles_key_version_check
+    CHECK (key_version > 0),
+  expires_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_reply_handles_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_reply_handles_event_scope_fkey
+    FOREIGN KEY (event_id, user_id, agent_id)
+    REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (id, user_id, agent_id),
+  UNIQUE (event_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_deliveries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  assistant_message_id uuid NOT NULL,
+  reply_handle_id uuid,
+  body text NOT NULL
+    CONSTRAINT channel_deliveries_body_size_check
+    CHECK (octet_length(body) <= 1048576),
+  recipient jsonb NOT NULL
+    CONSTRAINT channel_deliveries_recipient_check
+    CHECK (
+      jsonb_typeof(recipient) = 'object'
+      AND pg_column_size(recipient) <= 65536
+    ),
+  status text NOT NULL DEFAULT 'queued'
+    CONSTRAINT channel_deliveries_status_check
+    CHECK (
+      status IN (
+        'queued', 'running', 'retry', 'waiting_node',
+        'sent', 'dead_letter', 'cancelled'
+      )
+    ),
+  claim_owner text,
+  claim_expires_at timestamptz,
+  attempts integer NOT NULL DEFAULT 0
+    CONSTRAINT channel_deliveries_attempts_check
+    CHECK (attempts >= 0),
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  last_error_code text,
+  sent_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_deliveries_claim_state_check
+    CHECK (
+      (status = 'running'
+        AND claim_owner IS NOT NULL
+        AND claim_expires_at IS NOT NULL)
+      OR status <> 'running'
+    ),
+  CONSTRAINT channel_deliveries_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_deliveries_event_scope_fkey
+    FOREIGN KEY (event_id, user_id, agent_id)
+    REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_deliveries_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_deliveries_message_scope_fkey
+    FOREIGN KEY (assistant_message_id, user_id, agent_id)
+    REFERENCES messages(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_deliveries_reply_handle_scope_fkey
+    FOREIGN KEY (reply_handle_id, user_id, agent_id)
+    REFERENCES channel_reply_handles(id, user_id, agent_id)
+    ON DELETE SET NULL (reply_handle_id),
+  UNIQUE (id, user_id, agent_id),
+  UNIQUE (event_id),
+  UNIQUE (connection_id, assistant_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_delivery_attempts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  delivery_id uuid NOT NULL,
+  attempt_no integer NOT NULL
+    CONSTRAINT channel_delivery_attempts_attempt_no_check
+    CHECK (attempt_no > 0),
+  segment_no integer NOT NULL DEFAULT 1
+    CONSTRAINT channel_delivery_attempts_segment_no_check
+    CHECK (segment_no > 0),
+  status text NOT NULL
+    CONSTRAINT channel_delivery_attempts_status_check
+    CHECK (status IN ('started', 'sent', 'retryable', 'failed')),
+  platform_result jsonb
+    CONSTRAINT channel_delivery_attempts_result_size_check
+    CHECK (
+      platform_result IS NULL
+      OR pg_column_size(platform_result) <= 65536
+    ),
+  error_code text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  CONSTRAINT channel_delivery_attempts_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_delivery_attempts_delivery_scope_fkey
+    FOREIGN KEY (delivery_id, user_id, agent_id)
+    REFERENCES channel_deliveries(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (delivery_id, attempt_no, segment_no)
+);
+
+CREATE TABLE IF NOT EXISTS channel_access_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  chat_type text NOT NULL
+    CONSTRAINT channel_access_rules_chat_type_check
+    CHECK (chat_type IN ('direct', 'group')),
+  target_kind text NOT NULL
+    CONSTRAINT channel_access_rules_target_kind_check
+    CHECK (target_kind IN ('sender', 'conversation')),
+  target_id text NOT NULL
+    CONSTRAINT channel_access_rules_target_id_check
+    CHECK (btrim(target_id) <> ''),
+  effect text NOT NULL
+    CONSTRAINT channel_access_rules_effect_check
+    CHECK (effect IN ('allow', 'deny')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_access_rules_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_access_rules_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (
+    connection_id, chat_type, target_kind, target_id
+  )
+);
+
+CREATE TABLE IF NOT EXISTS channel_access_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  chat_type text NOT NULL
+    CONSTRAINT channel_access_requests_chat_type_check
+    CHECK (chat_type IN ('direct', 'group')),
+  external_sender_id text NOT NULL
+    CONSTRAINT channel_access_requests_sender_check
+    CHECK (btrim(external_sender_id) <> ''),
+  external_conversation_id text NOT NULL
+    CONSTRAINT channel_access_requests_conversation_check
+    CHECK (btrim(external_conversation_id) <> ''),
+  status text NOT NULL DEFAULT 'pending'
+    CONSTRAINT channel_access_requests_status_check
+    CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  CONSTRAINT channel_access_requests_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_access_requests_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_access_requests_event_scope_fkey
+    FOREIGN KEY (event_id, user_id, agent_id)
+    REFERENCES channel_inbound_events(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (event_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_access_requests_pending
+  ON channel_access_requests(
+    connection_id, chat_type, external_sender_id,
+    external_conversation_id
+  )
+  WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS channel_node_outbox (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  node_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  delivery_id uuid NOT NULL,
+  sequence bigint NOT NULL
+    CONSTRAINT channel_node_outbox_sequence_check
+    CHECK (sequence > 0),
+  frame jsonb NOT NULL
+    CONSTRAINT channel_node_outbox_frame_check
+    CHECK (
+      jsonb_typeof(frame) = 'object'
+      AND pg_column_size(frame) <= 1048576
+    ),
+  size_bytes integer NOT NULL
+    CONSTRAINT channel_node_outbox_size_check
+    CHECK (size_bytes > 0 AND size_bytes <= 1048576),
+  status text NOT NULL DEFAULT 'pending'
+    CONSTRAINT channel_node_outbox_status_check
+    CHECK (status IN ('pending', 'sent', 'failed', 'expired')),
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  CONSTRAINT channel_node_outbox_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_outbox_node_scope_fkey
+    FOREIGN KEY (node_id, user_id)
+    REFERENCES channel_runtime_nodes(id, user_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_outbox_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id, agent_id)
+    REFERENCES channel_connections(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_outbox_delivery_scope_fkey
+    FOREIGN KEY (delivery_id, user_id, agent_id)
+    REFERENCES channel_deliveries(id, user_id, agent_id)
+    ON DELETE CASCADE,
+  UNIQUE (node_id, sequence),
+  UNIQUE (delivery_id)
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1213,6 +1698,23 @@ CREATE INDEX IF NOT EXISTS idx_channel_connections_scope_type_active
 CREATE INDEX IF NOT EXISTS idx_channel_connections_scope_health
   ON channel_connections(user_id, agent_id, health_status)
   WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_channel_inbound_events_claimable
+  ON channel_inbound_events(status, claim_expires_at, received_at)
+  WHERE status IN ('accepted', 'running');
+CREATE INDEX IF NOT EXISTS idx_channel_inbound_events_scope_received
+  ON channel_inbound_events(
+    user_id, agent_id, connection_id, received_at DESC
+  );
+CREATE INDEX IF NOT EXISTS idx_channel_deliveries_claimable
+  ON channel_deliveries(status, next_attempt_at, claim_expires_at)
+  WHERE status IN ('queued', 'retry', 'running');
+CREATE INDEX IF NOT EXISTS idx_channel_deliveries_scope_created
+  ON channel_deliveries(user_id, agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_runtime_nodes_heartbeat
+  ON channel_runtime_nodes(status, last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_channel_node_outbox_pending
+  ON channel_node_outbox(node_id, sequence)
+  WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_scope_created
   ON admin_audit_logs(user_id, agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_resource_created

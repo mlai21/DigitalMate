@@ -976,6 +976,12 @@ describe("personal data helpers", () => {
     expect(sql[0]).toBe("BEGIN");
     expect(sql.at(-1)).toBe("COMMIT");
     expect(sql).toContain("DELETE FROM agent_resource_grants WHERE user_id = $1");
+    expect(sql).toContain(
+      "DELETE FROM channel_inbound_events WHERE user_id = $1",
+    );
+    expect(sql).toContain(
+      "DELETE FROM channel_runtime_nodes WHERE user_id = $1",
+    );
     const fingerprintDelete = sql.findIndex((statement) =>
       statement.includes(
         "DELETE FROM channel_secret_exposure_fingerprints",

@@ -25,6 +25,49 @@ const AGENT_SCOPED_TABLES = [
 ] as const;
 
 describe("database schema", () => {
+  it("defines the channel transaction, delivery, access, and node ledgers", async () => {
+    const schema = await readFile(
+      path.join(process.cwd(), "src/server/db/schema.sql"),
+      "utf8",
+    );
+
+    for (const table of [
+      "channel_inbound_events",
+      "channel_execution_steps",
+      "channel_event_attachments",
+      "channel_reply_handles",
+      "channel_deliveries",
+      "channel_delivery_attempts",
+      "channel_access_rules",
+      "channel_access_requests",
+      "channel_runtime_nodes",
+      "channel_node_bindings",
+      "channel_node_outbox",
+    ]) {
+      expect(schema).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+    }
+
+    expect(schema).toContain(
+      "UNIQUE (connection_id, external_event_id)",
+    );
+    expect(schema).toContain(
+      "UNIQUE (user_id, agent_id, client_turn_id)",
+    );
+    expect(schema).toContain(
+      "UNIQUE (connection_id, assistant_message_id)",
+    );
+    expect(schema).toContain("channel_inbound_events_connection_scope_fkey");
+    expect(schema).toContain("channel_execution_steps_event_scope_fkey");
+    expect(schema).toContain("channel_deliveries_event_scope_fkey");
+    expect(schema).toContain("channel_deliveries_message_scope_fkey");
+    expect(schema).toContain("channel_connections_runtime_node_id_fkey");
+    expect(schema).toContain("channel_runtime_node_binding_invalid");
+    expect(schema).toContain("pg_column_size(output) <= 65536");
+    expect(schema).toContain("pg_column_size(platform_result) <= 65536");
+    expect(schema).toContain("idx_channel_inbound_events_claimable");
+    expect(schema).toContain("idx_channel_deliveries_claimable");
+  });
+
   it("defines P0 business tables with user ownership", async () => {
     const schema = await readFile(path.join(process.cwd(), "src/server/db/schema.sql"), "utf8");
 
