@@ -72,6 +72,44 @@ describe("channel runtime start", () => {
     ).resolves.toBe("streaming");
   });
 
+  it("小艺 A2A 固定使用可恢复的任务分片事务", async () => {
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "xiaoyi" as const,
+        enabled: true,
+        revision: 1,
+        config: {
+          ak: "ak",
+          sk: "sk",
+          agent_id: "agent-xiaoyi",
+          task_timeout_ms: 3_600_000,
+        },
+      })),
+      createAdapter: () => ({
+        streaming: vi.fn(),
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send: vi.fn(),
+      }),
+      loadReplyHandle: vi.fn(),
+    });
+
+    await expect(
+      transport.mode(
+        delivery,
+        new AbortController().signal,
+      ),
+    ).resolves.toBe("task-streaming");
+    await expect(
+      transport.taskSegmentCodePointLimit!(
+        delivery,
+        new AbortController().signal,
+      ),
+    ).resolves.toBe(4_000);
+  });
+
   it("发送 Worker 从加密仓储加载配置和回复句柄", async () => {
     const send = vi.fn(async () => ({
       externalMessageId: "platform-1",
@@ -282,6 +320,35 @@ describe("channel runtime start", () => {
         },
       }),
     );
+  });
+
+  it("小艺任务句柄过期后不允许退化为主动消息", async () => {
+    const enqueueProactive = vi.fn();
+    const result = await enqueueProactiveChannelDelivery({
+      pool: {
+        query: vi.fn(),
+      } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-xiaoyi-1",
+      assistantMessageId: "assistant-xiaoyi-1",
+      content: "不应主动发送",
+      target: {
+        channel: "xiaoyi",
+        externalConversationId: "session-alice",
+        externalMessageId: "message-xiaoyi-1",
+        senderId: "session-alice",
+        chatType: "direct",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: false });
+    expect(enqueueProactive).not.toHaveBeenCalled();
   });
 
   it("清空数据删除已 claim 事件后不会复活旧消息", async () => {

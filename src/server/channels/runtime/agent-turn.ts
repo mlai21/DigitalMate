@@ -234,7 +234,19 @@ export function toLegacyChannelMessage(
 ): NormalizedChannelMessage {
   const event = context.claim.normalizedEvent;
   if (
-    !["telegram", "slack", "feishu", "dingtalk"]
+    ![
+      "telegram",
+      "discord",
+      "slack",
+      "mattermost",
+      "feishu",
+      "dingtalk",
+      "qq",
+      "mqtt",
+      "matrix",
+      "wecom",
+      "xiaoyi",
+    ]
       .includes(event.channelType)
   ) {
     throw new Error("channel_legacy_message_unsupported");

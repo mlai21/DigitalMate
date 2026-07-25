@@ -579,6 +579,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     description: "连接华为小艺智能体",
     runtime: "central",
     capabilities: [],
+    prerequisites: ["华为小艺智能体 A2A 接入资格"],
     platformFields: [
       stringField("ak", "Access Key"),
       secretField("sk", "Secret Key", false, true),

@@ -243,6 +243,32 @@ describe("channel agent turn", () => {
       platformMessageId: "m-1",
     });
   });
+
+  it("小艺事件进入唯一 DigitalMate Agent 而非第二套运行时", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("小艺渠道回复"),
+    );
+    const context = createContext({
+      channelType: "xiaoyi",
+    });
+
+    await expect(runner.decideTurn(context))
+      .resolves.toEqual({ kind: "proceed" });
+    await expect(
+      collect(runner.runAgentTurn(context)),
+    ).resolves.toBe("小艺渠道回复");
+    expect(repositories.channels.createChannelMessage)
+      .toHaveBeenCalledWith(
+        scope,
+        expect.objectContaining({
+          message: expect.objectContaining({
+            channel: "xiaoyi",
+          }),
+        }),
+      );
+  });
 });
 
 function createRunner(
@@ -267,6 +293,7 @@ function createContext(
     skillPermission?: "none" | "explicit_slash";
     attachmentsPresent?: boolean;
     rawSummary?: Record<string, string>;
+    channelType?: "telegram" | "xiaoyi";
   } = {},
   journal = memoryJournal(),
 ): ChannelAgentTurnContext {
@@ -277,7 +304,7 @@ function createContext(
     normalizedEvent: {
       connectionId: "connection-1",
       agentId: scope.agentId,
-      channelType: "telegram",
+      channelType: overrides.channelType ?? "telegram",
       externalEventId:
         overrides.externalEventId ?? "event-1",
       externalConversationId: "chat-1",

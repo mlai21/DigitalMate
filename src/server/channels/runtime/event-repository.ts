@@ -461,6 +461,27 @@ function eventPayloadHash(
     ...stableEvent
   } = stored;
   void _localReceiptTime;
+  if (stored.channelType === "xiaoyi") {
+    const {
+      occurredAt: _localOccurrenceTime,
+      rawSummary,
+      ...stableXiaoYiEvent
+    } = stableEvent;
+    const {
+      serverName: _deliveryRoute,
+      ...stableRawSummary
+    } = rawSummary;
+    void _localOccurrenceTime;
+    void _deliveryRoute;
+    return hashCanonical({
+      normalizedEvent: {
+        ...stableXiaoYiEvent,
+        rawSummary: stableRawSummary,
+      },
+      permission,
+      replyHandleRequired,
+    });
+  }
   return hashCanonical({
     normalizedEvent: stableEvent,
     permission,

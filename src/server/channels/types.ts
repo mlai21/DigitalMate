@@ -34,6 +34,7 @@ export type ChannelName =
   | "mqtt"
   | "matrix"
   | "wecom"
+  | "xiaoyi"
   | "web";
 
 export type NormalizedChannelMessage = {

@@ -1,0 +1,19 @@
+{
+  "msgType": "message",
+  "agentId": "agent-xiaoyi",
+  "id": "message-1",
+  "method": "message/stream",
+  "params": {
+    "sessionId": "session-alice",
+    "id": "task-9901",
+    "message": {
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "你好，DigitalMate"
+        }
+      ]
+    }
+  }
+}

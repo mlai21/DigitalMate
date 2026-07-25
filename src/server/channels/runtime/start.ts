@@ -77,6 +77,13 @@ import {
   createWeComAdapter,
 } from "@/server/channels/adapters/wecom";
 import {
+  createXiaoYiAdapter,
+} from "@/server/channels/adapters/xiaoyi";
+import {
+  createXiaoYiAttachmentFetcher,
+  prepareXiaoYiAttachmentBatch,
+} from "@/server/channels/adapters/xiaoyi/transport";
+import {
   createTelegramTransport,
 } from "@/server/channels/adapters/telegram/transport";
 import { createSlackWebhookAdapter } from "@/server/channels/adapters/webhook/slack";
@@ -468,6 +475,12 @@ export function createChannelDeliveryTransport(input: Readonly<{
         input,
         delivery,
       );
+      if (
+        resolved.channelType === "xiaoyi"
+        && resolved.adapter.streaming
+      ) {
+        return "task-streaming";
+      }
       return resolved.adapter.streaming
         && resolved.config.streaming_enabled === true
         && (
@@ -484,6 +497,27 @@ export function createChannelDeliveryTransport(input: Readonly<{
         )
         ? "streaming"
         : "segmented";
+    },
+
+    async taskSegmentCodePointLimit(delivery) {
+      try {
+        const resolved = await resolveDeliveryTarget(
+          input,
+          delivery,
+        );
+        if (resolved.channelType !== "xiaoyi") return 4_000;
+        const prefix =
+          typeof resolved.config.bot_prefix === "string"
+            ? resolved.config.bot_prefix
+            : "";
+        return Math.max(
+          1,
+          4_000 - Array.from(prefix).length,
+        );
+      } catch {
+        // The normal send path records the stable delivery error.
+        return 4_000;
+      }
     },
 
     async send(part, signal): Promise<SendResult> {
@@ -520,7 +554,10 @@ export function createChannelDeliveryTransport(input: Readonly<{
           ...(replyHandle ? { replyHandle } : {}),
         };
         if (
-          part.mode === "streaming"
+          (
+            part.mode === "streaming"
+            || part.mode === "task-streaming"
+          )
           && resolved.adapter.streaming
         ) {
           return await resolved.adapter.streaming(
@@ -584,7 +621,11 @@ async function resolveDeliveryTarget(
       retryable: false,
     });
   }
-  return { adapter, config };
+  return {
+    adapter,
+    config,
+    channelType: connection.channelType,
+  };
 }
 
 type ManagedAdapterDependencies = Readonly<{
@@ -627,6 +668,11 @@ function createManagedAdapter(
       ) as ChannelAdapter<Record<string, unknown>>;
     case "wecom":
       return createManagedWeComAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
+    case "xiaoyi":
+      return createManagedXiaoYiAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
@@ -909,6 +955,170 @@ function createManagedWeComAdapter(
                   },
                   signal,
                 });
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
+}
+
+function createManagedXiaoYiAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const attachmentFetcher =
+    createXiaoYiAttachmentFetcher();
+  const adapter = createXiaoYiAdapter({
+    scope: connection.scope,
+    attachmentFetcher,
+    acceptControl: (event, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          const access = createChannelAccessControl(
+            dependencies.pool,
+          );
+          const decision = await access.evaluate(
+            scope,
+            event,
+          );
+          const accepted =
+            await dependencies.repositories.channelEvents.accept(
+              scope,
+              event,
+              {
+                initialStatus: "failed",
+                failureCode: decision.allowed
+                  ? "xiaoyi_control_completed"
+                  : decision.reason,
+              },
+            );
+          if (
+            accepted.created
+            && decision.kind === "pending"
+          ) {
+            await access.recordPendingRequest(
+              scope,
+              accepted.event,
+            );
+          }
+          return accepted.created && decision.allowed;
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+    acceptInbound: (
+      payload,
+      context,
+      scope,
+    ) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                  {
+                    firstWriteWinsPublicFields: [
+                      "serverName",
+                    ],
+                    firstWriteWinsExpiresAt: true,
+                  },
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 15 * 60 * 1_000,
+              );
+              const pendingAttachments =
+                await prepareXiaoYiAttachmentBatch({
+                  scope: event.scope,
+                  eventId: event.id,
+                  connectionId: event.connectionId,
+                  descriptors: normalized.attachments,
+                  expiresAt,
+                  receivedAt: context.receivedAt,
+                  locators,
+                  fetcher: attachmentFetcher,
+                  signal,
+                });
+              try {
+                for (const descriptor of pendingAttachments) {
+                  await downloadInboundAttachment({
+                    scope: event.scope,
+                    descriptor,
+                    fetcher: attachmentFetcher,
+                    storageRoot:
+                      dependencies.attachmentStorageDir,
+                    repository:
+                      dependencies.repositories.messageAttachments,
+                    bindPrivateAttachment: async (
+                      attachmentId,
+                    ) => {
+                      const bound =
+                        await locators.bindPrivateAttachment(
+                          event.scope,
+                          event.id,
+                          descriptor.externalAttachmentId,
+                          attachmentId,
+                          new Date(),
+                        );
+                      if (!bound) {
+                        throw new Error(
+                          "attachment_bind_transition_failed",
+                        );
+                      }
+                    },
+                    signal,
+                  });
+                }
+              } finally {
+                for (const descriptor of pendingAttachments) {
+                  attachmentFetcher.release(descriptor);
+                }
               }
             },
           });

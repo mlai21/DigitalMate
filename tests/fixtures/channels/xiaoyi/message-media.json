@@ -1,0 +1,28 @@
+{
+  "msgType": "message",
+  "agentId": "agent-xiaoyi",
+  "id": "message-2",
+  "method": "message/stream",
+  "params": {
+    "sessionId": "session-bob",
+    "id": "task-9902",
+    "message": {
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "看看这张图"
+        },
+        {
+          "kind": "file",
+          "file": {
+            "name": "xiaoyi-image.png",
+            "mimeType": "image/png",
+            "sizeBytes": 1024,
+            "uri": "https://digitalmate-fixture.obs.cn-north-4.myhuaweicloud.com/xiaoyi/image.png"
+          }
+        }
+      ]
+    }
+  }
+}

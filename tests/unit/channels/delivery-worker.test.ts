@@ -138,6 +138,61 @@ describe("channel delivery retry", () => {
     expect(harness.state.status).toBe("sent");
   });
 
+  it("persists XiaoYi task chunks before advancing to the next visible frame", async () => {
+    const body = "😀".repeat(8_001);
+    const harness = deliveryHarness({
+      body,
+      mode: "task-streaming",
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-task")
+    );
+
+    await harness.worker.runOne();
+
+    const parts = harness.transport.send.mock.calls.map(
+      ([part]) => part,
+    );
+    expect(parts).toHaveLength(4);
+    expect(parts.at(-1)?.body).toBe(body);
+    let previousLength = 0;
+    expect(parts.map((part) => {
+      const currentLength = Array.from(part.body).length;
+      const deltaLength = currentLength - previousLength;
+      previousLength = currentLength;
+      return deltaLength;
+    })).toEqual([4_000, 4_000, 1, 0]);
+    expect(parts.map((part) => part.state)).toEqual([
+      { sequence: 1, final: false },
+      { sequence: 2, final: false },
+      { sequence: 3, final: false },
+      { sequence: 4, final: true },
+    ]);
+    expect(harness.state.status).toBe("sent");
+  });
+
+  it("resumes XiaoYi at the failed task chunk without resending prior text", async () => {
+    const body = "文".repeat(4_001);
+    const harness = deliveryHarness({
+      body,
+      mode: "task-streaming",
+    });
+    harness.transport.send
+      .mockResolvedValueOnce(sendResult("platform-task"))
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce(sendResult("platform-task"))
+      .mockResolvedValueOnce(sendResult("platform-task"));
+
+    await harness.worker.runOne();
+    harness.advanceToRetry();
+    await harness.worker.runOne();
+
+    expect(harness.transport.send.mock.calls.map(
+      ([part]) => Array.from(part.body).length,
+    )).toEqual([4_000, 4_001, 4_001, 4_001]);
+    expect(harness.state.status).toBe("sent");
+  });
+
   it("continues after a partial segmented send without duplicating sent segments", async () => {
     const harness = deliveryHarness({
       body: "第一段。\n\n第二段。",
@@ -211,7 +266,7 @@ type FakeStatus =
 
 function deliveryHarness(options: {
   body?: string;
-  mode?: "segmented" | "streaming";
+  mode?: "segmented" | "streaming" | "task-streaming";
   cadence?: {
     responseDelayMs: number;
     segmentDelayMs: number;

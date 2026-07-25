@@ -13,12 +13,23 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from "vitest";
 
 import type { AgentScope } from "@/server/agents/types";
 import {
+  createXiaoYiAdapter,
+} from "@/server/channels/adapters/xiaoyi";
+import {
+  createXiaoYiAttachmentFetcher,
+  prepareXiaoYiAttachmentBatch,
+} from "@/server/channels/adapters/xiaoyi/transport";
+import {
   createChannelAccessControl,
 } from "@/server/channels/runtime/access";
+import type {
+  ChannelAdapter,
+} from "@/server/channels/runtime/adapter";
 import {
   createChannelAttachmentLocatorRepository,
 } from "@/server/channels/runtime/attachment-ingress";
@@ -26,6 +37,12 @@ import {
   channelClientTurnId,
   createChannelEventRepository,
 } from "@/server/channels/runtime/event-repository";
+import {
+  acceptInbound,
+} from "@/server/channels/runtime/ingress";
+import {
+  createChannelReplyHandleRepository,
+} from "@/server/channels/runtime/reply-handle";
 import { createChannelDeliveryRepository } from "@/server/channels/runtime/delivery-repository";
 import type { NormalizedChannelEvent } from "@/server/channels/runtime/types";
 import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
@@ -154,6 +171,267 @@ describe("channel event transaction ledger", () => {
     expect(first.created).toBe(true);
     expect(retry.created).toBe(false);
     expect(retry.event.id).toBe(first.event.id);
+  });
+
+  it("deduplicates XiaoYi dual-link ingress and keeps the first reply route", async () => {
+    const keyState = createChannelSecretsKey(
+      Buffer.alloc(32, 47).toString("base64"),
+    );
+    if (keyState.status !== "ready") {
+      throw new Error("test_channel_key_invalid");
+    }
+    const events = createChannelEventRepository(pool);
+    const handles = createChannelReplyHandleRepository(
+      pool,
+      keyState.key,
+    );
+    const adapter = createXiaoYiAdapter({
+      autoListen: false,
+    });
+    adapter.validateConfig({
+      enabled: true,
+      ak: "xiaoyi-ak",
+      sk: "xiaoyi-sk",
+      agent_id: "xiaoyi-agent",
+      task_timeout_ms: 3_600_000,
+    });
+    const frame = {
+      agentId: "xiaoyi-agent",
+      id: "message-dual-1",
+      method: "message/stream",
+      params: {
+        sessionId: "session-dual",
+        id: "task-dual-1",
+        message: {
+          role: "user",
+          parts: [{ kind: "text", text: "双路去重" }],
+        },
+      },
+    };
+    const access = {
+      evaluate: async () => ({
+        kind: "allowed" as const,
+        allowed: true as const,
+      }),
+      recordPendingRequest: async () => undefined,
+    };
+    const ingest = (
+      serverName: "primary" | "backup",
+      receivedAt: Date,
+    ) => acceptInbound({
+      adapter: adapter as ChannelAdapter<
+        Record<string, unknown>
+      >,
+      payload: { serverName, payload: frame },
+      context: {
+        connectionId: CONNECTION_A,
+        agentId: AGENT_ID,
+        receivedAt,
+      },
+      scope,
+      access,
+      events,
+      afterPersist: async (event, normalized) => {
+        await handles.persist(
+          scope,
+          event.id,
+          CONNECTION_A,
+          normalized.replyHandle!,
+          receivedAt,
+          {
+            firstWriteWinsPublicFields: ["serverName"],
+            firstWriteWinsExpiresAt: true,
+          },
+        );
+      },
+    });
+    const firstReceivedAt =
+      new Date("2026-07-26T00:00:00.000Z");
+
+    const first = await ingest("primary", firstReceivedAt);
+    const duplicate = await ingest(
+      "backup",
+      new Date(firstReceivedAt.getTime() + 1),
+    );
+
+    expect(first).toMatchObject({ kind: "accepted" });
+    if (first.kind !== "accepted") {
+      throw new Error("xiaoyi_first_ingress_not_accepted");
+    }
+    expect(duplicate).toMatchObject({
+      kind: "duplicate",
+      eventId: first.eventId,
+    });
+    const handleId = await handles.findIdForEvent(
+      scope,
+      first.eventId,
+    );
+    expect(handleId).not.toBeNull();
+    await expect(
+      handles.load(scope, handleId!, firstReceivedAt),
+    ).resolves.toMatchObject({
+      publicFields: {
+        sessionId: "session-dual",
+        serverName: "primary",
+      },
+      secretFields: {
+        taskId: "task-dual-1",
+        messageId: "message-dual-1",
+      },
+      expiresAt: new Date(
+        firstReceivedAt.getTime() + 3_600_000,
+      ),
+    });
+  });
+
+  it("does not fetch a bound XiaoYi attachment again on the backup link", async () => {
+    const keyState = createChannelSecretsKey(
+      Buffer.alloc(32, 53).toString("base64"),
+    );
+    if (keyState.status !== "ready") {
+      throw new Error("test_channel_key_invalid");
+    }
+    const events = createChannelEventRepository(pool);
+    const handles = createChannelReplyHandleRepository(
+      pool,
+      keyState.key,
+    );
+    const locators = createChannelAttachmentLocatorRepository(
+      pool,
+      keyState.key,
+    );
+    const adapter = createXiaoYiAdapter({
+      autoListen: false,
+    });
+    adapter.validateConfig({
+      enabled: true,
+      ak: "xiaoyi-ak",
+      sk: "xiaoyi-sk",
+      agent_id: "xiaoyi-agent",
+      task_timeout_ms: 3_600_000,
+    });
+    const fetchImpl = vi.fn(async () => new Response(
+      "hello",
+      {
+        status: 200,
+        headers: {
+          "content-length": "5",
+          "content-type": "text/plain",
+        },
+      },
+    ));
+    const fetcher = createXiaoYiAttachmentFetcher(
+      fetchImpl as typeof fetch,
+    );
+    const frame = {
+      agentId: "xiaoyi-agent",
+      id: "message-dual-attachment",
+      method: "message/stream",
+      params: {
+        sessionId: "session-dual-attachment",
+        id: "task-dual-attachment",
+        message: {
+          role: "user",
+          parts: [{
+            kind: "file",
+            file: {
+              name: "note.txt",
+              mimeType: "text/plain",
+              sizeBytes: 5,
+              uri:
+                "https://digitalmate-fixture.obs.cn-north-4.myhuaweicloud.com/note.txt",
+            },
+          }],
+        },
+      },
+    };
+    const access = {
+      evaluate: async () => ({
+        kind: "allowed" as const,
+        allowed: true as const,
+      }),
+      recordPendingRequest: async () => undefined,
+    };
+    const ingest = (
+      serverName: "primary" | "backup",
+      receivedAt: Date,
+    ) => acceptInbound({
+      adapter: adapter as ChannelAdapter<
+        Record<string, unknown>
+      >,
+      payload: { serverName, payload: frame },
+      context: {
+        connectionId: CONNECTION_A,
+        agentId: AGENT_ID,
+        receivedAt,
+      },
+      scope,
+      access,
+      events,
+      afterPersist: async (event, normalized) => {
+        await handles.persist(
+          scope,
+          event.id,
+          CONNECTION_A,
+          normalized.replyHandle!,
+          receivedAt,
+          {
+            firstWriteWinsPublicFields: ["serverName"],
+            firstWriteWinsExpiresAt: true,
+          },
+        );
+        const pending = await prepareXiaoYiAttachmentBatch({
+          scope,
+          eventId: event.id,
+          connectionId: CONNECTION_A,
+          descriptors: normalized.attachments,
+          expiresAt: new Date(
+            receivedAt.getTime() + 15 * 60 * 1_000,
+          ),
+          receivedAt,
+          locators,
+          fetcher,
+        });
+        for (const descriptor of pending) {
+          await pool.query(
+            `INSERT INTO message_attachments (
+               id, user_id, agent_id, kind, file_name,
+               mime_type, size_bytes, storage_key, status
+             )
+             VALUES (
+               $1, $2, $3, 'document', 'note.txt',
+               'text/plain', 5,
+               '70000000-0000-4000-8000-000000000001',
+               'ready'
+             )`,
+            [
+              "70000000-0000-4000-8000-000000000001",
+              USER_ID,
+              AGENT_ID,
+            ],
+          );
+          await expect(locators.bindPrivateAttachment(
+            scope,
+            event.id,
+            descriptor.externalAttachmentId,
+            "70000000-0000-4000-8000-000000000001",
+            receivedAt,
+          )).resolves.toBe(true);
+          fetcher.release(descriptor);
+        }
+      },
+    });
+    const firstReceivedAt =
+      new Date("2026-07-26T00:00:00.000Z");
+
+    await expect(
+      ingest("primary", firstReceivedAt),
+    ).resolves.toMatchObject({ kind: "accepted" });
+    await expect(ingest(
+      "backup",
+      new Date(firstReceivedAt.getTime() + 1),
+    )).resolves.toMatchObject({ kind: "duplicate" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("permits the same external event id on different connections", async () => {

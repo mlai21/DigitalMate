@@ -11,7 +11,10 @@ const DEFAULT_MAX_ATTEMPTS = 8;
 
 export type { DeliverySegmentStart };
 
-export type ChannelDeliveryMode = "segmented" | "streaming";
+export type ChannelDeliveryMode =
+  | "segmented"
+  | "streaming"
+  | "task-streaming";
 
 export type ChannelDeliveryPart = Readonly<{
   delivery: ClaimedChannelDelivery;
@@ -28,6 +31,10 @@ export type ChannelDeliveryTransport = Readonly<{
     delivery: ClaimedChannelDelivery,
     signal: AbortSignal,
   ): Promise<ChannelDeliveryMode>;
+  taskSegmentCodePointLimit?(
+    delivery: ClaimedChannelDelivery,
+    signal: AbortSignal,
+  ): Promise<number>;
   send(
     part: ChannelDeliveryPart,
     signal: AbortSignal,
@@ -226,6 +233,36 @@ export function segmentDeliveryBody(
   ];
 }
 
+export function segmentTaskDeliveryBody(
+  body: string,
+  maxCodePoints = 4_000,
+): string[] {
+  if (
+    !Number.isInteger(maxCodePoints)
+    || maxCodePoints <= 0
+    || maxCodePoints > 4_000
+  ) {
+    throw new Error("channel_task_segment_limit_invalid");
+  }
+  const codePoints = Array.from(body);
+  const segments: string[] = [];
+  for (
+    let index = 0;
+    index < codePoints.length;
+    index += maxCodePoints
+  ) {
+    segments.push(
+      codePoints
+        .slice(index, index + maxCodePoints)
+        .join(""),
+    );
+  }
+  if (segments.length > 0) {
+    segments.push("");
+  }
+  return segments;
+}
+
 async function processDelivery(input: {
   claim: ClaimedChannelDelivery;
   deliveries: DeliveryRepository;
@@ -261,10 +298,18 @@ async function processDelivery(input: {
     input.claim,
     input.signal,
   );
-  const segments = segmentDeliveryBody(
-    input.claim.body,
-    input.cadence,
-  );
+  const segments = mode === "task-streaming"
+    ? segmentTaskDeliveryBody(
+        input.claim.body,
+        await input.transport.taskSegmentCodePointLimit?.(
+          input.claim,
+          input.signal,
+        ) ?? 4_000,
+      )
+    : segmentDeliveryBody(
+        input.claim.body,
+        input.cadence,
+      );
   if (segments.length === 0) {
     await requireClaimMutation(
       input.deliveries.deadLetter(
@@ -313,13 +358,14 @@ async function processDelivery(input: {
     try {
       const cumulativeBody = segments
         .slice(0, segmentNo)
-        .join("\n\n");
+        .join(mode === "task-streaming" ? "" : "\n\n");
       result = await input.transport.send({
         delivery: input.claim,
         mode,
         segmentNo,
         segmentCount: segments.length,
         body: mode === "streaming"
+          || mode === "task-streaming"
           ? cumulativeBody
           : segment,
         state: {
@@ -461,7 +507,10 @@ function validateSendResult(
     || result.rawSummary === null
     || Array.isArray(result.rawSummary)
     || (
-      mode === "streaming"
+      (
+        mode === "streaming"
+        || mode === "task-streaming"
+      )
       && previousResult !== null
       && previousResult.externalMessageId
         !== result.externalMessageId

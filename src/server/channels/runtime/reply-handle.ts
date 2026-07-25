@@ -23,6 +23,11 @@ type ReplyHandleRow = {
   expires_at: Date | string | null;
 };
 
+export type ReplyHandlePersistOptions = Readonly<{
+  firstWriteWinsPublicFields?: readonly string[];
+  firstWriteWinsExpiresAt?: boolean;
+}>;
+
 export function createChannelReplyHandleRepository(
   pool: Pool,
   key: ChannelSecretsKey,
@@ -34,6 +39,7 @@ export function createChannelReplyHandleRepository(
       connectionId: string,
       handle: UnsealedReplyHandle,
       now = new Date(),
+      options: ReplyHandlePersistOptions = {},
     ): Promise<string> {
       const publicFields = normalizeFields(
         handle.publicFields,
@@ -43,6 +49,10 @@ export function createChannelReplyHandleRepository(
         handle.secretFields,
         true,
       );
+      const firstWriteWinsPublicFields =
+        normalizeFirstWriteWinsFields(
+          options.firstWriteWinsPublicFields,
+        );
       validateExpiry(handle.expiresAt, now);
       const secretPlaintext = JSON.stringify(secretFields);
       const encrypted = key.encrypt(secretPlaintext, {
@@ -92,9 +102,16 @@ export function createChannelReplyHandleRepository(
       const stored = unseal(scope, existing, key);
       if (
         existing.connection_id !== connectionId
-        || !sameFields(stored.publicFields, publicFields)
+        || !sameFieldsExcept(
+          stored.publicFields,
+          publicFields,
+          firstWriteWinsPublicFields,
+        )
         || !sameFields(stored.secretFields, secretFields)
-        || !sameDate(stored.expiresAt, handle.expiresAt)
+        || (
+          options.firstWriteWinsExpiresAt !== true
+          && !sameDate(stored.expiresAt, handle.expiresAt)
+        )
       ) {
         throw new Error("channel_reply_handle_payload_conflict");
       }
@@ -147,6 +164,24 @@ export function createChannelReplyHandleRepository(
       return row ? unseal(scope, row, key) : null;
     },
   };
+}
+
+function normalizeFirstWriteWinsFields(
+  value: readonly string[] | undefined,
+): ReadonlySet<string> {
+  if (value === undefined) return new Set();
+  if (
+    value.length > 8
+    || new Set(value).size !== value.length
+    || value.some((fieldName) =>
+      !/^[a-zA-Z][a-zA-Z0-9_-]{0,127}$/.test(fieldName)
+    )
+  ) {
+    throw new Error(
+      "channel_reply_handle_persist_options_invalid",
+    );
+  }
+  return new Set(value);
 }
 
 async function readByEvent(
@@ -270,6 +305,25 @@ function sameFields(
   const leftEntries = Object.entries(left).sort();
   const rightEntries = Object.entries(right).sort();
   return JSON.stringify(leftEntries) === JSON.stringify(rightEntries);
+}
+
+function sameFieldsExcept(
+  left: Record<string, string>,
+  right: Record<string, string>,
+  ignored: ReadonlySet<string>,
+): boolean {
+  return sameFields(
+    Object.fromEntries(
+      Object.entries(left).filter(
+        ([fieldName]) => !ignored.has(fieldName),
+      ),
+    ),
+    Object.fromEntries(
+      Object.entries(right).filter(
+        ([fieldName]) => !ignored.has(fieldName),
+      ),
+    ),
+  );
 }
 
 function sameDate(left: Date | null, right: Date | null): boolean {
