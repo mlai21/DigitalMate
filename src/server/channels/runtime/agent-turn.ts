@@ -19,20 +19,13 @@ import type { LlmRouteConfig } from "@/server/llm/router";
 import type { createRepositories } from "@/server/db/repositories";
 
 import { shouldInterject } from "../interjection";
-import {
-  hashExecutionRequest,
-  type ExecutionJournal,
-} from "./execution-journal";
+import { hashExecutionRequest } from "./execution-journal";
 import type {
   ChannelAgentTurnContext,
   ChannelTurnDecision,
 } from "./turn-executor";
 
 type Repositories = ReturnType<typeof createRepositories>;
-
-type ChannelSettings = Awaited<
-  ReturnType<Repositories["settings"]["get"]>
->;
 
 type ResolvedModel = Readonly<{
   client: LlmClient;

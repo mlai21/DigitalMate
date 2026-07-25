@@ -11,6 +11,8 @@ const eslintConfig = defineConfig([
     ".next/**",
     "out/**",
     "build/**",
+    "public/_admin-console/**",
+    "vendor/qwenpaw-console/**",
     "next-env.d.ts",
   ]),
 ]);

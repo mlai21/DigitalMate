@@ -36,7 +36,6 @@ import type {
 import {
   ChannelSendError,
   createChannelDeliveryWorker,
-  type ChannelDeliveryPart,
   type ChannelDeliveryTransport,
 } from "./delivery-worker";
 import { createChannelEventWorker } from "./event-worker";
