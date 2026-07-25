@@ -6,6 +6,7 @@ import {
 import type { ChannelAdapter } from "./adapter";
 import type { AdapterDependencies } from "./types";
 import { createDiscordAdapter } from "../adapters/discord";
+import { createMattermostAdapter } from "../adapters/mattermost";
 import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
 
@@ -136,6 +137,22 @@ export function registerSlackChannelAdapter(
               return result;
             },
           }
+        : {}),
+    })
+  );
+}
+
+export function registerMattermostChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("mattermost", (dependencies) =>
+    createMattermostAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
         : {}),
     })
   );

@@ -1,0 +1,13 @@
+{
+  "event": "posted",
+  "seq": 42,
+  "data": {
+    "channel_type": "O",
+    "post": "{\"id\":\"post-124\",\"channel_id\":\"channel-team\",\"user_id\":\"user-101\",\"message\":\"@mate 看一下附件\",\"create_at\":1785024001000,\"root_id\":\"root-100\",\"file_ids\":[\"file-100\"]}"
+  },
+  "broadcast": {
+    "channel_id": "channel-team",
+    "user_id": "user-101",
+    "team_id": "team-1"
+  }
+}

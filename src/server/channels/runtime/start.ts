@@ -16,6 +16,15 @@ import {
   createDiscordAttachmentFetcher,
 } from "@/server/channels/adapters/discord/transport";
 import {
+  createMattermostAdapter,
+} from "@/server/channels/adapters/mattermost";
+import {
+  parseMattermostConfig,
+} from "@/server/channels/adapters/mattermost/config";
+import {
+  createMattermostAttachmentFetcher,
+} from "@/server/channels/adapters/mattermost/transport";
+import {
   createSlackAdapter,
 } from "@/server/channels/adapters/slack";
 import {
@@ -561,6 +570,11 @@ function createManagedAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
+    case "mattermost":
+      return createManagedMattermostAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     case "telegram":
       return createManagedTelegramAdapter(
         connection,
@@ -580,6 +594,112 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedMattermostAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createMattermostAdapter({
+    scope: connection.scope,
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const fetcher =
+                createMattermostAttachmentFetcher(
+                  parseMattermostConfig(connection.config),
+                );
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (!persisted) continue;
+                await downloadInboundAttachment({
+                  scope: event.scope,
+                  descriptor,
+                  fetcher,
+                  storageRoot:
+                    dependencies.attachmentStorageDir,
+                  repository:
+                    dependencies.repositories.messageAttachments,
+                  bindPrivateAttachment: async (
+                    attachmentId,
+                  ) => {
+                    const bound =
+                      await locators.bindPrivateAttachment(
+                        event.scope,
+                        event.id,
+                        descriptor.externalAttachmentId,
+                        attachmentId,
+                        new Date(),
+                      );
+                    if (!bound) {
+                      throw new Error(
+                        "attachment_bind_transition_failed",
+                      );
+                    }
+                  },
+                  signal,
+                });
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedSlackAdapter(

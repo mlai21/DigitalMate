@@ -1,0 +1,12 @@
+{
+  "event": "posted",
+  "seq": 41,
+  "data": {
+    "channel_type": "D",
+    "post": "{\"id\":\"post-123\",\"channel_id\":\"channel-dm\",\"user_id\":\"user-100\",\"message\":\"你好\",\"create_at\":1785024000000,\"root_id\":\"\",\"file_ids\":[]}"
+  },
+  "broadcast": {
+    "channel_id": "channel-dm",
+    "user_id": "user-100"
+  }
+}
