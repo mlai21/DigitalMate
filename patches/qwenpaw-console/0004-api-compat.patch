@@ -1525,7 +1525,7 @@ index ce104e5..661a6c0 100644
      });
 
 diff --git a/src/api/request.test.ts b/src/api/request.test.ts
-index ce94f9a..de70478 100644
+index ce94f9a..0bb84e7 100644
 --- a/src/api/request.test.ts
 +++ b/src/api/request.test.ts
 @@ -1,19 +1,23 @@
@@ -1584,11 +1584,11 @@ index ce94f9a..de70478 100644
 +    mockFetch(200, { data: "ok" });
 +
 +    await request("/models", { method: "POST", body: "{}" });
-+    let headers: Headers = (fetch as any).mock.calls[0][1].headers;
++    let headers = new Headers(vi.mocked(fetch).mock.calls[0]?.[1]?.headers);
 +    expect(headers.get("x-csrf-token")).toBe("csrf-value");
 +
 +    await request("/models");
-+    headers = (fetch as any).mock.calls[1][1].headers;
++    headers = new Headers(vi.mocked(fetch).mock.calls[1]?.[1]?.headers);
 +    expect(headers.has("x-csrf-token")).toBe(false);
 +  });
 +
@@ -2786,34 +2786,19 @@ index 2b7fac0..c28a5eb 100644
              block
              className={`${styles.authBtn} ${
                collapsed ? styles.authBtnCollapsed : ""
-diff --git a/src/layouts/registry/builtinRoutes.tsx b/src/layouts/registry/builtinRoutes.tsx
-index e8f9fd1..dd0d4f7 100644
---- a/src/layouts/registry/builtinRoutes.tsx
-+++ b/src/layouts/registry/builtinRoutes.tsx
-@@ -13,7 +13,9 @@
-  * Naming convention mirrors builtinMenu: `core.<key>`.
-  */
- import { Suspense, useEffect } from "react";
+diff --git a/src/layouts/registry/CodingCapabilityRoute.tsx b/src/layouts/registry/CodingCapabilityRoute.tsx
+new file mode 100644
+index 0000000..6057b48
+--- /dev/null
++++ b/src/layouts/registry/CodingCapabilityRoute.tsx
+@@ -0,0 +1,19 @@
 +import { Result } from "antd";
- import { Navigate } from "react-router-dom";
 +import { useTranslation } from "react-i18next";
- import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
- import { routeRegistry } from "../../plugins/registry/store";
- import type { Route } from "../../plugins/registry/types";
-@@ -21,6 +23,8 @@ import type { Route } from "../../plugins/registry/types";
- // Eager pages
- import CodingPage from "../../pages/Coding";
-
++import CodingPage from "../../pages/Coding";
++
 +const CODING_CAPABILITY = "unsupported" as const;
 +
- // Lazy pages
- const ChannelsPage = lazyImportWithRetry("../../pages/Control/Channels");
- const SessionsPage = lazyImportWithRetry("../../pages/Control/Sessions");
-@@ -66,6 +70,20 @@ function DigitalMateHomeRedirect() {
-   return null;
- }
-
-+function CodingCapabilityRoute() {
++export default function CodingCapabilityRoute() {
 +  const { t } = useTranslation();
 +  if (CODING_CAPABILITY === "unsupported") {
 +    return (
@@ -2826,11 +2811,24 @@ index e8f9fd1..dd0d4f7 100644
 +  }
 +  return <CodingPage />;
 +}
-+
- /** Synonym for /acp. Kept for plugins / external links that reference uppercase. */
- function ACPRedirect() {
-   return <Navigate to="/acp" replace />;
-@@ -74,7 +92,7 @@ function ACPRedirect() {
+diff --git a/src/layouts/registry/builtinRoutes.tsx b/src/layouts/registry/builtinRoutes.tsx
+index bb2aea6..340582e 100644
+--- a/src/layouts/registry/builtinRoutes.tsx
++++ b/src/layouts/registry/builtinRoutes.tsx
+@@ -17,11 +17,9 @@ import { Navigate } from "react-router-dom";
+ import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
+ import { routeRegistry } from "../../plugins/registry/store";
+ import type { Route } from "../../plugins/registry/types";
++import CodingCapabilityRoute from "./CodingCapabilityRoute";
+ import DigitalMateHomeRedirect from "./DigitalMateHomeRedirect";
+
+-// Eager pages
+-import CodingPage from "../../pages/Coding";
+-
+ // Lazy pages
+ const ChannelsPage = lazyImportWithRetry("../../pages/Control/Channels");
+ const SessionsPage = lazyImportWithRetry("../../pages/Control/Sessions");
+@@ -68,7 +66,7 @@ function ACPRedirect() {
  export const BUILTIN_ROUTES: Route[] = [
    { id: "core.root", path: "/", component: DefaultRedirect },
    { id: "core.chat", path: "/chat/*", component: DigitalMateHomeRedirect },
