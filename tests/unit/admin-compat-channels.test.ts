@@ -13,6 +13,10 @@ import type {
 } from "@/server/admin/compat/handlers/channels";
 import { createAdminAuthStatusResponse } from "@/server/admin/compat/security";
 import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
+import {
+  ChannelAdapterRegistry,
+  registerStandardChannelAdapters,
+} from "@/server/channels/runtime/registry";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const AGENT_ID = "10000000-0000-4000-8000-000000000011";
@@ -108,6 +112,28 @@ async function request(
 }
 
 describe("admin compatibility channel contract", () => {
+  it("registers every M4-A standard channel adapter exactly once", () => {
+    const registry = new ChannelAdapterRegistry();
+
+    registerStandardChannelAdapters(registry);
+
+    expect(registry.registeredTypes()).toEqual(
+      expect.arrayContaining([
+        "telegram",
+        "discord",
+        "slack",
+        "mattermost",
+        "feishu",
+        "dingtalk",
+        "qq",
+      ]),
+    );
+    expect(registry.registeredTypes()).toHaveLength(7);
+    expect(() => registerStandardChannelAdapters(registry)).toThrow(
+      "duplicate_channel_adapter:telegram",
+    );
+  });
+
   it("returns the fixed 17 types and built-in strict schemas", async () => {
     const router = createCoreAdminCompatRouter(dependencies());
     const types = await router.dispatch(

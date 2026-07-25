@@ -220,3 +220,15 @@ export function registerQQChannelAdapter(
     })
   );
 }
+
+export function registerStandardChannelAdapters(
+  registry: ChannelAdapterRegistry,
+): void {
+  registerTelegramChannelAdapter(registry);
+  registerDiscordChannelAdapter(registry);
+  registerSlackChannelAdapter(registry);
+  registerMattermostChannelAdapter(registry);
+  registerFeishuChannelAdapter(registry);
+  registerDingTalkChannelAdapter(registry);
+  registerQQChannelAdapter(registry);
+}

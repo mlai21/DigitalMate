@@ -44,7 +44,15 @@ import {
   runPreparedConsoleTests,
 } from "../../scripts/qwenpaw-console/test.mjs";
 import * as consoleTestScript from "../../scripts/qwenpaw-console/test.mjs";
+import {
+  __testing as channelParityTesting,
+  auditChannelParity,
+} from "../../scripts/qwenpaw-console/audit-channel-parity.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
+import {
+  getChannelManifest,
+  isChannelType,
+} from "../../src/server/channels/manifests/catalog";
 
 const { UPSTREAM } = qwenpawSync;
 const execFileAsync = promisify(execFile);
@@ -1751,6 +1759,188 @@ describe("QwenPaw Console snapshot", () => {
         "snapshot directory hash mismatch",
       );
     });
+  });
+});
+
+describe("QwenPaw standard channel parity audit", () => {
+  const ledgerPath = path.resolve(
+    "docs/verification/qwenpaw-channel-parity.md",
+  );
+  const requiredChannels = [
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "feishu",
+    "dingtalk",
+    "qq",
+  ];
+
+  type LedgerFixture = {
+    channel: string;
+    upstream: {
+      config_fields: string[];
+      source_files: string[];
+      source_sha256: string;
+    };
+    intentional_differences: string[];
+  };
+
+  async function withLedgerFixture(
+    update: (ledger: LedgerFixture[]) => void,
+    run: (fixturePath: string) => Promise<void>,
+  ): Promise<void> {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-channel-parity-"),
+    );
+    try {
+      const markdown = await readFile(ledgerPath, "utf8");
+      const ledger = structuredClone(
+        channelParityTesting.extractLedger(markdown),
+      ) as LedgerFixture[];
+      update(ledger);
+      const fixturePath = path.join(temporaryRoot, "parity.md");
+      await writeFile(
+        fixturePath,
+        [
+          "# Fixture",
+          "",
+          "<!-- qwenpaw-channel-parity-ledger:start -->",
+          "```json",
+          JSON.stringify(ledger, null, 2),
+          "```",
+          "<!-- qwenpaw-channel-parity-ledger:end -->",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await run(fixturePath);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  }
+
+  it("核验固定快照与七个非空渠道证据", async () => {
+    await expect(
+      auditChannelParity({ requiredChannels }),
+    ).resolves.toMatchObject({
+      channels: 7,
+      required: 7,
+      tag: "v2.0.0.post3",
+      commit: "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
+    });
+  });
+
+  it("每个上游配置字段都由本地严格 manifest 接受", async () => {
+    const markdown = await readFile(ledgerPath, "utf8");
+    const ledger = channelParityTesting.extractLedger(
+      markdown,
+    ) as LedgerFixture[];
+
+    for (const entry of ledger) {
+      expect(isChannelType(entry.channel)).toBe(true);
+      if (!isChannelType(entry.channel)) continue;
+      const localFields = getChannelManifest(entry.channel).fields.map(
+        (field) => field.name,
+      );
+      expect(
+        entry.upstream.config_fields.filter(
+          (field) => !localFields.includes(field),
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  it.each([
+    {
+      variant: "未知渠道",
+      expected: "unknown channel ledger entry",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[0].channel = "unknown";
+      },
+    },
+    {
+      variant: "重复渠道",
+      expected: "duplicate channel ledger entry",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[1].channel = ledger[0].channel;
+      },
+    },
+    {
+      variant: "空证据",
+      expected: "intentional_differences must not be empty",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[0].intentional_differences = [];
+      },
+    },
+    {
+      variant: "错误源集合哈希",
+      expected: "source_sha256 mismatch",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[0].upstream.source_sha256 = "0".repeat(64);
+      },
+    },
+  ])("拒绝$variant", async ({ expected, update }) => {
+    await withLedgerFixture(update, async (fixturePath) => {
+      await expect(
+        auditChannelParity({
+          ledgerPath: fixturePath,
+          requiredChannels,
+        }),
+      ).rejects.toThrow(expected);
+    });
+  });
+
+  it("拒绝命令行和程序化入口中的未知或重复必需渠道", async () => {
+    expect(() =>
+      channelParityTesting.parseRequiredChannels([
+        "--require",
+        "telegram,unknown",
+      ]),
+    ).toThrow("unknown required channel:unknown");
+    expect(() =>
+      channelParityTesting.parseRequiredChannels([
+        "--require",
+        "telegram,telegram",
+      ]),
+    ).toThrow("duplicate required channel");
+    await expect(
+      auditChannelParity({
+        requiredChannels: ["telegram", "telegram"],
+      }),
+    ).rejects.toThrow("duplicate required channel");
+  });
+
+  it("拒绝通过父目录符号链接读取证据根之外的文件", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-channel-parity-path-"),
+    );
+    const evidenceRoot = path.join(temporaryRoot, "evidence");
+    const externalRoot = path.join(temporaryRoot, "external");
+    try {
+      await mkdir(evidenceRoot);
+      await mkdir(externalRoot);
+      await writeFile(
+        path.join(externalRoot, "proof.txt"),
+        "outside\n",
+        "utf8",
+      );
+      await symlink(
+        externalRoot,
+        path.join(evidenceRoot, "linked"),
+        "dir",
+      );
+
+      await expect(
+        channelParityTesting.assertRealPathWithin(
+          evidenceRoot,
+          path.join(evidenceRoot, "linked", "proof.txt"),
+          "test evidence",
+        ),
+      ).rejects.toThrow("test evidence escapes its evidence root");
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 });
 
