@@ -14,6 +14,7 @@ export type ChannelContractInput = Readonly<{
   assertOutbound: ContractAssertion;
   assertHealth: ContractAssertion;
   assertShutdown: ContractAssertion;
+  assertBinarySafety?: ContractAssertion;
 }>;
 
 export function defineChannelContract(input: ChannelContractInput): void {
@@ -40,6 +41,12 @@ export function defineChannelContract(input: ChannelContractInput): void {
       "honors abort and closes sockets/timers",
       input.assertShutdown,
     );
+    if (input.assertBinarySafety) {
+      it(
+        "verifies binary fixtures without exposing secret bytes",
+        input.assertBinarySafety,
+      );
+    }
   });
 }
 

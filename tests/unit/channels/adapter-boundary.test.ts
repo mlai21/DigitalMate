@@ -1,4 +1,11 @@
-import { readdir, readFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -18,6 +25,10 @@ import {
   createFakeHttpClient,
   createFakeSocket,
 } from "@/server/channels/testing/fixtures";
+import {
+  readBinaryFixture,
+  redactBinaryDiagnostic,
+} from "@/server/channels/testing/binary-fixtures";
 
 const ADAPTER_KEYS = [
   "manifest",
@@ -155,6 +166,33 @@ describe("ChannelAdapter boundary", () => {
     expect(clock.now().toISOString()).toBe(
       "2026-07-26T00:00:01.500Z",
     );
+  });
+
+  it("hashes binary fixtures and redacts secret bytes from diagnostics", async () => {
+    const temporaryRoot = await mkdtemp(
+      path.join(tmpdir(), "dm-channel-binary-"),
+    );
+    const fixturePath = path.join(temporaryRoot, "frame.bin");
+    try {
+      await writeFile(
+        fixturePath,
+        Buffer.from("prefix-secret-suffix", "utf8"),
+      );
+
+      const fixture = await readBinaryFixture(fixturePath);
+      const diagnostic = redactBinaryDiagnostic(fixture.bytes, [
+        Buffer.from("secret", "utf8"),
+      ]);
+
+      expect(fixture.sha256).toBe(
+        "05d906092b13121358830884cf5c25b682f1657a33299fb0042804c8bad114b5",
+      );
+      expect(diagnostic).toContain("[redacted]");
+      expect(diagnostic).not.toContain("736563726574");
+      expect(diagnostic.length).toBeLessThanOrEqual(512);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 
   it("exports the reusable seven-assertion contract", () => {

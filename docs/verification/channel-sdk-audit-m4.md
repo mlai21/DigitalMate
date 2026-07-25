@@ -11,6 +11,10 @@
 | `@slack/bolt` | `5.0.0` | MIT | Slack Socket Mode |
 | `@larksuiteoapi/node-sdk` | `1.71.1` | MIT | 飞书/Lark WebSocket 与 OpenAPI |
 | `dingtalk-stream-sdk-nodejs` | `2.0.4` | MIT | 钉钉 Stream |
+| `mqtt` | `5.15.2` | MIT | MQTT Broker 连接、订阅与发布 |
+| `matrix-js-sdk` | `41.9.0` | Apache-2.0 | Matrix Sync、房间消息与端到端加密 |
+| `@wecom/aibot-node-sdk` | `1.0.7` | MIT | 企业微信智能机器人长连接 |
+| `protobufjs` | `8.7.1` | BSD-3-Clause | 腾讯元宝固定描述符编解码 |
 | `undici` | `7.28.0` | MIT | 渠道 HTTP 连接与受控代理 |
 | `@types/ws` | `8.18.1` | MIT | WebSocket TypeScript 类型 |
 
