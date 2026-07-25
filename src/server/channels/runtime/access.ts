@@ -77,6 +77,12 @@ export function evaluateChannelAccess(
   }
   const explicitlyAllowed =
     snapshot.allowFrom.includes(event.externalSenderId)
+    || (
+      event.chatType === "group"
+      && snapshot.allowFrom.includes(
+        event.externalConversationId,
+      )
+    )
     || matchingRules.some((rule) => rule.effect === "allow");
   const policy = event.chatType === "direct"
     ? snapshot.directPolicy
@@ -174,13 +180,20 @@ async function readAccessSnapshot(
      ORDER BY created_at, id`,
     [event.connectionId, scope.userId, scope.agentId],
   );
-  return snapshotFromConfig(row, rules.rows);
+  return snapshotFromConfig(row, rules.rows, event);
 }
 
 function snapshotFromConfig(
   row: ChannelConnectionAccessRow,
   rules: readonly ChannelAccessRuleRow[],
+  event: NormalizedChannelEvent,
 ): ChannelAccessSnapshot {
+  const roomConfig = event.chatType === "group"
+    ? readRoomConfig(
+        row.config,
+        event.externalConversationId,
+      )
+    : {};
   return {
     exists: true,
     enabled: row.enabled,
@@ -189,8 +202,16 @@ function snapshotFromConfig(
     groupDisabled: readBoolean(row.config, "group_disabled"),
     directPolicy: readPolicy(row.config, "dm_policy"),
     groupPolicy: readPolicy(row.config, "group_policy"),
-    allowFrom: readStringList(row.config, "allow_from"),
-    requireMention: readBoolean(row.config, "require_mention"),
+    allowFrom: Array.from(new Set([
+      ...readStringList(row.config, "allow_from"),
+      ...readStringList(row.config, "group_allow_from"),
+    ])),
+    requireMention:
+      roomConfig.autoReply === true
+        ? false
+        : typeof roomConfig.requireMention === "boolean"
+          ? roomConfig.requireMention
+          : readBoolean(row.config, "require_mention"),
     directApprovalRequired: readBoolean(
       row.config,
       "access_control_dm",
@@ -259,4 +280,37 @@ function readStringList(
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : [];
+}
+
+function readRoomConfig(
+  config: Record<string, unknown>,
+  roomId: string,
+): Readonly<{
+  autoReply?: boolean;
+  requireMention?: boolean;
+}> {
+  const groups = isRecord(config.groups)
+    ? config.groups
+    : {};
+  const room = isRecord(groups[roomId])
+    ? groups[roomId]
+    : isRecord(groups["*"])
+      ? groups["*"]
+      : {};
+  return {
+    ...(typeof room.autoReply === "boolean"
+      ? { autoReply: room.autoReply }
+      : {}),
+    ...(typeof room.requireMention === "boolean"
+      ? { requireMention: room.requireMention }
+      : {}),
+  };
+}
+
+function isRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value);
 }

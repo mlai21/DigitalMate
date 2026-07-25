@@ -9,6 +9,7 @@ import { createDingTalkAdapter } from "../adapters/dingtalk";
 import { createDiscordAdapter } from "../adapters/discord";
 import { createFeishuAdapter } from "../adapters/feishu";
 import { createMattermostAdapter } from "../adapters/mattermost";
+import { createMatrixAdapter } from "../adapters/matrix";
 import { createMqttAdapter } from "../adapters/mqtt";
 import { createQQAdapter } from "../adapters/qq";
 import { createSlackAdapter } from "../adapters/slack";
@@ -227,6 +228,22 @@ export function registerMqttChannelAdapter(
 ): void {
   registry.register("mqtt", (dependencies) =>
     createMqttAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
+export function registerMatrixChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("matrix", (dependencies) =>
+    createMatrixAdapter({
       now: dependencies.now,
       ...(dependencies.scope
         ? { scope: dependencies.scope }

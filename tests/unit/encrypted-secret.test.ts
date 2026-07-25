@@ -213,6 +213,43 @@ describe("encrypted channel secret", () => {
     expect(state.key.decrypt(encrypted, CONTEXT)).toBe(PLAINTEXT);
   });
 
+  it("derives isolated opaque runtime storage keys", () => {
+    const state = createChannelSecretsKey(
+      KEY.toString("base64"),
+    );
+    if (state.status !== "ready") {
+      throw new Error("expected_ready_key");
+    }
+    const context = {
+      userId: CONTEXT.userId,
+      agentId: CONTEXT.agentId,
+      connectionId: CONTEXT.connectionId,
+    };
+    const first = state.key.runtimeStorageKey(
+      "matrix-crypto-store",
+      context,
+    );
+    const second = state.key.runtimeStorageKey(
+      "matrix-crypto-store",
+      context,
+    );
+    const otherAgent = state.key.runtimeStorageKey(
+      "matrix-crypto-store",
+      {
+        ...context,
+        agentId:
+          "20000000-0000-4000-8000-000000000012",
+      },
+    );
+
+    expect(first).toHaveLength(32);
+    expect(first).toEqual(second);
+    expect(first).not.toEqual(otherAgent);
+    expect(JSON.stringify(state.key)).not.toContain(
+      first.toString("base64"),
+    );
+  });
+
   it.each([
     ["user", { ...CONTEXT, userId: "20000000-0000-4000-8000-000000000002" }],
     ["agent", { ...CONTEXT, agentId: "10000000-0000-4000-8000-000000000012" }],

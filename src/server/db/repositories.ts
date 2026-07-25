@@ -3267,6 +3267,17 @@ export function createRepositories(
         );
         return result.rows.map((row) => row.storage_key);
       },
+      async listMatrixConnectionIds(userId: string): Promise<string[]> {
+        const result = await pool.query<{ id: string }>(
+          `SELECT id::text AS id
+           FROM channel_connections
+           WHERE user_id = $1
+             AND channel_type = 'matrix'
+           ORDER BY created_at ASC, id ASC`,
+          [userId],
+        );
+        return result.rows.map((row) => row.id);
+      },
       async clear(userId: string): Promise<void> {
         const client = await pool.connect();
         const clientGuard = guardPoolClientWithAbort(client);

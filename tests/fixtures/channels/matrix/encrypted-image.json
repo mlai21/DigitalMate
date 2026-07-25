@@ -1,0 +1,34 @@
+{
+  "eventId": "$image-event:example.org",
+  "roomId": "!dm-room:example.org",
+  "senderId": "@alice:example.org",
+  "botUserId": "@digitalmate:example.org",
+  "eventType": "m.room.message",
+  "timestamp": 1785024003000,
+  "isDirect": true,
+  "encrypted": true,
+  "visionEnabled": true,
+  "mediaHomeserver": "https://matrix.example.org",
+  "mediaAccessToken": "fixture-media-token",
+  "content": {
+    "msgtype": "m.image",
+    "body": "pixel.png",
+    "info": {
+      "mimetype": "image/png",
+      "size": 8
+    },
+    "file": {
+      "url": "mxc://example.org/media-123",
+      "key": {
+        "alg": "A256CTR",
+        "kty": "oct",
+        "k": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+      },
+      "iv": "AwMDAwMDAwMDAwMDAwMDAw==",
+      "hashes": {
+        "sha256": "F/1xVG9FlyZqwhMZxX+vmuCOdOI8NEuMgCJ/x0ZV2KE="
+      },
+      "v": "v2"
+    }
+  }
+}

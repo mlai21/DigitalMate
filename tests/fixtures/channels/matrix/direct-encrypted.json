@@ -1,0 +1,24 @@
+{
+  "eventId": "$event-123:example.org",
+  "roomId": "!dm-room:example.org",
+  "senderId": "@alice:example.org",
+  "botUserId": "@digitalmate:example.org",
+  "eventType": "m.room.message",
+  "timestamp": 1785024000000,
+  "isDirect": true,
+  "encrypted": true,
+  "content": {
+    "msgtype": "m.text",
+    "body": "加密消息已解密",
+    "m.mentions": {
+      "user_ids": [
+        "@digitalmate:example.org"
+      ]
+    },
+    "m.relates_to": {
+      "m.in_reply_to": {
+        "event_id": "$parent:example.org"
+      }
+    }
+  }
+}

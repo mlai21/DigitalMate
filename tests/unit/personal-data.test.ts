@@ -305,6 +305,34 @@ describe("personal data helpers", () => {
     expect(params).toEqual(["user-1"]);
   });
 
+  it("lists only the requested user's Matrix connection ids before clearing crypto stores", async () => {
+    const query = vi.fn(async () => ({
+      rows: [{ id: "connection-matrix-1" }],
+    }));
+    const repositories = createRepositories({
+      query,
+      connect: vi.fn(async () => ({
+        query,
+        release: vi.fn(),
+      })),
+    } as unknown as Pool);
+
+    await expect(
+      repositories.personalData.listMatrixConnectionIds(
+        "user-1",
+      ),
+    ).resolves.toEqual(["connection-matrix-1"]);
+
+    const [sql, params] = query.mock.calls[0] as unknown as [
+      string,
+      unknown[],
+    ];
+    expect(sql).toContain("FROM channel_connections");
+    expect(sql).toContain("WHERE user_id = $1");
+    expect(sql).toContain("channel_type = 'matrix'");
+    expect(params).toEqual(["user-1"]);
+  });
+
   it("clears unbound attachment rows as well as message-bound attachments", async () => {
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
       void params;

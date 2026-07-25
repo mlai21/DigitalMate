@@ -43,6 +43,12 @@ import {
   createMattermostAttachmentFetcher,
 } from "@/server/channels/adapters/mattermost/transport";
 import {
+  createMatrixAdapter,
+} from "@/server/channels/adapters/matrix";
+import {
+  createMatrixAttachmentFetcher,
+} from "@/server/channels/adapters/matrix/transport";
+import {
   createMqttAdapter,
 } from "@/server/channels/adapters/mqtt";
 import {
@@ -89,6 +95,9 @@ import {
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
+import type {
+  ChannelSecretsKey,
+} from "@/server/security/encrypted-secret";
 
 import type { ChannelAdapter } from "./adapter";
 import { createChannelAgentTurnRunner } from "./agent-turn";
@@ -186,6 +195,7 @@ export async function startChannelRuntime(input: Readonly<{
   const managedAdapterDependencies = {
     pool,
     repositories: input.repositories,
+    secretKey,
     replyHandles,
     attachmentLocators,
     attachmentStorageDir: input.env.attachmentStorageDir,
@@ -391,6 +401,7 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
       "dingtalk",
       "qq",
       "mqtt",
+      "matrix",
     ]
       .includes(input.target.channel)
   ) {
@@ -575,6 +586,7 @@ async function resolveDeliveryTarget(
 type ManagedAdapterDependencies = Readonly<{
   pool: Pool;
   repositories: Repositories;
+  secretKey: ChannelSecretsKey | null;
   replyHandles: ReturnType<
     typeof createChannelReplyHandleRepository
   > | null;
@@ -601,6 +613,11 @@ function createManagedAdapter(
       ) as ChannelAdapter<Record<string, unknown>>;
     case "mqtt":
       return createManagedMqttAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
+    case "matrix":
+      return createManagedMatrixAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
@@ -634,6 +651,119 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedMatrixAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const cryptoStorageKey =
+    dependencies.secretKey?.runtimeStorageKey(
+      "matrix-crypto-store",
+      {
+        userId: connection.scope.userId,
+        agentId: connection.scope.agentId,
+        connectionId: connection.id,
+      },
+    );
+  const adapter = createMatrixAdapter({
+    scope: connection.scope,
+    ...(cryptoStorageKey ? { cryptoStorageKey } : {}),
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const fetcher = createMatrixAttachmentFetcher();
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (!persisted) continue;
+                await downloadInboundAttachment({
+                  scope: event.scope,
+                  descriptor,
+                  fetcher,
+                  storageRoot:
+                    dependencies.attachmentStorageDir,
+                  repository:
+                    dependencies.repositories.messageAttachments,
+                  bindPrivateAttachment: async (
+                    attachmentId,
+                  ) => {
+                    const bound =
+                      await locators.bindPrivateAttachment(
+                        event.scope,
+                        event.id,
+                        descriptor.externalAttachmentId,
+                        attachmentId,
+                        new Date(),
+                      );
+                    if (!bound) {
+                      throw new Error(
+                        "attachment_bind_transition_failed",
+                      );
+                    }
+                  },
+                  signal,
+                });
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedMqttAdapter(

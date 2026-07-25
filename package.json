@@ -31,6 +31,7 @@
     "cheerio": "^1.2.0",
     "dingtalk-stream-sdk-nodejs": "2.0.4",
     "discord.js": "14.27.0",
+    "fake-indexeddb": "6.2.5",
     "lucide-react": "^1.23.0",
     "matrix-js-sdk": "41.9.0",
     "mqtt": "5.15.2",

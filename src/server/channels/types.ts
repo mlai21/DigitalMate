@@ -32,6 +32,7 @@ export type ChannelName =
   | "dingtalk"
   | "qq"
   | "mqtt"
+  | "matrix"
   | "web";
 
 export type NormalizedChannelMessage = {

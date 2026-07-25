@@ -9,6 +9,8 @@ import type { UserDataLease } from "@/server/db/repositories";
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const OWNED_KEY = "10000000-0000-4000-8000-000000000001";
 const OTHER_KEY = "20000000-0000-4000-8000-000000000002";
+const MATRIX_CONNECTION_ID =
+  "30000000-0000-4000-8000-000000000003";
 
 const mocks = vi.hoisted(() => ({
   callOrder: [] as string[],
@@ -18,6 +20,10 @@ const mocks = vi.hoisted(() => ({
   releaseConnectionDrain: vi.fn(),
   hasEnabledChannelConnections: vi.fn(async () => false),
   listAttachmentStorageKeys: vi.fn(async () => [OWNED_KEY]),
+  listMatrixConnectionIds: vi.fn(async () => [
+    MATRIX_CONNECTION_ID,
+  ]),
+  deleteMatrixCryptoStoreDirectory: vi.fn(async () => undefined),
   clear: vi.fn(async () => undefined),
   acquireUserMutationLock: vi.fn<(userId: string) => Promise<UserDataLease>>(),
   releaseUserMutationLock: vi.fn(async () => undefined),
@@ -50,6 +56,17 @@ vi.mock("@/server/config/env", () => ({
   readEnv: vi.fn(() => ({ attachmentStorageDir: mocks.attachmentStorageDir })),
 }));
 
+vi.mock(
+  "@/server/channels/adapters/matrix/crypto-store",
+  () => ({
+    defaultMatrixCryptoStorageRoot: vi.fn(
+      () => "/private/matrix/connections",
+    ),
+    deleteMatrixCryptoStoreDirectory:
+      mocks.deleteMatrixCryptoStoreDirectory,
+  }),
+);
+
 vi.mock("@/server/db/repositories", () => ({
   createRepositories: mocks.createRepositories,
 }));
@@ -70,6 +87,15 @@ describe("admin personal data clear route", () => {
       mocks.callOrder.push("enumerate");
       return [OWNED_KEY];
     });
+    mocks.listMatrixConnectionIds.mockImplementation(async () => {
+      mocks.callOrder.push("enumerate-matrix");
+      return [MATRIX_CONNECTION_ID];
+    });
+    mocks.deleteMatrixCryptoStoreDirectory.mockImplementation(
+      async () => {
+        mocks.callOrder.push("matrix-store");
+      },
+    );
     mocks.hasEnabledChannelConnections.mockImplementation(async () => {
       mocks.callOrder.push("channel-shutdown");
       return false;
@@ -108,6 +134,7 @@ describe("admin personal data clear route", () => {
       personalData: {
         hasEnabledChannelConnections: mocks.hasEnabledChannelConnections,
         listAttachmentStorageKeys: mocks.listAttachmentStorageKeys,
+        listMatrixConnectionIds: mocks.listMatrixConnectionIds,
         clear: mocks.clear,
       },
     });
@@ -130,6 +157,15 @@ describe("admin personal data clear route", () => {
 
     expect(response.status).toBe(303);
     expect(mocks.listAttachmentStorageKeys).toHaveBeenCalledWith(USER_ID);
+    expect(mocks.listMatrixConnectionIds).toHaveBeenCalledWith(
+      USER_ID,
+    );
+    expect(
+      mocks.deleteMatrixCryptoStoreDirectory,
+    ).toHaveBeenCalledWith(
+      "/private/matrix/connections",
+      MATRIX_CONNECTION_ID,
+    );
     expect(mocks.clear).toHaveBeenCalledWith(USER_ID);
     expect(mocks.acquireUserMutationLock).toHaveBeenCalledWith(USER_ID);
     expect(mocks.disconnectUser).toHaveBeenCalledWith(USER_ID);
@@ -141,6 +177,8 @@ describe("admin personal data clear route", () => {
       "disconnect",
       "enumerate",
       "attachment",
+      "enumerate-matrix",
+      "matrix-store",
       "artifacts",
       "database",
       "release-drain",

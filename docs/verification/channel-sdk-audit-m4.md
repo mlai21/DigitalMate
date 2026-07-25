@@ -13,12 +13,13 @@
 | `dingtalk-stream-sdk-nodejs` | `2.0.4` | MIT | 钉钉 Stream |
 | `mqtt` | `5.15.2` | MIT | MQTT Broker 连接、订阅与发布 |
 | `matrix-js-sdk` | `41.9.0` | Apache-2.0 | Matrix Sync、房间消息与端到端加密 |
+| `fake-indexeddb` | `6.2.5` | Apache-2.0 | 为 Node 版 Matrix Rust Crypto 提供可加密落盘的 IndexedDB 兼容层 |
 | `@wecom/aibot-node-sdk` | `1.0.7` | MIT | 企业微信智能机器人长连接 |
 | `protobufjs` | `8.7.1` | BSD-3-Clause | 腾讯元宝固定描述符编解码 |
 | `undici` | `7.28.0` | MIT | 渠道 HTTP 连接与受控代理 |
 | `@types/ws` | `8.18.1` | MIT | WebSocket TypeScript 类型 |
 
-版本和许可证均由 npm registry 逐项核对，与 M4 规格一致。运行时依赖全部使用精确版本，避免平台协议实现被间接升级改变。
+版本和许可证均由 npm registry 逐项核对。`fake-indexeddb` 是 Matrix Node 持久化加密设备状态所需的实现补充；其余依赖与 M4 规格一致。运行时依赖全部使用精确版本，避免平台协议实现被间接升级改变。
 
 ## 生产依赖安全结果
 
@@ -40,7 +41,8 @@
 
 ## 兼容性验证
 
-- 渠道合同自测：7 项通过。
+- Matrix 渠道合同自测：15 项通过。
+- DigitalMate 全量测试：137 个测试文件、1757 项测试通过。
 - `npm run typecheck`：通过。
 - `npm run lint`：通过。
 - `npm run build`：QwenPaw Console 与 Next.js 生产构建通过；Next.js 34 个页面完成生成或编译。

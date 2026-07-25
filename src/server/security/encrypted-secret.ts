@@ -191,6 +191,40 @@ export class ChannelSecretsKey {
       .digest("hex");
   }
 
+  runtimeStorageKey(
+    purpose: string,
+    context: Readonly<{
+      userId: string;
+      agentId: string;
+      connectionId: string;
+    }>,
+  ): Buffer {
+    if (
+      purpose.length === 0
+      || purpose.length > 128
+      || [
+        context.userId,
+        context.agentId,
+        context.connectionId,
+      ].some((value) => value.length === 0 || value.length > 512)
+    ) {
+      throw new Error("channel_runtime_storage_context_invalid");
+    }
+    return createHmac("sha256", this.#material)
+      .update(
+        "digitalmate.channel-runtime-storage\0",
+        "utf8",
+      )
+      .update(purpose, "utf8")
+      .update("\0", "utf8")
+      .update(context.userId, "utf8")
+      .update("\0", "utf8")
+      .update(context.agentId, "utf8")
+      .update("\0", "utf8")
+      .update(context.connectionId, "utf8")
+      .digest();
+  }
+
   toJSON(): Readonly<{
     configured: true;
     keyVersion: number;

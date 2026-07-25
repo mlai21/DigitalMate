@@ -3,6 +3,10 @@ import { deleteAttachment } from "@/server/attachments/storage";
 import { createDisabledOnlyChannelShutdownPort } from "@/server/admin/personal-data";
 import { userConnectionDisconnector } from "@/server/admin/user-connections";
 import { requireCurrentUser } from "@/server/auth/current-user";
+import {
+  defaultMatrixCryptoStorageRoot,
+  deleteMatrixCryptoStoreDirectory,
+} from "@/server/channels/adapters/matrix/crypto-store";
 import { readEnv } from "@/server/config/env";
 import { createRepositories, type UserDataLease } from "@/server/db/repositories";
 import { redirectUrl } from "@/server/http/redirect";
@@ -27,6 +31,18 @@ export async function POST(request: Request) {
     // Delete blobs first. If any deletion fails, DB keys remain available for a safe retry.
     for (const storageKey of storageKeys) {
       await deleteAttachment(storageRoot, storageKey);
+    }
+    const matrixConnectionIds =
+      await repositories.personalData.listMatrixConnectionIds(
+        user.id,
+      );
+    const matrixStorageRoot =
+      defaultMatrixCryptoStorageRoot();
+    for (const connectionId of matrixConnectionIds) {
+      await deleteMatrixCryptoStoreDirectory(
+        matrixStorageRoot,
+        connectionId,
+      );
     }
     await deleteArtifactTree(defaultArtifactRoot(), user.id);
     await repositories.personalData.clear(user.id);

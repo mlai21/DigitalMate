@@ -1,0 +1,22 @@
+{
+  "eventId": "$edit-event:example.org",
+  "roomId": "!team-room:example.org",
+  "senderId": "@bob:example.org",
+  "botUserId": "@digitalmate:example.org",
+  "eventType": "m.room.message",
+  "timestamp": 1785024002000,
+  "isDirect": false,
+  "encrypted": false,
+  "content": {
+    "msgtype": "m.text",
+    "body": "* 修改后的内容",
+    "m.new_content": {
+      "msgtype": "m.text",
+      "body": "修改后的内容"
+    },
+    "m.relates_to": {
+      "rel_type": "m.replace",
+      "event_id": "$group-event:example.org"
+    }
+  }
+}

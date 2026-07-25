@@ -1,0 +1,16 @@
+{
+  "eventId": "$group-event:example.org",
+  "roomId": "!team-room:example.org",
+  "senderId": "@bob:example.org",
+  "botUserId": "@digitalmate:example.org",
+  "eventType": "m.room.message",
+  "timestamp": 1785024001000,
+  "isDirect": false,
+  "encrypted": false,
+  "content": {
+    "msgtype": "m.text",
+    "body": "DigitalMate 请总结",
+    "format": "org.matrix.custom.html",
+    "formatted_body": "<a href=\"https://matrix.to/#/@digitalmate:example.org\">DigitalMate</a> 请总结"
+  }
+}

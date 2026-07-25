@@ -1,0 +1,21 @@
+[
+  {
+    "status": 401,
+    "errcode": "M_UNKNOWN_TOKEN",
+    "expectedCode": "credential_invalid",
+    "retryable": false
+  },
+  {
+    "status": 403,
+    "errcode": "M_FORBIDDEN",
+    "expectedCode": "permission_denied",
+    "retryable": false
+  },
+  {
+    "status": 429,
+    "errcode": "M_LIMIT_EXCEEDED",
+    "retry_after_ms": 1250,
+    "expectedCode": "rate_limited",
+    "retryable": true
+  }
+]

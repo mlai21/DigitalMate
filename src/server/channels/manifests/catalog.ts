@@ -471,25 +471,11 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
       booleanField("vision_enabled", "视觉能力", true),
       numberField("history_limit", "历史消息数量", 50, 0, 1_000),
       secretField("password", "密码"),
-      stringField("device_name", "设备名称", "qwenpaw-worker"),
+      stringField("device_name", "设备名称", "digitalmate-worker"),
       numberField("sync_timeout_ms", "同步超时（毫秒）", 30_000, 5_000, 300_000),
       booleanField("mention_pill_in_body", "正文包含提及标签", false),
       booleanField("outbound_structured_mentions", "发送结构化提及", true),
       booleanField("streaming_enabled", "流式回复", false),
-    ],
-    conditions: [
-      {
-        field: "access_token",
-        when: { field: "auth_method", equals: "token" },
-      },
-      {
-        field: "password",
-        when: { field: "auth_method", equals: "password" },
-      },
-      {
-        field: "encryption",
-        when: { field: "auth_method", equals: "password" },
-      },
     ],
   },
   slack: {
@@ -652,9 +638,13 @@ const buildManifest = <TType extends ChannelType>(
   const definition = DEFINITIONS[type];
   const definitions = [
     ...BASE_FIELDS.map((baseField) => {
-      if (type !== "slack") return baseField;
+      if (type !== "slack" && type !== "matrix") {
+        return baseField;
+      }
       if (baseField.name === "allow_from") {
-        return nullableListField("allow_from", "允许来源");
+        return type === "slack"
+          ? nullableListField("allow_from", "允许来源")
+          : baseField;
       }
       if (baseField.name === "require_mention") {
         return booleanField("require_mention", "群聊需要 @", true);
