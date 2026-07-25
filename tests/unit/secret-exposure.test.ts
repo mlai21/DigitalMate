@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   containsSecretFingerprintExposure,
   createSecretExposureFingerprint,
 } from "@/server/admin/secret-content";
 import {
+  ChannelSecretsKey,
   createChannelSecretsKey,
 } from "@/server/security/encrypted-secret";
 
@@ -139,6 +140,88 @@ describe("historical channel secret exposure fingerprints", () => {
       [fingerprint],
       keyState.key,
     )).toBe(true);
+  });
+
+  it("precharges a long window before its first slice or HMAC", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprint = createSecretExposureFingerprint(
+      keyState.key,
+      "a".repeat(20_000),
+    );
+    const hmac = vi.spyOn(
+      ChannelSecretsKey.prototype,
+      "secretExposureFingerprint",
+    );
+    const slice = vi.spyOn(Array.prototype, "slice");
+    hmac.mockClear();
+    slice.mockClear();
+    let result: boolean;
+    let hmacCalls = -1;
+    let sliceCalls = -1;
+    try {
+      result = containsSecretFingerprintExposure(
+        "b".repeat(40_000),
+        [fingerprint],
+        keyState.key,
+        [],
+        { maxWorkUnits: 40_010 },
+      );
+      hmacCalls = hmac.mock.calls.length;
+      sliceCalls = slice.mock.calls.length;
+    } finally {
+      hmac.mockRestore();
+      slice.mockRestore();
+    }
+
+    expect(result!).toBe(true);
+    expect(sliceCalls).toBe(0);
+    expect(hmacCalls).toBe(0);
+  });
+
+  it("uses the exact bounded cost for one ASCII digest comparison", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprint = createSecretExposureFingerprint(
+      keyState.key,
+      "abcdefgh",
+    );
+
+    expect(containsSecretFingerprintExposure(
+      "abcdefgi",
+      [fingerprint],
+      keyState.key,
+      [],
+      { maxWorkUnits: 61 },
+    )).toBe(true);
+    expect(containsSecretFingerprintExposure(
+      "abcdefgi",
+      [fingerprint],
+      keyState.key,
+      [],
+      { maxWorkUnits: 62 },
+    )).toBe(false);
+  });
+
+  it("charges surrogate pairs and multibyte windows within a sufficient budget", () => {
+    if (keyState.status !== "ready") throw new Error("key_not_ready");
+    const fingerprint = createSecretExposureFingerprint(
+      keyState.key,
+      "🔐🔐",
+    );
+
+    expect(containsSecretFingerprintExposure(
+      "x🔐🔐y",
+      [fingerprint],
+      keyState.key,
+      [],
+      { maxWorkUnits: 45 },
+    )).toBe(true);
+    expect(containsSecretFingerprintExposure(
+      "🔐🧪",
+      [fingerprint],
+      keyState.key,
+      [],
+      { maxWorkUnits: 32 },
+    )).toBe(false);
   });
 
   it("retains short and long matching when the bounded budget is sufficient", () => {

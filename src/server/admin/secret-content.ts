@@ -96,6 +96,28 @@ export function containsSecretFingerprintExposure(
     remainingWorkUnits -= units;
     return true;
   };
+  const consumeLinearWork = (units: number): boolean => {
+    if (!Number.isSafeInteger(units) || units < 0) return false;
+    return units === 0 || consumeWork(units);
+  };
+  const consumeScaledWork = (
+    units: number,
+    multiplier: number,
+  ): boolean => {
+    if (
+      !Number.isSafeInteger(units)
+      || units < 0
+      || !Number.isSafeInteger(multiplier)
+      || multiplier < 1
+    ) {
+      return false;
+    }
+    if (units === 0) return true;
+    if (units > Math.floor(remainingWorkUnits / multiplier)) {
+      return false;
+    }
+    return consumeWork(units * multiplier);
+  };
   const groups = new Map<string, SecretExposureFingerprint[]>();
   for (const fingerprint of fingerprints) {
     if (!consumeWork(2)) return true;
@@ -118,7 +140,12 @@ export function containsSecretFingerprintExposure(
   }
 
   const matches = (candidate: string): boolean => {
-    if (!consumeWork(1 + candidate.length)) return true;
+    if (
+      !consumeWork()
+      || !consumeLinearWork(candidate.length)
+    ) {
+      return true;
+    }
     const characters = Array.from(candidate);
     for (const group of groups.values()) {
       if (!consumeWork()) return true;
@@ -127,11 +154,20 @@ export function containsSecretFingerprintExposure(
         sample.utf8Bytes >= SECRET_SUBSTRING_MIN_UTF8_BYTES;
       if (!embeddedMatch) {
         if (characters.length !== sample.characterLength) continue;
-        if (!consumeWork()) return true;
-        if (Buffer.byteLength(candidate, "utf8") !== sample.utf8Bytes) {
+        if (!consumeLinearWork(candidate.length)) return true;
+        const candidateUtf8Bytes = Buffer.byteLength(
+          candidate,
+          "utf8",
+        );
+        if (candidateUtf8Bytes !== sample.utf8Bytes) {
           continue;
         }
-        if (!consumeWork()) return true;
+        if (
+          !consumeLinearWork(candidate.length)
+          || !consumeLinearWork(candidateUtf8Bytes)
+        ) {
+          return true;
+        }
         const digest = key.secretExposureFingerprint(candidate);
         for (const fingerprint of group) {
           if (!consumeWork()) return true;
@@ -142,14 +178,26 @@ export function containsSecretFingerprintExposure(
       if (characters.length < sample.characterLength) continue;
       const finalStart = characters.length - sample.characterLength;
       for (let start = 0; start <= finalStart; start += 1) {
-        if (!consumeWork(3)) return true;
-        const fragment = characters
-          .slice(start, start + sample.characterLength)
-          .join("");
-        if (Buffer.byteLength(fragment, "utf8") !== sample.utf8Bytes) {
+        if (!consumeLinearWork(sample.characterLength)) return true;
+        const window = characters.slice(
+          start,
+          start + sample.characterLength,
+        );
+        if (!consumeScaledWork(sample.characterLength, 2)) {
+          return true;
+        }
+        const fragment = window.join("");
+        if (!consumeLinearWork(fragment.length)) return true;
+        const fragmentUtf8Bytes = Buffer.byteLength(fragment, "utf8");
+        if (fragmentUtf8Bytes !== sample.utf8Bytes) {
           continue;
         }
-        if (!consumeWork()) return true;
+        if (
+          !consumeLinearWork(fragment.length)
+          || !consumeLinearWork(fragmentUtf8Bytes)
+        ) {
+          return true;
+        }
         const digest = key.secretExposureFingerprint(fragment);
         for (const fingerprint of group) {
           if (!consumeWork()) return true;

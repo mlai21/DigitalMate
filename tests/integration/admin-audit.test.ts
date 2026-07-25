@@ -183,7 +183,7 @@ describe("channel config revision, secret and audit transaction", () => {
           DROP CONSTRAINT
             channel_secret_exposure_fingerprints_user_id_fkey,
           DROP CONSTRAINT
-            channel_secret_exposure_fingerprints_connection_id_fkey,
+            channel_secret_exposure_fingerprints_connection_user_fkey,
           DROP CONSTRAINT
             channel_secret_exposure_fingerprints_pkey,
           DROP COLUMN user_id;
@@ -205,6 +205,12 @@ describe("channel config revision, secret and audit transaction", () => {
         "90000000-0000-4000-8000-000000000011";
       const migrationConnectionId =
         "90000000-0000-4000-8000-000000000021";
+      const otherMigrationUserId =
+        "90000000-0000-4000-8000-000000000002";
+      const otherMigrationAgentId =
+        "90000000-0000-4000-8000-000000000012";
+      const otherMigrationConnectionId =
+        "90000000-0000-4000-8000-000000000022";
       await firstPool.query(
         "INSERT INTO users (id, display_name) VALUES ($1, 'Migration user')",
         [migrationUserId],
@@ -261,7 +267,7 @@ describe("channel config revision, secret and audit transaction", () => {
                   WHERE conrelid =
                     'channel_secret_exposure_fingerprints'::regclass
                     AND conname =
-                      'channel_secret_exposure_fingerprints_connection_id_fkey'
+                      'channel_secret_exposure_fingerprints_connection_user_fkey'
                 ) AS delete_action
          FROM channel_secret_exposure_fingerprints AS fingerprint`,
       );
@@ -272,6 +278,74 @@ describe("channel config revision, secret and audit transaction", () => {
           "PRIMARY KEY (user_id, key_version, digest)",
         delete_action: "n",
       });
+      await firstPool.query(
+        "INSERT INTO users (id, display_name) VALUES ($1, 'Other migration user')",
+        [otherMigrationUserId],
+      );
+      await firstPool.query(
+        `INSERT INTO digital_agents (
+           id, user_id, slug, display_name, is_default
+         )
+         VALUES ($1, $2, 'default-other', 'Other migration agent', true)`,
+        [otherMigrationAgentId, otherMigrationUserId],
+      );
+      await firstPool.query(
+        `INSERT INTO channel_connections (
+           id, user_id, agent_id, channel_type, display_name
+         )
+         VALUES ($1, $2, $3, 'telegram', 'Other migration channel')`,
+        [
+          otherMigrationConnectionId,
+          otherMigrationUserId,
+          otherMigrationAgentId,
+        ],
+      );
+      await firstPool.query(`
+        ALTER TABLE channel_secret_exposure_fingerprints
+          DROP CONSTRAINT
+            channel_secret_exposure_fingerprints_connection_user_fkey,
+          ADD CONSTRAINT
+            channel_secret_exposure_fingerprints_connection_id_fkey
+            FOREIGN KEY (connection_id)
+            REFERENCES channel_connections(id)
+            ON DELETE SET NULL;
+      `);
+      await firstPool.query(
+        `UPDATE channel_secret_exposure_fingerprints
+         SET connection_id = $1
+         WHERE user_id = $2`,
+        [otherMigrationConnectionId, migrationUserId],
+      );
+
+      await migrateSchema(firstPool, schema);
+      const repaired = await firstPool.query<{
+        connection_id: string | null;
+        source_definition: string;
+      }>(
+        `SELECT fingerprint.connection_id,
+                (
+                  SELECT pg_get_constraintdef(oid)
+                  FROM pg_constraint
+                  WHERE conrelid =
+                    'channel_secret_exposure_fingerprints'::regclass
+                    AND conname =
+                      'channel_secret_exposure_fingerprints_connection_user_fkey'
+                ) AS source_definition
+         FROM channel_secret_exposure_fingerprints AS fingerprint
+         WHERE fingerprint.user_id = $1`,
+        [migrationUserId],
+      );
+      expect(repaired.rows).toEqual([{
+        connection_id: null,
+        source_definition:
+          "FOREIGN KEY (connection_id, user_id) REFERENCES channel_connections(id, user_id) ON DELETE SET NULL (connection_id)",
+      }]);
+      await firstPool.query(
+        `UPDATE channel_secret_exposure_fingerprints
+         SET connection_id = $1
+         WHERE user_id = $2`,
+        [migrationConnectionId, migrationUserId],
+      );
       await firstPool.query(
         "DELETE FROM channel_connections WHERE id = $1",
         [migrationConnectionId],
@@ -287,12 +361,70 @@ describe("channel config revision, secret and audit transaction", () => {
         user_id: migrationUserId,
         connection_id: null,
       }]);
+      await firstPool.query(
+        "DELETE FROM users WHERE id = $1",
+        [migrationUserId],
+      );
+      const userDeleted = await firstPool.query<{ count: string }>(
+        `SELECT count(*) AS count
+         FROM channel_secret_exposure_fingerprints
+         WHERE user_id = $1`,
+        [migrationUserId],
+      );
+      expect(userDeleted.rows[0]?.count).toBe("0");
+      await migrateSchema(firstPool, schema);
     } finally {
       await firstPool.end();
       await secondPool.end();
       await primaryPool.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
     }
   }, 60_000);
+
+  it("keeps fingerprint source connections inside the owning user scope", async () => {
+    await expect(primaryPool.query(
+      `INSERT INTO channel_secret_exposure_fingerprints (
+         user_id, connection_id, field_name, key_version, digest,
+         utf8_bytes, character_length
+       )
+       VALUES ($1, $2, 'bot_token', 1, $3, 16, 16)`,
+      [USER_A, CONNECTION_B, Buffer.alloc(32, 51)],
+    )).rejects.toMatchObject({ code: "23503" });
+
+    await primaryPool.query(
+      `INSERT INTO channel_secret_exposure_fingerprints (
+         user_id, connection_id, field_name, key_version, digest,
+         utf8_bytes, character_length
+       )
+       VALUES ($1, $2, 'bot_token', 1, $3, 16, 16)`,
+      [USER_A, CONNECTION_A, Buffer.alloc(32, 52)],
+    );
+    await primaryPool.query(
+      "DELETE FROM channel_connections WHERE id = $1",
+      [CONNECTION_A],
+    );
+    const retained = await primaryPool.query<{
+      user_id: string;
+      connection_id: string | null;
+    }>(
+      `SELECT user_id, connection_id
+       FROM channel_secret_exposure_fingerprints
+       WHERE user_id = $1`,
+      [USER_A],
+    );
+    expect(retained.rows).toEqual([{
+      user_id: USER_A,
+      connection_id: null,
+    }]);
+
+    await primaryPool.query("DELETE FROM users WHERE id = $1", [USER_A]);
+    const deleted = await primaryPool.query<{ count: string }>(
+      `SELECT count(*) AS count
+       FROM channel_secret_exposure_fingerprints
+       WHERE user_id = $1`,
+      [USER_A],
+    );
+    expect(deleted.rows[0]?.count).toBe("0");
+  });
 
   it("allows only one concurrent writer for the same revision across pools", async () => {
     if (keyState.status !== "ready") throw new Error("test_key_not_ready");

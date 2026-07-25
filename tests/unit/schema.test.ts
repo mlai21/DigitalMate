@@ -94,6 +94,7 @@ describe("database schema", () => {
     expect(schema).toContain("source_task_id uuid REFERENCES proactive_tasks(id) ON DELETE SET NULL");
     expect(schema).toContain("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_task");
     expect(schema).toContain("channel_connections_user_agent_fkey");
+    expect(schema).toContain("channel_connections_id_user_key");
     expect(schema).toContain("channel_connections_revision_check");
     expect(schema).toContain("channel_connections_health_status_check");
     expect(schema).toContain("idx_channel_connections_scope_type_active");
@@ -101,7 +102,7 @@ describe("database schema", () => {
     expect(schema).toContain("channel_secrets_nonce_length_check");
     expect(schema).toContain("channel_secrets_auth_tag_length_check");
     expect(schema).toContain(
-      "channel_secret_exposure_fingerprints_connection_id_fkey",
+      "channel_secret_exposure_fingerprints_connection_user_fkey",
     );
     expect(schema).toContain(
       "channel_secret_exposure_fingerprints_user_id_fkey",
@@ -110,7 +111,7 @@ describe("database schema", () => {
       "channel_secret_exposure_fingerprints_digest_length_check",
     );
     expect(schema).toMatch(
-      /channel_secret_exposure_fingerprints_connection_id_fkey[\s\S]*?ON DELETE SET NULL/,
+      /channel_secret_exposure_fingerprints_connection_user_fkey[\s\S]*?FOREIGN KEY \(connection_id, user_id\)[\s\S]*?REFERENCES channel_connections\(id, user_id\)[\s\S]*?ON DELETE SET NULL \(connection_id\)/,
     );
     expect(schema).toContain("admin_audit_logs_user_agent_fkey");
     expect(schema).toContain("idx_admin_audit_logs_scope_created");
