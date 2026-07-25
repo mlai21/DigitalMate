@@ -1278,7 +1278,9 @@ CREATE TABLE IF NOT EXISTS channel_inbound_events (
     CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
   status text NOT NULL DEFAULT 'accepted'
     CONSTRAINT channel_inbound_events_status_check
-    CHECK (status IN ('accepted', 'running', 'completed', 'failed')),
+    CHECK (status IN (
+      'pending_attachments', 'accepted', 'running', 'completed', 'failed'
+    )),
   claim_owner text,
   claim_expires_at timestamptz,
   attempts integer NOT NULL DEFAULT 0
@@ -1318,6 +1320,15 @@ CREATE TABLE IF NOT EXISTS channel_inbound_events (
 ALTER TABLE IF EXISTS channel_inbound_events
   ADD COLUMN IF NOT EXISTS
     reply_handle_required boolean NOT NULL DEFAULT false;
+
+ALTER TABLE IF EXISTS channel_inbound_events
+  DROP CONSTRAINT IF EXISTS channel_inbound_events_status_check;
+
+ALTER TABLE IF EXISTS channel_inbound_events
+  ADD CONSTRAINT channel_inbound_events_status_check
+  CHECK (status IN (
+    'pending_attachments', 'accepted', 'running', 'completed', 'failed'
+  ));
 
 CREATE TABLE IF NOT EXISTS channel_execution_steps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -3,6 +3,7 @@ export type FakeHttpRequest = Readonly<{
   url: string;
   headers: Readonly<Record<string, string>>;
   body?: unknown;
+  responseType?: "json" | "bytes";
   signal?: AbortSignal;
 }>;
 
@@ -54,6 +55,9 @@ export function createFakeHttpClient() {
         url: redactUrl(request.url),
         headers: redactHeaders(request.headers),
         body: redactBody(request.body),
+        ...(request.responseType
+          ? { responseType: request.responseType }
+          : {}),
       });
       const response = responses.shift();
       if (!response) {

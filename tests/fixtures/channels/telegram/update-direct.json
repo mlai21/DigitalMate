@@ -1,0 +1,17 @@
+{
+  "update_id": 90001,
+  "message": {
+    "message_id": 76,
+    "date": 1785024000,
+    "chat": {
+      "id": 123456,
+      "type": "private"
+    },
+    "from": {
+      "id": 654321,
+      "is_bot": false,
+      "username": "alice"
+    },
+    "text": "你好 DigitalMate"
+  }
+}

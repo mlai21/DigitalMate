@@ -24,6 +24,10 @@ type IngressEventRepository = Readonly<{
     created: boolean;
     event: ChannelEventRecord;
   }>;
+  markAttachmentsReady?(
+    scope: AgentScope,
+    eventId: string,
+  ): Promise<boolean>;
 }>;
 
 type IngressAccessControl = Readonly<{
@@ -84,7 +88,7 @@ export async function acceptInboundWithAcknowledgement(
   const accepted = await input.events.accept(
     input.scope,
     normalized,
-    accessOptions(access),
+    accessOptions(access, normalized),
   );
   if (accepted.created && access.kind === "pending") {
     await input.access.recordPendingRequest(
@@ -92,8 +96,27 @@ export async function acceptInboundWithAcknowledgement(
       accepted.event,
     );
   }
-  if (accepted.event.status === "accepted") {
+  if (
+    accepted.event.status === "accepted"
+    || accepted.event.status === "pending_attachments"
+  ) {
     await input.afterPersist?.(accepted.event, normalized);
+  }
+  if (accepted.event.status === "pending_attachments") {
+    if (!input.events.markAttachmentsReady) {
+      throw new Error(
+        "channel_attachment_ready_transition_unavailable",
+      );
+    }
+    const ready = await input.events.markAttachmentsReady(
+      input.scope,
+      accepted.event.id,
+    );
+    if (!ready) {
+      throw new Error(
+        "channel_attachment_ready_transition_failed",
+      );
+    }
   }
 
   const result: IngressResult = !accepted.created
@@ -118,10 +141,13 @@ export async function acceptInboundWithAcknowledgement(
 
 function accessOptions(
   access: ChannelAccessDecision,
+  event: NormalizedChannelEvent,
 ): AcceptChannelEventOptions {
   return access.allowed
     ? {
-        initialStatus: "accepted",
+        initialStatus: event.attachments.length > 0
+          ? "pending_attachments"
+          : "accepted",
         failureCode: null,
       }
     : {

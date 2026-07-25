@@ -11,6 +11,7 @@
 | `@slack/bolt` | `5.0.0` | MIT | Slack Socket Mode |
 | `@larksuiteoapi/node-sdk` | `1.71.1` | MIT | 飞书/Lark WebSocket 与 OpenAPI |
 | `dingtalk-stream-sdk-nodejs` | `2.0.4` | MIT | 钉钉 Stream |
+| `undici` | `7.28.0` | MIT | 渠道 HTTP 连接与受控代理 |
 | `@types/ws` | `8.18.1` | MIT | WebSocket TypeScript 类型 |
 
 版本和许可证均由 npm registry 逐项核对，与 M4 规格一致。运行时依赖全部使用精确版本，避免平台协议实现被间接升级改变。

@@ -1,0 +1,35 @@
+{
+  "update_id": 90002,
+  "message": {
+    "message_id": 77,
+    "message_thread_id": 12,
+    "date": 1785024001,
+    "chat": {
+      "id": -100123,
+      "type": "supergroup"
+    },
+    "from": {
+      "id": 654322,
+      "is_bot": false,
+      "username": "bob"
+    },
+    "text": "@digitalmate_bot 看一下这个文件",
+    "entities": [
+      {
+        "type": "mention",
+        "offset": 0,
+        "length": 16
+      }
+    ],
+    "reply_to_message": {
+      "message_id": 71
+    },
+    "document": {
+      "file_id": "BQACAgQAAxkBAAIB",
+      "file_unique_id": "AgADunique",
+      "file_name": "notes.txt",
+      "mime_type": "text/plain",
+      "file_size": 128
+    }
+  }
+}

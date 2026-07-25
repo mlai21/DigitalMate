@@ -1,3 +1,4 @@
+import type { AgentScope } from "@/server/agents/types";
 import type { ChannelType } from "@/server/channels/manifests/catalog";
 
 export type ChatType = "direct" | "group";
@@ -80,6 +81,7 @@ export type ChannelHealthStatus =
 export type ChannelHealthErrorCode =
   | "credential_invalid"
   | "permission_denied"
+  | "polling_conflict"
   | "network_unreachable"
   | "rate_limited"
   | "runtime_prerequisite_missing"
@@ -127,6 +129,8 @@ export type SendResult = Readonly<{
 export type StreamingState = Readonly<{
   sequence: number;
   final: boolean;
+  previousResult?: SendResult | null;
+  signal?: AbortSignal;
 }>;
 
 export type ChannelRuntimeContext<
@@ -149,4 +153,29 @@ export type SendContext<
 
 export type AdapterDependencies = Readonly<{
   now: () => Date;
+  scope?: AgentScope;
+  http?: Readonly<{
+    request(input: Readonly<{
+      method: "GET" | "POST";
+      url: string;
+      headers: Readonly<Record<string, string>>;
+      body?: unknown;
+      responseType?: "json" | "bytes";
+      signal?: AbortSignal;
+    }>): Promise<Readonly<{
+      status: number;
+      headers?: Readonly<Record<string, string>>;
+      body?: unknown;
+    }>>;
+  }>;
+  acceptInbound?(
+    payload: unknown,
+    context: InboundContext,
+    scope: AgentScope,
+  ): Promise<IngressResult>;
+  loadCursor?(
+    connectionId: string,
+    scope: AgentScope,
+    cursor: string,
+  ): Promise<string | null>;
 }>;

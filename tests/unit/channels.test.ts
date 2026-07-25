@@ -33,7 +33,7 @@ describe("webhook channel adapters", () => {
         },
       },
       {
-        externalEventId: "11",
+        externalEventId: "update:11",
         externalConversationId: "123",
         externalSenderId: "456",
         chatType: "direct",

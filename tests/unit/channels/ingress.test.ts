@@ -72,6 +72,81 @@ describe("channel ingress", () => {
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
+  it("keeps attachment events unclaimable until private files are bound", async () => {
+    const order: string[] = [];
+    const attachmentEvent = normalizedEvent({
+      attachments: [{
+        externalAttachmentId: "telegram-file-1",
+        fileName: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        source: { fileId: "platform-file-1" },
+      }],
+      permission: {
+        webSearch: false,
+        backgroundNetwork: false,
+        tools: false,
+        skills: "none",
+        attachmentsPresent: true,
+      },
+    });
+    const markAttachmentsReady = vi.fn(async () => {
+      order.push("ready");
+      return true;
+    });
+    const events = {
+      accept: vi.fn(async () => {
+        order.push("persist-pending");
+        return {
+          created: true,
+          event: persistedEvent("pending_attachments"),
+        };
+      }),
+      markAttachmentsReady,
+    };
+
+    const result = await acceptInbound({
+      adapter: fakeAdapter({
+        normalizeInbound: vi.fn(async () => attachmentEvent),
+        acknowledge: vi.fn(async () => {
+          order.push("ack");
+          return { status: 200 };
+        }),
+      }),
+      payload: {},
+      context: inboundContext(),
+      scope,
+      access: fakeAccess({ kind: "allowed", allowed: true }),
+      events,
+      afterPersist: vi.fn(async () => {
+        order.push("bind-private-files");
+      }),
+    });
+
+    expect(result).toEqual({
+      kind: "accepted",
+      eventId: "event-id",
+    });
+    expect(events.accept).toHaveBeenCalledWith(
+      scope,
+      attachmentEvent,
+      {
+        initialStatus: "pending_attachments",
+        failureCode: null,
+      },
+    );
+    expect(markAttachmentsReady).toHaveBeenCalledWith(
+      scope,
+      "event-id",
+    );
+    expect(order).toEqual([
+      "persist-pending",
+      "bind-private-files",
+      "ready",
+      "ack",
+    ]);
+  });
+
   it("acknowledges a duplicate without creating a second access request", async () => {
     const acknowledge = vi.fn(async (
       _payload: unknown,
@@ -108,7 +183,10 @@ describe("channel ingress", () => {
         _scope: AgentScope,
         _event: NormalizedChannelEvent,
         options: {
-          initialStatus: "accepted" | "failed";
+          initialStatus:
+            | "accepted"
+            | "pending_attachments"
+            | "failed";
           failureCode: string | null;
         },
       ) => ({
@@ -382,7 +460,9 @@ function normalizedEvent(
   };
 }
 
-function persistedEvent(status: "accepted" | "failed") {
+function persistedEvent(
+  status: "accepted" | "pending_attachments" | "failed",
+) {
   return {
     id: "event-id",
     scope,

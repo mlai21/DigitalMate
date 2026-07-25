@@ -14,6 +14,7 @@ const DEFAULT_EVENT_LEASE_MS = 60_000;
 type Queryable = Pick<Pool | PoolClient, "query">;
 
 type ChannelEventStatus =
+  | "pending_attachments"
   | "accepted"
   | "running"
   | "completed"
@@ -76,7 +77,10 @@ export type ChannelEventRepositoryOptions = Readonly<{
 }>;
 
 export type AcceptChannelEventOptions = Readonly<{
-  initialStatus: "accepted" | "failed";
+  initialStatus:
+    | "pending_attachments"
+    | "accepted"
+    | "failed";
   failureCode: string | null;
 }>;
 
@@ -131,11 +135,11 @@ export function createChannelEventRepository(
       );
       const stored = toStoredNormalizedEvent(event);
       const replyHandleRequired = event.replyHandle !== undefined;
-      const payloadHash = hashCanonical({
-        normalizedEvent: stored,
-        permission: event.permission,
+      const payloadHash = eventPayloadHash(
+        stored,
+        event.permission,
         replyHandleRequired,
-      });
+      );
       const inserted = await pool.query<ChannelEventRow>(
         `INSERT INTO channel_inbound_events (
            user_id, agent_id, connection_id, channel_type,
@@ -202,7 +206,14 @@ export function createChannelEventRepository(
         throw new Error("channel_event_scope_mismatch");
       }
       if (
-        row.payload_hash !== payloadHash
+        (
+          row.payload_hash !== payloadHash
+          && eventPayloadHash(
+            row.normalized_payload,
+            row.permission_envelope,
+            row.reply_handle_required,
+          ) !== payloadHash
+        )
         || row.client_turn_id !== clientTurnId
         || row.reply_handle_required !== replyHandleRequired
       ) {
@@ -258,6 +269,44 @@ export function createChannelEventRepository(
       );
       const row = result.rows[0];
       return row ? asClaim(mapEventRow(row)) : null;
+    },
+
+    async markAttachmentsReady(
+      scope: AgentScope,
+      eventId: string,
+      now = new Date(),
+    ): Promise<boolean> {
+      const result = await pool.query(
+        `UPDATE channel_inbound_events AS event
+         SET status = 'accepted',
+             updated_at = $3
+         WHERE event.id = $1
+           AND event.user_id = $2
+           AND event.agent_id = $4
+           AND event.status = 'pending_attachments'
+           AND jsonb_array_length(
+             event.normalized_payload->'attachments'
+           ) > 0
+           AND (
+             SELECT count(*)
+             FROM channel_event_attachments AS attachment
+             WHERE attachment.event_id = event.id
+               AND attachment.user_id = event.user_id
+               AND attachment.agent_id = event.agent_id
+           ) = jsonb_array_length(
+             event.normalized_payload->'attachments'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM channel_event_attachments AS attachment
+             WHERE attachment.event_id = event.id
+               AND attachment.user_id = event.user_id
+               AND attachment.agent_id = event.agent_id
+               AND attachment.private_attachment_id IS NULL
+           )`,
+        [eventId, scope.userId, now, scope.agentId],
+      );
+      return result.rowCount === 1;
     },
 
     async complete(
@@ -400,6 +449,23 @@ function hashCanonical(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(canonicalize(value)))
     .digest("hex");
+}
+
+function eventPayloadHash(
+  stored: StoredNormalizedEvent,
+  permission: PermissionEnvelope,
+  replyHandleRequired: boolean,
+): string {
+  const {
+    receivedAt: _localReceiptTime,
+    ...stableEvent
+  } = stored;
+  void _localReceiptTime;
+  return hashCanonical({
+    normalizedEvent: stableEvent,
+    permission,
+    replyHandleRequired,
+  });
 }
 
 function canonicalize(value: unknown): unknown {

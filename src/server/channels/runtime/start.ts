@@ -6,10 +6,22 @@ import type { Pool } from "pg";
 import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { searchWeb } from "@/server/agent/tools/web-search";
 import { assertAuthorizedModelRoutes } from "@/server/agents/service";
+import {
+  createTelegramAdapter,
+  parseTelegramConfig,
+} from "@/server/channels/adapters/telegram";
+import {
+  createTelegramTransport,
+} from "@/server/channels/adapters/telegram/transport";
 import { createDingTalkWebhookAdapter } from "@/server/channels/adapters/webhook/dingtalk";
 import { createFeishuWebhookAdapter } from "@/server/channels/adapters/webhook/feishu";
 import { createSlackWebhookAdapter } from "@/server/channels/adapters/webhook/slack";
-import { createTelegramWebhookAdapter } from "@/server/channels/adapters/webhook/telegram";
+import { createChannelAccessControl } from "@/server/channels/runtime/access";
+import {
+  createChannelAttachmentLocatorRepository,
+  downloadInboundAttachment,
+} from "@/server/channels/runtime/attachment-ingress";
+import { acceptInbound } from "@/server/channels/runtime/ingress";
 import {
   getChannelManifest,
   type ChannelType,
@@ -110,10 +122,26 @@ export async function startChannelRuntime(input: Readonly<{
     pool,
     secretKey,
   );
+  const replyHandles = secretKey
+    ? createChannelReplyHandleRepository(pool, secretKey)
+    : null;
+  const attachmentLocators = secretKey
+    ? createChannelAttachmentLocatorRepository(pool, secretKey)
+    : null;
+  const managedAdapterDependencies = {
+    pool,
+    repositories: input.repositories,
+    replyHandles,
+    attachmentLocators,
+    attachmentStorageDir: input.env.attachmentStorageDir,
+  };
   const connectionManager = createChannelConnectionManager({
     store,
     createAdapter: (connection) =>
-      createManagedAdapter(connection.channelType),
+      createManagedAdapter(
+        connection,
+        managedAdapterDependencies,
+      ),
     onError(error, context) {
       console.error("channel_connection_runtime_failed", {
         ...context,
@@ -123,9 +151,6 @@ export async function startChannelRuntime(input: Readonly<{
   });
   await connectionManager.startAll();
 
-  const replyHandles = secretKey
-    ? createChannelReplyHandleRepository(pool, secretKey)
-    : null;
   const agentTurn = createChannelAgentTurnRunner({
     repositories: input.repositories,
     resolveMainModel: async (scope, routing) => {
@@ -190,10 +215,36 @@ export async function startChannelRuntime(input: Readonly<{
       )
     ).id,
     resolveAttachmentIds: async (claim) => {
-      if (claim.normalizedEvent.attachments.length > 0) {
+      const expected = claim.normalizedEvent.attachments;
+      if (expected.length === 0) return [];
+      const stored = await pool.query<{
+        external_attachment_id: string;
+        private_attachment_id: string | null;
+      }>(
+        `SELECT external_attachment_id, private_attachment_id
+         FROM channel_event_attachments
+         WHERE event_id = $1
+           AND user_id = $2
+           AND agent_id = $3`,
+        [
+          claim.id,
+          claim.scope.userId,
+          claim.scope.agentId,
+        ],
+      );
+      const byExternalId = new Map(
+        stored.rows.map((row) => [
+          row.external_attachment_id,
+          row.private_attachment_id,
+        ]),
+      );
+      const attachmentIds = expected.map((descriptor) =>
+        byExternalId.get(descriptor.externalAttachmentId)
+      );
+      if (attachmentIds.some((attachmentId) => !attachmentId)) {
         throw new Error("channel_attachments_not_ready");
       }
-      return [];
+      return attachmentIds as string[];
     },
     resolveReplyHandleId: (claim) =>
       replyHandles?.findIdForEvent(
@@ -223,7 +274,10 @@ export async function startChannelRuntime(input: Readonly<{
     loadConnection: (connectionId) =>
       store.get(connectionId),
     createAdapter: (connection) =>
-      createManagedAdapter(connection.channelType),
+      createManagedAdapter(
+        connection,
+        managedAdapterDependencies,
+      ),
     loadReplyHandle: (scope, handleId) =>
       replyHandles?.load(scope, handleId)
       ?? Promise.resolve(null),
@@ -405,7 +459,11 @@ export function createChannelDeliveryTransport(input: Readonly<{
         ) {
           return await resolved.adapter.streaming(
             channelDelivery,
-            part.state,
+            {
+              ...part.state,
+              previousResult: part.previousResult,
+              signal,
+            },
           );
         }
         return await resolved.adapter.send(
@@ -463,12 +521,28 @@ async function resolveDeliveryTarget(
   return { adapter, config };
 }
 
+type ManagedAdapterDependencies = Readonly<{
+  pool: Pool;
+  repositories: Repositories;
+  replyHandles: ReturnType<
+    typeof createChannelReplyHandleRepository
+  > | null;
+  attachmentLocators: ReturnType<
+    typeof createChannelAttachmentLocatorRepository
+  > | null;
+  attachmentStorageDir: string;
+}>;
+
 function createManagedAdapter(
-  type: ChannelType,
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
 ): ChannelAdapter<Record<string, unknown>> {
-  switch (type) {
+  switch (connection.channelType) {
     case "telegram":
-      return createTelegramWebhookAdapter();
+      return createManagedTelegramAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     case "slack":
       return createSlackWebhookAdapter();
     case "feishu":
@@ -476,8 +550,141 @@ function createManagedAdapter(
     case "dingtalk":
       return createDingTalkWebhookAdapter();
     default:
-      return unavailableAdapter(type);
+      return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedTelegramAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createTelegramAdapter({
+    scope: connection.scope,
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length > 0) {
+                if (!dependencies.attachmentLocators) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                const expiresAt = new Date(
+                  context.receivedAt.getTime()
+                    + 60 * 60 * 1_000,
+                );
+                const fetcher = createTelegramTransport()
+                  .attachmentFetcher(
+                    parseTelegramConfig(connection.config),
+                  );
+                for (const descriptor of normalized.attachments) {
+                  const persisted =
+                    await dependencies.attachmentLocators.persist(
+                      event.scope,
+                      event.id,
+                      event.connectionId,
+                      descriptor,
+                      expiresAt,
+                      context.receivedAt,
+                    );
+                  if (!persisted) continue;
+                  await downloadInboundAttachment({
+                    scope: event.scope,
+                    descriptor,
+                    fetcher,
+                    storageRoot:
+                      dependencies.attachmentStorageDir,
+                    repository:
+                      dependencies.repositories.messageAttachments,
+                    bindPrivateAttachment: async (
+                      attachmentId,
+                    ) => {
+                      const bound =
+                        await dependencies.attachmentLocators!
+                          .bindPrivateAttachment(
+                            event.scope,
+                            event.id,
+                            descriptor.externalAttachmentId,
+                            attachmentId,
+                            new Date(),
+                          );
+                      if (!bound) {
+                        throw new Error(
+                          "attachment_bind_transition_failed",
+                        );
+                      }
+                    },
+                    signal,
+                  });
+                }
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+    loadLastUpdateId: async (_connectionId, scope) => {
+      const result = await dependencies.pool.query<{
+        update_id: string | null;
+      }>(
+        `SELECT max(
+           substring(external_event_id from 8)::bigint
+         )::text AS update_id
+         FROM channel_inbound_events
+         WHERE user_id = $1
+           AND agent_id = $2
+           AND connection_id = $3
+           AND status <> 'pending_attachments'
+           AND external_event_id ~ '^update:[0-9]+$'`,
+        [
+          scope.userId,
+          scope.agentId,
+          connection.id,
+        ],
+      );
+      const value = result.rows[0]?.update_id;
+      if (!value) return null;
+      const updateId = Number(value);
+      return Number.isSafeInteger(updateId)
+        && updateId >= 0
+        ? updateId
+        : null;
+    },
+  });
+  return adapter;
 }
 
 function unavailableAdapter(

@@ -111,7 +111,9 @@ function normalizeTelegramInbound(
     context,
     channelType: "telegram",
     externalEventId:
-      updateId ?? `${chatId}:${messageId}`,
+      updateId
+        ? `update:${updateId}`
+        : `message:${chatId}:${messageId}`,
     externalConversationId: chatId,
     externalSenderId: senderId,
     chatType: direct ? "direct" : "group",

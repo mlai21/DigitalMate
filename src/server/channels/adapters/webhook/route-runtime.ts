@@ -106,6 +106,12 @@ export async function acceptWebhookEvent(input: Readonly<{
           candidate.channelType === input.channelType
           && candidate.scope.userId === fence.userId
           && candidate.scope.agentId === agent.id
+          && (
+            input.channelType !== "telegram"
+            || hasConfiguredString(
+              candidate.config.webhook_secret,
+            )
+          )
         );
         if (!connection || connection.runtimeError) {
           return adapter.acknowledge(input.payload, {
@@ -193,4 +199,9 @@ function assertDate(value: Date): void {
   ) {
     throw new Error("channel_webhook_received_at_invalid");
   }
+}
+
+function hasConfiguredString(value: unknown): boolean {
+  return typeof value === "string"
+    && value.trim().length > 0;
 }

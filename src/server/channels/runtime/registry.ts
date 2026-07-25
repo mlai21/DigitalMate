@@ -5,6 +5,7 @@ import {
 
 import type { ChannelAdapter } from "./adapter";
 import type { AdapterDependencies } from "./types";
+import { createTelegramAdapter } from "../adapters/telegram";
 
 export type ChannelAdapterFactory = (
   dependencies: AdapterDependencies,
@@ -18,6 +19,16 @@ export class ChannelAdapterRegistry {
       throw new Error(`duplicate_channel_adapter:${type}`);
     }
     this.#factories.set(type, factory);
+  }
+
+  has(type: ChannelType): boolean {
+    return this.#factories.has(type);
+  }
+
+  registeredTypes(): ChannelType[] {
+    return CHANNEL_TYPES.filter((type) =>
+      this.#factories.has(type)
+    );
   }
 
   assertComplete(): void {
@@ -39,4 +50,43 @@ export class ChannelAdapterRegistry {
     }
     return factory(dependencies);
   }
+}
+
+export function registerTelegramChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("telegram", (dependencies) =>
+    createTelegramAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.http
+        ? { http: dependencies.http }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+      ...(dependencies.loadCursor
+        ? {
+            loadLastUpdateId: async (
+              connectionId,
+              scope,
+            ) => {
+              const cursor = await dependencies.loadCursor!(
+                connectionId,
+                scope,
+                "telegram_update_id",
+              );
+              if (cursor === null) return null;
+              const updateId = Number(cursor);
+              return Number.isSafeInteger(updateId)
+                && updateId >= 0
+                ? updateId
+                : null;
+            },
+          }
+        : {}),
+    })
+  );
 }

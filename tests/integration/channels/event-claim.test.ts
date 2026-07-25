@@ -137,6 +137,25 @@ describe("channel event transaction ledger", () => {
     );
   });
 
+  it("deduplicates a retry even when its local receipt time changed", async () => {
+    const events = createChannelEventRepository(pool);
+    const original = normalizedEvent(
+      CONNECTION_A,
+      "event-received-at-retry",
+    );
+    const first = await events.accept(scope, original);
+    const retry = await events.accept(scope, {
+      ...original,
+      receivedAt: new Date(
+        original.receivedAt.getTime() + 5_000,
+      ),
+    });
+
+    expect(first.created).toBe(true);
+    expect(retry.created).toBe(false);
+    expect(retry.event.id).toBe(first.event.id);
+  });
+
   it("permits the same external event id on different connections", async () => {
     const events = createChannelEventRepository(pool);
     const first = await events.accept(
@@ -220,14 +239,6 @@ describe("channel event transaction ledger", () => {
       throw new Error("test_channel_key_invalid");
     }
     const events = createChannelEventRepository(pool);
-    const accepted = await events.accept(
-      scope,
-      normalizedEvent(CONNECTION_A, "event-locator"),
-    );
-    const locators = createChannelAttachmentLocatorRepository(
-      pool,
-      keyState.key,
-    );
     const secret = "temporary-platform-token";
     const now = new Date("2026-07-26T00:00:00.000Z");
     const descriptor = {
@@ -237,6 +248,28 @@ describe("channel event transaction ledger", () => {
       sizeBytes: 5,
       source: { token: secret, opaqueId: "file-1" },
     } as const;
+    const accepted = await events.accept(
+      scope,
+      {
+        ...normalizedEvent(CONNECTION_A, "event-locator"),
+        attachments: [descriptor],
+        permission: {
+          webSearch: false,
+          backgroundNetwork: false,
+          tools: false,
+          skills: "none",
+          attachmentsPresent: true,
+        },
+      },
+      {
+        initialStatus: "pending_attachments",
+        failureCode: null,
+      },
+    );
+    const locators = createChannelAttachmentLocatorRepository(
+      pool,
+      keyState.key,
+    );
 
     await expect(locators.persist(
       scope,
@@ -310,6 +343,25 @@ describe("channel event transaction ledger", () => {
       source_locator_nonce: null,
       source_locator_auth_tag: null,
       source_locator_key_version: null,
+    });
+    await expect(
+      events.claimNext("attachment-worker-early", now),
+    ).resolves.toBeNull();
+    await expect(
+      events.markAttachmentsReady(
+        scope,
+        accepted.event.id,
+        new Date(now.getTime() + 3_000),
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      events.claimNext(
+        "attachment-worker-ready",
+        new Date(now.getTime() + 4_000),
+      ),
+    ).resolves.toMatchObject({
+      id: accepted.event.id,
+      status: "running",
     });
   });
 
