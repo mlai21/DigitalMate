@@ -4,14 +4,27 @@ channel-node 是 iMessage 与 SIP 的受限运行端。它只负责本地协议�
 
 ## 准备
 
-中心端先创建节点、绑定渠道连接，并签发由专用节点 CA 签名的客户端证书。节点主机需要保存四个私有文件：
+中心端先创建节点、绑定渠道连接，并签发由专用 enrollment CA 签名的客户端证书。enrollment CA 与网关服务端信任根必须是不同公钥、互不成链的独立自签根；Web 只读取网关信任根的公开证书，不能获得网关私钥。节点主机需要保存四个文件：
 
 - `node.json`：节点 ID、中心地址、证书路径和允许的连接 ID。
 - `node.pem`：客户端证书。
 - `node.key`：客户端私钥。
-- `ca.pem`：中心节点 CA。
+- `ca.pem`：网关服务端公开 CA/信任链，不是客户端证书签发 CA。
 
 `node.json`、`node.pem` 和 `node.key` 必须是普通文件且权限为 `0600`；CA 可为 `0644`，但不能允许组或其他用户写入。中心地址必须使用精确的 `wss://<域名>/channel-node`，不能携带用户名、密码、查询参数或片段；mTLS 是唯一的节点认证方式。
+
+Console 创建或轮换节点时会下载 `.dmnode` 加密包，并单独显示一次 10 分钟有效的解密令牌。不要把令牌直接放进命令行历史；先写入权限 `0600` 的临时文件，再安装到一个尚不存在的新目录：
+
+```bash
+npm run channel-node:build
+chmod 600 /absolute/private/enrollment-token
+npm --prefix runners/channel-node run install-bundle -- \
+  --bundle /absolute/path/digitalmate-channel-node.dmnode \
+  --token-file /absolute/private/enrollment-token \
+  --target /absolute/private/channel-node
+```
+
+安装器校验加密包、路径与令牌文件权限，生成 `node.json`、`node.pem`、`node.key` 和 `ca.pem`；失败时清理本次新建的目标目录。加密包只包含网关公开信任根，不包含 enrollment CA。中心配置加载会先校验 enrollment 私钥确实属于 enrollment 根证书，再拒绝下级 CA、交叉签名根及复用公钥的不同证书，避免误挂私钥或 Web 的客户端签发权限能够伪造网关身份。安装成功并完成首次 mTLS 后，中心会消费该一次性 enrollment。随后删除令牌文件，并按 iMessage 或 SIP 文档补充节点本地渠道配置。中心响应、数据库和日志都不会出现已签发私钥明文。
 
 示例配置：
 

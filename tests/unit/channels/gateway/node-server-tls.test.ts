@@ -27,6 +27,7 @@ import {
 
 const NODE_ID = "30000000-0000-4000-8000-000000000001";
 const USER_ID = "10000000-0000-4000-8000-000000000001";
+const AGENT_ID = "10000000-0000-4000-8000-000000000011";
 const CLIENT_FINGERPRINT = createHash("sha256")
   .update(new X509Certificate(
     TEST_NODE_CLIENT_CERTIFICATE,
@@ -65,6 +66,28 @@ describe("channel node mTLS WebSocket server", () => {
       nodeId: NODE_ID,
       sequence: 1,
     });
+  });
+
+  it("closes an established WebSocket at the certificate deadline", async () => {
+    const repository = nodeRepository({
+      certificateExpiresAt:
+        new Date(Date.now() + 250),
+    });
+    const { server, port } = await startServer(repository);
+    servers.push(server);
+    const socket = await connectNode(port);
+    sockets.push(socket);
+    socket.send(JSON.stringify(registerFrame()));
+    await readFrame(socket);
+
+    const [code, reason] = await once(
+      socket,
+      "close",
+    ) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(reason.toString()).toBe(
+      "node_certificate_expired",
+    );
   });
 
   it("rejects clients signed by another CA before upgrade", async () => {
@@ -504,6 +527,7 @@ function inboundFrame(sequence: number) {
 
 function nodeRepository(options: {
   status?: "unknown" | "revoked" | "disconnected";
+  certificateExpiresAt?: Date;
 } = {}) {
   let serverSequence = 0;
   let clientSequence = 0;
@@ -521,8 +545,12 @@ function nodeRepository(options: {
         : {
             id: NODE_ID,
             userId: USER_ID,
+            agentId: AGENT_ID,
             status,
             certificateFingerprint: CLIENT_FINGERPRINT,
+            certificateExpiresAt:
+              options.certificateExpiresAt
+              ?? new Date("2035-01-01T00:00:00.000Z"),
           }
     ),
     isBound: async () => true,

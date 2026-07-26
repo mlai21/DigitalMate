@@ -22,6 +22,9 @@ import {
   AdminChannelConfigError,
 } from "@/server/admin/channel-config";
 import {
+  AdminChannelNodeError,
+} from "@/server/admin/channel-nodes";
+import {
   CHANNEL_MANIFESTS,
 } from "@/server/channels/manifests/catalog";
 
@@ -663,6 +666,23 @@ function mapError(error: unknown): Response {
         "bulk_operation_incomplete",
         "bulk_operation_incomplete",
       );
+    }
+    return errorResponse(500, "internal_error", "internal_error");
+  }
+  if (error instanceof AdminChannelNodeError) {
+    const status = normalizeErrorStatus(error.status);
+    if (status === 400) {
+      return errorResponse(
+        400,
+        "invalid_request",
+        error.code,
+      );
+    }
+    if (status === 404) {
+      return errorResponse(404, "not_found", error.code);
+    }
+    if (status === 409) {
+      return errorResponse(409, error.code, error.code);
     }
     return errorResponse(500, "internal_error", "internal_error");
   }

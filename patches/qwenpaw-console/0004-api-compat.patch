@@ -2211,7 +2211,7 @@ diff --git a/src/api/types/channel.ts b/src/api/types/channel.ts
 index b936175..1c75d0b 100644
 --- a/src/api/types/channel.ts
 +++ b/src/api/types/channel.ts
-@@ -221,3 +221,47 @@ export type SingleChannelConfig =
+@@ -221,3 +221,54 @@ export type SingleChannelConfig =
    | XiaoYiConfig
    | YuanbaoConfig
    | OneBotConfig;
@@ -2222,7 +2222,14 @@ index b936175..1c75d0b 100644
 +}
 +
 +export interface ChannelHealth {
-+  status: "blocked" | "disabled";
++  status:
++    | "blocked"
++    | "disabled"
++    | "starting"
++    | "connected"
++    | "degraded"
++    | "disconnected";
++  reason?: string;
 +  detail: Record<string, unknown>;
 +}
 +
@@ -2828,6 +2835,14 @@ index bb2aea6..340582e 100644
  // Lazy pages
  const ChannelsPage = lazyImportWithRetry("../../pages/Control/Channels");
  const SessionsPage = lazyImportWithRetry("../../pages/Control/Sessions");
+@@ -40,6 +38,6 @@ const ACPPage = lazyImportWithRetry("../../pages/Agent/ACP");
+ const ModelsPage = lazyImportWithRetry("../../pages/Settings/Models");
+ const EnvironmentsPage = lazyImportWithRetry(
+-  "../../pages/Settings/Environments",
++  "../../pages/Settings/Environments/ChannelNodes",
+ );
+ const SecurityPage = lazyImportWithRetry("../../pages/Settings/Security");
+ const TokenUsagePage = lazyImportWithRetry("../../pages/Settings/TokenUsage");
 @@ -68,7 +66,7 @@ function ACPRedirect() {
  export const BUILTIN_ROUTES: Route[] = [
    { id: "core.root", path: "/", component: DefaultRedirect },
@@ -4249,7 +4264,51 @@ index c0bc4b1..4bba206 100644
  }: ChannelCardProps) {
    const { t } = useTranslation();
    const [isHover, setIsHover] = useState(false);
-@@ -39,11 +41,18 @@ export const ChannelCard = React.memo(function ChannelCard({
+@@ -24,9 +26,43 @@ export const ChannelCard = React.memo(function ChannelCard({
+   const isBuiltin = Boolean(config.isBuiltin);
+   const label = getChannelLabel(channelKey, t);
+   const getConfigString = (key: string) =>
+     typeof config[key] === "string" ? config[key] : "";
+   const botPrefix = getConfigString("bot_prefix");
++  const health =
++    typeof config.health === "object" && config.health !== null
++      ? (config.health as { status?: unknown; reason?: unknown })
++      : null;
++  const healthStatus =
++    typeof health?.status === "string"
++      ? health.status
++      : enabled
++        ? "starting"
++        : "disabled";
++  const healthReason =
++    typeof health?.reason === "string" ? health.reason : "";
++  const healthReasonLabel =
++    ({
++      macos_node_required: "需要在线 macOS 节点与 iMessage 权限",
++      media_node_required: "需要在线 SIP / LiveKit 媒体节点",
++      public_https_required: "需要可公开访问的 HTTPS 地址",
++      twilio_configuration_required: "需要完整的 Twilio 配置",
++      companion_service_required: "需要已连接的 OneBot companion",
++    } as Record<string, string>)[healthReason] ?? healthReason;
++  const healthLabel =
++    healthStatus === "connected"
++      ? "已连接"
++      : healthStatus === "degraded"
++        ? "连接异常"
++        : healthStatus === "blocked"
++          ? "前置条件未满足"
++          : healthStatus === "starting"
++            ? "启动中"
++            : healthStatus === "disconnected"
++              ? "未连接"
++              : t("common.disabled");
++  const healthActive =
++    healthStatus === "connected" || healthStatus === "degraded";
+
+   const getChannelIcon = () => (
+     <ChannelIcon channelKey={channelKey} size={32} iconUrl={iconUrl} />
+   );
+@@ -39,11 +75,18 @@ export const ChannelCard = React.memo(function ChannelCard({
 
    return (
      <Card
@@ -4272,6 +4331,37 @@ index c0bc4b1..4bba206 100644
        bodyStyle={{ padding: 24 }}
      >
        {/* Top section: Icon and Status */}
+@@ -53,14 +96,14 @@ export const ChannelCard = React.memo(function ChannelCard({
+           <div
+             className={`${styles.statusDot} ${
+-              enabled ? styles.enabled : styles.disabled
++              healthActive ? styles.enabled : styles.disabled
+             }`}
+           />
+           <span
+             className={`${styles.statusText} ${
+-              enabled ? styles.enabled : styles.disabled
++              healthActive ? styles.enabled : styles.disabled
+             }`}
+           >
+-            {enabled ? t("common.enabled") : t("common.disabled")}
++            {healthLabel}
+           </span>
+         </div>
+       </div>
+@@ -78,7 +121,11 @@ export const ChannelCard = React.memo(function ChannelCard({
+       {/* Bottom section: Bot Prefix */}
+       <div className={styles.cardBottomSection}>
+         <div className={styles.cardDescription}>
+-          {t("channels.botPrefix")}: {botPrefix || t("channels.notSet")}
++          {healthStatus === "blocked"
++            ? `前置条件：${healthReasonLabel || "尚未满足"}`
++            : `${t("channels.botPrefix")}: ${
++              botPrefix || t("channels.notSet")
++            }`}
+         </div>
+       </div>
+     </Card>
 diff --git a/src/pages/Control/Channels/components/ChannelDrawer.tsx b/src/pages/Control/Channels/components/ChannelDrawer.tsx
 index db43570..41610db 100644
 --- a/src/pages/Control/Channels/components/ChannelDrawer.tsx
@@ -7067,3 +7157,645 @@ index 5e19f38..1744a41 100644
    const msg = error.message;
    // Try " - " separator first (from request.ts formatted errors)
    const idx = msg.indexOf(" - ");
+diff --git a/src/pages/Settings/Environments/ChannelNodes.module.less b/src/pages/Settings/Environments/ChannelNodes.module.less
+new file mode 100644
+index 0000000..78fdf42
+--- /dev/null
++++ b/src/pages/Settings/Environments/ChannelNodes.module.less
+@@ -0,0 +1,233 @@
++.page {
++  height: 100%;
++  overflow: auto;
++  background: var(--dm-color-bg, #fffaf7);
++}
++
++.header {
++  padding: 20px 24px;
++}
++
++.content {
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++  padding: 0 24px 32px;
++}
++
++.intro,
++.createPanel,
++.nodeCard,
++.empty {
++  border: 1px solid var(--dm-color-border, #eadfd9);
++  border-radius: 12px;
++  background: #fff;
++}
++
++.intro {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 20px;
++  padding: 18px 20px;
++}
++
++.introText h2 {
++  margin: 0 0 6px;
++  color: #2d2725;
++  font-size: 18px;
++}
++
++.introText p {
++  max-width: 720px;
++  margin: 0;
++  color: #766c68;
++  font-size: 13px;
++  line-height: 1.65;
++}
++
++.createPanel {
++  display: grid;
++  grid-template-columns: minmax(240px, 1fr) minmax(220px, 1fr) auto;
++  gap: 20px;
++  align-items: end;
++  padding: 20px;
++}
++
++.field {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.fieldLabel {
++  color: #4b413e;
++  font-size: 13px;
++  font-weight: 600;
++}
++
++.checks {
++  display: flex;
++  min-height: 32px;
++  align-items: center;
++  gap: 20px;
++}
++
++.toolbar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  color: #766c68;
++  font-size: 13px;
++}
++
++.list {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
++  gap: 14px;
++}
++
++.nodeCard {
++  display: flex;
++  min-width: 0;
++  flex-direction: column;
++  gap: 16px;
++  padding: 18px;
++}
++
++.nodeHeader {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++}
++
++.nodeTitle {
++  min-width: 0;
++}
++
++.nodeTitle h3 {
++  overflow: hidden;
++  margin: 0 0 4px;
++  color: #2d2725;
++  font-size: 16px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.nodeId {
++  overflow: hidden;
++  color: #948984;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 11px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.metadata {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 12px;
++}
++
++.metaItem {
++  min-width: 0;
++}
++
++.metaItem span {
++  display: block;
++  margin-bottom: 3px;
++  color: #948984;
++  font-size: 11px;
++}
++
++.metaItem strong {
++  display: block;
++  overflow: hidden;
++  color: #4b413e;
++  font-size: 12px;
++  font-weight: 500;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.types,
++.bindings {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 7px;
++}
++
++.sectionLabel {
++  margin-bottom: 7px;
++  color: #766c68;
++  font-size: 12px;
++  font-weight: 600;
++}
++
++.binding {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  max-width: 100%;
++  padding: 4px 7px;
++  border-radius: 6px;
++  background: #f8f3f0;
++  color: #615653;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 10px;
++}
++
++.binding button {
++  padding: 0;
++  border: 0;
++  background: transparent;
++  color: #c75e4d;
++  cursor: pointer;
++}
++
++.bindRow {
++  display: flex;
++  gap: 8px;
++}
++
++.actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  padding-top: 2px;
++  border-top: 1px solid #f2ebe7;
++}
++
++.empty {
++  padding: 64px 24px;
++  color: #948984;
++  text-align: center;
++}
++
++.token {
++  display: block;
++  overflow-wrap: anywhere;
++  margin: 12px 0;
++  padding: 12px;
++  border-radius: 8px;
++  background: #f8f3f0;
++  color: #4b413e;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 12px;
++}
++
++@media (max-width: 760px) {
++  .intro {
++    align-items: stretch;
++    flex-direction: column;
++  }
++
++  .createPanel {
++    grid-template-columns: 1fr;
++  }
++
++  .list {
++    grid-template-columns: 1fr;
++  }
++}
+diff --git a/src/pages/Settings/Environments/ChannelNodes.tsx b/src/pages/Settings/Environments/ChannelNodes.tsx
+new file mode 100644
+index 0000000..3cd351e
+--- /dev/null
++++ b/src/pages/Settings/Environments/ChannelNodes.tsx
+@@ -0,0 +1,397 @@
++import { useCallback, useEffect, useState } from "react";
++import {
++  Button,
++  Checkbox,
++  Input,
++  Modal,
++  Tag,
++} from "@agentscope-ai/design";
++
++import { request } from "../../../api/request";
++import { PageHeader } from "../../../components/PageHeader";
++import { useAppMessage } from "../../../hooks/useAppMessage";
++import styles from "./ChannelNodes.module.less";
++
++type NodeChannelType = "imessage" | "sip";
++
++type NodeSummary = {
++  id: string;
++  display_name: string;
++  status: "connected" | "disconnected" | "revoked";
++  supported_channel_types: NodeChannelType[];
++  bound_connection_ids: string[];
++  client_version: string | null;
++  certificate_expires_at: string | null;
++  last_heartbeat_at: string | null;
++  outbox: {
++    pending_items: number;
++    pending_bytes: number;
++  };
++};
++
++type Enrollment = {
++  enrollment_id: string;
++  node_id: string;
++  token: string;
++  expires_at: string;
++  bundle: {
++    format: "digitalmate-channel-node-v1";
++    algorithm: "A256GCM";
++    salt: string;
++    iv: string;
++    ciphertext: string;
++    auth_tag: string;
++  };
++};
++
++const STATUS_COLORS = {
++  connected: "green",
++  disconnected: "orange",
++  revoked: "red",
++} as const;
++
++function ChannelNodesPage() {
++  const { message } = useAppMessage();
++  const [nodes, setNodes] = useState<NodeSummary[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [creating, setCreating] = useState(false);
++  const [showCreate, setShowCreate] = useState(false);
++  const [displayName, setDisplayName] = useState("");
++  const [types, setTypes] = useState<NodeChannelType[]>([
++    "imessage",
++  ]);
++  const [bindingInputs, setBindingInputs] = useState<
++    Record<string, string>
++  >({});
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    try {
++      setNodes(await request<NodeSummary[]>("/channel-nodes"));
++    } catch (error) {
++      message.error(error instanceof Error ? error.message : "运行节点加载失败");
++    } finally {
++      setLoading(false);
++    }
++  }, [message]);
++
++  useEffect(() => {
++    void load();
++  }, [load]);
++
++  const presentEnrollment = useCallback((enrollment: Enrollment) => {
++    const blob = new Blob(
++      [JSON.stringify(enrollment.bundle, null, 2)],
++      { type: "application/json" },
++    );
++    const url = URL.createObjectURL(blob);
++    const anchor = document.createElement("a");
++    anchor.href = url;
++    anchor.download = `digitalmate-channel-node-${enrollment.node_id}.dmnode`;
++    document.body.appendChild(anchor);
++    anchor.click();
++    anchor.remove();
++    window.setTimeout(() => URL.revokeObjectURL(url), 0);
++    Modal.info({
++      title: "节点包已下载",
++      width: 560,
++      content: (
++        <div>
++          <p>
++            下面的解密令牌只显示一次，有效期至{" "}
++            {formatTime(enrollment.expires_at)}。请与下载的节点包分开保存。
++          </p>
++          <code className={styles.token}>{enrollment.token}</code>
++          <p>
++            节点首次通过 mTLS 连接后，此令牌会立即失效。
++          </p>
++        </div>
++      ),
++    });
++  }, []);
++
++  const createNode = useCallback(async () => {
++    if (!displayName.trim() || types.length === 0) {
++      message.warning("请填写节点名称并至少选择一种渠道");
++      return;
++    }
++    setCreating(true);
++    try {
++      const enrollment = await request<Enrollment>(
++        "/channel-nodes/enrollments",
++        {
++          method: "POST",
++          body: JSON.stringify({
++            display_name: displayName.trim(),
++            supported_channel_types: types,
++          }),
++        },
++      );
++      presentEnrollment(enrollment);
++      setDisplayName("");
++      setShowCreate(false);
++      message.success("运行节点已创建");
++      await load();
++    } catch (error) {
++      message.error(error instanceof Error ? error.message : "节点创建失败");
++    } finally {
++      setCreating(false);
++    }
++  }, [displayName, load, message, presentEnrollment, types]);
++
++  const rotate = useCallback(async (nodeId: string) => {
++    try {
++      const enrollment = await request<Enrollment>(
++        `/channel-nodes/${encodeURIComponent(nodeId)}/certificate/rotate`,
++        { method: "POST", body: "{}" },
++      );
++      presentEnrollment(enrollment);
++      message.success("节点证书已轮换，旧证书已失效");
++      await load();
++    } catch (error) {
++      message.error(error instanceof Error ? error.message : "证书轮换失败");
++    }
++  }, [load, message, presentEnrollment]);
++
++  const revoke = useCallback((node: NodeSummary) => {
++    Modal.confirm({
++      title: `吊销“${node.display_name}”`,
++      content: "吊销后现有连接会立即下线，且不能恢复。中心消息与审计记录仍会保留。",
++      okText: "确认吊销",
++      okButtonProps: { danger: true },
++      cancelText: "取消",
++      onOk: async () => {
++        await request(
++          `/channel-nodes/${encodeURIComponent(node.id)}/revoke`,
++          { method: "POST", body: "{}" },
++        );
++        message.success("节点已吊销");
++        await load();
++      },
++    });
++  }, [load, message]);
++
++  const bind = useCallback(async (nodeId: string) => {
++    const connectionId = bindingInputs[nodeId]?.trim();
++    if (!connectionId) {
++      message.warning("请输入渠道连接 ID");
++      return;
++    }
++    try {
++      await request(
++        `/channel-nodes/${encodeURIComponent(nodeId)}/bindings`,
++        {
++          method: "POST",
++          body: JSON.stringify({ connection_id: connectionId }),
++        },
++      );
++      setBindingInputs((current) => ({ ...current, [nodeId]: "" }));
++      message.success("渠道连接已绑定");
++      await load();
++    } catch (error) {
++      message.error(error instanceof Error ? error.message : "绑定失败");
++    }
++  }, [bindingInputs, load, message]);
++
++  const unbind = useCallback(async (
++    nodeId: string,
++    connectionId: string,
++  ) => {
++    try {
++      await request(
++        `/channel-nodes/${encodeURIComponent(nodeId)}/bindings/${
++          encodeURIComponent(connectionId)
++        }`,
++        { method: "DELETE" },
++      );
++      message.success("渠道连接已解绑");
++      await load();
++    } catch (error) {
++      message.error(error instanceof Error ? error.message : "解绑失败");
++    }
++  }, [load, message]);
++
++  return (
++    <div className={styles.page}>
++      <PageHeader
++        parent="设置"
++        current="运行环境"
++        className={styles.header}
++      />
++      <div className={styles.content}>
++        <section className={styles.intro}>
++          <div className={styles.introText}>
++            <h2>渠道运行节点</h2>
++            <p>
++              iMessage 与 SIP 在受限节点运行。节点只负责协议收发，不运行模型、记忆、
++              Skill、工具或自主调度；第二套记忆与数字分身不会在节点创建。
++            </p>
++          </div>
++          <Button type="primary" onClick={() => setShowCreate((value) => !value)}>
++            {showCreate ? "取消创建" : "创建运行节点"}
++          </Button>
++        </section>
++
++        {showCreate && (
++          <section className={styles.createPanel}>
++            <label className={styles.field}>
++              <span className={styles.fieldLabel}>节点名称</span>
++              <Input
++                value={displayName}
++                maxLength={128}
++                placeholder="例如：客厅 Mac 或 SIP 媒体节点"
++                onChange={(event) => setDisplayName(event.target.value)}
++              />
++            </label>
++            <div className={styles.field}>
++              <span className={styles.fieldLabel}>支持渠道</span>
++              <div className={styles.checks}>
++                {(["imessage", "sip"] as const).map((type) => (
++                  <Checkbox
++                    key={type}
++                    checked={types.includes(type)}
++                    onChange={(event) => {
++                      setTypes((current) => event.target.checked
++                        ? [...current, type]
++                        : current.filter((candidate) => candidate !== type));
++                    }}
++                  >
++                    {type === "imessage" ? "iMessage" : "SIP / LiveKit"}
++                  </Checkbox>
++                ))}
++              </div>
++            </div>
++            <Button type="primary" loading={creating} onClick={createNode}>
++              创建并下载节点包
++            </Button>
++          </section>
++        )}
++
++        <div className={styles.toolbar}>
++          <span>{nodes.length} 个运行节点</span>
++          <Button size="small" loading={loading} onClick={load}>
++            刷新
++          </Button>
++        </div>
++
++        {!loading && nodes.length === 0 ? (
++          <div className={styles.empty}>
++            尚未创建运行节点。启用 iMessage 或 SIP 前，请先创建并安装对应节点。
++          </div>
++        ) : (
++          <div className={styles.list}>
++            {nodes.map((node) => (
++              <article className={styles.nodeCard} key={node.id}>
++                <div className={styles.nodeHeader}>
++                  <div className={styles.nodeTitle}>
++                    <h3>{node.display_name}</h3>
++                    <div className={styles.nodeId}>{node.id}</div>
++                  </div>
++                  <Tag color={STATUS_COLORS[node.status]}>
++                    {statusLabel(node.status)}
++                  </Tag>
++                </div>
++                <div className={styles.metadata}>
++                  <Meta label="最后心跳" value={formatTime(node.last_heartbeat_at)} />
++                  <Meta label="节点版本" value={node.client_version ?? "尚未注册"} />
++                  <Meta label="证书到期" value={formatTime(node.certificate_expires_at)} />
++                  <Meta
++                    label="待发 outbox"
++                    value={`${node.outbox.pending_items} 条 / ${formatBytes(
++                      node.outbox.pending_bytes,
++                    )}`}
++                  />
++                </div>
++                <div>
++                  <div className={styles.sectionLabel}>支持渠道</div>
++                  <div className={styles.types}>
++                    {node.supported_channel_types.map((type) => (
++                      <Tag key={type}>{type === "imessage" ? "iMessage" : "SIP"}</Tag>
++                    ))}
++                  </div>
++                </div>
++                <div>
++                  <div className={styles.sectionLabel}>已绑定连接</div>
++                  <div className={styles.bindings}>
++                    {node.bound_connection_ids.length === 0 && (
++                      <span className={styles.nodeId}>尚未绑定</span>
++                    )}
++                    {node.bound_connection_ids.map((connectionId) => (
++                      <span className={styles.binding} key={connectionId}>
++                        {connectionId}
++                        <button
++                          type="button"
++                          title="解绑"
++                          onClick={() => void unbind(node.id, connectionId)}
++                        >
++                          ×
++                        </button>
++                      </span>
++                    ))}
++                  </div>
++                </div>
++                {node.status !== "revoked" && (
++                  <div className={styles.bindRow}>
++                    <Input
++                      value={bindingInputs[node.id] ?? ""}
++                      placeholder="渠道连接 UUID"
++                      onChange={(event) => setBindingInputs((current) => ({
++                        ...current,
++                        [node.id]: event.target.value,
++                      }))}
++                    />
++                    <Button onClick={() => void bind(node.id)}>绑定</Button>
++                  </div>
++                )}
++                <div className={styles.actions}>
++                  <Button
++                    disabled={node.status === "revoked"}
++                    onClick={() => void rotate(node.id)}
++                  >
++                    轮换证书
++                  </Button>
++                  <Button
++                    danger
++                    disabled={node.status === "revoked"}
++                    onClick={() => revoke(node)}
++                  >
++                    吊销
++                  </Button>
++                </div>
++              </article>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
++
++function Meta({ label, value }: { label: string; value: string }) {
++  return (
++    <div className={styles.metaItem}>
++      <span>{label}</span>
++      <strong title={value}>{value}</strong>
++    </div>
++  );
++}
++
++function formatTime(value: string | null): string {
++  if (!value) return "—";
++  const date = new Date(value);
++  return Number.isFinite(date.getTime()) ? date.toLocaleString() : "—";
++}
++
++function formatBytes(value: number): string {
++  if (value < 1024) return `${value} B`;
++  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
++  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
++}
++
++function statusLabel(status: NodeSummary["status"]): string {
++  if (status === "connected") return "已连接";
++  if (status === "revoked") return "已吊销";
++  return "未连接";
++}
++
++export default ChannelNodesPage;

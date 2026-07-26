@@ -110,9 +110,14 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "config", "revision", "health_status", "created_at", "updated_at",
   ],
   channel_runtime_nodes: [
-    "id", "user_id", "display_name", "supported_channel_types", "status",
-    "last_sequence", "last_server_sequence", "last_heartbeat_at",
-    "created_at", "updated_at",
+    "id", "user_id", "agent_id", "display_name",
+    "supported_channel_types", "status",
+    "last_sequence", "last_server_sequence", "client_version",
+    "certificate_expires_at", "last_heartbeat_at", "created_at", "updated_at",
+  ],
+  channel_node_enrollments: [
+    "id", "user_id", "node_id", "token_digest",
+    "expires_at", "consumed_at", "created_at",
   ],
   channel_node_bindings: [
     "connection_id", "user_id", "agent_id", "node_id", "created_at",
@@ -239,6 +244,7 @@ const PERSONAL_DATA_EXPORT_ORDER_BY: {
   channel_identities: "id ASC",
   channel_connections: "id ASC",
   channel_runtime_nodes: "id ASC",
+  channel_node_enrollments: "id ASC",
   channel_node_bindings: "connection_id ASC",
   channel_node_inbound_receipts:
     "node_id ASC, client_sequence ASC",
@@ -299,6 +305,7 @@ const PERSONAL_DATA_CLEAR_TABLES = [
   "channel_access_rules",
   "channel_inbound_events",
   "channel_node_bindings",
+  "channel_node_enrollments",
   "channel_runtime_nodes",
   "goals",
   "skill_usage_logs",

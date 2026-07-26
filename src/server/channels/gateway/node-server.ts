@@ -77,6 +77,16 @@ type NodeRepository = Readonly<{
     userId: string,
     nodeId: string,
   ): Promise<string[]>;
+  recordRegistration?(
+    userId: string,
+    nodeId: string,
+    supportedChannelTypes: Extract<
+      NodeFrame,
+      { type: "register" }
+    >["supportedChannelTypes"],
+    clientVersion: string,
+    registeredAt?: Date,
+  ): Promise<void>;
 }>;
 
 type NodeSessionInput = Readonly<{
@@ -84,6 +94,7 @@ type NodeSessionInput = Readonly<{
     id: string;
     userId: string;
     certificateFingerprintHex: string;
+    certificateExpiresAt: Date;
   }>;
   repository: NodeRepository;
   send(frame: NodeFrame): void | Promise<void>;
@@ -137,6 +148,13 @@ function createNodeTaskQueue() {
 
 export function createNodeMessageSession(input: NodeSessionInput) {
   const now = input.now ?? (() => new Date());
+  if (
+    !Number.isFinite(
+      input.node.certificateExpiresAt.getTime(),
+    )
+  ) {
+    throw new Error("node_certificate_expiry_invalid");
+  }
   let registered = false;
   let closed = false;
 
@@ -150,6 +168,9 @@ export function createNodeMessageSession(input: NodeSessionInput) {
     async receive(raw: string | Buffer): Promise<void> {
       if (closed) return;
       try {
+        if (now() >= input.node.certificateExpiresAt) {
+          throw new Error("node_certificate_expired");
+        }
         if (
           input.isAuthorized
           && !await input.isAuthorized()
@@ -172,6 +193,13 @@ export function createNodeMessageSession(input: NodeSessionInput) {
             frame,
             input.node.id,
             input.node.certificateFingerprintHex,
+          );
+          await input.repository.recordRegistration?.(
+            input.node.userId,
+            input.node.id,
+            frame.supportedChannelTypes,
+            frame.clientVersion,
+            now(),
           );
           const serverSequence =
             await input.repository.allocateServerSequence(
@@ -315,6 +343,21 @@ export function createNodeMessageSession(input: NodeSessionInput) {
       close("node_session_replaced");
     },
 
+    expire(): void {
+      close("node_certificate_expired");
+    },
+
+    isAuthorizedAt(at: Date): boolean {
+      if (
+        !Number.isFinite(at.getTime())
+        || at >= input.node.certificateExpiresAt
+      ) {
+        close("node_certificate_expired");
+        return false;
+      }
+      return !closed;
+    },
+
     isClosed(): boolean {
       return closed;
     },
@@ -380,6 +423,7 @@ export function createChannelNodeServer(input: Readonly<{
       socket: WebSocket;
       session: ReturnType<typeof createNodeMessageSession>;
       receiveQueue: ReturnType<typeof createNodeTaskQueue>;
+      certificateFingerprint: Buffer;
     }>
   >();
   const nodeReceiveQueues = new Map<
@@ -406,14 +450,23 @@ export function createChannelNodeServer(input: Readonly<{
   });
 
   const idleTimer = setInterval(() => {
-    const now = Date.now();
+    const wallNow = Date.now();
+    const authorizationNow =
+      input.now?.() ?? new Date(wallNow);
     for (const connections of sessions.values()) {
       for (const connection of connections) {
+        if (
+          !connection.session.isAuthorizedAt(
+            authorizationNow,
+          )
+        ) {
+          continue;
+        }
         const lastActivity =
           (connection.socket as WebSocket & {
             lastActivity?: number;
-          }).lastActivity ?? now;
-        if (now - lastActivity > idleTimeoutMs) {
+          }).lastActivity ?? wallNow;
+        if (wallNow - lastActivity > idleTimeoutMs) {
           connection.socket.terminate();
         } else if (
           connection.socket.readyState === WebSocket.OPEN
@@ -481,17 +534,31 @@ export function createChannelNodeServer(input: Readonly<{
           userId: node.userId,
           certificateFingerprintHex:
             node.certificateFingerprint.toString("hex"),
+          certificateExpiresAt:
+            node.certificateExpiresAt,
         },
         repository: input.repository,
         send: (frame) => sendWebSocketFrame(socket, frame),
         close: (code, reason) => socket.close(code, reason),
         isAuthorized: async () => {
+          const checkedAt =
+            input.now?.() ?? new Date();
+          if (checkedAt >= node.certificateExpiresAt) {
+            throw new Error("node_certificate_expired");
+          }
           const current =
             await input.repository.findByCertificateFingerprint(
               node.certificateFingerprint,
             );
+          if (
+            current
+            && checkedAt >= current.certificateExpiresAt
+          ) {
+            throw new Error("node_certificate_expired");
+          }
           return current?.id === node.id
             && current.userId === node.userId
+            && current.agentId === node.agentId
             && current.status !== "revoked";
         },
         ...(input.now ? { now: input.now } : {}),
@@ -532,7 +599,14 @@ export function createChannelNodeServer(input: Readonly<{
       socket,
       session,
       receiveQueue,
+      certificateFingerprint:
+        Buffer.from(node.certificateFingerprint),
     };
+    const cancelCertificateExpiry =
+      scheduleCertificateExpiry(
+        node.certificateExpiresAt,
+        () => session.expire(),
+      );
     const nodeSessions = sessions.get(node.id) ?? new Set();
     nodeSessions.add(entry);
     sessions.set(node.id, nodeSessions);
@@ -563,6 +637,7 @@ export function createChannelNodeServer(input: Readonly<{
       socket.terminate();
     });
     socket.once("close", () => {
+      cancelCertificateExpiry();
       nodeSessions.delete(entry);
       if (nodeSessions.size === 0) {
         sessions.delete(node.id);
@@ -624,11 +699,33 @@ export function createChannelNodeServer(input: Readonly<{
         .filter(({ socket, session }) =>
           socket.readyState === WebSocket.OPEN
           && !session.isClosed()
-        );
-      const target = entries.at(-1);
-      if (!target) return false;
-      await sendWebSocketFrame(target.socket, frame);
-      return true;
+        )
+        .reverse();
+      for (const target of entries) {
+        const checkedAt = input.now?.() ?? new Date();
+        if (!target.session.isAuthorizedAt(checkedAt)) {
+          continue;
+        }
+        const current =
+          await input.repository.findByCertificateFingerprint(
+            target.certificateFingerprint,
+          );
+        if (
+          !current
+          || current.id !== nodeId
+          || current.status === "revoked"
+        ) {
+          target.session.revoke();
+          continue;
+        }
+        if (checkedAt >= current.certificateExpiresAt) {
+          target.session.expire();
+          continue;
+        }
+        await sendWebSocketFrame(target.socket, frame);
+        return true;
+      }
+      return false;
     },
 
     async stop(drainMs = 5_000): Promise<void> {
@@ -688,6 +785,33 @@ async function delayUntil(deadline: number): Promise<void> {
   const remaining = Math.max(0, deadline - Date.now());
   if (remaining === 0) return;
   await new Promise((resolve) => setTimeout(resolve, remaining));
+}
+
+function scheduleCertificateExpiry(
+  expiresAt: Date,
+  expire: () => void,
+): () => void {
+  const maximumDelay = 2_147_000_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  const schedule = () => {
+    if (cancelled) return;
+    const remaining = expiresAt.getTime() - Date.now();
+    if (remaining <= 0) {
+      expire();
+      return;
+    }
+    timer = setTimeout(
+      schedule,
+      Math.min(remaining, maximumDelay),
+    );
+    timer.unref();
+  };
+  schedule();
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
 }
 
 function assertRegisterFrame(

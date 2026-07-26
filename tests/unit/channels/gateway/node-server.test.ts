@@ -15,6 +15,13 @@ const FINGERPRINT = createHash("sha256")
   .update(RAW_CERTIFICATE)
   .digest("hex");
 const SENT_AT = "2026-07-26T00:00:00.000Z";
+const NODE = Object.freeze({
+  id: NODE_ID,
+  userId: "10000000-0000-4000-8000-000000000001",
+  certificateFingerprintHex: FINGERPRINT,
+  certificateExpiresAt:
+    new Date("2026-08-26T00:00:00.000Z"),
+});
 
 describe("channel node message session", () => {
   it("serializes frames from the same WebSocket in arrival order", async () => {
@@ -44,11 +51,7 @@ describe("channel node message session", () => {
     const close = vi.fn();
     const send = vi.fn();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: repository(),
       send,
       close,
@@ -61,13 +64,10 @@ describe("channel node message session", () => {
       "node_register_required",
     );
 
+    const nodeRepository = repository();
     const registered = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
-      repository: repository(),
+      node: NODE,
+      repository: nodeRepository,
       send,
       close,
       now: () => new Date(SENT_AT),
@@ -83,17 +83,22 @@ describe("channel node message session", () => {
         sequence: 1,
       }),
     );
+    expect(
+      nodeRepository.recordRegistration,
+    ).toHaveBeenCalledWith(
+      "10000000-0000-4000-8000-000000000001",
+      NODE_ID,
+      ["imessage", "sip"],
+      "test",
+      new Date(SENT_AT),
+    );
   });
 
   it("rejects replayed sequences and unbound connections", async () => {
     const close = vi.fn();
     const nodeRepository = repository();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close,
@@ -111,11 +116,7 @@ describe("channel node message session", () => {
     );
 
     const unbound = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: repository({ bound: false }),
       send: vi.fn(),
       close,
@@ -136,11 +137,7 @@ describe("channel node message session", () => {
   it("stops accepting frames after revocation", async () => {
     const close = vi.fn();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: repository(),
       send: vi.fn(),
       close,
@@ -160,14 +157,42 @@ describe("channel node message session", () => {
     expect(session.isClosed()).toBe(true);
   });
 
-  it("rejects frame types that are only valid from the server", async () => {
+  it("closes an established session once its certificate expires", async () => {
+    let current = new Date(SENT_AT);
     const close = vi.fn();
     const session = createNodeMessageSession({
       node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
+        ...NODE,
+        certificateExpiresAt:
+          new Date("2026-07-26T00:00:01.000Z"),
       },
+      repository: repository(),
+      send: vi.fn(),
+      close,
+      now: () => current,
+      isAuthorized: async () => true,
+    });
+
+    await session.receive(
+      JSON.stringify(register(FINGERPRINT, 1)),
+    );
+    current = new Date("2026-07-26T00:00:01.000Z");
+    await session.receive(JSON.stringify(heartbeat(2)));
+
+    expect(close).toHaveBeenCalledWith(
+      1008,
+      "node_certificate_expired",
+    );
+    expect(session.isClosed()).toBe(true);
+    expect(
+      session.isAuthorizedAt(current),
+    ).toBe(false);
+  });
+
+  it("rejects frame types that are only valid from the server", async () => {
+    const close = vi.fn();
+    const session = createNodeMessageSession({
+      node: NODE,
       repository: repository(),
       send: vi.fn(),
       close,
@@ -197,11 +222,7 @@ describe("channel node message session", () => {
     const close = vi.fn();
     const nodeRepository = repository();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close,
@@ -225,11 +246,7 @@ describe("channel node message session", () => {
     const nodeRepository = repository();
     const send = vi.fn();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send,
       close,
@@ -262,11 +279,7 @@ describe("channel node message session", () => {
     const close = vi.fn();
     const nodeRepository = repository();
     const session = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close,
@@ -296,11 +309,7 @@ describe("channel node message session", () => {
     }));
     const firstSend = vi.fn();
     const first = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: firstSend,
       close: vi.fn(),
@@ -313,11 +322,7 @@ describe("channel node message session", () => {
 
     const secondSend = vi.fn();
     const second = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: secondSend,
       close: vi.fn(),
@@ -344,11 +349,7 @@ describe("channel node message session", () => {
   it("rejects a changed payload that reuses a persisted client sequence", async () => {
     const nodeRepository = repository();
     const first = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close: vi.fn(),
@@ -360,11 +361,7 @@ describe("channel node message session", () => {
 
     const close = vi.fn();
     const second = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close,
@@ -390,11 +387,7 @@ describe("channel node message session", () => {
     const options = { bound: true };
     const nodeRepository = repository(options);
     const first = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close: vi.fn(),
@@ -408,11 +401,7 @@ describe("channel node message session", () => {
     const close = vi.fn();
     const onInbound = vi.fn();
     const second = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: vi.fn(),
       close,
@@ -433,11 +422,7 @@ describe("channel node message session", () => {
     const nodeRepository = repository();
     const firstSend = vi.fn();
     const first = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: firstSend,
       close: vi.fn(),
@@ -449,11 +434,7 @@ describe("channel node message session", () => {
 
     const secondSend = vi.fn();
     const second = createNodeMessageSession({
-      node: {
-        id: NODE_ID,
-        userId: "10000000-0000-4000-8000-000000000001",
-        certificateFingerprintHex: FINGERPRINT,
-      },
+      node: NODE,
       repository: nodeRepository,
       send: secondSend,
       close: vi.fn(),
@@ -478,6 +459,7 @@ function repository(options: { bound?: boolean } = {}) {
   }>();
   return {
     isBound: vi.fn(async () => options.bound ?? true),
+    recordRegistration: vi.fn(async () => undefined),
     allocateServerSequence: vi.fn(async () => {
       lastServerSequence += 1;
       return lastServerSequence;

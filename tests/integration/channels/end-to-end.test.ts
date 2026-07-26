@@ -733,6 +733,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "Test node",
       certificateFingerprint: Buffer.alloc(32, 7),
       supportedChannelTypes: ["telegram"],
@@ -812,6 +814,8 @@ describe("channel runtime end-to-end recovery", () => {
     const deliveries = createChannelDeliveryRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "Result node",
       certificateFingerprint: Buffer.alloc(32, 12),
       supportedChannelTypes: ["imessage"],
@@ -907,6 +911,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "ACK node",
       certificateFingerprint: Buffer.alloc(32, 8),
       supportedChannelTypes: ["telegram"],
@@ -993,6 +999,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "iMessage node",
       certificateFingerprint: Buffer.alloc(32, 13),
       supportedChannelTypes: ["imessage"],
@@ -1074,6 +1082,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "iMessage attachment node",
       certificateFingerprint: Buffer.alloc(32, 14),
       supportedChannelTypes: ["imessage"],
@@ -1236,6 +1246,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "Revoked node",
       certificateFingerprint: Buffer.alloc(32, 10),
       supportedChannelTypes: ["telegram"],
@@ -1275,6 +1287,8 @@ describe("channel runtime end-to-end recovery", () => {
     const nodes = createChannelNodeRepository(pool);
     const node = await nodes.register({
       userId: USER_ID,
+      agentId: AGENT_ID,
+      certificateExpiresAt: new Date("2035-01-01T00:00:00.000Z"),
       displayName: "Offline node",
       certificateFingerprint: Buffer.alloc(32, 9),
       supportedChannelTypes: ["telegram"],

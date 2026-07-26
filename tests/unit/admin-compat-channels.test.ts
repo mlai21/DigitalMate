@@ -10,6 +10,7 @@ import type {
   AdminChannelConfigBatchWriter,
   AdminChannelConfigReader,
   AdminChannelConfigWriter,
+  AdminChannelHealthResolver,
 } from "@/server/admin/compat/handlers/channels";
 import { createAdminAuthStatusResponse } from "@/server/admin/compat/security";
 import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
@@ -879,6 +880,77 @@ describe("admin compatibility channel contract", () => {
     expect(valid.status).toBe(200);
     expect(invalid.status).toBe(404);
   });
+
+  it.each([
+    ["imessage", "macos_node_required"],
+    ["sip", "media_node_required"],
+    ["voice", "public_https_required"],
+    ["onebot", "companion_service_required"],
+  ] as const)(
+    "%s 缺少特殊前置条件时保存仍可成功，但健康状态显示 blocked",
+    async (type, reason) => {
+      const resolveHealth = vi.fn<AdminChannelHealthResolver>(
+        async (_scope, candidate) => ({
+          status: candidate === type ? "blocked" : "disabled",
+          reason: candidate === type ? reason : undefined,
+          detail:
+            candidate === type
+              ? { code: reason }
+              : {},
+        }),
+      );
+      const update = vi.fn<AdminChannelConfigWriter>(
+        async (input) => ({
+          type: input.type,
+          enabled: true,
+          revision: input.expectedRevision + 1,
+          config: input.config,
+          secrets: {},
+          health: {
+            status: "starting",
+            detail: {},
+          },
+        }),
+      );
+      const router = createCoreAdminCompatRouter(
+        dependencies({
+          updateChannelConfig: update,
+          resolveChannelHealth: resolveHealth,
+        }),
+      );
+
+      const healthResponse = await router.dispatch(
+        await request(`/config/channels/${type}/health`),
+        runtime(),
+      );
+      const saved = await router.dispatch(
+        await request(`/config/channels/${type}`, {
+          method: "PUT",
+          body: {
+            operation_id: OPERATION_ID,
+            revision: 0,
+            enabled: true,
+          },
+        }),
+        runtime(),
+      );
+
+      expect(healthResponse.status).toBe(200);
+      await expect(healthResponse.json()).resolves.toMatchObject({
+        status: "blocked",
+        reason,
+      });
+      expect(saved.status).toBe(200);
+      await expect(saved.json()).resolves.toMatchObject({
+        enabled: true,
+        health: {
+          status: "blocked",
+          reason,
+        },
+      });
+      expect(update).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("turns a save into a typed secret change without ever returning its value", async () => {
     const update = vi.fn<AdminChannelConfigWriter>(

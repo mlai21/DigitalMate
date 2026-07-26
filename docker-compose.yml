@@ -70,12 +70,17 @@ services:
       FEISHU_VERIFICATION_TOKEN: ${FEISHU_VERIFICATION_TOKEN:-}
       DINGTALK_ROBOT_CODE: ${DINGTALK_ROBOT_CODE:-}
       CHANNEL_IMPORT_LEGACY_ENABLED: ${CHANNEL_IMPORT_LEGACY_ENABLED:-0}
+      CHANNEL_NODE_ENROLLMENT_CA_PATH: ${CHANNEL_NODE_ENROLLMENT_CA_PATH:-}
+      CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH: ${CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH:-}
+      CHANNEL_NODE_SERVER_CA_PATH: ${CHANNEL_NODE_SERVER_CA_PATH:-}
     # 不再向宿主机暴露 3000，仅通过 Caddy(443) 对外，防止 HTTP 明文绕过
     expose:
       - "3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - digitalmate-attachments:/app/data/attachments
+      - ${CHANNEL_NODE_ENROLLMENT_CA_DIR:-./data/channel-node-enrollment-ca}:/run/digitalmate/channel-node-enrollment-ca:ro
+      - ${CHANNEL_NODE_SERVER_CA_DIR:-./data/channel-node-server-ca}:/run/digitalmate/channel-node-server-ca:ro
     depends_on:
       postgres:
         condition: service_healthy

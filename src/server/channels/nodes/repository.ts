@@ -27,8 +27,10 @@ export const NODE_OUTBOX_LIMITS = Object.freeze({
 
 export type RegisterChannelNodeInput = Readonly<{
   userId: string;
+  agentId: string;
   displayName: string;
   certificateFingerprint: Buffer;
+  certificateExpiresAt: Date;
   supportedChannelTypes: readonly ChannelType[];
 }>;
 
@@ -92,8 +94,10 @@ export function createChannelNodeRepository(pool: Pool) {
     ): Promise<{
       id: string;
       userId: string;
+      agentId: string;
       status: "connected" | "disconnected" | "revoked";
       certificateFingerprint: Buffer;
+      certificateExpiresAt: Date;
     } | null> {
       if (fingerprint.length !== 32) {
         throw new Error("node_certificate_fingerprint_invalid");
@@ -101,10 +105,14 @@ export function createChannelNodeRepository(pool: Pool) {
       const result = await pool.query<{
         id: string;
         user_id: string;
+        agent_id: string;
         status: "connected" | "disconnected" | "revoked";
         certificate_fingerprint: Buffer;
+        certificate_expires_at: Date | string;
       }>(
-        `SELECT id, user_id, status, certificate_fingerprint
+        `SELECT id, user_id, agent_id, status,
+                certificate_fingerprint,
+                certificate_expires_at
          FROM channel_runtime_nodes
          WHERE certificate_fingerprint = $1`,
         [fingerprint],
@@ -114,10 +122,98 @@ export function createChannelNodeRepository(pool: Pool) {
         ? {
             id: row.id,
             userId: row.user_id,
+            agentId: row.agent_id,
             status: row.status,
             certificateFingerprint: row.certificate_fingerprint,
+            certificateExpiresAt: parseDatabaseDate(
+              row.certificate_expires_at,
+              "node_certificate_expiry_invalid",
+            ),
           }
         : null;
+    },
+
+    async consumeEnrollmentByCertificateFingerprint(
+      fingerprint: Buffer,
+      consumedAt = new Date(),
+    ): Promise<boolean> {
+      if (fingerprint.length !== 32) {
+        throw new Error("node_certificate_fingerprint_invalid");
+      }
+      assertDate(consumedAt, "node_enrollment_time_invalid");
+      const result = await pool.query(
+        `UPDATE channel_node_enrollments AS enrollment
+         SET consumed_at = $2
+         FROM channel_runtime_nodes AS node
+         WHERE node.certificate_fingerprint = $1
+           AND node.id = enrollment.node_id
+           AND node.user_id = enrollment.user_id
+           AND enrollment.consumed_at IS NULL
+           AND enrollment.expires_at >= $2
+         RETURNING enrollment.id`,
+        [fingerprint, consumedAt],
+      );
+      if ((result.rowCount ?? 0) > 0) return true;
+      const pending = await pool.query(
+        `SELECT 1
+         FROM channel_node_enrollments AS enrollment
+         JOIN channel_runtime_nodes AS node
+           ON node.id = enrollment.node_id
+          AND node.user_id = enrollment.user_id
+         WHERE node.certificate_fingerprint = $1
+           AND enrollment.consumed_at IS NULL
+         LIMIT 1`,
+        [fingerprint],
+      );
+      if (pending.rowCount === 1) {
+        throw new Error("node_enrollment_expired");
+      }
+      return false;
+    },
+
+    async recordRegistration(
+      userId: string,
+      nodeId: string,
+      supportedChannelTypes: readonly ChannelType[],
+      clientVersion: string,
+      registeredAt = new Date(),
+    ): Promise<void> {
+      assertDate(registeredAt, "node_registration_time_invalid");
+      if (
+        clientVersion.trim().length === 0
+        || clientVersion.length > 128
+      ) {
+        throw new Error("node_client_version_invalid");
+      }
+      const uniqueTypes = [...new Set(supportedChannelTypes)];
+      if (
+        uniqueTypes.length === 0
+        || uniqueTypes.length !== supportedChannelTypes.length
+      ) {
+        throw new Error("node_supported_channel_types_invalid");
+      }
+      const updated = await pool.query(
+        `UPDATE channel_runtime_nodes
+         SET client_version = $4,
+             updated_at = $5
+         WHERE id = $1
+           AND user_id = $2
+           AND status <> 'revoked'
+           AND supported_channel_types @> $3::text[]
+           AND supported_channel_types <@ $3::text[]`,
+        [
+          nodeId,
+          userId,
+          uniqueTypes,
+          clientVersion.trim(),
+          registeredAt,
+        ],
+      );
+      if (updated.rowCount !== 1) {
+        throw new Error(
+          "node_supported_channel_types_mismatch",
+        );
+      }
     },
 
     async listBoundConnectionIds(
@@ -139,18 +235,25 @@ export function createChannelNodeRepository(pool: Pool) {
       id: string;
       created: boolean;
     }> {
+      assertDate(
+        input.certificateExpiresAt,
+        "node_certificate_expiry_invalid",
+      );
       const inserted = await pool.query<{ id: string }>(
         `INSERT INTO channel_runtime_nodes (
-           user_id, display_name, certificate_fingerprint,
+           user_id, agent_id, display_name,
+           certificate_fingerprint, certificate_expires_at,
            supported_channel_types
          )
-         VALUES ($1, $2, $3, $4::text[])
+         VALUES ($1, $2, $3, $4, $5, $6::text[])
          ON CONFLICT (user_id, certificate_fingerprint) DO NOTHING
          RETURNING id`,
         [
           input.userId,
+          input.agentId,
           input.displayName,
           input.certificateFingerprint,
+          input.certificateExpiresAt,
           [...input.supportedChannelTypes],
         ],
       );
@@ -161,8 +264,13 @@ export function createChannelNodeRepository(pool: Pool) {
         `SELECT id
          FROM channel_runtime_nodes
          WHERE user_id = $1
-           AND certificate_fingerprint = $2`,
-        [input.userId, input.certificateFingerprint],
+           AND agent_id = $2
+           AND certificate_fingerprint = $3`,
+        [
+          input.userId,
+          input.agentId,
+          input.certificateFingerprint,
+        ],
       );
       const row = existing.rows[0];
       if (!row) {
@@ -689,8 +797,13 @@ export function createChannelNodeRepository(pool: Pool) {
            FROM channel_runtime_nodes
            WHERE id = $1
              AND user_id = $2
+             AND agent_id = $3
            FOR UPDATE`,
-          [input.nodeId, input.scope.userId],
+          [
+            input.nodeId,
+            input.scope.userId,
+            input.scope.agentId,
+          ],
         );
         const nodeRow = node.rows[0];
         if (!nodeRow) throw new Error("channel_node_not_found");
@@ -772,12 +885,14 @@ export function createChannelNodeRepository(pool: Pool) {
                updated_at = $4
            WHERE id = $1
              AND user_id = $2
+             AND agent_id = $5
              AND status <> 'revoked'`,
           [
             input.nodeId,
             input.scope.userId,
             nextSequence,
             now,
+            input.scope.agentId,
           ],
         );
         if (sequenceUpdated.rowCount !== 1) {
@@ -1646,6 +1761,17 @@ function assertDate(value: Date, code: string): void {
   ) {
     throw new Error(code);
   }
+}
+
+function parseDatabaseDate(
+  value: Date | string,
+  code: string,
+): Date {
+  const parsed = value instanceof Date
+    ? value
+    : new Date(value);
+  assertDate(parsed, code);
+  return parsed;
 }
 
 function assertBoundedInteger(

@@ -69,6 +69,9 @@ const envSchema = z.object({
   CHANNEL_NODE_TLS_CERT_PATH: z.string().optional(),
   CHANNEL_NODE_TLS_KEY_PATH: z.string().optional(),
   CHANNEL_NODE_CA_PATH: z.string().optional(),
+  CHANNEL_NODE_SERVER_CA_PATH: z.string().optional(),
+  CHANNEL_NODE_ENROLLMENT_CA_PATH: z.string().optional(),
+  CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH: z.string().optional(),
   PUBLIC_BASE_URL: z.string().optional(),
   ATTACHMENT_STORAGE_DIR: z.string().optional(),
 });
@@ -89,6 +92,27 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     parsed.NODE_ENV,
   );
   const channelNodeTls = parseChannelNodeTls(parsed);
+  const channelNodeEnrollmentCa =
+    parseChannelNodeEnrollmentCa(parsed);
+  const channelNodeServerCaPath =
+    parseOptionalPath(parsed.CHANNEL_NODE_SERVER_CA_PATH);
+  if (
+    channelNodeEnrollmentCa.status === "ready"
+    && !channelNodeServerCaPath
+  ) {
+    throw new Error(
+      "启用渠道节点 enrollment 时必须配置独立的网关服务端 CA。",
+    );
+  }
+  if (
+    channelNodeEnrollmentCa.status === "ready"
+    && channelNodeServerCaPath
+      === channelNodeEnrollmentCa.certificateAuthorityPath
+  ) {
+    throw new Error(
+      "网关服务端 CA 不能与节点 enrollment CA 复用。",
+    );
+  }
 
   return {
     databaseUrl: parsed.DATABASE_URL,
@@ -129,10 +153,19 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     channelGatewayPort: parsed.CHANNEL_GATEWAY_PORT,
     channelNodePort: parsed.CHANNEL_NODE_PORT,
     channelNodeTls,
+    channelNodeEnrollmentCa,
+    channelNodeServerCaPath,
     publicBaseUrl,
     attachmentStorageDir:
       attachmentStorageDir || path.join(process.cwd(), "data", "attachments"),
   };
+}
+
+function parseOptionalPath(
+  value: string | undefined,
+): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? path.resolve(trimmed) : null;
 }
 
 function parseChannelNodeTls(parsed: Readonly<{
@@ -163,6 +196,36 @@ function parseChannelNodeTls(parsed: Readonly<{
     certificatePath: path.resolve(values[0]!),
     privateKeyPath: path.resolve(values[1]!),
     certificateAuthorityPath: path.resolve(values[2]!),
+  };
+}
+
+function parseChannelNodeEnrollmentCa(parsed: Readonly<{
+  CHANNEL_NODE_ENROLLMENT_CA_PATH?: string;
+  CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH?: string;
+}>):
+  | Readonly<{ status: "disabled" }>
+  | Readonly<{
+      status: "ready";
+      certificateAuthorityPath: string;
+      certificateAuthorityPrivateKeyPath: string;
+    }> {
+  const certificate =
+    parsed.CHANNEL_NODE_ENROLLMENT_CA_PATH?.trim();
+  const privateKey =
+    parsed.CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH?.trim();
+  if (!certificate && !privateKey) {
+    return { status: "disabled" };
+  }
+  if (!certificate || !privateKey) {
+    throw new Error(
+      "渠道节点 enrollment CA 必须同时配置证书与私钥。",
+    );
+  }
+  return {
+    status: "ready",
+    certificateAuthorityPath: path.resolve(certificate),
+    certificateAuthorityPrivateKeyPath:
+      path.resolve(privateKey),
   };
 }
 

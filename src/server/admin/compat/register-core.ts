@@ -1,4 +1,5 @@
 import packageJson from "../../../../package.json";
+import { readFile } from "node:fs/promises";
 import {
   createAdminAuthStatusResponse,
   type AdminSecurityOptions,
@@ -48,6 +49,7 @@ import {
 } from "@/server/admin/channel-config";
 import {
   createGetChannelHandler,
+  createGetChannelHealthHandler,
   createListChannelsHandler,
   createUpdateChannelHandler,
   createUpdateChannelsHandler,
@@ -58,11 +60,31 @@ import {
   type AdminChannelConfigReader,
   type AdminChannelConfigBatchWriter,
   type AdminChannelConfigWriter,
+  type AdminChannelHealthResolver,
 } from "@/server/admin/compat/handlers/channels";
+import {
+  createBindChannelNodeHandler,
+  createChannelNodeEnrollmentHandler,
+  createListChannelNodesHandler,
+  createRevokeChannelNodeHandler,
+  createRotateChannelNodeCertificateHandler,
+  createUnbindChannelNodeHandler,
+  type AdminChannelNodeService,
+} from "@/server/admin/compat/handlers/nodes";
 import {
   createWechatQrAuthService,
   type WechatQrAuthService,
 } from "@/server/admin/wechat-qrcode";
+import {
+  createAdminChannelNodeService,
+} from "@/server/admin/channel-nodes";
+import {
+  assertIndependentChannelNodeCertificateAuthorities,
+  createOpenSslChannelNodeCertificateIssuer,
+} from "@/server/admin/channel-node-certificates";
+import {
+  createAdminChannelHealthResolver,
+} from "@/server/admin/channel-prerequisites";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
@@ -81,6 +103,8 @@ export type CoreAdminCompatDependencies = Readonly<{
   updateChannelConfig?: AdminChannelConfigWriter;
   updateChannelConfigs?: AdminChannelConfigBatchWriter;
   wechatQrAuth?: WechatQrAuthService;
+  resolveChannelHealth?: AdminChannelHealthResolver;
+  channelNodes?: AdminChannelNodeService;
 }>;
 
 export function createCoreAdminCompatRouter(
@@ -148,7 +172,10 @@ export function createCoreAdminCompatRouter(
     );
     router.put(
       "/config/channels",
-      createUpdateChannelsHandler(dependencies.updateChannelConfigs),
+      createUpdateChannelsHandler(
+        dependencies.updateChannelConfigs,
+        dependencies.resolveChannelHealth,
+      ),
       channelRouteOptions,
     );
     router.get(
@@ -158,17 +185,34 @@ export function createCoreAdminCompatRouter(
     );
     router.get(
       "/config/channels",
-      createListChannelsHandler(dependencies.readChannelConfigs),
+      createListChannelsHandler(
+        dependencies.readChannelConfigs,
+        dependencies.resolveChannelHealth,
+      ),
+      channelRouteOptions,
+    );
+    router.get(
+      "/config/channels/:channelType/health",
+      createGetChannelHealthHandler(
+        dependencies.readChannelConfigs,
+        dependencies.resolveChannelHealth,
+      ),
       channelRouteOptions,
     );
     router.get(
       "/config/channels/:channelType",
-      createGetChannelHandler(dependencies.readChannelConfigs),
+      createGetChannelHandler(
+        dependencies.readChannelConfigs,
+        dependencies.resolveChannelHealth,
+      ),
       channelRouteOptions,
     );
     router.put(
       "/config/channels/:channelType",
-      createUpdateChannelHandler(dependencies.updateChannelConfig),
+      createUpdateChannelHandler(
+        dependencies.updateChannelConfig,
+        dependencies.resolveChannelHealth,
+      ),
       channelRouteOptions,
     );
     if (dependencies.wechatQrAuth) {
@@ -187,6 +231,48 @@ export function createCoreAdminCompatRouter(
         channelRouteOptions,
       );
     }
+  }
+
+  if (dependencies.channelNodes) {
+    const nodeRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/channel-nodes",
+      createListChannelNodesHandler(dependencies.channelNodes),
+      nodeRouteOptions,
+    );
+    router.post(
+      "/channel-nodes/enrollments",
+      createChannelNodeEnrollmentHandler(
+        dependencies.channelNodes,
+      ),
+      nodeRouteOptions,
+    );
+    router.post(
+      "/channel-nodes/:nodeId/bindings",
+      createBindChannelNodeHandler(dependencies.channelNodes),
+      nodeRouteOptions,
+    );
+    router.delete(
+      "/channel-nodes/:nodeId/bindings/:connectionId",
+      createUnbindChannelNodeHandler(
+        dependencies.channelNodes,
+      ),
+      nodeRouteOptions,
+    );
+    router.post(
+      "/channel-nodes/:nodeId/certificate/rotate",
+      createRotateChannelNodeCertificateHandler(
+        dependencies.channelNodes,
+      ),
+      nodeRouteOptions,
+    );
+    router.post(
+      "/channel-nodes/:nodeId/revoke",
+      createRevokeChannelNodeHandler(dependencies.channelNodes),
+      nodeRouteOptions,
+    );
   }
 
   for (const path of ["/language", "/settings/language"]) {
@@ -227,6 +313,59 @@ export async function dispatchAdminCompatRequest(
       : null;
   const getChannelConfigService = () =>
     createAdminChannelConfigService(getPool(), channelSecretKey);
+  const pool = getPool();
+  const channelNodeIssuer =
+    env.channelNodeEnrollmentCa?.status === "ready"
+      ? createOpenSslChannelNodeCertificateIssuer({
+          certificateAuthorityPath:
+            env.channelNodeEnrollmentCa
+              .certificateAuthorityPath,
+          certificateAuthorityKeyPath:
+            env.channelNodeEnrollmentCa
+              .certificateAuthorityPrivateKeyPath,
+        })
+      : null;
+  const channelNodeServerCertificateAuthority =
+    env.channelNodeServerCaPath
+      ? await readFile(
+          env.channelNodeServerCaPath,
+          "utf8",
+        )
+      : null;
+  if (
+    channelNodeServerCertificateAuthority
+    && env.channelNodeEnrollmentCa?.status === "ready"
+  ) {
+    const enrollmentCertificateAuthority =
+      await readFile(
+        env.channelNodeEnrollmentCa
+          .certificateAuthorityPath,
+        "utf8",
+      );
+    const enrollmentCertificateAuthorityPrivateKey =
+      await readFile(
+        env.channelNodeEnrollmentCa
+          .certificateAuthorityPrivateKeyPath,
+        "utf8",
+      );
+    assertIndependentChannelNodeCertificateAuthorities(
+      channelNodeServerCertificateAuthority,
+      enrollmentCertificateAuthority,
+      enrollmentCertificateAuthorityPrivateKey,
+    );
+  }
+  const channelNodes = createAdminChannelNodeService(
+    pool,
+    {
+      issueCertificate: channelNodeIssuer,
+      serverCertificateAuthority:
+        channelNodeServerCertificateAuthority,
+      serverUrl: channelNodeServerUrl(
+        env.publicBaseUrl ?? null,
+        env.channelNodePort ?? 9_443,
+      ),
+    },
+  );
   const wechatQrAuth = getDefaultWechatQrAuth({
     hmacKey: env.appSecret,
     readChannels: (scope, signal) =>
@@ -258,6 +397,11 @@ export async function dispatchAdminCompatRequest(
       getChannelConfigService().update(input, signal),
     updateChannelConfigs: (inputs, signal) =>
       getChannelConfigService().updateMany(inputs, signal),
+    resolveChannelHealth:
+      createAdminChannelHealthResolver(pool, {
+        publicBaseUrl: env.publicBaseUrl ?? null,
+      }),
+    channelNodes,
     wechatQrAuth,
   });
   const runtime = {
@@ -296,6 +440,19 @@ export async function dispatchAdminCompatRequest(
   return router.dispatch(request, runtime, {
     routeSegments: route.routeSegments,
   });
+}
+
+function channelNodeServerUrl(
+  publicBaseUrl: string | null,
+  port: number,
+): string {
+  const url = new URL(
+    publicBaseUrl ?? "https://localhost",
+  );
+  url.protocol = "wss:";
+  url.port = port === 443 ? "" : String(port);
+  url.pathname = "/channel-node";
+  return url.toString();
 }
 
 let defaultWechatQrAuth:

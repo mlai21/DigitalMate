@@ -7,8 +7,10 @@ import type { TlsOptions } from "node:tls";
 export type ChannelNodeCertificateRecord = Readonly<{
   id: string;
   userId: string;
+  agentId: string;
   status: "connected" | "disconnected" | "revoked";
   certificateFingerprint: Buffer;
+  certificateExpiresAt: Date;
 }>;
 
 type PeerCertificate = Readonly<{
@@ -25,6 +27,10 @@ export async function authorizeNodeCertificate(
     findByCertificateFingerprint(
       fingerprint: Buffer,
     ): Promise<ChannelNodeCertificateRecord | null>;
+    consumeEnrollmentByCertificateFingerprint?(
+      fingerprint: Buffer,
+      consumedAt?: Date,
+    ): Promise<boolean>;
   }>,
   now = new Date(),
 ): Promise<ChannelNodeCertificateRecord> {
@@ -45,7 +51,7 @@ export async function authorizeNodeCertificate(
   if (now < validFrom) {
     throw new Error("node_certificate_not_yet_valid");
   }
-  if (now > validTo) {
+  if (now >= validTo) {
     throw new Error("node_certificate_expired");
   }
 
@@ -70,7 +76,25 @@ export async function authorizeNodeCertificate(
   if (node.status === "revoked") {
     throw new Error("node_certificate_revoked");
   }
-  return node;
+  if (
+    !Number.isFinite(node.certificateExpiresAt.getTime())
+    || now >= node.certificateExpiresAt
+  ) {
+    throw new Error("node_certificate_expired");
+  }
+  await repository.consumeEnrollmentByCertificateFingerprint?.(
+    fingerprint,
+    now,
+  );
+  return {
+    ...node,
+    certificateExpiresAt: new Date(
+      Math.min(
+        validTo.getTime(),
+        node.certificateExpiresAt.getTime(),
+      ),
+    ),
+  };
 }
 
 export function buildNodeTlsOptions(input: Readonly<{

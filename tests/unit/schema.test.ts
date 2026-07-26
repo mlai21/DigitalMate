@@ -75,6 +75,18 @@ describe("database schema", () => {
     expect(schema).toContain("channel_deliveries_message_scope_fkey");
     expect(schema).toContain("channel_connections_runtime_node_id_fkey");
     expect(schema).toContain("channel_runtime_node_binding_invalid");
+    expect(schema).toContain(
+      "channel_runtime_nodes_user_agent_fkey",
+    );
+    expect(schema).toContain(
+      "channel_runtime_nodes_id_user_agent_key",
+    );
+    expect(schema).toContain(
+      "FOREIGN KEY (runtime_node_id, user_id, agent_id)",
+    );
+    expect(schema).toContain(
+      "FOREIGN KEY (node_id, user_id, agent_id)",
+    );
     expect(schema).toContain("last_server_sequence bigint");
     expect(schema).toContain(
       "PRIMARY KEY (node_id, client_sequence)",

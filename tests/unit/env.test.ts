@@ -20,6 +20,9 @@ describe("readEnv", () => {
     expect(env.channelGatewayPort).toBe(3_101);
     expect(env.channelNodePort).toBe(9_443);
     expect(env.channelNodeTls).toEqual({ status: "disabled" });
+    expect(env.channelNodeEnrollmentCa).toEqual({
+      status: "disabled",
+    });
     expect(env.publicBaseUrl).toBeNull();
   });
 
@@ -174,6 +177,49 @@ describe("readEnv", () => {
         PUBLIC_BASE_URL: "https://mate.example/private",
       }),
     ).toThrow(/PUBLIC_BASE_URL/);
+  });
+
+  it("separates the Web enrollment CA from Agent gateway TLS material", () => {
+    expect(() =>
+      readEnv({
+        CHANNEL_NODE_ENROLLMENT_CA_PATH: "./client-ca.crt",
+      }),
+    ).toThrow(/enrollment CA.*同时配置/);
+    expect(() =>
+      readEnv({
+        CHANNEL_NODE_ENROLLMENT_CA_PATH: "./client-ca.crt",
+        CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH: "./client-ca.key",
+      }),
+    ).toThrow(/独立的网关服务端 CA/);
+    expect(() =>
+      readEnv({
+        CHANNEL_NODE_ENROLLMENT_CA_PATH: "./shared-ca.crt",
+        CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH: "./client-ca.key",
+        CHANNEL_NODE_SERVER_CA_PATH: "./shared-ca.crt",
+      }),
+    ).toThrow(/不能与.*enrollment CA 复用/);
+
+    const env = readEnv({
+      CHANNEL_NODE_ENROLLMENT_CA_PATH: "./client-ca.crt",
+      CHANNEL_NODE_ENROLLMENT_CA_KEY_PATH: "./client-ca.key",
+      CHANNEL_NODE_SERVER_CA_PATH: "./server-ca.crt",
+    });
+
+    expect(env.channelNodeTls).toEqual({ status: "disabled" });
+    expect(env.channelNodeEnrollmentCa).toMatchObject({
+      status: "ready",
+      certificateAuthorityPath:
+        expect.stringMatching(/client-ca\.crt$/),
+      certificateAuthorityPrivateKeyPath:
+        expect.stringMatching(/client-ca\.key$/),
+    });
+    expect(env.channelNodeServerCaPath).toMatch(
+      /server-ca\.crt$/,
+    );
+    expect(env.channelNodeEnrollmentCa).not.toMatchObject({
+      certificateAuthorityPath:
+        env.channelNodeServerCaPath,
+    });
   });
 
   it("requires HTTPS and nonzero listener ports in production", () => {

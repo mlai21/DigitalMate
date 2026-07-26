@@ -561,8 +561,12 @@ describe("channel-node restricted runner", () => {
             id: NODE_ID,
             userId:
               "10000000-0000-4000-8000-000000000001",
+            agentId:
+              "10000000-0000-4000-8000-000000000011",
             status: "disconnected" as const,
             certificateFingerprint,
+            certificateExpiresAt:
+              new Date("2035-01-01T00:00:00.000Z"),
           }
         : null,
       isBound: async (

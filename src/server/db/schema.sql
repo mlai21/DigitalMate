@@ -1174,6 +1174,7 @@ $channel_secret_exposure_fingerprint_constraints$;
 CREATE TABLE IF NOT EXISTS channel_runtime_nodes (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
   display_name text NOT NULL
     CONSTRAINT channel_runtime_nodes_display_name_check
     CHECK (btrim(display_name) <> ''),
@@ -1192,16 +1193,97 @@ CREATE TABLE IF NOT EXISTS channel_runtime_nodes (
   last_server_sequence bigint NOT NULL DEFAULT 0
     CONSTRAINT channel_runtime_nodes_last_server_sequence_check
     CHECK (last_server_sequence >= 0),
+  client_version text
+    CONSTRAINT channel_runtime_nodes_client_version_check
+    CHECK (
+      client_version IS NULL
+      OR (
+        btrim(client_version) <> ''
+        AND length(client_version) <= 128
+      )
+    ),
+  certificate_expires_at timestamptz NOT NULL,
   last_heartbeat_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (id, user_id),
+  CONSTRAINT channel_runtime_nodes_id_user_agent_key
+    UNIQUE (id, user_id, agent_id),
+  CONSTRAINT channel_runtime_nodes_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
   UNIQUE (user_id, certificate_fingerprint)
 );
 
 ALTER TABLE IF EXISTS channel_runtime_nodes
   ADD COLUMN IF NOT EXISTS
     last_server_sequence bigint NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS channel_runtime_nodes
+  ADD COLUMN IF NOT EXISTS client_version text;
+ALTER TABLE IF EXISTS channel_runtime_nodes
+  ADD COLUMN IF NOT EXISTS certificate_expires_at timestamptz;
+ALTER TABLE IF EXISTS channel_runtime_nodes
+  ADD COLUMN IF NOT EXISTS agent_id uuid;
+
+UPDATE channel_runtime_nodes AS node
+SET agent_id = selected.agent_id
+FROM (
+  SELECT runtime_node_id AS node_id, min(agent_id::text)::uuid AS agent_id
+  FROM channel_connections
+  WHERE runtime_node_id IS NOT NULL
+  GROUP BY runtime_node_id
+  HAVING count(DISTINCT agent_id) = 1
+) AS selected
+WHERE node.agent_id IS NULL
+  AND node.id = selected.node_id;
+
+UPDATE channel_runtime_nodes AS node
+SET agent_id = selected.id
+FROM digital_agents AS selected
+WHERE node.agent_id IS NULL
+  AND selected.user_id = node.user_id
+  AND selected.is_default = true;
+
+UPDATE channel_runtime_nodes
+SET certificate_expires_at = now()
+WHERE certificate_expires_at IS NULL;
+
+ALTER TABLE channel_runtime_nodes
+  ALTER COLUMN agent_id SET NOT NULL,
+  ALTER COLUMN certificate_expires_at SET NOT NULL;
+
+DO $channel_runtime_nodes_agent_scope$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_runtime_nodes'::regclass
+      AND conname =
+        'channel_runtime_nodes_user_agent_fkey'
+  ) THEN
+    ALTER TABLE channel_runtime_nodes
+      ADD CONSTRAINT
+        channel_runtime_nodes_user_agent_fkey
+      FOREIGN KEY (user_id, agent_id)
+      REFERENCES digital_agents(user_id, id)
+      ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_runtime_nodes'::regclass
+      AND conname =
+        'channel_runtime_nodes_id_user_agent_key'
+  ) THEN
+    ALTER TABLE channel_runtime_nodes
+      ADD CONSTRAINT
+        channel_runtime_nodes_id_user_agent_key
+      UNIQUE (id, user_id, agent_id);
+  END IF;
+END
+$channel_runtime_nodes_agent_scope$;
 
 DO $channel_runtime_nodes_server_sequence_constraint$
 BEGIN
@@ -1220,14 +1302,68 @@ BEGIN
 END
 $channel_runtime_nodes_server_sequence_constraint$;
 
+DO $channel_runtime_nodes_client_version_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_runtime_nodes'::regclass
+      AND conname =
+        'channel_runtime_nodes_client_version_check'
+  ) THEN
+    ALTER TABLE channel_runtime_nodes
+      ADD CONSTRAINT
+        channel_runtime_nodes_client_version_check
+      CHECK (
+        client_version IS NULL
+        OR (
+          btrim(client_version) <> ''
+          AND length(client_version) <= 128
+        )
+      );
+  END IF;
+END
+$channel_runtime_nodes_client_version_constraint$;
+
+CREATE TABLE IF NOT EXISTS channel_node_enrollments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  node_id uuid NOT NULL,
+  token_digest bytea NOT NULL
+    CONSTRAINT channel_node_enrollments_token_digest_check
+    CHECK (octet_length(token_digest) = 32),
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_node_enrollments_node_scope_fkey
+    FOREIGN KEY (node_id, user_id)
+    REFERENCES channel_runtime_nodes(id, user_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_enrollments_ttl_check
+    CHECK (
+      expires_at > created_at
+      AND expires_at <= created_at + interval '10 minutes'
+    ),
+  CONSTRAINT channel_node_enrollments_consumed_check
+    CHECK (
+      consumed_at IS NULL
+      OR consumed_at >= created_at
+    ),
+  UNIQUE (token_digest)
+);
+
 CREATE OR REPLACE FUNCTION
   notify_channel_runtime_node_revoked()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $channel_runtime_node_revoked_function$
 BEGIN
-  IF NEW.status = 'revoked'
-     AND OLD.status IS DISTINCT FROM NEW.status THEN
+  IF (
+       NEW.status = 'revoked'
+       AND OLD.status IS DISTINCT FROM NEW.status
+     )
+     OR NEW.certificate_fingerprint
+          IS DISTINCT FROM OLD.certificate_fingerprint THEN
     PERFORM pg_notify(
       'channel_runtime_node_revoked',
       NEW.id::text
@@ -1241,7 +1377,8 @@ DROP TRIGGER IF EXISTS
   channel_runtime_node_revoked_notify
   ON channel_runtime_nodes;
 CREATE TRIGGER channel_runtime_node_revoked_notify
-AFTER UPDATE OF status ON channel_runtime_nodes
+AFTER UPDATE OF status, certificate_fingerprint
+ON channel_runtime_nodes
 FOR EACH ROW
 EXECUTE FUNCTION notify_channel_runtime_node_revoked();
 
@@ -1256,24 +1393,21 @@ BEGIN
         FROM channel_runtime_nodes AS node
         WHERE node.id = connection.runtime_node_id
           AND node.user_id = connection.user_id
+          AND node.agent_id = connection.agent_id
       )
   ) THEN
     RAISE EXCEPTION 'channel_runtime_node_binding_invalid'
       USING ERRCODE = '23503';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_constraint
-    WHERE conrelid = 'channel_connections'::regclass
-      AND conname = 'channel_connections_runtime_node_id_fkey'
-  ) THEN
-    ALTER TABLE channel_connections
-      ADD CONSTRAINT channel_connections_runtime_node_id_fkey
-      FOREIGN KEY (runtime_node_id, user_id)
-      REFERENCES channel_runtime_nodes(id, user_id)
-      ON DELETE SET NULL (runtime_node_id);
-  END IF;
+  ALTER TABLE channel_connections
+    DROP CONSTRAINT IF EXISTS
+      channel_connections_runtime_node_id_fkey;
+  ALTER TABLE channel_connections
+    ADD CONSTRAINT channel_connections_runtime_node_id_fkey
+    FOREIGN KEY (runtime_node_id, user_id, agent_id)
+    REFERENCES channel_runtime_nodes(id, user_id, agent_id)
+    ON DELETE SET NULL (runtime_node_id);
 END
 $channel_connections_runtime_node_constraint$;
 
@@ -1288,11 +1422,20 @@ CREATE TABLE IF NOT EXISTS channel_node_bindings (
     REFERENCES channel_connections(id, user_id, agent_id)
     ON DELETE CASCADE,
   CONSTRAINT channel_node_bindings_node_scope_fkey
-    FOREIGN KEY (node_id, user_id)
-    REFERENCES channel_runtime_nodes(id, user_id)
+    FOREIGN KEY (node_id, user_id, agent_id)
+    REFERENCES channel_runtime_nodes(id, user_id, agent_id)
     ON DELETE CASCADE,
   UNIQUE (node_id, connection_id)
 );
+
+ALTER TABLE channel_node_bindings
+  DROP CONSTRAINT IF EXISTS
+    channel_node_bindings_node_scope_fkey;
+ALTER TABLE channel_node_bindings
+  ADD CONSTRAINT channel_node_bindings_node_scope_fkey
+  FOREIGN KEY (node_id, user_id, agent_id)
+  REFERENCES channel_runtime_nodes(id, user_id, agent_id)
+  ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS channel_node_inbound_receipts (
   user_id uuid NOT NULL,
@@ -1936,8 +2079,8 @@ CREATE TABLE IF NOT EXISTS channel_node_outbox (
     REFERENCES digital_agents(user_id, id)
     ON DELETE CASCADE,
   CONSTRAINT channel_node_outbox_node_scope_fkey
-    FOREIGN KEY (node_id, user_id)
-    REFERENCES channel_runtime_nodes(id, user_id)
+    FOREIGN KEY (node_id, user_id, agent_id)
+    REFERENCES channel_runtime_nodes(id, user_id, agent_id)
     ON DELETE CASCADE,
   CONSTRAINT channel_node_outbox_connection_scope_fkey
     FOREIGN KEY (connection_id, user_id, agent_id)
@@ -1950,6 +2093,15 @@ CREATE TABLE IF NOT EXISTS channel_node_outbox (
   UNIQUE (node_id, sequence),
   UNIQUE (delivery_id)
 );
+
+ALTER TABLE channel_node_outbox
+  DROP CONSTRAINT IF EXISTS
+    channel_node_outbox_node_scope_fkey;
+ALTER TABLE channel_node_outbox
+  ADD CONSTRAINT channel_node_outbox_node_scope_fkey
+  FOREIGN KEY (node_id, user_id, agent_id)
+  REFERENCES channel_runtime_nodes(id, user_id, agent_id)
+  ON DELETE CASCADE;
 
 UPDATE channel_runtime_nodes AS node
 SET last_server_sequence = GREATEST(

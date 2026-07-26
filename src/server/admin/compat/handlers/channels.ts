@@ -42,8 +42,9 @@ export type AdminChannelHealth = Readonly<{
     | "disabled"
     | "starting"
     | "connected"
-    | "degraded"
-    | "disconnected";
+      | "degraded"
+      | "disconnected";
+  reason?: string;
   detail: Readonly<Record<string, unknown>>;
   lastConnectedAt?: string;
   lastDisconnectedAt?: string;
@@ -100,6 +101,13 @@ export type AdminChannelConfigBatchWriter = (
   signal?: AbortSignal,
 ) => Promise<AdminChannelConfigCollection>;
 
+export type AdminChannelHealthResolver = (
+  scope: AgentScope,
+  type: ChannelType,
+  snapshot: AdminChannelConfigSnapshot,
+  signal?: AbortSignal,
+) => Promise<AdminChannelHealth>;
+
 export const listChannelTypes: AdminCompatHandler = async () =>
   CHANNEL_TYPES;
 
@@ -138,13 +146,25 @@ export const listChannelSchemas: AdminCompatHandler = async () =>
 
 export function createListChannelsHandler(
   readChannels: AdminChannelConfigReader,
+  resolveHealth?: AdminChannelHealthResolver,
 ): AdminCompatHandler {
   return async (context) => {
     const channels = await readChannels(context.scope, context.signal);
-    return Object.fromEntries(
-      CHANNEL_TYPES.map((type) => [
+    const resolved = await Promise.all(
+      CHANNEL_TYPES.map(async (type) => [
         type,
-        toChannelResponse(channels[type]),
+        await withResolvedHealth(
+          context.scope,
+          channels[type],
+          resolveHealth,
+          context.signal,
+        ),
+      ] as const),
+    );
+    return Object.fromEntries(
+      resolved.map(([type, snapshot]) => [
+        type,
+        toChannelResponse(snapshot),
       ]),
     );
   };
@@ -152,16 +172,25 @@ export function createListChannelsHandler(
 
 export function createGetChannelHandler(
   readChannels: AdminChannelConfigReader,
+  resolveHealth?: AdminChannelHealthResolver,
 ): AdminCompatHandler {
   return async (context) => {
     const type = parseChannelType(context.params.channelType);
     const channels = await readChannels(context.scope, context.signal);
-    return toChannelResponse(channels[type]);
+    return toChannelResponse(
+      await withResolvedHealth(
+        context.scope,
+        channels[type],
+        resolveHealth,
+        context.signal,
+      ),
+    );
   };
 }
 
 export function createUpdateChannelHandler(
   updateChannel: AdminChannelConfigWriter,
+  resolveHealth?: AdminChannelHealthResolver,
 ): AdminCompatHandler {
   return async (context) => {
     const type = parseChannelType(context.params.channelType);
@@ -171,12 +200,20 @@ export function createUpdateChannelHandler(
       input,
       context.signal,
     );
-    return toChannelResponse(updated);
+    return toChannelResponse(
+      await withResolvedHealth(
+        context.scope,
+        updated,
+        resolveHealth,
+        context.signal,
+      ),
+    );
   };
 }
 
 export function createUpdateChannelsHandler(
   updateChannels: AdminChannelConfigBatchWriter,
+  resolveHealth?: AdminChannelHealthResolver,
 ): AdminCompatHandler {
   return async (context) => {
     const raw = await readAdminCompatJson(context.request);
@@ -196,12 +233,41 @@ export function createUpdateChannelsHandler(
       parseChannelWrite(context.scope, type, raw[type])
     );
     const updated = await updateChannels(writes, context.signal);
-    return Object.fromEntries(
-      CHANNEL_TYPES.map((type) => [
+    const resolved = await Promise.all(
+      CHANNEL_TYPES.map(async (type) => [
         type,
-        toChannelResponse(updated[type]),
+        await withResolvedHealth(
+          context.scope,
+          updated[type],
+          resolveHealth,
+          context.signal,
+        ),
+      ] as const),
+    );
+    return Object.fromEntries(
+      resolved.map(([type, snapshot]) => [
+        type,
+        toChannelResponse(snapshot),
       ]),
     );
+  };
+}
+
+export function createGetChannelHealthHandler(
+  readChannels: AdminChannelConfigReader,
+  resolveHealth?: AdminChannelHealthResolver,
+): AdminCompatHandler {
+  return async (context) => {
+    const type = parseChannelType(context.params.channelType);
+    const channels = await readChannels(context.scope, context.signal);
+    return (
+      await withResolvedHealth(
+        context.scope,
+        channels[type],
+        resolveHealth,
+        context.signal,
+      )
+    ).health;
   };
 }
 
@@ -367,6 +433,24 @@ function toChannelResponse(
     isBuiltin: true,
     health: snapshot.health,
   };
+}
+
+async function withResolvedHealth(
+  scope: AgentScope,
+  snapshot: AdminChannelConfigSnapshot,
+  resolveHealth: AdminChannelHealthResolver | undefined,
+  signal?: AbortSignal,
+): Promise<AdminChannelConfigSnapshot> {
+  if (!resolveHealth) return snapshot;
+  signal?.throwIfAborted();
+  const health = await resolveHealth(
+    scope,
+    snapshot.type,
+    snapshot,
+    signal,
+  );
+  signal?.throwIfAborted();
+  return { ...snapshot, health };
 }
 
 function assertSafeObject(value: unknown): asserts value is Record<string, unknown> {
