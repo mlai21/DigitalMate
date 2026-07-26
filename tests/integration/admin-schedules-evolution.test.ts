@@ -31,6 +31,15 @@ import {
   createPostgresAdminWorkspaceService,
 } from "@/server/admin/workspace/service";
 import {
+  createPostgresAdminModelsService,
+} from "@/server/admin/compat/handlers/models";
+import {
+  createPostgresAdminOperationsService,
+} from "@/server/admin/views/stats";
+import {
+  createPostgresAdminSecurityService,
+} from "@/server/admin/views/security";
+import {
   trackEmbeddedPostgresPool,
   type EmbeddedPostgresLifecycle,
 } from "./embedded-postgres-lifecycle";
@@ -427,6 +436,224 @@ describe("admin schedules and evolution PostgreSQL mapping", () => {
     );
     expect(JSON.stringify({ tools, mcp })).not.toContain(
       "secret-runner",
+    );
+  });
+
+  it("maps models and operational views with agent isolation and redaction", async () => {
+    const models = createPostgresAdminModelsService(pool, {
+      credentialsConfigured: true,
+    });
+    const operations =
+      createPostgresAdminOperationsService(pool);
+    const security =
+      createPostgresAdminSecurityService(pool);
+    const current = await models.getActiveModels(scope, {
+      scope: "agent",
+      agentId: scope.agentId,
+    });
+    const operationId =
+      "10000000-0000-4000-8000-000000000499";
+    const update = {
+      providerId: "openai",
+      model: "gpt-5-2-mini-openai",
+      purpose: "light" as const,
+      scope: "agent" as const,
+      agentId: scope.agentId,
+      expectedRevision: current.revision,
+      operationId,
+    };
+
+    const first = await models.updateActiveModel(
+      scope,
+      update,
+    );
+    const replay = await models.updateActiveModel(
+      scope,
+      update,
+    );
+    expect(first).toEqual(replay);
+    expect(first).toMatchObject({
+      routes: { light: "gpt-5-2-mini-openai" },
+      revision: current.revision + 1,
+    });
+
+    const seedParameters = [
+      scope.userId,
+      scope.agentId,
+      conversationId,
+    ];
+    await Promise.all([
+      pool.query(
+        `INSERT INTO messages (
+           id, user_id, agent_id, conversation_id,
+           role, content, created_at
+         )
+         VALUES (
+           '10000000-0000-4000-8000-000000000498',
+           $1, $2, $3, 'assistant',
+           'raw assistant message must not leak',
+           '2026-07-27T02:00:00Z'
+         )`,
+        seedParameters,
+      ),
+      pool.query(
+        `INSERT INTO llm_usage_logs (
+           user_id, agent_id, conversation_id, purpose,
+           model, input_tokens, output_tokens,
+           total_tokens, created_at
+         )
+         VALUES (
+           $1, $2, $3, 'light',
+           'gpt-5-2-mini-openai', 17, 8, 25,
+           '2026-07-27T02:00:00Z'
+         )`,
+        seedParameters,
+      ),
+      pool.query(
+        `INSERT INTO admin_audit_logs (
+           user_id, agent_id, action, resource_type,
+           resource_id, before_summary, after_summary,
+           confirmation_source, status
+         )
+         VALUES (
+           $1, $2, 'security.test', 'diagnostic',
+           'safe-id',
+           '{"raw_payload":"APP_SECRET"}',
+           '{"storage_key":"/private/file"}',
+           '{"token":"Bearer hidden"}',
+           'success'
+         )`,
+        [scope.userId, scope.agentId],
+      ),
+      pool.query(
+        `INSERT INTO tool_call_logs (
+           user_id, agent_id, conversation_id,
+           tool_name, input_summary, output_summary,
+           status, error, created_at
+         )
+         VALUES (
+           $1, $2, $3, 'safe_tool',
+           'raw input APP_SECRET',
+           'raw output /private/file',
+           'error', 'Bearer hidden',
+           '2026-07-27T02:00:00Z'
+         )`,
+        seedParameters,
+      ),
+    ]);
+    const otherAgentId =
+      "10000000-0000-4000-8000-000000000012";
+    await pool.query(
+      `INSERT INTO digital_agents (
+         id, user_id, slug, display_name, persona,
+         is_default
+       )
+       VALUES (
+         $1, $2, 'future-second', 'Future Agent',
+         '{}', false
+       )`,
+      [otherAgentId, scope.userId],
+    );
+    await Promise.all([
+      pool.query(
+        `INSERT INTO agent_settings (
+           user_id, agent_id, persona, proactivity,
+           cadence, search
+         )
+         VALUES ($1, $2, '{}', '{}', '{}', '{}')`,
+        [scope.userId, otherAgentId],
+      ),
+      pool.query(
+        `INSERT INTO llm_usage_logs (
+           user_id, agent_id, purpose, model,
+           input_tokens, output_tokens, total_tokens,
+           created_at
+         )
+         VALUES (
+           $1, $2, 'main', 'claude-opus-4-8',
+           100, 50, 150, '2026-07-27T03:00:00Z'
+         )`,
+        [scope.userId, otherAgentId],
+      ),
+    ]);
+
+    const range = {
+      startDate: "2026-07-27",
+      endDate: "2026-07-27",
+    };
+    const [stats, usage, debug, overview, voice] =
+      await Promise.all([
+        operations.getAgentStats(scope, range),
+        operations.getTokenUsage(scope, range),
+        operations.getDebugLogs(scope, 200),
+        security.getOverview(scope),
+        operations.getVoiceOverview(scope),
+      ]);
+    expect(stats).toMatchObject({
+      total_prompt_tokens: 17,
+      total_completion_tokens: 8,
+      total_llm_calls: 1,
+    });
+    expect(usage).toMatchObject({
+      total_prompt_tokens: 17,
+      total_completion_tokens: 8,
+      total_calls: 1,
+      scope: "agent",
+      user_total: {
+        total_prompt_tokens: 117,
+        total_completion_tokens: 58,
+        total_calls: 2,
+      },
+    });
+    await expect(
+      Promise.all([
+        security.getToolGuard(scope),
+        security.getSandbox(scope),
+        security.getFileGuard(scope),
+        security.getSkillScanner(scope),
+        security.getBlockedHistory(scope),
+      ]),
+    ).resolves.toMatchObject([
+      {
+        enabled: true,
+        custom_rules: [],
+        mutation_supported: false,
+      },
+      {
+        enabled: false,
+        effective: false,
+      },
+      {
+        enabled: true,
+        allow_preview_outside_workspace: false,
+      },
+      {
+        mode: "block",
+        timeout: 30,
+        whitelist: [],
+      },
+      [],
+    ]);
+    const auditCount = await pool.query<{
+      count: string;
+    }>(
+      `SELECT count(*)::text AS count
+       FROM admin_audit_logs
+       WHERE user_id = $1 AND agent_id = $2
+         AND action = 'model_route.update'
+         AND confirmation_source->>'requestId' = $3`,
+      [scope.userId, scope.agentId, operationId],
+    );
+    expect(auditCount.rows[0]?.count).toBe("1");
+    expect(
+      JSON.stringify({
+        debug,
+        overview,
+        voice,
+        providers: await models.listProviders(scope),
+      }),
+    ).not.toMatch(
+      /raw assistant message|raw_payload|APP_SECRET|storage_key|\/private\/file|secret-runner|Bearer hidden/iu,
     );
   });
 

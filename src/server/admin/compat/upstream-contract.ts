@@ -111,32 +111,40 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   agent: moduleContract(
     "mapped",
     "agent-runtime",
-    disabled(
-      PENDING,
+    mapped(
       "GET /agent",
       "GET /agent/health",
-      "POST /console/chat",
       "GET /agent/admin/status",
+      "GET /workspace/audio-mode",
+      "GET /workspace/transcription-providers",
+      "GET /workspace/transcription-provider-type",
+      "GET /workspace/local-whisper-status",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.agentRuntimeMutation,
       "POST /agent/shutdown",
       "POST /agent/admin/shutdown",
       "GET /workspace/running-config",
       "PUT /workspace/running-config",
       "GET /workspace/language",
       "PUT /workspace/language",
-      "GET /workspace/audio-mode",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.voiceTranscriptionSettings,
       "PUT /workspace/audio-mode",
-      "GET /workspace/transcription-providers",
       "PUT /workspace/transcription-provider",
-      "GET /workspace/transcription-provider-type",
       "PUT /workspace/transcription-provider-type",
-      "GET /workspace/local-whisper-status",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.voiceTranscriptionExecution,
       "POST /workspace/transcribe",
     ),
+    redirected("/", "POST /console/chat"),
   ),
   agentStats: moduleContract(
     "mapped",
     "stats",
-    disabled(PENDING, "GET /agent-stats"),
+    mapped("GET /agent-stats"),
   ),
   agents: moduleContract(
     "mapped",
@@ -285,14 +293,14 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   debug: moduleContract(
     "mapped",
     "operations",
-    disabled(PENDING, "GET /console/debug/backend-logs"),
+    mapped("GET /console/debug/backend-logs"),
   ),
   env: moduleContract(
     "mapped",
     "operations",
+    mapped("GET /envs"),
     disabled(
-      PENDING,
-      "GET /envs",
+      STABLE_CAPABILITY_CODES.environmentMutation,
       "PUT /envs",
       "DELETE /envs/:key",
     ),
@@ -409,19 +417,19 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   provider: moduleContract(
     "mapped",
     "models",
-    disabled(
-      PENDING,
+    mapped(
       "GET /models",
-      "PUT /models/:providerId/config",
       "GET /models/active",
       "PUT /models/active",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.modelProviderCredentials,
+      "PUT /models/:providerId/config",
       "POST /models/custom-providers",
       "DELETE /models/custom-providers/:providerId",
       "POST /models/:providerId/models",
       "DELETE /models/:providerId/models/:modelId",
       "PUT /models/:providerId/models/:modelId/config",
-      "PUT /local-models/config",
-      "GET /local-models/config",
       "POST /models/:providerId/test",
       "POST /models/:providerId/models/test",
       "POST /models/:providerId/discover",
@@ -432,6 +440,11 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
       "POST /providers/:providerId/oauth/start",
       "GET /providers/:providerId/oauth/status",
     ),
+    disabled(
+      STABLE_CAPABILITY_CODES.localModels,
+      "PUT /local-models/config",
+      "GET /local-models/config",
+    ),
   ),
   root: moduleContract(
     "mapped",
@@ -441,23 +454,25 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   security: moduleContract(
     "mapped",
     "security",
-    disabled(
-      PENDING,
+    mapped(
       "GET /config/security/tool-guard",
-      "PUT /config/security/tool-guard",
       "GET /config/security/tool-guard/builtin-rules",
       "GET /config/security/sandbox",
-      "PUT /config/security/sandbox",
       "GET /config/security/file-guard",
-      "PUT /config/security/file-guard",
       "GET /config/security/skill-scanner",
-      "PUT /config/security/skill-scanner",
       "GET /config/security/skill-scanner/blocked-history",
+      "GET /config/security/allow-no-auth-hosts",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.securityPolicyMutation,
+      "PUT /config/security/tool-guard",
+      "PUT /config/security/sandbox",
+      "PUT /config/security/file-guard",
+      "PUT /config/security/skill-scanner",
       "DELETE /config/security/skill-scanner/blocked-history",
       "DELETE /config/security/skill-scanner/blocked-history/:index",
       "POST /config/security/skill-scanner/whitelist",
       "DELETE /config/security/skill-scanner/whitelist/:skillName",
-      "GET /config/security/allow-no-auth-hosts",
       "PUT /config/security/allow-no-auth-hosts",
     ),
   ),
@@ -517,8 +532,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   tokenUsage: moduleContract(
     "mapped",
     "stats",
-    disabled(
-      PENDING,
+    mapped(
       "GET /token-usage",
       "GET /token-usage/details",
     ),

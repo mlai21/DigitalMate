@@ -15,6 +15,12 @@ export const STABLE_CAPABILITY_CODES = Object.freeze({
   workspaceSystemPromptFiles: "workspace_system_prompt_files",
   workspaceCodeFiles: "workspace_code_files",
   localModels: "local_models",
+  modelProviderCredentials: "model_provider_credentials",
+  environmentMutation: "environment_mutation",
+  securityPolicyMutation: "security_policy_mutation",
+  voiceTranscriptionSettings: "voice_transcription_settings",
+  voiceTranscriptionExecution: "voice_transcription_execution",
+  agentRuntimeMutation: "agent_runtime_mutation",
   extensionMarket: "extension_market",
   plugins: "plugins",
 } as const);

@@ -187,11 +187,47 @@ import {
 import {
   createPostgresAdminAgentResourcesService,
 } from "@/server/admin/views/agent-resources";
+import {
+  createGetActiveModelsHandler,
+  createListModelsHandler,
+  createPostgresAdminModelsService,
+  createUpdateActiveModelsHandler,
+  type AdminModelsService,
+} from "@/server/admin/compat/handlers/models";
+import {
+  createGetAgentHealthHandler,
+  createGetAgentStatsHandler,
+  createGetAudioModeHandler,
+  createGetBackendDebugLogsHandler,
+  createGetEnvironmentHandler,
+  createGetLocalWhisperStatusHandler,
+  createGetTokenUsageDetailsHandler,
+  createGetTokenUsageHandler,
+  createGetTranscriptionProvidersHandler,
+  createGetTranscriptionProviderTypeHandler,
+  createGetVoiceOverviewHandler,
+  type AdminOperationsService,
+} from "@/server/admin/compat/handlers/operations";
+import {
+  createPostgresAdminOperationsService,
+} from "@/server/admin/views/stats";
+import {
+  createGetAllowNoAuthHostsHandler,
+  createGetBlockedSkillsHandler,
+  createGetBuiltinSecurityRulesHandler,
+  createGetFileGuardHandler,
+  createGetSandboxHandler,
+  createGetSecurityOverviewHandler,
+  createGetSkillScannerHandler,
+  createGetToolGuardHandler,
+  createPostgresAdminSecurityService,
+  type AdminSecurityService,
+} from "@/server/admin/views/security";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-27.4";
+export const adminCompatApiRevision = "2026-07-27.5";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -213,6 +249,9 @@ export type CoreAdminCompatDependencies = Readonly<{
   evolution?: AdminEvolutionService;
   workspace?: AdminWorkspaceService;
   agentResources?: AdminAgentResourcesService;
+  models?: AdminModelsService;
+  operations?: AdminOperationsService;
+  securityOverview?: AdminSecurityService;
   verifyUpstreamContract?: boolean;
 }>;
 
@@ -916,6 +955,173 @@ export function createCoreAdminCompatRouter(
     );
   }
 
+  if (dependencies.models) {
+    const modelRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/models",
+      createListModelsHandler(dependencies.models),
+      modelRouteOptions,
+    );
+    router.get(
+      "/models/active",
+      createGetActiveModelsHandler(dependencies.models),
+      modelRouteOptions,
+    );
+    router.put(
+      "/models/active",
+      createUpdateActiveModelsHandler(
+        dependencies.models,
+      ),
+      modelRouteOptions,
+    );
+  }
+
+  if (dependencies.operations) {
+    const operationsRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    const agentHealth = createGetAgentHealthHandler(
+      dependencies.operations,
+    );
+    router.get(
+      "/agent-stats",
+      createGetAgentStatsHandler(dependencies.operations),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/token-usage",
+      createGetTokenUsageHandler(dependencies.operations),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/token-usage/details",
+      createGetTokenUsageDetailsHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/envs",
+      createGetEnvironmentHandler(dependencies.operations),
+      operationsRouteOptions,
+    );
+    for (const path of [
+      "/agent",
+      "/agent/health",
+      "/agent/admin/status",
+    ]) {
+      router.get(
+        path,
+        agentHealth,
+        operationsRouteOptions,
+      );
+    }
+    router.get(
+      "/console/debug/backend-logs",
+      createGetBackendDebugLogsHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/voice/overview",
+      createGetVoiceOverviewHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/workspace/audio-mode",
+      createGetAudioModeHandler(dependencies.operations),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/workspace/transcription-providers",
+      createGetTranscriptionProvidersHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/workspace/transcription-provider-type",
+      createGetTranscriptionProviderTypeHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+    router.get(
+      "/workspace/local-whisper-status",
+      createGetLocalWhisperStatusHandler(
+        dependencies.operations,
+      ),
+      operationsRouteOptions,
+    );
+  }
+
+  if (dependencies.securityOverview) {
+    const securityRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/security/overview",
+      createGetSecurityOverviewHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/tool-guard",
+      createGetToolGuardHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/tool-guard/builtin-rules",
+      createGetBuiltinSecurityRulesHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/sandbox",
+      createGetSandboxHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/file-guard",
+      createGetFileGuardHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/skill-scanner",
+      createGetSkillScannerHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/skill-scanner/blocked-history",
+      createGetBlockedSkillsHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+    router.get(
+      "/config/security/allow-no-auth-hosts",
+      createGetAllowNoAuthHostsHandler(
+        dependencies.securityOverview,
+      ),
+      securityRouteOptions,
+    );
+  }
+
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);
     router.put(path, putLanguage);
@@ -1059,6 +1265,12 @@ export async function dispatchAdminCompatRequest(
     workspace: createPostgresAdminWorkspaceService(pool),
     agentResources:
       createPostgresAdminAgentResourcesService(pool),
+    models: createPostgresAdminModelsService(pool, {
+      credentialsConfigured: Boolean(env.kieAiApiKey),
+    }),
+    operations: createPostgresAdminOperationsService(pool),
+    securityOverview:
+      createPostgresAdminSecurityService(pool),
     wechatQrAuth,
     verifyUpstreamContract: true,
   });

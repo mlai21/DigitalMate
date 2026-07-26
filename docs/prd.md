@@ -1,11 +1,12 @@
 # DigitalMate 数字伙伴 PRD
 
-- 版本：v0.12
+- 版本：v0.13
 - 日期：2026-07-27
 - 状态：已确认
 
 > 修订记录
 >
+> - v0.13（2026-07-27）：细化 **QwenPaw Console 模型与运维边界**——Models 读取现有模型目录及主对话/轻量任务用途路由，按全局或当前分身 revision 写回，供应商凭据只展示“已配置/缺失”状态，密钥、Base URL、自定义供应商和本地模型写入保持禁用。Stats/Usage 按用户时区、当前 `user_id + agent_id`、用途、模型和日期聚合，同时提供用户级总览；Environment 仅展示 Web、Agent 与渠道节点健康/版本，不读取或返回环境变量值，写入与删除保持禁用。Security 只投影渠道访问规则数量、分身资源授权、工具确认策略、脱敏审计、节点证书状态和 Skill 扫描结论；Debug 只保留近 30 日的状态码事件，不返回消息正文、提示、载荷、审计摘要或存储路径。Voice/SIP 继续复用渠道连接的 revision 配置与健康状态，凭据只返回字段配置状态；聊天音频上传/转写不扩大 P0-10 附件白名单并保持禁用。
 > - v0.12（2026-07-27）：细化 **QwenPaw Console 数据边界**——Workspace 固定投影为 `/AGENT.md`、`/PROACTIVITY.md`、`/CHANNELS.md`、`/RUNTIME.json`，内容即时来自 PostgreSQL，不建立第二套磁盘配置或 Markdown 记忆；前两项以 revision 写回人设/主动性，后两项只读，任意文件上传、代码工作区和 Git 操作保持禁用。Skills/Tools/MCP 只展示当前分身获授权的真实资源，Skill 创建、启用和修订继续经过确认/待审批链路，动态工具/MCP 扩展仍属冻结 P2。Memory 编辑/删除及 Reflection 应用/忽略均按 `user_id + agent_id` 隔离并写安全审计；应用反思时只合并用户明确勾选的建议。
 > - v0.11（2026-07-27）：细化 **P1-13 SIP 媒体节点边界**——① Dev SIP 使用 UDP SIP/RTP、G.711 µ-law 与有界原子端口租约，零配置 registrar 只能绑定回环地址；②生产模式强制使用 LiveKit `wss://` 与随机后缀的 individual dispatch rule，实现独立 room/call 映射；SIP、DashScope、LiveKit 凭据仅驻留节点私有 `0600` 配置和内存，中心拒绝接收；③ DashScope STT 只把 `sentence_end=true` 的最终转写送往中心，TTS 固定按墙钟输出 20 ms 音频帧，barge-in 只中断当前语音播放；④每通电话默认 120 秒、每连接默认最多 5 路并发，第 6 路返回 busy；⑤原始音频、部分转写、供应商帧与 base64 永不进入中心消息、附件或持久队列。
 > - v0.10（2026-07-26）：细化 **P1-13 渠道运行节点与 iMessage 数据边界**——① 中心出站 Delivery 先持久化节点 outbox，在线推送与重连补发共用同一记录，`send_result` 原子回写原 Delivery，不重复运行 Agent；② 每次注册按最新绑定集合启动新增连接并停止已解绑连接；③ iMessage 附件固定为 4 个/单文件 10 MiB/单消息 20 MiB，通过 mTLS 以不超过 512 KiB 分块传输，中心完成统一白名单、真实内容校验和私有存储后才 ACK，Mac 临时副本随后删除；④ 单行坏附件写入不含正文的私有拒绝记录、清理临时文件并推进游标，避免阻塞后续消息；⑤ iMessage 群聊按持久化 `chatType` 显式拒绝，不得退化为对群成员私聊。
