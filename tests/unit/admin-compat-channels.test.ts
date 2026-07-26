@@ -150,6 +150,7 @@ describe("admin compatibility channel contract", () => {
     expect(registry.registeredTypes()).toEqual([
       "mqtt",
       "matrix",
+      "voice",
       "wecom",
       "xiaoyi",
       "yuanbao",

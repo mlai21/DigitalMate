@@ -16,6 +16,7 @@ import { createOneBotAdapter } from "../adapters/onebot";
 import { createQQAdapter } from "../adapters/qq";
 import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
+import { createVoiceAdapter } from "../adapters/voice";
 import { createWeComAdapter } from "../adapters/wecom";
 import { createXiaoYiAdapter } from "../adapters/xiaoyi";
 import { createYuanbaoAdapter } from "../adapters/yuanbao";
@@ -261,6 +262,25 @@ export function registerOneBotChannelAdapter(
   );
 }
 
+export function registerVoiceChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("voice", (dependencies) =>
+    createVoiceAdapter({
+      now: dependencies.now,
+      ...(dependencies.publicBaseUrl
+        ? { publicBaseUrl: dependencies.publicBaseUrl }
+        : {}),
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
 export function registerMatrixChannelAdapter(
   registry: ChannelAdapterRegistry,
 ): void {
@@ -403,6 +423,7 @@ export function registerProtocolChannelAdapters(
   registerYuanbaoChannelAdapter(registry);
   registerWechatChannelAdapter(registry);
   registerOneBotChannelAdapter(registry);
+  registerVoiceChannelAdapter(registry);
 }
 
 export function registerNodeProxyChannelAdapters(

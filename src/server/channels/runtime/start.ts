@@ -102,6 +102,9 @@ import {
   createWechatAdapter,
 } from "@/server/channels/adapters/wechat";
 import {
+  createVoiceAdapter,
+} from "@/server/channels/adapters/voice";
+import {
   prepareWechatAttachmentBatch,
   type WechatAttachmentFetcher,
 } from "@/server/channels/adapters/wechat/media";
@@ -239,6 +242,7 @@ export async function startChannelRuntime(input: Readonly<{
     replyHandles,
     attachmentLocators,
     attachmentStorageDir: input.env.attachmentStorageDir,
+    publicBaseUrl: input.env.publicBaseUrl ?? null,
   };
   const connectionManager = createChannelConnectionManager({
     store,
@@ -939,6 +943,7 @@ type ManagedAdapterDependencies = Readonly<{
     typeof createChannelAttachmentLocatorRepository
   > | null;
   attachmentStorageDir: string;
+  publicBaseUrl: string | null;
 }>;
 
 function createManagedAdapter(
@@ -974,6 +979,11 @@ function createManagedAdapter(
       ) as ChannelAdapter<Record<string, unknown>>;
     case "onebot":
       return createManagedOneBotAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
+    case "voice":
+      return createManagedVoiceAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
@@ -1027,6 +1037,57 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedVoiceAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createVoiceAdapter({
+    publicBaseUrl: dependencies.publicBaseUrl ?? "",
+    scope: connection.scope,
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (!normalized.replyHandle) return;
+              if (!dependencies.replyHandles) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              await dependencies.replyHandles.persist(
+                event.scope,
+                event.id,
+                event.connectionId,
+                normalized.replyHandle,
+                context.receivedAt,
+              );
+            },
+          });
+        },
+        {
+          timeoutMs: 45_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function nodeManagedAdapter(

@@ -512,6 +512,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
         "欢迎语",
         "Hi! This is DigitalMate. How can I help you?",
       ),
+      numberField("max_concurrent_calls", "最大并发通话", 5, 1, 100),
     ],
   },
   sip: {

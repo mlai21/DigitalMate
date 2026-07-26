@@ -22,6 +22,9 @@ import {
 import {
   oneBotGatewayHub,
 } from "@/server/channels/adapters/onebot/transport";
+import {
+  voiceGatewayHub,
+} from "@/server/channels/adapters/voice/relay";
 import type {
   createChannelNodeRepository,
 } from "@/server/channels/nodes/repository";
@@ -52,7 +55,12 @@ export function createPublicChannelGateway(input: Readonly<{
   onUpgrade?: PublicUpgradeHandler;
   idleTimeoutMs?: number;
 }>) {
-  const router = createChannelGatewayRouter();
+  const router = createChannelGatewayRouter({
+    onVoiceIncoming: (request, context) =>
+      voiceGatewayHub.handleIncoming(request, context),
+    onVoiceStatus: (request, context) =>
+      voiceGatewayHub.handleStatus(request, context),
+  });
   const idleTimeoutMs = input.idleTimeoutMs ?? 60_000;
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1) {
     throw new Error("channel_gateway_idle_timeout_invalid");
@@ -298,9 +306,13 @@ export async function startAgentChannelGateway(input: Readonly<{
   const publicGateway = createPublicChannelGateway({
     port: input.env.channelGatewayPort,
     authorizeUpgrade: (route, request) =>
-      oneBotGatewayHub.authorize(route, request),
+      route.type === "voice-relay"
+        ? voiceGatewayHub.authorize(route, request)
+        : oneBotGatewayHub.authorize(route, request),
     onUpgrade: (route, socket, request) =>
-      oneBotGatewayHub.accept(route, socket, request),
+      route.type === "voice-relay"
+        ? voiceGatewayHub.accept(route, socket, request)
+        : oneBotGatewayHub.accept(route, socket, request),
   });
   let nodeServer:
     | ReturnType<typeof createChannelNodeServer>

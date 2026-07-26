@@ -160,6 +160,7 @@ export type SendContext<
 
 export type AdapterDependencies = Readonly<{
   now: () => Date;
+  publicBaseUrl?: string;
   scope?: AgentScope;
   http?: Readonly<{
     request(input: Readonly<{
