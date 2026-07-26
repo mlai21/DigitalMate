@@ -23,11 +23,6 @@ const CONFIG_FILES = Object.freeze([
   "reference/src/qwenpaw/config/config.py",
   "reference/src/qwenpaw/app/routers/config.py",
 ]);
-const ALLOWED_STATUSES = new Set([
-  "automated_verified",
-  "pending_external",
-  "smoke_verified",
-]);
 const LEDGER_START = "<!-- qwenpaw-channel-parity-ledger:start -->";
 const LEDGER_END = "<!-- qwenpaw-channel-parity-ledger:end -->";
 const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -75,6 +70,79 @@ export const STANDARD_CHANNEL_AUDIT = Object.freeze({
     configClass: "QQConfig",
     upstreamUnitTest: "test_qq.py",
     upstreamContractTest: "test_qq_contract.py",
+  }),
+  mqtt: Object.freeze({
+    upstreamDirectory: "mqtt",
+    configClass: "MQTTConfig",
+    upstreamUnitTest: "test_mqtt.py",
+    upstreamContractTest: "test_mqtt_contract.py",
+    localSecretFields: Object.freeze(["password", "tls_keyfile"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/mqtt.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  matrix: Object.freeze({
+    upstreamDirectory: "matrix",
+    configClass: "MatrixConfig",
+    upstreamUnitTest: "test_matrix.py",
+    upstreamContractTest: "test_matrix_contract.py",
+    localSecretFields: Object.freeze(["access_token", "password"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/matrix.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  wecom: Object.freeze({
+    upstreamDirectory: "wecom",
+    configClass: "WecomConfig",
+    upstreamUnitTest: "test_wecom.py",
+    upstreamContractTest: "test_wecom_contract.py",
+    localSecretFields: Object.freeze(["secret"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/wecom.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  xiaoyi: Object.freeze({
+    upstreamDirectory: "xiaoyi",
+    configClass: "XiaoYiConfig",
+    upstreamUnitTest: "test_xiaoyi.py",
+    upstreamContractTest: "test_xiaoyi_contract.py",
+    localSecretFields: Object.freeze(["sk"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/xiaoyi.test.ts",
+      "tests/integration/channels/event-claim.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  yuanbao: Object.freeze({
+    upstreamDirectory: "yuanbao",
+    configClass: "YuanbaoConfig",
+    upstreamUnitTest: "test_yuanbao.py",
+    upstreamContractTest: "test_yuanbao_contract.py",
+    localSecretFields: Object.freeze(["app_secret"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/yuanbao.test.ts",
+      "tests/integration/channels/event-claim.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  wechat: Object.freeze({
+    upstreamDirectory: "wechat",
+    configClass: "WeChatConfig",
+    upstreamUnitTest: "test_wechat.py",
+    upstreamContractTest: "test_wechat_contract.py",
+    localSecretFields: Object.freeze([
+      "bot_token",
+      "bot_token_file",
+    ]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/wechat.test.ts",
+      "tests/unit/admin-compat-channels.test.ts",
+      "tests/integration/channels/event-claim.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
   }),
 });
 
@@ -373,11 +441,12 @@ async function collectExpectedEvidence(repositoryRoot, checksumMap) {
         repositoryRoot,
         `src/server/channels/adapters/${channel}`,
       ),
-      localTests: [
+      localTests: definition.localTests ?? [
         "tests/unit/channels/adapter-boundary.test.ts",
         `tests/unit/channels/adapters/${channel}.test.ts`,
         "tests/integration/channels/end-to-end.test.ts",
       ],
+      localSecretFields: definition.localSecretFields,
       localDocument: `docs/channels/${channel}.md`,
     };
   }
@@ -484,6 +553,17 @@ async function validateEntry(
     digitalMate.config_decisions,
     `${channel}.digitalmate.config_decisions`,
   );
+
+  if (expected.localSecretFields) {
+    assertExactArray(
+      assertNonEmptyStringArray(
+        digitalMate.secret_fields,
+        `${channel}.digitalmate.secret_fields`,
+      ),
+      expected.localSecretFields,
+      `${channel}.digitalmate.secret_fields`,
+    );
+  }
   assertNonEmptyString(
     decisions.default,
     `${channel}.digitalmate.config_decisions.default`,
@@ -509,8 +589,8 @@ async function validateEntry(
     `${channel}.intentional_differences`,
   );
   const status = assertNonEmptyString(entry.status, `${channel}.status`);
-  if (!ALLOWED_STATUSES.has(status)) {
-    throw new Error(`${channel}.status is invalid`);
+  if (status !== "automated_verified") {
+    throw new Error(`${channel}.status must be automated_verified`);
   }
 
   for (const relativePath of [

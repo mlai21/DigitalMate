@@ -15,6 +15,7 @@ import { createAdminAuthStatusResponse } from "@/server/admin/compat/security";
 import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
 import {
   ChannelAdapterRegistry,
+  registerProtocolChannelAdapters,
   registerStandardChannelAdapters,
 } from "@/server/channels/runtime/registry";
 import {
@@ -140,6 +141,24 @@ describe("admin compatibility channel contract", () => {
     );
   });
 
+  it("registers every M4-B protocol channel adapter exactly once", () => {
+    const registry = new ChannelAdapterRegistry();
+
+    registerProtocolChannelAdapters(registry);
+
+    expect(registry.registeredTypes()).toEqual([
+      "mqtt",
+      "matrix",
+      "wecom",
+      "xiaoyi",
+      "yuanbao",
+      "wechat",
+    ]);
+    expect(() => registerProtocolChannelAdapters(registry)).toThrow(
+      "duplicate_channel_adapter:mqtt",
+    );
+  });
+
   it("returns the fixed 17 types and built-in strict schemas", async () => {
     const router = createCoreAdminCompatRouter(dependencies());
     const types = await router.dispatch(
@@ -158,6 +177,7 @@ describe("admin compatibility channel contract", () => {
         config_fields: Array<{
           name: string;
           default: unknown;
+          type: string;
         }>;
       }
     >;
@@ -167,6 +187,24 @@ describe("admin compatibility channel contract", () => {
         (field) => field.name === "allow_from",
       )?.default,
     ).toBeNull();
+
+    const expectedProtocolSecrets = {
+      mqtt: ["password", "tls_keyfile"],
+      matrix: ["access_token", "password"],
+      wecom: ["secret"],
+      xiaoyi: ["sk"],
+      yuanbao: ["app_secret"],
+      wechat: ["bot_token", "bot_token_file"],
+    } as const;
+    for (const [channel, expected] of Object.entries(
+      expectedProtocolSecrets,
+    )) {
+      expect(
+        schemaBody[channel].config_fields
+          .filter((field) => field.type === "password")
+          .map((field) => field.name),
+      ).toEqual(expected);
+    }
   });
 
   it("stores confirmed WeChat QR credentials without returning plaintext", async () => {

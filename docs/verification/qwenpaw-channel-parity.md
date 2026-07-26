@@ -1,10 +1,11 @@
-# QwenPaw 标准渠道对齐账本
+# QwenPaw 渠道对齐账本
 
 基线固定为 QwenPaw `v2.0.0.post3`，commit
-`fef7e64d984f4332d0b84a343cd209bd3ea5d316`。本账本只描述 M4-A
-的 Telegram、Discord、Slack、Mattermost、飞书、钉钉和 QQ；它不是
-真实平台可用性声明，外部联调状态见
-[`channels-standard-m4a.md`](./channels-standard-m4a.md)。
+`fef7e64d984f4332d0b84a343cd209bd3ea5d316`。本账本覆盖 M4-A
+七个标准渠道，以及 M4-B 的 MQTT、Matrix、企业微信、小艺、腾讯元宝
+和微信 iLink。它不是实际平台可用性声明；标准渠道外部联调见
+[`channels-standard-m4a.md`](./channels-standard-m4a.md)，协议渠道验收见
+[`channels-protocol-m4b.md`](./channels-protocol-m4b.md)。
 
 `source_sha256` 的计算方式是：先由 M1 校验整个只读快照和
 `SHA256SUMS`，再取该渠道目录下全部文件的已验证清单行，按 POSIX
@@ -12,6 +13,12 @@
 `config.py` 中 `BaseChannelConfig` 与渠道子类合并得到；第二份固定配置
 路由文件也纳入证据边界。`config_decisions.default` 适用于全部上游字段，
 `exceptions` 只记录有意收紧或兼容处理的字段。
+
+M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测试会把该
+集合与运行时 manifest 及 Console 返回的 `password` 字段做精确比较，防止
+凭据字段退化为普通配置。JSON 中的 `status` 只表示代码自动化状态，本阶段
+必须是 `automated_verified`；真实平台状态由单独 smoke 矩阵维护，无外部
+证据不能写成 `smoke_verified`。
 
 | 渠道 | 上游源集合 SHA-256 | 上游 unit / contract | DigitalMate 状态 | 外部状态 |
 | --- | --- | --- | --- | --- |
@@ -22,6 +29,12 @@
 | 飞书 | `69b55337a8c68afd3ab78a7e5e6bfc2486186e428fe752c281e71cf58f64903c` | 均存在 | `automated_verified` | `pending_external` |
 | 钉钉 | `a93810f3aff11f33925ca5a8e571de2ee4413f08ae5ba96146d60a4e03e214c2` | 均存在 | `automated_verified` | `pending_external` |
 | QQ | `b929dcf86392cdd15bb8401ce5bd772bbd4585ca2c57702b75c628b55afae7ce` | 均存在 | `automated_verified` | `pending_external` |
+| MQTT | `8503779c9b9bb3b90c3f2b49549b370775a4bba72975efc00bfff60d75b73465` | 均存在 | `automated_verified` | `pending_external` |
+| Matrix | `356cde1e51630c43c197c2c26356ebfbbcda30ea7e96b9b310dff8022f82b9e5` | 均存在 | `automated_verified` | `pending_external` |
+| 企业微信 | `a34fcd818a6c9f1c607837ad4fa85f6a8f10372864341fdfb720a6e76aa2f14c` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
+| 小艺 | `056120d5f5cabd7af04032e620ed559e1ac52574c027b924e5792146ae74c2d7` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
+| 腾讯元宝 | `3f258fc31991f91ba71f60a5d4a6fec8a801468f9d25c4a92735a7928cd50537` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
+| 微信 iLink | `1b3a247a53540b0d3da1e39f89ab7ee29c62ab865a77c1d552a3b8a75e7bf26d` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
 
 以下 JSON 是审计脚本读取的规范证据；不得手工删减为空或用“同上”替代。
 
@@ -551,6 +564,492 @@
       "msg_seq 来自持久化 Delivery 分段序号，重连、重试和进程重启均复用同一序号。"
     ],
     "status": "automated_verified"
+  },
+  {
+    "channel": "mqtt",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/mqtt/__init__.py",
+        "reference/src/qwenpaw/app/channels/mqtt/channel.py"
+      ],
+      "source_sha256": "8503779c9b9bb3b90c3f2b49549b370775a4bba72975efc00bfff60d75b73465",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "host",
+        "port",
+        "transport",
+        "clean_session",
+        "qos",
+        "username",
+        "password",
+        "subscribe_topic",
+        "publish_topic",
+        "tls_enabled",
+        "tls_ca_certs",
+        "tls_certfile",
+        "tls_keyfile"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_mqtt.py"
+      ],
+      "contract_tests": [
+        "reference/tests/contract/channels/test_mqtt_contract.py"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "password",
+        "tls_keyfile"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/mqtt/config.ts",
+        "src/server/channels/adapters/mqtt/index.ts",
+        "src/server/channels/adapters/mqtt/normalize.ts",
+        "src/server/channels/adapters/mqtt/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/mqtt.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/mqtt.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "tls_ca_certs": "inline_pem_in_encrypted_config_not_filesystem_path",
+          "tls_certfile": "inline_pem_in_encrypted_config_not_filesystem_path",
+          "tls_keyfile": "inline_pem_secret_not_filesystem_path"
+        }
+      }
+    },
+    "intentional_differences": [
+      "TLS CA、客户端证书和私钥沿用上游字段名，但值改为加密配置中的 PEM 内容，运行时不读取任意宿主文件。",
+      "QoS 1/2 只有在统一事件账本完成持久化后才允许协议 ACK；QoS 0 明确要求业务 event_id 才能获得跨时间窗幂等。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "matrix",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/matrix/__init__.py",
+        "reference/src/qwenpaw/app/channels/matrix/channel.py"
+      ],
+      "source_sha256": "356cde1e51630c43c197c2c26356ebfbbcda30ea7e96b9b310dff8022f82b9e5",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "homeserver",
+        "user_id",
+        "access_token",
+        "group_allow_from",
+        "groups",
+        "encryption",
+        "vision_enabled",
+        "history_limit",
+        "password",
+        "device_name",
+        "sync_timeout_ms",
+        "mention_pill_in_body",
+        "outbound_structured_mentions",
+        "streaming_enabled"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_matrix.py"
+      ],
+      "contract_tests": [
+        "reference/tests/contract/channels/test_matrix_contract.py"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "access_token",
+        "password"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/matrix/config.ts",
+        "src/server/channels/adapters/matrix/crypto-store.ts",
+        "src/server/channels/adapters/matrix/index.ts",
+        "src/server/channels/adapters/matrix/normalize.ts",
+        "src/server/channels/adapters/matrix/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/matrix.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/matrix.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary"
+        }
+      }
+    },
+    "intentional_differences": [
+      "修正固定上游 Console 依赖不存在 auth_method 字段的问题，Access Token 与密码配置始终可见并按确定优先级解析。",
+      "端到端加密设备库使用按用户、分身和连接派生的密钥落入私有文件，普通数据导出不包含同步令牌或 Olm/Megolm 状态。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "wecom",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/wecom/__init__.py",
+        "reference/src/qwenpaw/app/channels/wecom/cards/__init__.py",
+        "reference/src/qwenpaw/app/channels/wecom/cards/context.py",
+        "reference/src/qwenpaw/app/channels/wecom/cards/dispatcher.py",
+        "reference/src/qwenpaw/app/channels/wecom/cards/tool_guard.py",
+        "reference/src/qwenpaw/app/channels/wecom/channel.py",
+        "reference/src/qwenpaw/app/channels/wecom/utils.py"
+      ],
+      "source_sha256": "a34fcd818a6c9f1c607837ad4fa85f6a8f10372864341fdfb720a6e76aa2f14c",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "bot_id",
+        "secret",
+        "media_dir",
+        "welcome_text",
+        "share_session_in_group",
+        "max_reconnect_attempts",
+        "streaming_enabled"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_wecom.py"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "secret"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/wecom/config.ts",
+        "src/server/channels/adapters/wecom/index.ts",
+        "src/server/channels/adapters/wecom/media.ts",
+        "src/server/channels/adapters/wecom/normalize.ts",
+        "src/server/channels/adapters/wecom/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/wecom.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/wecom.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "media_dir": "compatibility_field_private_storage_is_authoritative"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游缺少企业微信 contract 测试，DigitalMate 由 wecom Adapter 合同覆盖认证、欢迎语、流式、附件和停止语义。",
+      "回调 req_id、媒体 URL 和 AES key 分别进入加密 reply handle 与短期 locator，不写入公开事件或日志。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "xiaoyi",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/xiaoyi/__init__.py",
+        "reference/src/qwenpaw/app/channels/xiaoyi/auth.py",
+        "reference/src/qwenpaw/app/channels/xiaoyi/channel.py",
+        "reference/src/qwenpaw/app/channels/xiaoyi/constants.py",
+        "reference/src/qwenpaw/app/channels/xiaoyi/utils.py"
+      ],
+      "source_sha256": "056120d5f5cabd7af04032e620ed559e1ac52574c027b924e5792146ae74c2d7",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "ak",
+        "sk",
+        "agent_id",
+        "task_timeout_ms"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_xiaoyi.py"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "sk"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/xiaoyi/auth.ts",
+        "src/server/channels/adapters/xiaoyi/config.ts",
+        "src/server/channels/adapters/xiaoyi/index.ts",
+        "src/server/channels/adapters/xiaoyi/protocol.ts",
+        "src/server/channels/adapters/xiaoyi/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/xiaoyi.test.ts",
+        "tests/integration/channels/event-claim.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/xiaoyi.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游缺少小艺 contract 测试，DigitalMate 合同补齐双链路去重、签名、任务帧、取消、附件和回复状态机。",
+      "备用 IP 端点仍执行 TLS 证书校验并固定 SNI，不沿用参考实现关闭校验的做法。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "yuanbao",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/yuanbao/__init__.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/auth.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/channel.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/codec.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/constants.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/media.py",
+        "reference/src/qwenpaw/app/channels/yuanbao/proto/biz.json",
+        "reference/src/qwenpaw/app/channels/yuanbao/proto/conn.json",
+        "reference/src/qwenpaw/app/channels/yuanbao/utils.py"
+      ],
+      "source_sha256": "3f258fc31991f91ba71f60a5d4a6fec8a801468f9d25c4a92735a7928cd50537",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "app_id",
+        "app_secret",
+        "api_domain",
+        "media_dir",
+        "accept_bot_messages"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_yuanbao.py"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "app_secret"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/yuanbao/UPSTREAM.md",
+        "src/server/channels/adapters/yuanbao/auth.ts",
+        "src/server/channels/adapters/yuanbao/codec.ts",
+        "src/server/channels/adapters/yuanbao/config.ts",
+        "src/server/channels/adapters/yuanbao/index.ts",
+        "src/server/channels/adapters/yuanbao/media.ts",
+        "src/server/channels/adapters/yuanbao/normalize.ts",
+        "src/server/channels/adapters/yuanbao/proto/biz.json",
+        "src/server/channels/adapters/yuanbao/proto/conn.json",
+        "src/server/channels/adapters/yuanbao/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/yuanbao.test.ts",
+        "tests/integration/channels/event-claim.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/yuanbao.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "media_dir": "compatibility_field_private_storage_is_authoritative"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游缺少腾讯元宝 contract 测试，DigitalMate 使用原始描述符哈希、binary golden 和 TypeScript 协议合同防止 wire format 漂移。",
+      "临时 COS 凭据只存在于单次上传内存，资源 locator 加密保存并在私有附件绑定后清除。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "wechat",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/wechat/__init__.py",
+        "reference/src/qwenpaw/app/channels/wechat/channel.py",
+        "reference/src/qwenpaw/app/channels/wechat/client.py",
+        "reference/src/qwenpaw/app/channels/wechat/utils.py"
+      ],
+      "source_sha256": "1b3a247a53540b0d3da1e39f89ab7ee29c62ab865a77c1d552a3b8a75e7bf26d",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "bot_token",
+        "bot_token_file",
+        "base_url",
+        "media_dir",
+        "message_merge_enabled",
+        "message_merge_delay_ms"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_wechat.py"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "secret_fields": [
+        "bot_token",
+        "bot_token_file"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/wechat/UPSTREAM.md",
+        "src/server/channels/adapters/wechat/auth.ts",
+        "src/server/channels/adapters/wechat/client.ts",
+        "src/server/channels/adapters/wechat/config.ts",
+        "src/server/channels/adapters/wechat/crypto.ts",
+        "src/server/channels/adapters/wechat/index.ts",
+        "src/server/channels/adapters/wechat/media.ts",
+        "src/server/channels/adapters/wechat/normalize.ts",
+        "src/server/channels/adapters/wechat/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/wechat.test.ts",
+        "tests/unit/admin-compat-channels.test.ts",
+        "tests/integration/channels/event-claim.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/wechat.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "bot_token_file": "plaintext_token_file_rejected_use_encrypted_qr_secret",
+          "media_dir": "compatibility_field_private_storage_is_authoritative",
+          "message_merge_enabled": "retained_single_delivery_message_is_authoritative",
+          "message_merge_delay_ms": "retained_single_delivery_message_is_authoritative"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游缺少微信 contract 测试，DigitalMate 合同补齐二维码全状态、游标、上下文令牌、AES 媒体、typing 和启停竞态。",
+      "Bot Token 与 context token 只进入加密配置或 reply handle；ret=-2 持久失效句柄，主动任务和重启恢复都不会再次选择。"
+    ],
+    "status": "automated_verified"
   }
 ]
 ```
@@ -561,11 +1060,11 @@
 运行：
 
 ```bash
-node scripts/qwenpaw-console/audit-channel-parity.mjs --require telegram,discord,slack,mattermost,feishu,dingtalk,qq
+node scripts/qwenpaw-console/audit-channel-parity.mjs --require telegram,discord,slack,mattermost,feishu,dingtalk,qq,mqtt,matrix,wecom,xiaoyi,yuanbao,wechat
 ```
 
-脚本先执行 M1 快照校验，再验证固定身份、七个渠道集合、逐文件哈希、
+脚本先执行 M1 快照校验，再验证固定身份、十三个渠道集合、逐文件哈希、
 继承后的配置字段、上游 unit/contract 证据、本地 manifest/Adapter/测试/
-文档和差异说明。未知渠道、重复渠道、空证据、错误哈希、漏字段或缺文件
-都会退出 1。若未来固定上游确实没有某类测试，该数组必须明确写
+文档、密钥字段和差异说明。未知渠道、重复渠道、空证据、错误哈希、漏字段、
+无证据 smoke 或缺文件都会退出 1。若未来固定上游确实没有某类测试，该数组必须明确写
 `missing_upstream`，并继续保留 DigitalMate 的本地补齐测试。

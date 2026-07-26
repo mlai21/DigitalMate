@@ -1762,7 +1762,7 @@ describe("QwenPaw Console snapshot", () => {
   });
 });
 
-describe("QwenPaw standard channel parity audit", () => {
+describe("QwenPaw channel parity audit", () => {
   const ledgerPath = path.resolve(
     "docs/verification/qwenpaw-channel-parity.md",
   );
@@ -1774,6 +1774,12 @@ describe("QwenPaw standard channel parity audit", () => {
     "feishu",
     "dingtalk",
     "qq",
+    "mqtt",
+    "matrix",
+    "wecom",
+    "xiaoyi",
+    "yuanbao",
+    "wechat",
   ];
 
   type LedgerFixture = {
@@ -1783,7 +1789,11 @@ describe("QwenPaw standard channel parity audit", () => {
       source_files: string[];
       source_sha256: string;
     };
+    digitalmate: {
+      secret_fields?: string[];
+    };
     intentional_differences: string[];
+    status: string;
   };
 
   async function withLedgerFixture(
@@ -1820,12 +1830,12 @@ describe("QwenPaw standard channel parity audit", () => {
     }
   }
 
-  it("核验固定快照与七个非空渠道证据", async () => {
+  it("核验固定快照与十三个非空渠道证据", async () => {
     await expect(
       auditChannelParity({ requiredChannels }),
     ).resolves.toMatchObject({
-      channels: 7,
-      required: 7,
+      channels: 13,
+      required: 13,
       tag: "v2.0.0.post3",
       commit: "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
     });
@@ -1840,7 +1850,8 @@ describe("QwenPaw standard channel parity audit", () => {
     for (const entry of ledger) {
       expect(isChannelType(entry.channel)).toBe(true);
       if (!isChannelType(entry.channel)) continue;
-      const localFields = getChannelManifest(entry.channel).fields.map(
+      const manifest = getChannelManifest(entry.channel);
+      const localFields = manifest.fields.map(
         (field) => field.name,
       );
       expect(
@@ -1848,6 +1859,11 @@ describe("QwenPaw standard channel parity audit", () => {
           (field) => !localFields.includes(field),
         ),
       ).toEqual([]);
+      if (entry.digitalmate.secret_fields) {
+        expect(manifest.secretFields).toEqual(
+          entry.digitalmate.secret_fields,
+        );
+      }
     }
   });
 
@@ -1878,6 +1894,20 @@ describe("QwenPaw standard channel parity audit", () => {
       expected: "source_sha256 mismatch",
       update: (ledger: LedgerFixture[]) => {
         ledger[0].upstream.source_sha256 = "0".repeat(64);
+      },
+    },
+    {
+      variant: "无外部证据的 smoke 状态",
+      expected: "status must be automated_verified",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[0].status = "smoke_verified";
+      },
+    },
+    {
+      variant: "错误密钥字段集合",
+      expected: "digitalmate.secret_fields",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[7].digitalmate.secret_fields = ["password"];
       },
     },
   ])("拒绝$variant", async ({ expected, update }) => {

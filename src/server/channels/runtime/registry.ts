@@ -374,3 +374,14 @@ export function registerStandardChannelAdapters(
   registerDingTalkChannelAdapter(registry);
   registerQQChannelAdapter(registry);
 }
+
+export function registerProtocolChannelAdapters(
+  registry: ChannelAdapterRegistry,
+): void {
+  registerMqttChannelAdapter(registry);
+  registerMatrixChannelAdapter(registry);
+  registerWeComChannelAdapter(registry);
+  registerXiaoYiChannelAdapter(registry);
+  registerYuanbaoChannelAdapter(registry);
+  registerWechatChannelAdapter(registry);
+}
