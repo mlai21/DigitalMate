@@ -142,6 +142,7 @@ import type {
   ClaimedChannelDelivery,
 } from "./delivery-repository";
 import {
+  ChannelDeliveryDeferred,
   ChannelSendError,
   createChannelDeliveryWorker,
   type ChannelDeliveryTransport,
@@ -178,6 +179,13 @@ export async function startChannelRuntime(input: Readonly<{
   env: AppEnv;
   pool?: Pool;
   owner?: string;
+  channelNodes?: Readonly<{
+    enqueueDelivery(input: Readonly<{
+      connection: RuntimeChannelConnection;
+      delivery: ChannelDelivery;
+      expiresAt: Date;
+    }>): Promise<void>;
+  }>;
 }>): Promise<Readonly<{
   stop(): Promise<void>;
 }>> {
@@ -418,6 +426,14 @@ export async function startChannelRuntime(input: Readonly<{
     invalidateReplyHandle: (scope, handleId, at) =>
       replyHandles?.invalidate(scope, handleId, at)
       ?? Promise.resolve(false),
+    ...(input.channelNodes
+      ? {
+          sendViaNode: (deliveryInput) =>
+            input.channelNodes!.enqueueDelivery(
+              deliveryInput,
+            ),
+        }
+      : {}),
   });
   const deliveryWorker = createChannelDeliveryWorker({
     owner: `${owner}:delivery`,
@@ -568,11 +584,21 @@ export function createChannelDeliveryTransport(input: Readonly<{
     at: Date,
   ): Promise<boolean>;
   now?: () => Date;
+  sendViaNode?(input: Readonly<{
+    connection: RuntimeChannelConnection;
+    delivery: ChannelDelivery;
+    expiresAt: Date;
+  }>): Promise<void>;
 }>): ChannelDeliveryTransport {
   const now = input.now ?? (() => new Date());
 
   return {
     async mode(delivery) {
+      const nodeConnection = await resolveNodeConnection(
+        input,
+        delivery,
+      );
+      if (nodeConnection) return "segmented";
       const resolved = await resolveDeliveryTarget(
         input,
         delivery,
@@ -624,6 +650,16 @@ export function createChannelDeliveryTransport(input: Readonly<{
 
     async segmentBodies(delivery, signal) {
       signal.throwIfAborted();
+      const nodeConnection = await resolveNodeConnection(
+        input,
+        delivery,
+      );
+      if (nodeConnection) {
+        return {
+          segments: [delivery.body],
+          prefix: "",
+        };
+      }
       const resolved = await resolveDeliveryTarget(
         input,
         delivery,
@@ -662,6 +698,52 @@ export function createChannelDeliveryTransport(input: Readonly<{
     async send(part, signal): Promise<SendResult> {
       signal.throwIfAborted();
       try {
+        const nodeConnection = await resolveNodeConnection(
+          input,
+          part.delivery,
+        );
+        if (nodeConnection) {
+          if (!input.sendViaNode) {
+            throw new ChannelSendError({
+              code: "runtime_prerequisite_missing",
+              retryable: false,
+            });
+          }
+          if (
+            nodeConnection.channelType === "imessage"
+            && part.delivery.recipient.chatType !== "direct"
+          ) {
+            throw new ChannelSendError({
+              code: "imessage_group_unsupported",
+              retryable: false,
+            });
+          }
+          const replyHandle = part.delivery.replyHandleId
+            ? await input.loadReplyHandle(
+                part.delivery.scope,
+                part.delivery.replyHandleId,
+              )
+            : null;
+          const channelDelivery: ChannelDelivery = {
+            id: part.delivery.id,
+            eventId: part.delivery.eventId,
+            connectionId: part.delivery.connectionId,
+            assistantMessageId:
+              part.delivery.assistantMessageId,
+            deliverySequence: part.state.sequence,
+            body: part.body,
+            recipient: part.delivery.recipient,
+            ...(replyHandle ? { replyHandle } : {}),
+          };
+          await input.sendViaNode({
+            connection: nodeConnection,
+            delivery: channelDelivery,
+            expiresAt: new Date(
+              now().getTime() + 5 * 60_000,
+            ),
+          });
+          throw new ChannelDeliveryDeferred();
+        }
         const resolved = await resolveDeliveryTarget(
           input,
           part.delivery,
@@ -725,6 +807,9 @@ export function createChannelDeliveryTransport(input: Readonly<{
           },
         );
       } catch (error) {
+        if (error instanceof ChannelDeliveryDeferred) {
+          throw error;
+        }
         if (signal.aborted) throw error;
         if (
           part.delivery.replyHandleId
@@ -786,6 +871,39 @@ async function resolveDeliveryTarget(
   };
 }
 
+async function resolveNodeConnection(
+  input: Readonly<{
+    loadConnection(
+      connectionId: string,
+    ): Promise<RuntimeChannelConnection | null>;
+    sendViaNode?: unknown;
+  }>,
+  delivery: ClaimedChannelDelivery,
+): Promise<RuntimeChannelConnection | null> {
+  if (!input.sendViaNode) return null;
+  const connection = await input.loadConnection(
+    delivery.connectionId,
+  );
+  if (
+    !connection?.runtimeNodeId
+    || !["imessage", "sip"].includes(connection.channelType)
+  ) {
+    return null;
+  }
+  if (
+    !connection.enabled
+    || connection.runtimeError
+    || connection.scope.userId !== delivery.scope.userId
+    || connection.scope.agentId !== delivery.scope.agentId
+  ) {
+    throw new ChannelSendError({
+      code: "runtime_prerequisite_missing",
+      retryable: false,
+    });
+  }
+  return connection;
+}
+
 function segmentCodePoints(
   value: string,
   firstLimit: number,
@@ -827,6 +945,12 @@ function createManagedAdapter(
   connection: RuntimeChannelConnection,
   dependencies: ManagedAdapterDependencies,
 ): ChannelAdapter<Record<string, unknown>> {
+  if (
+    connection.runtimeNodeId
+    && ["imessage", "sip"].includes(connection.channelType)
+  ) {
+    return nodeManagedAdapter(connection.channelType);
+  }
   switch (connection.channelType) {
     case "discord":
       return createManagedDiscordAdapter(
@@ -903,6 +1027,45 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function nodeManagedAdapter(
+  type: ChannelType,
+): ChannelAdapter<Record<string, unknown>> {
+  const manifest = getChannelManifest(type);
+  return {
+    manifest,
+    validateConfig(config) {
+      return config && typeof config === "object"
+        ? config as Record<string, unknown>
+        : {};
+    },
+    async start() {},
+    async stop() {},
+    async health() {
+      return {
+        status: "healthy",
+        checkedAt: new Date(),
+        reconnectAttempts: 0,
+      };
+    },
+    async normalizeInbound() {
+      return null;
+    },
+    async acknowledge() {
+      return { status: 200 };
+    },
+    async send() {
+      throw new Error("channel_node_send_via_bridge");
+    },
+    async resolveRecipient(target) {
+      return {
+        address: {
+          conversationId: target.externalConversationId,
+        },
+      };
+    },
+  };
 }
 
 function createManagedOneBotAdapter(

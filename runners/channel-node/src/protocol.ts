@@ -19,6 +19,8 @@ const safeString = (maximum: number) =>
 const errorCode = z
   .string()
   .regex(/^[a-z][a-z0-9_]{0,127}$/);
+const transferId = z.string().regex(/^[a-f0-9]{64}$/);
+const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 const stringRecord = z
   .record(
     z.string().min(1).max(128),
@@ -94,6 +96,7 @@ const sendFrameSchema = z
             externalConversationId: safeString(1_024),
             externalThreadId: safeString(1_024).optional(),
             externalUserId: safeString(1_024).optional(),
+            chatType: z.enum(["direct", "group"]).optional(),
           })
           .strict(),
         replyHandle: replyHandleSchema.optional(),
@@ -139,13 +142,13 @@ const inboundFrameSchema = z
                   .number()
                   .int()
                   .nonnegative()
-                  .max(1024 * 1024 * 1024)
+                  .max(10 * 1024 * 1024)
                   .nullable(),
                 source: stringRecord,
               })
               .strict(),
           )
-          .max(32),
+          .max(4),
         occurredAt: isoDate,
         rawSummary,
         replyHandle: replyHandleSchema.optional(),
@@ -191,6 +194,7 @@ const sendResultFrameSchema = z.discriminatedUnion(
         ...baseShape,
         connectionId: uuid,
         deliveryId: uuid,
+        requestSequence: sequence,
         ...sentOutcomeShape,
       })
       .strict(),
@@ -200,6 +204,7 @@ const sendResultFrameSchema = z.discriminatedUnion(
         ...baseShape,
         connectionId: uuid,
         deliveryId: uuid,
+        requestSequence: sequence,
         ...retryableOutcomeShape,
       })
       .strict(),
@@ -209,11 +214,60 @@ const sendResultFrameSchema = z.discriminatedUnion(
         ...baseShape,
         connectionId: uuid,
         deliveryId: uuid,
+        requestSequence: sequence,
         ...failedOutcomeShape,
       })
       .strict(),
   ],
 );
+
+const attachmentStartFrameSchema = z
+  .object({
+    type: z.literal("attachment_start"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    externalEventId: safeString(1_024),
+    externalAttachmentId: safeString(1_024),
+    fileName: safeString(1_024),
+    mimeType: safeString(256),
+    sizeBytes: z.number().int().positive()
+      .max(10 * 1024 * 1024),
+    sha256,
+  })
+  .strict();
+
+const attachmentChunkFrameSchema = z
+  .object({
+    type: z.literal("attachment_chunk"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    chunkIndex: z.number().int().nonnegative().max(63),
+    dataBase64: z.string().min(1).max(700_000),
+  })
+  .strict();
+
+const attachmentCommitFrameSchema = z
+  .object({
+    type: z.literal("attachment_commit"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    chunkCount: z.number().int().positive().max(64),
+  })
+  .strict();
+
+const attachmentAckFrameSchema = z
+  .object({
+    type: z.literal("attachment_ack"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    status: z.enum(["ready", "rejected"]),
+    errorCode: errorCode.optional(),
+  })
+  .strict();
 
 const registerFrameSchema = z
   .object({
@@ -254,12 +308,16 @@ const serverFrameSchema = z.union([
   registeredFrameSchema,
   inboundAckFrameSchema,
   sendFrameSchema,
+  attachmentAckFrameSchema,
 ]);
 const runnerFrameSchema = z.union([
   registerFrameSchema,
   heartbeatFrameSchema,
   inboundFrameSchema,
   sendResultFrameSchema,
+  attachmentStartFrameSchema,
+  attachmentChunkFrameSchema,
+  attachmentCommitFrameSchema,
   errorFrameSchema,
 ]);
 
@@ -275,6 +333,9 @@ export type RunnerInboundFrame = z.infer<
 >;
 export type RunnerSendResultFrame = z.infer<
   typeof sendResultFrameSchema
+>;
+export type RunnerAttachmentAckFrame = z.infer<
+  typeof attachmentAckFrameSchema
 >;
 export type RunnerSendOutcome = z.infer<
   typeof sendOutcomeSchema

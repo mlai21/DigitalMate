@@ -131,6 +131,13 @@ export class ChannelSendError extends Error {
   }
 }
 
+export class ChannelDeliveryDeferred extends Error {
+  constructor() {
+    super("channel_delivery_deferred");
+    this.name = "ChannelDeliveryDeferred";
+  }
+}
+
 export function createChannelDeliveryWorker(input: Readonly<{
   owner: string;
   deliveries: DeliveryRepository;
@@ -404,6 +411,9 @@ async function processDelivery(input: {
       );
     } catch (error) {
       if (input.signal.aborted) throw error;
+      if (error instanceof ChannelDeliveryDeferred) {
+        return;
+      }
       const failure = normalizeSendFailure(error);
       await requireClaimMutation(
         input.deliveries.completeSegment(

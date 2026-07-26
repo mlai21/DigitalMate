@@ -31,8 +31,38 @@ describe("channel node protocol", () => {
       "inbound_ack",
       "send",
       "send_result",
+      "attachment_start",
+      "attachment_chunk",
+      "attachment_commit",
+      "attachment_ack",
       "error",
     ]);
+  });
+
+  it("keeps attachment chunks below the one MiB frame boundary", () => {
+    const chunk = parseNodeFrame({
+      type: "attachment_chunk",
+      protocolVersion: 1,
+      nodeId: NODE_ID,
+      sequence: 11,
+      sentAt: SENT_AT,
+      connectionId: CONNECTION_ID,
+      transferId: "a".repeat(64),
+      chunkIndex: 0,
+      dataBase64: Buffer.alloc(512 * 1024, 0x61)
+        .toString("base64"),
+    });
+
+    expect(chunk).toMatchObject({
+      type: "attachment_chunk",
+      transferId: "a".repeat(64),
+      chunkIndex: 0,
+    });
+    expect(() => parseNodeFrame({
+      ...chunk,
+      dataBase64: Buffer.alloc(800 * 1024, 0x61)
+        .toString("base64"),
+    })).toThrow("node_frame_too_large");
   });
 
   it("parses a strict inbound frame and rejects unknown fields", () => {

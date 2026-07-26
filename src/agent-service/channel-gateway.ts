@@ -8,7 +8,6 @@ import {
 } from "ws";
 
 import type { AppEnv } from "@/server/config/env";
-import { getPool } from "@/server/db/client";
 import {
   CHANNEL_GATEWAY_MAX_BODY_BYTES,
   createChannelGatewayRouter,
@@ -23,9 +22,17 @@ import {
 import {
   oneBotGatewayHub,
 } from "@/server/channels/adapters/onebot/transport";
-import {
+import type {
   createChannelNodeRepository,
 } from "@/server/channels/nodes/repository";
+import type {
+  NodeFrame,
+  NodeInboundAckFrame,
+  NodeInboundFrame,
+} from "@/server/channels/nodes/protocol";
+import type {
+  ChannelNodeCertificateRecord,
+} from "@/server/channels/gateway/tls";
 
 type PublicUpgradeHandler = (
   route: ChannelGatewayUpgradeRoute,
@@ -257,6 +264,36 @@ async function closeWebSocketServer(
 
 export async function startAgentChannelGateway(input: Readonly<{
   env: AppEnv;
+  channelNodes: Readonly<{
+    repository: ReturnType<typeof createChannelNodeRepository>;
+    setSender(
+      sender: ((
+        nodeId: string,
+        frame: NodeFrame,
+      ) => Promise<boolean>) | null,
+    ): void;
+    onRegistered(
+      node: ChannelNodeCertificateRecord,
+    ): Promise<void>;
+    onDisconnected(
+      node: ChannelNodeCertificateRecord,
+    ): Promise<void>;
+    onInbound(
+      node: ChannelNodeCertificateRecord,
+      frame: NodeInboundFrame,
+    ): Promise<Readonly<{
+      disposition: NodeInboundAckFrame["disposition"];
+      eventId?: string;
+    }>>;
+    onFrame(
+      node: ChannelNodeCertificateRecord,
+      frame: NodeFrame,
+    ): Promise<NodeFrame | void>;
+    onInboundCommitted(
+      node: ChannelNodeCertificateRecord,
+      frame: NodeInboundFrame,
+    ): Promise<void>;
+  }>;
 }>): Promise<Readonly<{ stop(): Promise<void> }>> {
   const publicGateway = createPublicChannelGateway({
     port: input.env.channelGatewayPort,
@@ -283,7 +320,6 @@ export async function startAgentChannelGateway(input: Readonly<{
         readFile(input.env.channelNodeTls.privateKeyPath),
         readFile(input.env.channelNodeTls.certificateAuthorityPath),
       ]);
-      const repository = createChannelNodeRepository(getPool());
       nodeServer = createChannelNodeServer({
         port: input.env.channelNodePort,
         tls: buildNodeTlsOptions({
@@ -291,15 +327,34 @@ export async function startAgentChannelGateway(input: Readonly<{
           privateKey,
           certificateAuthority,
         }),
-        repository,
+        repository: input.channelNodes.repository,
+        onRegistered: (node) =>
+          input.channelNodes.onRegistered(node),
+        onDisconnected: (node) =>
+          input.channelNodes.onDisconnected(node),
+        onInbound: (node, frame) =>
+          input.channelNodes.onInbound(node, frame),
+        onInboundCommitted: (node, frame) =>
+          input.channelNodes.onInboundCommitted(
+            node,
+            frame,
+          ),
+        onFrame: (node, frame) =>
+          input.channelNodes.onFrame(node, frame),
       });
+      input.channelNodes.setSender(
+        (nodeId, frame) =>
+          nodeServer!.sendFrame(nodeId, frame),
+      );
       unsubscribeRevocations =
-        await repository.subscribeToRevocations((nodeId) => {
+        await input.channelNodes.repository
+          .subscribeToRevocations((nodeId) => {
           nodeServer?.revokeNode(nodeId);
         });
       await nodeServer.start();
     }
   } catch (error) {
+    input.channelNodes.setSender(null);
     await nodeServer?.stop(0).catch(() => undefined);
     await unsubscribeRevocations?.().catch(() => undefined);
     await publicGateway.stop().catch(() => undefined);
@@ -318,6 +373,8 @@ export async function startAgentChannelGateway(input: Readonly<{
         await nodeServer?.stop();
       } catch (error) {
         failure ??= error;
+      } finally {
+        input.channelNodes.setSender(null);
       }
       try {
         await unsubscribeRevocations?.();

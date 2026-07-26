@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
@@ -30,6 +31,9 @@ import {
 import {
   createChannelNodeRepository,
 } from "@/server/channels/nodes/repository";
+import {
+  createChannelNodeRuntimeBridge,
+} from "@/server/channels/nodes/runtime-bridge";
 import {
   createNodeFrameDigest,
   parseNodeFrame,
@@ -786,6 +790,116 @@ describe("channel runtime end-to-end recovery", () => {
     await expect(
       countRows("messages", "role = 'assistant'"),
     ).resolves.toBe(1);
+    await expect(
+      nodes.listPendingOutbox(USER_ID, node.id, now),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        deliveryId: delivery.id,
+        status: "pending",
+        frame: expect.objectContaining({
+          type: "send",
+          payload: expect.objectContaining({
+            body: "single persisted reply",
+          }),
+        }),
+      }),
+    ]);
+  });
+
+  it("atomically completes a waiting node delivery from send_result without rerunning the Agent", async () => {
+    const now = new Date();
+    const nodes = createChannelNodeRepository(pool);
+    const deliveries = createChannelDeliveryRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "Result node",
+      certificateFingerprint: Buffer.alloc(32, 12),
+      supportedChannelTypes: ["imessage"],
+    });
+    await nodes.bindConnection(scope, node.id, CONNECTION_ID);
+    await nodes.recordHeartbeat(USER_ID, node.id, 1, now);
+    const delivery = await seedNodeDelivery("node-result-1");
+    const claimAt = new Date(Date.now() + 1_000);
+    const claim = await deliveries.claimNext(
+      "node-delivery-worker",
+      claimAt,
+    );
+    await deliveries.beginSegment(claim!, 1, claimAt);
+    const enqueued = await nodes.enqueueSend({
+      scope,
+      nodeId: node.id,
+      connectionId: CONNECTION_ID,
+      deliveryId: delivery.id,
+      expiresAt: new Date(now.getTime() + 5 * 60_000),
+      payload: {
+        body: delivery.body,
+        recipient: {
+          externalConversationId: "conversation-1",
+          externalUserId: "sender-1",
+          chatType: "direct",
+        },
+      },
+    }, now);
+
+    const result = parseNodeFrame({
+      type: "send_result",
+      protocolVersion: 1,
+      nodeId: node.id,
+      sequence: 2,
+      sentAt: now.toISOString(),
+      connectionId: CONNECTION_ID,
+      deliveryId: delivery.id,
+      requestSequence:
+        enqueued.action === "enqueued"
+          ? enqueued.outbox.sequence
+          : 1,
+      status: "sent",
+      externalMessageId: "imessage:guid:1",
+      platformSentAt: now.toISOString(),
+      rawSummary: { transport: "imsg" },
+    });
+    if (result.type !== "send_result") {
+      throw new Error("test_send_result_invalid");
+    }
+    await nodes.completeSendResult({
+      userId: USER_ID,
+      nodeId: node.id,
+      frame: {
+        ...result,
+        requestSequence: result.requestSequence + 1,
+      },
+    }, new Date(claimAt.getTime() + 1));
+    await expect(
+      countRows("channel_node_outbox", "status = 'pending'"),
+    ).resolves.toBe(1);
+    await expect(
+      countRows(
+        "channel_delivery_attempts",
+        "status = 'started'",
+      ),
+    ).resolves.toBe(1);
+
+    await nodes.completeSendResult({
+      userId: USER_ID,
+      nodeId: node.id,
+      frame: result,
+    }, new Date(claimAt.getTime() + 1));
+
+    await expect(
+      countRows("channel_node_outbox", "status = 'sent'"),
+    ).resolves.toBe(1);
+    await expect(
+      countRows("channel_deliveries", "status = 'sent'"),
+    ).resolves.toBe(1);
+    await expect(
+      countRows(
+        "channel_delivery_attempts",
+        "status = 'sent'",
+      ),
+    ).resolves.toBe(1);
+    await expect(
+      countRows("messages", "role = 'assistant'"),
+    ).resolves.toBe(1);
   });
 
   it("persists inbound results and reissues ACKs on the shared server sequence", async () => {
@@ -806,6 +920,7 @@ describe("channel runtime end-to-end recovery", () => {
     await expect(
       nodes.allocateServerSequence(USER_ID, node.id),
     ).resolves.toBe(1);
+    await nodes.acceptSequence(USER_ID, node.id, 10);
     const inbound = parseNodeFrame({
       type: "inbound",
       protocolVersion: 1,
@@ -845,6 +960,15 @@ describe("channel runtime end-to-end recovery", () => {
       externalEventId: "node-event-ack-1",
       disposition: "accepted",
     });
+    const sequenceState = await pool.query<{
+      last_sequence: number | string;
+    }>(
+      `SELECT last_sequence
+       FROM channel_runtime_nodes
+       WHERE id = $1`,
+      [node.id],
+    );
+    expect(Number(sequenceState.rows[0]?.last_sequence)).toBe(10);
     await expect(nodes.replayInboundAck({
       userId: USER_ID,
       nodeId: node.id,
@@ -862,6 +986,250 @@ describe("channel runtime end-to-end recovery", () => {
     await expect(
       countRows("channel_node_inbound_receipts", "true"),
     ).resolves.toBe(1);
+  });
+
+  it("routes iMessage node inbound through the common access and event repositories", async () => {
+    const repositories = createRepositories(pool);
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "iMessage node",
+      certificateFingerprint: Buffer.alloc(32, 13),
+      supportedChannelTypes: ["imessage"],
+    });
+    await pool.query(
+      `UPDATE channel_connections
+       SET channel_type = 'imessage',
+           display_name = 'iMessage',
+           enabled = true
+       WHERE id = $1`,
+      [CONNECTION_ID],
+    );
+    await nodes.bindConnection(scope, node.id, CONNECTION_ID);
+    const attachmentDirectory = await mkdtemp(
+      path.join(os.tmpdir(), "digitalmate-node-ingress-"),
+    );
+    const bridge = createChannelNodeRuntimeBridge({
+      pool,
+      repositories,
+      repository: nodes,
+      secretKey: ChannelSecretsKey.fromBase64(
+        Buffer.alloc(32, 4).toString("base64"),
+      ),
+      attachmentStorageDir: attachmentDirectory,
+      now: () => new Date(
+        "2026-07-26T00:00:01.000Z",
+      ),
+    });
+    try {
+      const frame = parseNodeFrame({
+        type: "inbound",
+        protocolVersion: 1,
+        nodeId: node.id,
+        sequence: 1,
+        sentAt: "2026-07-26T00:00:00.000Z",
+        connectionId: CONNECTION_ID,
+        payload: {
+          externalEventId: "imessage:rowid:42",
+          externalConversationId: "chat:7",
+          externalSenderId: "+8613800000000",
+          chatType: "direct",
+          mentioned: false,
+          text: "来自 iMessage",
+          thread: {},
+          attachments: [],
+          occurredAt: "2026-07-26T00:00:00.000Z",
+          rawSummary: { rowid: 42 },
+        },
+      });
+      if (frame.type !== "inbound") {
+        throw new Error("test_inbound_invalid");
+      }
+
+      await expect(
+        bridge.onInbound({
+          id: node.id,
+          userId: USER_ID,
+        }, frame),
+      ).resolves.toEqual({
+        disposition: "accepted",
+        eventId: expect.any(String),
+      });
+      await expect(
+        countRows(
+          "channel_inbound_events",
+          "channel_type = 'imessage' AND status = 'accepted'",
+        ),
+      ).resolves.toBe(1);
+    } finally {
+      await rm(attachmentDirectory, {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("accepts iMessage attachment chunks only after central validation and private binding", async () => {
+    const repositories = createRepositories(pool);
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "iMessage attachment node",
+      certificateFingerprint: Buffer.alloc(32, 14),
+      supportedChannelTypes: ["imessage"],
+    });
+    await pool.query(
+      `UPDATE channel_connections
+       SET channel_type = 'imessage',
+           display_name = 'iMessage',
+           enabled = true
+       WHERE id = $1`,
+      [CONNECTION_ID],
+    );
+    await nodes.bindConnection(scope, node.id, CONNECTION_ID);
+    const attachmentDirectory = await mkdtemp(
+      path.join(os.tmpdir(), "digitalmate-node-attachment-"),
+    );
+    const bridge = createChannelNodeRuntimeBridge({
+      pool,
+      repositories,
+      repository: nodes,
+      secretKey: ChannelSecretsKey.fromBase64(
+        Buffer.alloc(32, 5).toString("base64"),
+      ),
+      attachmentStorageDir: attachmentDirectory,
+      now: () => new Date(
+        "2026-07-26T00:00:01.000Z",
+      ),
+    });
+    const bytes = Buffer.from("hello");
+    const transferId = "b".repeat(64);
+    const nodeRecord = { id: node.id, userId: USER_ID };
+    try {
+      const start = parseNodeFrame({
+        type: "attachment_start",
+        protocolVersion: 1,
+        nodeId: node.id,
+        sequence: 1,
+        sentAt: "2026-07-26T00:00:00.000Z",
+        connectionId: CONNECTION_ID,
+        transferId,
+        externalEventId: "imessage:rowid:43",
+        externalAttachmentId:
+          "imessage:attachment:note",
+        fileName: "note.txt",
+        mimeType: "text/plain",
+        sizeBytes: bytes.byteLength,
+        sha256: createHash("sha256")
+          .update(bytes)
+          .digest("hex"),
+      });
+      const chunk = parseNodeFrame({
+        type: "attachment_chunk",
+        protocolVersion: 1,
+        nodeId: node.id,
+        sequence: 2,
+        sentAt: "2026-07-26T00:00:00.000Z",
+        connectionId: CONNECTION_ID,
+        transferId,
+        chunkIndex: 0,
+        dataBase64: bytes.toString("base64"),
+      });
+      const commit = parseNodeFrame({
+        type: "attachment_commit",
+        protocolVersion: 1,
+        nodeId: node.id,
+        sequence: 3,
+        sentAt: "2026-07-26T00:00:00.000Z",
+        connectionId: CONNECTION_ID,
+        transferId,
+        chunkCount: 1,
+      });
+      await expect(
+        bridge.onFrame(nodeRecord, start),
+      ).resolves.toBeUndefined();
+      await expect(
+        bridge.onFrame(nodeRecord, chunk),
+      ).resolves.toBeUndefined();
+      await expect(
+        bridge.onFrame(nodeRecord, commit),
+      ).resolves.toMatchObject({
+        type: "attachment_ack",
+        status: "ready",
+        transferId,
+      });
+
+      const inbound = parseNodeFrame({
+        type: "inbound",
+        protocolVersion: 1,
+        nodeId: node.id,
+        sequence: 4,
+        sentAt: "2026-07-26T00:00:00.000Z",
+        connectionId: CONNECTION_ID,
+        payload: {
+          externalEventId: "imessage:rowid:43",
+          externalConversationId: "chat:7",
+          externalSenderId: "+8613800000000",
+          chatType: "direct",
+          mentioned: false,
+          text: "带附件",
+          thread: {},
+          attachments: [{
+            externalAttachmentId:
+              "imessage:attachment:note",
+            fileName: "note.txt",
+            mimeType: "text/plain",
+            sizeBytes: bytes.byteLength,
+            source: {
+              kind: "node_transfer",
+              transferId,
+            },
+          }],
+          occurredAt: "2026-07-26T00:00:00.000Z",
+          rawSummary: { rowid: 43 },
+        },
+      });
+      if (inbound.type !== "inbound") {
+        throw new Error("test_inbound_invalid");
+      }
+      await expect(
+        bridge.onInbound(nodeRecord, inbound),
+      ).resolves.toEqual({
+        disposition: "accepted",
+        eventId: expect.any(String),
+      });
+      await expect(
+        countRows(
+          "channel_event_attachments",
+          "private_attachment_id IS NOT NULL AND locator_cleared_at IS NOT NULL",
+        ),
+      ).resolves.toBe(1);
+      await expect(
+        countRows(
+          "message_attachments",
+          "status = 'ready' AND file_name = 'note.txt'",
+        ),
+      ).resolves.toBe(1);
+      const stagingPath = path.join(
+        attachmentDirectory,
+        ".channel-node",
+        node.id,
+        `${transferId}.bin`,
+      );
+      await expect(readFile(stagingPath))
+        .resolves.toEqual(bytes);
+      await bridge.onInboundCommitted(nodeRecord, inbound);
+      await expect(readFile(stagingPath))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        bridge.onInboundCommitted(nodeRecord, inbound),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(attachmentDirectory, {
+        recursive: true,
+        force: true,
+      });
+    }
   });
 
   it("notifies the live node listener when a certificate is revoked", async () => {
@@ -960,6 +1328,15 @@ describe("channel runtime end-to-end recovery", () => {
       countRows(
         "channel_deliveries",
         "status = 'waiting_node'",
+      ),
+    ).resolves.toBe(1);
+    await expect(
+      nodes.wakeWaitingDeliveries(USER_ID, node.id, now),
+    ).resolves.toBe(1);
+    await expect(
+      countRows(
+        "channel_deliveries",
+        "status = 'retry'",
       ),
     ).resolves.toBe(1);
   });

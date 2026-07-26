@@ -6,6 +6,7 @@ import {
   enqueueProactiveChannelDelivery,
 } from "@/server/channels/runtime/start";
 import {
+  ChannelDeliveryDeferred,
   ChannelSendError,
 } from "@/server/channels/runtime/delivery-worker";
 import type {
@@ -35,6 +36,143 @@ const delivery = {
 } satisfies ClaimedChannelDelivery;
 
 describe("channel runtime start", () => {
+  it("把 iMessage 节点投递冻结为一条消息并交给持久化节点桥接", async () => {
+    const sendViaNode = vi.fn(async () => undefined);
+    const connection = {
+      id: "connection-1",
+      scope: delivery.scope,
+      channelType: "imessage" as const,
+      enabled: true,
+      revision: 1,
+      runtimeNodeId: "node-1",
+      config: {},
+    };
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => connection),
+      createAdapter: vi.fn(),
+      loadReplyHandle: vi.fn(async () => null),
+      sendViaNode,
+      now: () => new Date("2026-07-26T00:00:00.000Z"),
+    });
+    const signal = new AbortController().signal;
+
+    await expect(
+      transport.mode(delivery, signal),
+    ).resolves.toBe("segmented");
+    await expect(
+      transport.segmentBodies!(delivery, signal),
+    ).resolves.toEqual({
+      segments: ["完整回复"],
+      prefix: "",
+    });
+    await expect(transport.send({
+      delivery: {
+        ...delivery,
+        recipient: {
+          ...delivery.recipient,
+          externalUserId: "+8613800000000",
+          chatType: "direct",
+        },
+      },
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "完整回复",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, signal)).rejects.toBeInstanceOf(
+      ChannelDeliveryDeferred,
+    );
+    expect(sendViaNode).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connection,
+        delivery: expect.objectContaining({
+          body: "完整回复",
+          recipient: expect.objectContaining({
+            chatType: "direct",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("在进入 Mac 节点前按真实 chatType 拒绝 iMessage 群聊发送", async () => {
+    const sendViaNode = vi.fn();
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "imessage" as const,
+        enabled: true,
+        revision: 1,
+        runtimeNodeId: "node-1",
+        config: {},
+      })),
+      createAdapter: vi.fn(),
+      loadReplyHandle: vi.fn(async () => null),
+      sendViaNode,
+    });
+
+    await expect(transport.send({
+      delivery: {
+        ...delivery,
+        recipient: {
+          externalConversationId: "group-1",
+          externalUserId: "member-1",
+          chatType: "group",
+        },
+      },
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "不应发送",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "imessage_group_unsupported",
+      retryable: false,
+    });
+    expect(sendViaNode).not.toHaveBeenCalled();
+  });
+
+  it("拒绝缺少明确 direct 标记的 iMessage 收件人", async () => {
+    const sendViaNode = vi.fn();
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "imessage" as const,
+        enabled: true,
+        revision: 1,
+        runtimeNodeId: "node-1",
+        config: {},
+      })),
+      createAdapter: vi.fn(),
+      loadReplyHandle: vi.fn(async () => null),
+      sendViaNode,
+    });
+
+    await expect(transport.send({
+      delivery: {
+        ...delivery,
+        recipient: {
+          externalConversationId: "chat-1",
+          externalUserId: "member-1",
+        },
+      },
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "不应发送",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "imessage_group_unsupported",
+      retryable: false,
+    });
+    expect(sendViaNode).not.toHaveBeenCalled();
+  });
+
   it("仅在连接显式开启时选择累计流式发送", async () => {
     const loadConnection = vi.fn(async () => ({
       id: "connection-1",

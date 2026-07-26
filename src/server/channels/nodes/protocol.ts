@@ -16,6 +16,10 @@ export const NODE_FRAME_TYPES = [
   "inbound_ack",
   "send",
   "send_result",
+  "attachment_start",
+  "attachment_chunk",
+  "attachment_commit",
+  "attachment_ack",
   "error",
 ] as const;
 
@@ -29,6 +33,8 @@ const sequence = z.number().int().positive().max(
 const errorCode = z
   .string()
   .regex(/^[a-z][a-z0-9_]{0,127}$/);
+const transferId = z.string().regex(/^[a-f0-9]{64}$/);
+const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 const scalar = z.union([
   z.string().max(4_096),
   z.number().finite(),
@@ -77,7 +83,7 @@ const attachmentSchema = z
       .number()
       .int()
       .nonnegative()
-      .max(1024 * 1024 * 1024)
+      .max(10 * 1024 * 1024)
       .nullable(),
     source: stringRecord(32, 16_384),
   })
@@ -96,6 +102,7 @@ const recipientSchema = z
     externalConversationId: safeString(1_024),
     externalThreadId: safeString(1_024).optional(),
     externalUserId: safeString(1_024).optional(),
+    chatType: z.enum(["direct", "group"]).optional(),
   })
   .strict();
 
@@ -152,7 +159,7 @@ const inboundFrameSchema = z
         mentioned: z.boolean(),
         text: z.string().max(NODE_MAX_FRAME_BYTES),
         thread: threadSchema,
-        attachments: z.array(attachmentSchema).max(32),
+        attachments: z.array(attachmentSchema).max(4),
         occurredAt: isoDate,
         rawSummary,
         replyHandle: replyHandleSchema.optional(),
@@ -207,6 +214,7 @@ const sentResultFrameSchema = z
     ...baseShape,
     connectionId: uuid,
     deliveryId: uuid,
+    requestSequence: sequence,
     status: z.literal("sent"),
     externalMessageId: safeString(1_024),
     platformSentAt: isoDate,
@@ -220,6 +228,7 @@ const retryableResultFrameSchema = z
     ...baseShape,
     connectionId: uuid,
     deliveryId: uuid,
+    requestSequence: sequence,
     status: z.literal("retryable"),
     errorCode,
     retryAfterMs: z
@@ -237,8 +246,57 @@ const failedResultFrameSchema = z
     ...baseShape,
     connectionId: uuid,
     deliveryId: uuid,
+    requestSequence: sequence,
     status: z.literal("failed"),
     errorCode,
+  })
+  .strict();
+
+const attachmentStartFrameSchema = z
+  .object({
+    type: z.literal("attachment_start"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    externalEventId: safeString(1_024),
+    externalAttachmentId: safeString(1_024),
+    fileName: safeString(1_024),
+    mimeType: safeString(256),
+    sizeBytes: z.number().int().positive()
+      .max(10 * 1024 * 1024),
+    sha256,
+  })
+  .strict();
+
+const attachmentChunkFrameSchema = z
+  .object({
+    type: z.literal("attachment_chunk"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    chunkIndex: z.number().int().nonnegative().max(63),
+    dataBase64: z.string().min(1).max(700_000),
+  })
+  .strict();
+
+const attachmentCommitFrameSchema = z
+  .object({
+    type: z.literal("attachment_commit"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    chunkCount: z.number().int().positive().max(64),
+  })
+  .strict();
+
+const attachmentAckFrameSchema = z
+  .object({
+    type: z.literal("attachment_ack"),
+    ...baseShape,
+    connectionId: uuid,
+    transferId,
+    status: z.enum(["ready", "rejected"]),
+    errorCode: errorCode.optional(),
   })
   .strict();
 
@@ -262,6 +320,10 @@ const nodeFrameSchema = z.union([
   sentResultFrameSchema,
   retryableResultFrameSchema,
   failedResultFrameSchema,
+  attachmentStartFrameSchema,
+  attachmentChunkFrameSchema,
+  attachmentCommitFrameSchema,
+  attachmentAckFrameSchema,
   errorFrameSchema,
 ]);
 
@@ -274,6 +336,18 @@ export type NodeInboundAckFrame = z.infer<
 >;
 export type NodeSendFrame = z.infer<typeof sendFrameSchema>;
 export type NodeSendPayload = NodeSendFrame["payload"];
+export type NodeAttachmentStartFrame = z.infer<
+  typeof attachmentStartFrameSchema
+>;
+export type NodeAttachmentChunkFrame = z.infer<
+  typeof attachmentChunkFrameSchema
+>;
+export type NodeAttachmentCommitFrame = z.infer<
+  typeof attachmentCommitFrameSchema
+>;
+export type NodeAttachmentAckFrame = z.infer<
+  typeof attachmentAckFrameSchema
+>;
 
 export function parseNodeFrame(value: unknown): NodeFrame {
   let serialized: string | undefined;

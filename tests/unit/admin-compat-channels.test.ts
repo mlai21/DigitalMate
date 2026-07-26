@@ -15,6 +15,7 @@ import { createAdminAuthStatusResponse } from "@/server/admin/compat/security";
 import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
 import {
   ChannelAdapterRegistry,
+  registerNodeProxyChannelAdapters,
   registerProtocolChannelAdapters,
   registerStandardChannelAdapters,
 } from "@/server/channels/runtime/registry";
@@ -158,6 +159,17 @@ describe("admin compatibility channel contract", () => {
     expect(() => registerProtocolChannelAdapters(registry)).toThrow(
       "duplicate_channel_adapter:mqtt",
     );
+  });
+
+  it("registers iMessage as a node proxy instead of a server-local adapter", () => {
+    const registry = new ChannelAdapterRegistry();
+
+    registerNodeProxyChannelAdapters(registry);
+
+    expect(registry.registeredTypes()).toEqual(["imessage"]);
+    expect(() =>
+      registerNodeProxyChannelAdapters(registry)
+    ).toThrow("duplicate_channel_adapter:imessage");
   });
 
   it("returns the fixed 17 types and built-in strict schemas", async () => {

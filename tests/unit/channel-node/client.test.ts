@@ -27,7 +27,11 @@ import {
   buildNodeTlsOptions,
 } from "@/server/channels/gateway/tls";
 import {
+  parseNodeFrame,
+} from "@/server/channels/nodes/protocol";
+import {
   ChannelNodeClient,
+  FileChannelNodeDeliveryStore,
   FileChannelNodeOutbox,
   computeReconnectDelayMs,
   type ChannelNodeSocket,
@@ -217,6 +221,47 @@ describe("channel-node restricted runner", () => {
     );
   });
 
+  it("retains completed delivery receipts beyond the central offline window", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-delivery-retention-"),
+    );
+    const store = new FileChannelNodeDeliveryStore(
+      path.join(directory, "deliveries.jsonl"),
+    );
+    const startedAt = new Date(
+      "2026-07-26T00:00:00.000Z",
+    );
+    const frame = {
+      ...sendFrame(CONNECTION_ID, 2),
+      expiresAt: "2026-07-26T00:05:00.000Z",
+    };
+    await expect(
+      store.claim(frame, startedAt),
+    ).resolves.toEqual({ status: "execute" });
+    await store.complete(frame, {
+      status: "sent",
+      externalMessageId: "imessage:guid:retained",
+      platformSentAt: "2026-07-26T00:00:01.000Z",
+      rawSummary: {},
+    });
+
+    await expect(store.claim({
+      ...frame,
+      sequence: 3,
+      sentAt: "2026-07-27T01:00:00.000Z",
+      expiresAt: "2026-07-27T01:05:00.000Z",
+    }, new Date("2026-07-27T01:00:00.000Z")))
+      .resolves.toEqual({
+        status: "replay",
+        outcome: {
+          status: "sent",
+          externalMessageId: "imessage:guid:retained",
+          platformSentAt: "2026-07-26T00:00:01.000Z",
+          rawSummary: {},
+        },
+      });
+  });
+
   it("atomically allocates and persists inbound sequences after heartbeat allocations", async () => {
     const directory = await mkdtemp(
       path.join(tmpdir(), "digitalmate-node-sequence-"),
@@ -258,6 +303,50 @@ describe("channel-node restricted runner", () => {
     expect(
       (await outbox.list()).map((frame) => frame.sequence),
     ).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    await client.stop();
+  });
+
+  it("keeps an inbound frame durable when a live socket send races with disconnect", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-send-race-"),
+    );
+    const outbox = new FileChannelNodeOutbox(
+      path.join(directory, "outbox.jsonl"),
+    );
+    const socket = new FakeSocket();
+    const client = new ChannelNodeClient({
+      config: validConfig(),
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "a".repeat(64),
+      },
+      outbox,
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      socketFactory: () => socket,
+    });
+    const connected = client.connect();
+    socket.open();
+    socket.message(registeredFrame(1));
+    await connected;
+    socket.sendError = new Error(
+      "channel_node_connection_closed",
+    );
+
+    await expect(
+      client.enqueueInbound(
+        inboundDraft("imessage:rowid:send-race"),
+      ),
+    ).resolves.toMatchObject({
+      payload: {
+        externalEventId: "imessage:rowid:send-race",
+      },
+    });
+    await expect(outbox.list()).resolves.toHaveLength(1);
+    expect(client.getHealth().state).toBe("disconnected");
     await client.stop();
   });
 
@@ -304,6 +393,10 @@ describe("channel-node restricted runner", () => {
     await client.sendInbound(inboundFrame(7));
     await client.sendInbound(inboundFrame(8));
     sockets[0].message({
+      ...sendFrame(CONNECTION_ID, 3),
+      expiresAt: "2036-07-26T00:00:00.000Z",
+    });
+    sockets[0].message({
       type: "inbound_ack",
       protocolVersion: 1,
       nodeId: NODE_ID,
@@ -320,7 +413,7 @@ describe("channel-node restricted runner", () => {
     sockets[0].close();
     const reconnected = client.reconnect();
     sockets[1].open();
-    sockets[1].message(registeredFrame(3));
+    sockets[1].message(registeredFrame(4));
     await reconnected;
 
     expect(
@@ -440,13 +533,17 @@ describe("channel-node restricted runner", () => {
 
     await replacementConnection;
     expect(await firstConnection).toBeInstanceOf(Error);
-    expect(onRegistered).toHaveBeenCalledOnce();
+    expect(onRegistered).toHaveBeenCalledTimes(2);
+    expect(onRegistered).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ sequence: 2 }),
+    );
     expect(sockets[1].closedWith).toBeNull();
     expect(client.getHealth().state).toBe("registered");
     await client.stop();
   });
 
-  it("completes a real loopback mTLS registration with the central node server", async () => {
+  it("completes real loopback mTLS registration, inbound ACK and outbound result", async () => {
     const certificateFingerprint = createHash("sha256")
       .update(
         new X509Certificate(
@@ -530,6 +627,17 @@ describe("channel-node restricted runner", () => {
         clientSequence = sequence;
       },
     };
+    const onInbound = vi.fn(async (frame: unknown) => {
+      void frame;
+      return {
+        disposition: "accepted" as const,
+        eventId:
+          "40000000-0000-4000-8000-000000000002",
+      };
+    });
+    const onFrame = vi.fn(async (frame: unknown) => {
+      void frame;
+    });
     const server = createChannelNodeServer({
       host: "127.0.0.1",
       port: 0,
@@ -543,12 +651,20 @@ describe("channel-node restricted runner", () => {
         ),
       }),
       repository,
+      onInbound: (_node, frame) => onInbound(frame),
+      onFrame: (_node, frame) => onFrame(frame),
     });
     const { port } = await server.start();
     const directory = await mkdtemp(
       path.join(tmpdir(), "digitalmate-node-mtls-"),
     );
     const onRegistered = vi.fn();
+    const onSend = vi.fn(async () => ({
+      status: "sent" as const,
+      externalMessageId: "imessage:guid:loopback",
+      platformSentAt: "2026-07-26T00:00:03.000Z",
+      rawSummary: { transport: "imsg" },
+    }));
     const client = new ChannelNodeClient({
       config: {
         ...validConfig(),
@@ -570,6 +686,7 @@ describe("channel-node restricted runner", () => {
       clientVersion: "test",
       autoReconnect: false,
       onRegistered,
+      onSend,
     });
     try {
       await client.connect();
@@ -580,6 +697,56 @@ describe("channel-node restricted runner", () => {
         }),
       );
       expect(client.getHealth().state).toBe("registered");
+
+      await client.enqueueInbound(
+        inboundDraft("imessage:rowid:loopback"),
+      );
+      await vi.waitFor(() => {
+        expect(onInbound).toHaveBeenCalledWith(
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              externalEventId: "imessage:rowid:loopback",
+            }),
+          }),
+        );
+      });
+
+      const sequence =
+        await repository.allocateServerSequence();
+      const pushed = await server.sendFrame(
+        NODE_ID,
+        parseNodeFrame({
+          type: "send",
+          protocolVersion: 1,
+          nodeId: NODE_ID,
+          sequence,
+          sentAt: "2026-07-26T00:00:02.000Z",
+          connectionId: CONNECTION_ID,
+          deliveryId:
+            "40000000-0000-4000-8000-000000000001",
+          expiresAt: "2036-07-26T00:00:00.000Z",
+          payload: {
+            body: "loopback reply",
+            recipient: {
+              externalConversationId: "chat:1",
+              externalUserId: "+8613800000000",
+              chatType: "direct",
+            },
+          },
+        }),
+      );
+      expect(pushed).toBe(true);
+      await vi.waitFor(() => {
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(onFrame).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "send_result",
+            status: "sent",
+            externalMessageId:
+              "imessage:guid:loopback",
+          }),
+        );
+      });
     } finally {
       await client.stop();
       await server.stop(100);
@@ -633,6 +800,258 @@ describe("channel-node restricted runner", () => {
       });
     });
     expect(onSend).not.toHaveBeenCalled();
+    await client.stop();
+  });
+
+  it("reconciles local channel bindings after every registration", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-reconcile-"),
+    );
+    const sockets: FakeSocket[] = [];
+    const onRegistered = vi.fn();
+    const client = new ChannelNodeClient({
+      config: {
+        ...validConfig(),
+        connectionIds: [CONNECTION_ID, OTHER_CONNECTION_ID],
+      },
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "e".repeat(64),
+      },
+      outbox: new FileChannelNodeOutbox(
+        path.join(directory, "outbox.jsonl"),
+      ),
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      onRegistered,
+      socketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    const connected = client.connect();
+    sockets[0].open();
+    sockets[0].message(registeredFrame(1, [CONNECTION_ID]));
+    await connected;
+
+    const reconnected = client.reconnect();
+    sockets[1].open();
+    sockets[1].message(registeredFrame(2, [
+      OTHER_CONNECTION_ID,
+    ]));
+    await reconnected;
+
+    expect(onRegistered).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        boundConnectionIds: [CONNECTION_ID],
+      }),
+    );
+    expect(onRegistered).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        boundConnectionIds: [OTHER_CONNECTION_ID],
+      }),
+    );
+    await client.stop();
+  });
+
+  it("streams bounded attachment chunks and waits for a central ready ACK", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-transfer-"),
+    );
+    const sockets: FakeSocket[] = [];
+    const client = new ChannelNodeClient({
+      config: validConfig(),
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "9".repeat(64),
+      },
+      outbox: new FileChannelNodeOutbox(
+        path.join(directory, "outbox.jsonl"),
+      ),
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      socketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    const connected = client.connect();
+    sockets[0].open();
+    sockets[0].message(registeredFrame(1));
+    await connected;
+
+    const transferred = client.transferAttachment({
+      connectionId: CONNECTION_ID,
+      externalEventId: "imessage:rowid:42",
+      externalAttachmentId: "imessage:attachment:1",
+      fileName: "note.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.alloc(600 * 1024, 0x61),
+    });
+    await vi.waitFor(() => {
+      expect(sockets[0].sent.length).toBeGreaterThanOrEqual(4);
+    });
+    const frames = sockets[0].sent.slice(1, 4).map((value) =>
+      JSON.parse(value) as Record<string, unknown>
+    );
+    expect(frames.map((frame) => frame.type)).toEqual([
+      "attachment_start",
+      "attachment_chunk",
+      "attachment_chunk",
+    ]);
+    const transferId = String(frames[0].transferId);
+    expect(transferId).toMatch(/^[a-f0-9]{64}$/u);
+
+    await vi.waitFor(() => {
+      expect(sockets[0].sent).toHaveLength(5);
+    });
+    expect(parseSent(sockets[0], 4)).toMatchObject({
+      type: "attachment_commit",
+      transferId,
+      chunkCount: 2,
+    });
+    sockets[0].message({
+      type: "attachment_ack",
+      protocolVersion: 1,
+      nodeId: NODE_ID,
+      sequence: 2,
+      sentAt: "2026-07-26T00:00:02.000Z",
+      connectionId: CONNECTION_ID,
+      transferId,
+      status: "ready",
+    });
+
+    await expect(transferred).resolves.toEqual({ transferId });
+    expect(
+      Buffer.byteLength(sockets[0].sent[2] ?? ""),
+    ).toBeLessThanOrEqual(1024 * 1024);
+    await client.stop();
+  });
+
+  it("processes attachment ACKs while registration prepares durable inbound replay", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-register-transfer-"),
+    );
+    const sockets: FakeSocket[] = [];
+    const client = new ChannelNodeClient({
+      config: validConfig(),
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "6".repeat(64),
+      },
+      outbox: new FileChannelNodeOutbox(
+        path.join(directory, "outbox.jsonl"),
+      ),
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      onBeforeInboundReplay: async () => {
+        await client.transferAttachment({
+          connectionId: CONNECTION_ID,
+          externalEventId: "imessage:rowid:pending",
+          externalAttachmentId:
+            "imessage:attachment:pending",
+          fileName: "note.txt",
+          mimeType: "text/plain",
+          bytes: Buffer.from("hello"),
+        });
+      },
+      socketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    const connected = client.connect();
+    sockets[0].open();
+    sockets[0].message(registeredFrame(1));
+    await vi.waitFor(() => {
+      expect(sockets[0].sent).toHaveLength(4);
+    });
+    const commit = parseSent(sockets[0], 3);
+    sockets[0].message({
+      type: "attachment_ack",
+      protocolVersion: 1,
+      nodeId: NODE_ID,
+      sequence: 2,
+      sentAt: "2026-07-26T00:00:02.000Z",
+      connectionId: CONNECTION_ID,
+      transferId: commit.transferId,
+      status: "ready",
+    });
+
+    await expect(connected).resolves.toBeUndefined();
+    expect(client.getHealth().state).toBe("registered");
+    await client.stop();
+  });
+
+  it("notifies the local transport only after a durable inbound ACK", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-ack-cleanup-"),
+    );
+    const sockets: FakeSocket[] = [];
+    const onInboundAcknowledged = vi.fn();
+    const outbox = new FileChannelNodeOutbox(
+      path.join(directory, "outbox.jsonl"),
+    );
+    const client = new ChannelNodeClient({
+      config: validConfig(),
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "8".repeat(64),
+      },
+      outbox,
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      onInboundAcknowledged,
+      socketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    await outbox.append(inboundFrame(2));
+    const connected = client.connect();
+    sockets[0].open();
+    sockets[0].message(registeredFrame(1));
+    await connected;
+
+    sockets[0].message({
+      type: "inbound_ack",
+      protocolVersion: 1,
+      nodeId: NODE_ID,
+      sequence: 2,
+      sentAt: "2026-07-26T00:00:02.000Z",
+      connectionId: CONNECTION_ID,
+      externalEventId: "imessage:rowid:2",
+      disposition: "accepted",
+    });
+    await vi.waitFor(() => {
+      expect(onInboundAcknowledged).toHaveBeenCalledWith(
+        expect.objectContaining({
+          externalEventId: "imessage:rowid:2",
+          disposition: "accepted",
+        }),
+      );
+    });
+    expect(await outbox.list()).toEqual([]);
     await client.stop();
   });
 
@@ -692,7 +1111,6 @@ describe("channel-node restricted runner", () => {
     await replacementConnection;
     sockets[1].message({
       ...delivery,
-      sequence: 4,
       sentAt: "2026-07-26T00:00:02.000Z",
     });
     await vi.waitFor(() => {
@@ -705,7 +1123,97 @@ describe("channel-node restricted runner", () => {
       connectionId: CONNECTION_ID,
       deliveryId: delivery.deliveryId,
       status: "sent",
+      requestSequence: 2,
       externalMessageId: "imessage:guid:1",
+    });
+    await client.stop();
+  });
+
+  it("replays a lost retryable receipt and executes again only for a new request sequence", async () => {
+    const directory = await mkdtemp(
+      path.join(tmpdir(), "digitalmate-node-retry-receipt-"),
+    );
+    const sockets: FakeSocket[] = [];
+    const onSend = vi.fn(async () => {
+      if (onSend.mock.calls.length === 1) {
+        sockets[0].close();
+        return {
+          status: "retryable" as const,
+          errorCode: "imessage_send_failed",
+        };
+      }
+      return {
+        status: "sent" as const,
+        externalMessageId: "imessage:guid:retry",
+        platformSentAt: "2026-07-26T00:00:04.000Z",
+        rawSummary: {},
+      };
+    });
+    const client = new ChannelNodeClient({
+      config: validConfig(),
+      tls: {
+        ca: Buffer.from("ca"),
+        certificate: Buffer.from("certificate"),
+        key: Buffer.from("key"),
+        certificateFingerprint: "7".repeat(64),
+      },
+      outbox: new FileChannelNodeOutbox(
+        path.join(directory, "outbox.jsonl"),
+      ),
+      supportedChannelTypes: ["imessage"],
+      clientVersion: "test",
+      autoReconnect: false,
+      onSend,
+      socketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    const firstConnection = client.connect();
+    sockets[0].open();
+    sockets[0].message(registeredFrame(1));
+    await firstConnection;
+    const delivery = {
+      ...sendFrame(CONNECTION_ID, 2),
+      expiresAt: "2036-07-26T00:00:00.000Z",
+    };
+    sockets[0].message(delivery);
+    await vi.waitFor(() => {
+      expect(onSend).toHaveBeenCalledOnce();
+      expect(client.getHealth().state).toBe("disconnected");
+    });
+
+    const replacementConnection = client.reconnect();
+    sockets[1].open();
+    sockets[1].message(registeredFrame(3));
+    await replacementConnection;
+    sockets[1].message(delivery);
+    await vi.waitFor(() => {
+      expect(sockets[1].sent).toHaveLength(2);
+    });
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(parseSent(sockets[1], 1)).toMatchObject({
+      type: "send_result",
+      status: "retryable",
+      requestSequence: 2,
+    });
+
+    sockets[1].message({
+      ...delivery,
+      sequence: 4,
+      sentAt: "2026-07-26T00:00:04.000Z",
+      expiresAt: "2036-07-26T00:05:00.000Z",
+    });
+    await vi.waitFor(() => {
+      expect(sockets[1].sent).toHaveLength(3);
+    });
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(parseSent(sockets[1], 2)).toMatchObject({
+      type: "send_result",
+      status: "sent",
+      requestSequence: 4,
+      externalMessageId: "imessage:guid:retry",
     });
     await client.stop();
   });
@@ -888,6 +1396,7 @@ class FakeSocket
   readonly sent: string[] = [];
   readyState = 0;
   emitCloseOnClose = true;
+  sendError: Error | null = null;
   closedWith: { code?: number; reason?: string } | null = null;
 
   open(): void {
@@ -900,6 +1409,7 @@ class FakeSocket
   }
 
   send(data: string): void {
+    if (this.sendError) throw this.sendError;
     this.sent.push(data);
   }
 
@@ -940,6 +1450,7 @@ function validConfig() {
 
 function registeredFrame(
   sequence: number,
+  boundConnectionIds: readonly string[] = [CONNECTION_ID],
 ): RunnerRegisteredFrame {
   return {
     type: "registered",
@@ -948,7 +1459,7 @@ function registeredFrame(
     sequence,
     sentAt: new Date().toISOString(),
     heartbeatIntervalMs: 15_000,
-    boundConnectionIds: [CONNECTION_ID],
+    boundConnectionIds: [...boundConnectionIds],
   };
 }
 

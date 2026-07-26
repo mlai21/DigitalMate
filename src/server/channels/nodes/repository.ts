@@ -9,6 +9,7 @@ import {
   NODE_MAX_FRAME_BYTES,
   NODE_PROTOCOL_VERSION,
   parseNodeFrame,
+  type NodeFrame,
   type NodeInboundAckFrame,
   type NodeSendFrame,
   type NodeSendPayload,
@@ -359,9 +360,6 @@ export function createChannelNodeRepository(pool: Pool) {
           await client.query("COMMIT");
           return replayed;
         }
-        if (Number(node.last_sequence) >= input.clientSequence) {
-          throw new Error("node_sequence_replayed");
-        }
         const serverSequence =
           Number(node.last_server_sequence) + 1;
         assertNodeSequence(serverSequence);
@@ -381,7 +379,7 @@ export function createChannelNodeRepository(pool: Pool) {
         }
         const updated = await client.query(
           `UPDATE channel_runtime_nodes
-           SET last_sequence = $3,
+           SET last_sequence = GREATEST(last_sequence, $3),
                last_server_sequence = $4,
                updated_at = $5
            WHERE id = $1
@@ -705,11 +703,18 @@ export function createChannelNodeRepository(pool: Pool) {
           input.nodeId,
           input.connectionId,
         );
+        await expireOutbox(client, input.nodeId, now);
         const existing = await readExistingOutbox(
           client,
           input,
         );
-        if (existing) {
+        if (
+          existing
+          && (
+            existing.status === "pending"
+            || existing.status === "sent"
+          )
+        ) {
           await client.query("COMMIT");
           return {
             action: "enqueued",
@@ -717,7 +722,6 @@ export function createChannelNodeRepository(pool: Pool) {
             outbox: existing,
           };
         }
-        await expireOutbox(client, input.nodeId, now);
         const usage = await readOutboxUsage(
           client,
           input.nodeId,
@@ -779,29 +783,59 @@ export function createChannelNodeRepository(pool: Pool) {
         if (sequenceUpdated.rowCount !== 1) {
           throw new Error("channel_node_revoked");
         }
-        const inserted = await client.query<OutboxRow>(
-          `INSERT INTO channel_node_outbox (
-             user_id, agent_id, node_id, connection_id,
-             delivery_id, sequence, frame, size_bytes,
-             expires_at
-           )
-           VALUES (
-             $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9
-           )
-           RETURNING id, node_id, connection_id, delivery_id,
-                     sequence, frame, size_bytes, status, expires_at`,
-          [
-            input.scope.userId,
-            input.scope.agentId,
-            input.nodeId,
-            input.connectionId,
-            input.deliveryId,
-            nextSequence,
-            JSON.stringify(frame),
-            sizeBytes,
-            input.expiresAt,
-          ],
-        );
+        const inserted = existing
+          ? await client.query<OutboxRow>(
+              `UPDATE channel_node_outbox
+               SET sequence = $6,
+                   frame = $7::jsonb,
+                   size_bytes = $8,
+                   status = 'pending',
+                   expires_at = $9,
+                   completed_at = NULL
+               WHERE id = $5
+                 AND user_id = $1
+                 AND agent_id = $2
+                 AND node_id = $3
+                 AND connection_id = $4
+                 AND status IN ('failed', 'expired')
+               RETURNING id, node_id, connection_id,
+                         delivery_id, sequence, frame,
+                         size_bytes, status, expires_at`,
+              [
+                input.scope.userId,
+                input.scope.agentId,
+                input.nodeId,
+                input.connectionId,
+                existing.id,
+                nextSequence,
+                JSON.stringify(frame),
+                sizeBytes,
+                input.expiresAt,
+              ],
+            )
+          : await client.query<OutboxRow>(
+              `INSERT INTO channel_node_outbox (
+                 user_id, agent_id, node_id, connection_id,
+                 delivery_id, sequence, frame, size_bytes,
+                 expires_at
+               )
+               VALUES (
+                 $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9
+               )
+               RETURNING id, node_id, connection_id, delivery_id,
+                         sequence, frame, size_bytes, status, expires_at`,
+              [
+                input.scope.userId,
+                input.scope.agentId,
+                input.nodeId,
+                input.connectionId,
+                input.deliveryId,
+                nextSequence,
+                JSON.stringify(frame),
+                sizeBytes,
+                input.expiresAt,
+              ],
+            );
         await markDeliveryWaiting(client, input, now);
         const insertedRow = inserted.rows[0];
         if (!insertedRow) {
@@ -813,6 +847,274 @@ export function createChannelNodeRepository(pool: Pool) {
           created: true,
           outbox: mapOutboxRow(insertedRow),
         };
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          destroyClient = true;
+        }
+        throw error;
+      } finally {
+        client.release(destroyClient);
+      }
+    },
+
+    async listPendingOutbox(
+      userId: string,
+      nodeId: string,
+      now = new Date(),
+    ): Promise<ChannelNodeOutboxRecord[]> {
+      assertDate(now, "node_outbox_time_invalid");
+      const client = await pool.connect();
+      let destroyClient = false;
+      try {
+        await client.query("BEGIN");
+        await expireOutbox(client, nodeId, now);
+        const result = await client.query<OutboxRow>(
+          `SELECT id, node_id, connection_id, delivery_id,
+                  sequence, frame, size_bytes, status, expires_at
+           FROM channel_node_outbox
+           WHERE user_id = $1
+             AND node_id = $2
+             AND status = 'pending'
+             AND expires_at > $3
+           ORDER BY sequence ASC
+           LIMIT $4`,
+          [
+            userId,
+            nodeId,
+            now,
+            NODE_OUTBOX_LIMITS.maxItems,
+          ],
+        );
+        await client.query("COMMIT");
+        return result.rows.map(mapOutboxRow);
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          destroyClient = true;
+        }
+        throw error;
+      } finally {
+        client.release(destroyClient);
+      }
+    },
+
+    async wakeWaitingDeliveries(
+      userId: string,
+      nodeId: string,
+      now = new Date(),
+    ): Promise<number> {
+      assertDate(now, "node_outbox_time_invalid");
+      const result = await pool.query(
+        `UPDATE channel_deliveries AS delivery
+         SET status = 'retry',
+             next_attempt_at = $3,
+             updated_at = $3
+         FROM channel_node_bindings AS binding
+         WHERE binding.node_id = $2
+           AND binding.user_id = $1
+           AND delivery.connection_id =
+               binding.connection_id
+           AND delivery.user_id = binding.user_id
+           AND delivery.agent_id = binding.agent_id
+           AND delivery.status = 'waiting_node'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM channel_node_outbox AS outbox
+             WHERE outbox.delivery_id = delivery.id
+               AND outbox.status = 'pending'
+           )`,
+        [userId, nodeId, now],
+      );
+      return result.rowCount ?? 0;
+    },
+
+    async completeSendResult(
+      input: Readonly<{
+        userId: string;
+        nodeId: string;
+        frame: Extract<NodeFrame, { type: "send_result" }>;
+      }>,
+      now = new Date(),
+    ): Promise<void> {
+      assertDate(now, "node_result_time_invalid");
+      const client = await pool.connect();
+      let destroyClient = false;
+      try {
+        await client.query("BEGIN");
+        const outbox = await client.query<{
+          id: string;
+          user_id: string;
+          agent_id: string;
+          node_id: string;
+          connection_id: string;
+          delivery_id: string;
+          sequence: number | string;
+          status: "pending" | "sent" | "failed" | "expired";
+        }>(
+          `SELECT id, user_id, agent_id, node_id,
+                  connection_id, delivery_id, sequence, status
+           FROM channel_node_outbox
+           WHERE delivery_id = $1
+             AND user_id = $2
+             AND node_id = $3
+           FOR UPDATE`,
+          [
+            input.frame.deliveryId,
+            input.userId,
+            input.nodeId,
+          ],
+        );
+        const row = outbox.rows[0];
+        if (!row) {
+          throw new Error("channel_node_outbox_not_found");
+        }
+        if (
+          row.connection_id !== input.frame.connectionId
+          || row.delivery_id !== input.frame.deliveryId
+        ) {
+          throw new Error("channel_node_result_scope_mismatch");
+        }
+        if (
+          Number(row.sequence) !== input.frame.requestSequence
+        ) {
+          await client.query("COMMIT");
+          return;
+        }
+        if (
+          row.status === "sent"
+          || row.status === "failed"
+        ) {
+          await client.query("COMMIT");
+          return;
+        }
+        const attempt = await client.query<{
+          attempt_no: number;
+          segment_no: number;
+        }>(
+          `SELECT attempt_no, segment_no
+           FROM channel_delivery_attempts
+           WHERE delivery_id = $1
+             AND user_id = $2
+             AND agent_id = $3
+             AND status = 'started'
+           ORDER BY attempt_no DESC, segment_no DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [
+            row.delivery_id,
+            row.user_id,
+            row.agent_id,
+          ],
+        );
+        const activeAttempt = attempt.rows[0];
+        if (!activeAttempt) {
+          throw new Error("channel_node_delivery_attempt_missing");
+        }
+        const resultStatus = input.frame.status === "sent"
+          ? "sent"
+          : input.frame.status === "retryable"
+            ? "retryable"
+            : "failed";
+        const platformResult = input.frame.status === "sent"
+          ? JSON.stringify({
+              externalMessageId:
+                input.frame.externalMessageId,
+              sentAt: input.frame.platformSentAt,
+              rawSummary: input.frame.rawSummary,
+            })
+          : null;
+        const errorCode = input.frame.status === "sent"
+          ? null
+          : input.frame.errorCode;
+        const completedAttempt = await client.query(
+          `UPDATE channel_delivery_attempts
+           SET status = $6,
+               platform_result = $7::jsonb,
+               error_code = $8,
+               completed_at = $9
+           WHERE delivery_id = $1
+             AND user_id = $2
+             AND agent_id = $3
+             AND attempt_no = $4
+             AND segment_no = $5
+             AND status = 'started'`,
+          [
+            row.delivery_id,
+            row.user_id,
+            row.agent_id,
+            activeAttempt.attempt_no,
+            activeAttempt.segment_no,
+            resultStatus,
+            platformResult,
+            errorCode,
+            now,
+          ],
+        );
+        if (completedAttempt.rowCount !== 1) {
+          throw new Error("channel_node_delivery_attempt_lost");
+        }
+        const nextAttemptAt = input.frame.status === "retryable"
+          ? new Date(
+              now.getTime()
+                + Math.max(
+                  1_000,
+                  input.frame.retryAfterMs ?? 1_000,
+                ),
+            )
+          : now;
+        const deliveryStatus = input.frame.status === "sent"
+          ? "sent"
+          : input.frame.status === "retryable"
+            ? "retry"
+            : "dead_letter";
+        const delivery = await client.query(
+          `UPDATE channel_deliveries
+           SET status = $5,
+               claim_owner = NULL,
+               claim_expires_at = NULL,
+               next_attempt_at = $6,
+               last_error_code = $7,
+               sent_at = CASE
+                 WHEN $5 = 'sent' THEN $8
+                 ELSE sent_at
+               END,
+               updated_at = $8
+           WHERE id = $1
+             AND user_id = $2
+             AND agent_id = $3
+             AND connection_id = $4
+             AND status = 'waiting_node'`,
+          [
+            row.delivery_id,
+            row.user_id,
+            row.agent_id,
+            row.connection_id,
+            deliveryStatus,
+            nextAttemptAt,
+            errorCode,
+            now,
+          ],
+        );
+        if (delivery.rowCount !== 1) {
+          throw new Error("channel_node_delivery_result_lost");
+        }
+        await client.query(
+          `UPDATE channel_node_outbox
+           SET status = $2,
+               completed_at = $3
+           WHERE id = $1`,
+          [
+            row.id,
+            input.frame.status === "sent"
+              ? "sent"
+              : "failed",
+            now,
+          ],
+        );
+        await client.query("COMMIT");
       } catch (error) {
         try {
           await client.query("ROLLBACK");

@@ -27,6 +27,7 @@ export type RuntimeChannelConnection = Readonly<{
   channelType: ChannelType;
   enabled: boolean;
   revision: number;
+  runtimeNodeId?: string | null;
   config: Readonly<Record<string, unknown>>;
   resumeState?: Readonly<{
     sessionId: string;
@@ -668,6 +669,7 @@ type RuntimeConnectionRow = {
   enabled: boolean;
   config: Record<string, unknown>;
   revision: number;
+  runtime_node_id: string | null;
   health_detail: Record<string, unknown>;
   field_name: string | null;
   ciphertext: Buffer | null;
@@ -815,7 +817,8 @@ async function readRuntimeConnections(
     `SELECT connection.id, connection.user_id,
             connection.agent_id, connection.channel_type,
             connection.enabled, connection.config,
-            connection.revision, connection.health_detail,
+            connection.revision, connection.runtime_node_id,
+            connection.health_detail,
             secret.field_name,
             secret.ciphertext, secret.nonce,
             secret.auth_tag, secret.key_version
@@ -919,6 +922,7 @@ function materializeRuntimeConnection(
     channelType: row.channel_type,
     enabled: row.enabled,
     revision: Number(row.revision),
+    runtimeNodeId: row.runtime_node_id,
     config,
     ...(resumeState ? { resumeState } : {}),
     ...(runtimeError ? { runtimeError } : {}),

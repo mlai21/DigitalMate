@@ -1,5 +1,6 @@
 import {
   CHANNEL_TYPES,
+  getChannelManifest,
   type ChannelType,
 } from "@/server/channels/manifests/catalog";
 
@@ -402,4 +403,50 @@ export function registerProtocolChannelAdapters(
   registerYuanbaoChannelAdapter(registry);
   registerWechatChannelAdapter(registry);
   registerOneBotChannelAdapter(registry);
+}
+
+export function registerNodeProxyChannelAdapters(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("imessage", () =>
+    createNodeProxyBoundaryAdapter("imessage")
+  );
+}
+
+function createNodeProxyBoundaryAdapter(
+  type: "imessage",
+): ChannelAdapter<Record<string, unknown>> {
+  return {
+    manifest: getChannelManifest(type),
+    validateConfig(config) {
+      return config && typeof config === "object"
+        ? config as Record<string, unknown>
+        : {};
+    },
+    async start() {},
+    async stop() {},
+    async health() {
+      return {
+        status: "healthy",
+        checkedAt: new Date(),
+        reconnectAttempts: 0,
+      };
+    },
+    async normalizeInbound() {
+      return null;
+    },
+    async acknowledge() {
+      return { status: 200 };
+    },
+    async send() {
+      throw new Error("channel_node_send_via_bridge");
+    },
+    async resolveRecipient(target) {
+      return {
+        address: {
+          conversationId: target.externalConversationId,
+        },
+      };
+    },
+  };
 }

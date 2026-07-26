@@ -95,7 +95,14 @@ type NodeSessionInput = Readonly<{
     disposition: NodeInboundAckFrame["disposition"];
     eventId?: string;
   }>>;
-  onFrame?: (frame: NodeFrame) => Promise<void>;
+  onFrame?: (
+    frame: NodeFrame,
+  ) => Promise<NodeFrame | void>;
+  onRegistered?: () => void | Promise<void>;
+  onInboundCommitted?: (
+    frame: NodeInboundFrame,
+    ack: NodeInboundAckFrame,
+  ) => void | Promise<void>;
   isAuthorized?: () => Promise<boolean>;
 }>;
 
@@ -186,6 +193,7 @@ export function createNodeMessageSession(input: NodeSessionInput) {
             heartbeatIntervalMs: NODE_HEARTBEAT_INTERVAL_MS,
             boundConnectionIds,
           }));
+          await input.onRegistered?.();
           return;
         }
         if (frame.type === "register") {
@@ -195,6 +203,7 @@ export function createNodeMessageSession(input: NodeSessionInput) {
           frame.type === "registered"
           || frame.type === "inbound_ack"
           || frame.type === "send"
+          || frame.type === "attachment_ack"
         ) {
           throw new Error("node_frame_direction_invalid");
         }
@@ -228,6 +237,10 @@ export function createNodeMessageSession(input: NodeSessionInput) {
             });
           if (replayedAck) {
             assertInboundAckMatches(replayedAck, frame);
+            await input.onInboundCommitted?.(
+              frame,
+              replayedAck,
+            );
             await input.send(replayedAck);
             return;
           }
@@ -236,7 +249,13 @@ export function createNodeMessageSession(input: NodeSessionInput) {
           throw new Error("node_inbound_handler_unavailable");
         }
         if (
-          (frame.type === "send_result" || frame.type === "error")
+          (
+            frame.type === "send_result"
+            || frame.type === "attachment_start"
+            || frame.type === "attachment_chunk"
+            || frame.type === "attachment_commit"
+            || frame.type === "error"
+          )
           && !input.onFrame
         ) {
           throw new Error("node_result_handler_unavailable");
@@ -250,11 +269,6 @@ export function createNodeMessageSession(input: NodeSessionInput) {
           );
         } else {
           if (frame.type === "inbound") {
-            await input.repository.assertSequenceAvailable(
-              input.node.userId,
-              input.node.id,
-              frame.sequence,
-            );
             const result = await input.onInbound!(frame);
             const ack =
               await input.repository.recordInboundAck({
@@ -271,6 +285,7 @@ export function createNodeMessageSession(input: NodeSessionInput) {
                 frameDigest: inboundFrameDigest!,
                 sentAt: now(),
               });
+            await input.onInboundCommitted?.(frame, ack);
             await input.send(ack);
           } else {
             await input.repository.assertSequenceAvailable(
@@ -278,12 +293,13 @@ export function createNodeMessageSession(input: NodeSessionInput) {
               input.node.id,
               frame.sequence,
             );
-            await input.onFrame?.(frame);
+            const response = await input.onFrame?.(frame);
             await input.repository.acceptSequence(
               input.node.userId,
               input.node.id,
               frame.sequence,
             );
+            if (response) await input.send(response);
           }
         }
       } catch (error) {
@@ -327,7 +343,18 @@ export function createChannelNodeServer(input: Readonly<{
   onFrame?: (
     node: ChannelNodeCertificateRecord,
     frame: NodeFrame,
-  ) => Promise<void>;
+  ) => Promise<NodeFrame | void>;
+  onRegistered?: (
+    node: ChannelNodeCertificateRecord,
+  ) => void | Promise<void>;
+  onDisconnected?: (
+    node: ChannelNodeCertificateRecord,
+  ) => void | Promise<void>;
+  onInboundCommitted?: (
+    node: ChannelNodeCertificateRecord,
+    frame: NodeInboundFrame,
+    ack: NodeInboundAckFrame,
+  ) => void | Promise<void>;
 }>) {
   const idleTimeoutMs =
     input.idleTimeoutMs ?? NODE_IDLE_TIMEOUT_MS;
@@ -480,6 +507,22 @@ export function createChannelNodeServer(input: Readonly<{
                 input.onFrame!(node, frame),
             }
           : {}),
+        ...(input.onRegistered
+          ? {
+              onRegistered: () =>
+                input.onRegistered!(node),
+            }
+          : {}),
+        ...(input.onInboundCommitted
+          ? {
+              onInboundCommitted: (frame, ack) =>
+                input.onInboundCommitted!(
+                  node,
+                  frame,
+                  ack,
+                ),
+            }
+          : {}),
     });
     const receiveQueue =
       nodeReceiveQueues.get(node.id)
@@ -523,7 +566,16 @@ export function createChannelNodeServer(input: Readonly<{
       nodeSessions.delete(entry);
       if (nodeSessions.size === 0) {
         sessions.delete(node.id);
-        void receiveQueue.drain().finally(() => {
+        const cleanup = receiveQueue.enqueue(async () => {
+          if (
+            !sessions.has(node.id)
+            && nodeReceiveQueues.get(node.id)
+              === receiveQueue
+          ) {
+            await input.onDisconnected?.(node);
+          }
+        });
+        void cleanup.finally(() => {
           if (
             !sessions.has(node.id)
             && nodeReceiveQueues.get(node.id)
@@ -531,7 +583,7 @@ export function createChannelNodeServer(input: Readonly<{
           ) {
             nodeReceiveQueues.delete(node.id);
           }
-        });
+        }).catch(() => undefined);
       }
     });
   }
@@ -562,6 +614,21 @@ export function createChannelNodeServer(input: Readonly<{
       for (const entry of sessions.get(nodeId) ?? []) {
         entry.session.revoke();
       }
+    },
+
+    async sendFrame(
+      nodeId: string,
+      frame: NodeFrame,
+    ): Promise<boolean> {
+      const entries = [...(sessions.get(nodeId) ?? [])]
+        .filter(({ socket, session }) =>
+          socket.readyState === WebSocket.OPEN
+          && !session.isClosed()
+        );
+      const target = entries.at(-1);
+      if (!target) return false;
+      await sendWebSocketFrame(target.socket, frame);
+      return true;
     },
 
     async stop(drainMs = 5_000): Promise<void> {

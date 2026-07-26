@@ -17,8 +17,11 @@ import {
   startChannelRuntime,
 } from "@/server/channels/runtime/start";
 import { readEnv } from "@/server/config/env";
-import { closePool } from "@/server/db/client";
+import { closePool, getPool } from "@/server/db/client";
 import { createRepositories } from "@/server/db/repositories";
+import {
+  createChannelNodeRuntimeBridge,
+} from "@/server/channels/nodes/runtime-bridge";
 import { createSkillDraft } from "@/server/evolution/skills";
 import { consolidateMemoryKind, MEMORY_CAPACITY_LIMITS } from "@/server/evolution/memory-consolidation";
 import { generateReflectionWithLlm, normalizeReflection, shouldRunDailyReflection } from "@/server/evolution/reflection";
@@ -38,7 +41,8 @@ export const AGENT_TICK_TIMEOUT_MS = 120_000;
 const lastSkillImprovementAt = new Map<string, number>();
 
 async function main() {
-  const repositories = createRepositories();
+  const pool = getPool();
+  const repositories = createRepositories(pool);
   const user = await repositories.users.ensureDefault();
   await withUserDataLease(repositories, user.id, async () => {
     const defaultAgent = await repositories.agents.ensureDefault(user.id);
@@ -46,6 +50,14 @@ async function main() {
   });
 
   const env = readEnv();
+  const channelNodes = createChannelNodeRuntimeBridge({
+    pool,
+    repositories,
+    secretKey: env.channelSecretsKey.status === "ready"
+      ? env.channelSecretsKey.key
+      : null,
+    attachmentStorageDir: env.attachmentStorageDir,
+  });
   const cleanupScheduler = startAttachmentCleanupScheduler({
     run: async () => {
       const agents = await repositories.agents.listActive();
@@ -69,12 +81,17 @@ async function main() {
   const channelRuntime = await startChannelRuntime({
     repositories,
     env,
+    pool,
+    channelNodes,
   });
   let channelGateway:
     | Awaited<ReturnType<typeof startAgentChannelGateway>>
     | undefined;
   try {
-    channelGateway = await startAgentChannelGateway({ env });
+    channelGateway = await startAgentChannelGateway({
+      env,
+      channelNodes,
+    });
   } catch (error) {
     await stopAgentServiceResources({
       channelRuntime,

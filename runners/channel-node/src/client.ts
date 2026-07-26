@@ -25,6 +25,7 @@ import {
   serializeRunnerFrame,
   type RunnerChannelType,
   type RunnerFrame,
+  type RunnerInboundAckFrame,
   type RunnerInboundFrame,
   type RunnerRegisteredFrame,
   type RunnerSendFrame,
@@ -33,9 +34,13 @@ import {
 
 const OUTBOX_MAX_FRAMES = 1_000;
 const OUTBOX_MAX_BYTES = 50 * 1024 * 1024;
-const DELIVERY_MAX_RECORDS = 1_000;
+const DELIVERY_MAX_RECORDS = 10_000;
 const DELIVERY_MAX_BYTES = 50 * 1024 * 1024;
+const DELIVERY_RECEIPT_TTL_MS =
+  7 * 24 * 60 * 60 * 1_000;
 const OPEN_READY_STATE = 1;
+const ATTACHMENT_CHUNK_BYTES = 512 * 1024;
+const ATTACHMENT_ACK_TIMEOUT_MS = 30_000;
 const RECONNECT_DELAYS_MS = [
   1_000,
   2_000,
@@ -154,7 +159,7 @@ export class FileChannelNodeOutbox {
   async acknowledge(input: Readonly<{
     connectionId: string;
     externalEventId: string;
-  }>): Promise<void> {
+  }>): Promise<boolean> {
     return this.runExclusive(async () => {
       const records = await this.readRecords();
       const retained = records.filter(
@@ -163,8 +168,9 @@ export class FileChannelNodeOutbox {
           || frame.payload.externalEventId
             !== input.externalEventId,
       );
-      if (retained.length === records.length) return;
+      if (retained.length === records.length) return false;
       await this.atomicRewrite(retained);
+      return true;
     });
   }
 
@@ -408,6 +414,7 @@ export type ChannelNodeSendOutcome = RunnerSendOutcome;
 
 type DeliveryRecord = Readonly<{
   deliveryId: string;
+  requestSequence: number;
   requestDigest: string;
   expiresAt: string;
   state: "processing" | "completed";
@@ -422,6 +429,26 @@ type DeliveryClaim =
       outcome: ChannelNodeSendOutcome;
     }>
   | Readonly<{ status: "outcome_unknown" }>;
+
+type RunnerAttachmentFrame = Extract<
+  RunnerFrame,
+  {
+    type:
+      | "attachment_start"
+      | "attachment_chunk"
+      | "attachment_commit";
+  }
+>;
+type RunnerAttachmentDraft<T = RunnerAttachmentFrame> =
+  T extends RunnerAttachmentFrame
+    ? Omit<
+        T,
+        | "protocolVersion"
+        | "nodeId"
+        | "sequence"
+        | "sentAt"
+      >
+    : never;
 
 export interface ChannelNodeDeliveryStore {
   claim(
@@ -459,6 +486,51 @@ export class FileChannelNodeDeliveryStore
             "channel_node_delivery_id_conflict",
           );
         }
+        if (frame.sequence < existing.requestSequence) {
+          throw new Error(
+            "channel_node_delivery_sequence_replayed",
+          );
+        }
+        if (frame.sequence > existing.requestSequence) {
+          if (
+            existing.state !== "completed"
+            || !existing.outcome
+          ) {
+            return { status: "outcome_unknown" };
+          }
+          if (existing.outcome.status !== "retryable") {
+            records[records.indexOf(existing)] =
+              createDeliveryRecord({
+                deliveryId: frame.deliveryId,
+                requestSequence: frame.sequence,
+                requestDigest,
+                expiresAt: deliveryReceiptExpiresAt(
+                  frame,
+                  now,
+                ),
+                state: "completed",
+                outcome: existing.outcome,
+              });
+            await this.atomicRewrite(records);
+            return {
+              status: "replay",
+              outcome: existing.outcome,
+            };
+          }
+          records[records.indexOf(existing)] =
+            createDeliveryRecord({
+              deliveryId: frame.deliveryId,
+              requestSequence: frame.sequence,
+              requestDigest,
+              expiresAt: deliveryReceiptExpiresAt(
+                frame,
+                now,
+              ),
+              state: "processing",
+            });
+          await this.atomicRewrite(records);
+          return { status: "execute" };
+        }
         if (
           existing.state === "completed"
           && existing.outcome
@@ -478,8 +550,12 @@ export class FileChannelNodeDeliveryStore
       records.push(
         createDeliveryRecord({
           deliveryId: frame.deliveryId,
+          requestSequence: frame.sequence,
           requestDigest,
-          expiresAt: frame.expiresAt,
+          expiresAt: deliveryReceiptExpiresAt(
+            frame,
+            now,
+          ),
           state: "processing",
         }),
       );
@@ -517,6 +593,11 @@ export class FileChannelNodeDeliveryStore
           "channel_node_delivery_id_conflict",
         );
       }
+      if (existing.requestSequence !== frame.sequence) {
+        throw new Error(
+          "channel_node_delivery_sequence_mismatch",
+        );
+      }
       if (
         existing.state === "completed"
         && existing.outcome
@@ -533,6 +614,7 @@ export class FileChannelNodeDeliveryStore
       }
       records[index] = createDeliveryRecord({
         deliveryId: existing.deliveryId,
+        requestSequence: existing.requestSequence,
         requestDigest,
         expiresAt: existing.expiresAt,
         state: "completed",
@@ -657,6 +739,12 @@ type ChannelNodeClientInput = Readonly<{
   onRegistered?: (
     frame: RunnerRegisteredFrame,
   ) => void | Promise<void>;
+  onBeforeInboundReplay?: (
+    frame: RunnerRegisteredFrame,
+  ) => void | Promise<void>;
+  onInboundAcknowledged?: (
+    frame: RunnerInboundAckFrame,
+  ) => void | Promise<void>;
   onSend?: (
     frame: RunnerSendFrame,
   ) => ChannelNodeSendOutcome
@@ -672,8 +760,8 @@ export class ChannelNodeClient {
   private readonly deliveryStore: ChannelNodeDeliveryStore;
   private socket: ChannelNodeSocket | null = null;
   private registered = false;
+  private registrationReady = false;
   private stopped = false;
-  private localChannelsStarted = false;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null =
     null;
@@ -681,12 +769,20 @@ export class ChannelNodeClient {
     | ReturnType<typeof setInterval>
     | null = null;
   private receiveQueue: Promise<void> = Promise.resolve();
+  private sendQueue: Promise<void> = Promise.resolve();
   private connectionDeferred: Deferred<void> | null = null;
   private boundConnectionIds = new Set<string>();
   private lastServerSequence = 0;
   private socketGeneration = 0;
-  private localChannelsStartPromise: Promise<void> | null =
-    null;
+  private localChannelsReconciliation: Promise<void> =
+    Promise.resolve();
+  private readonly attachmentTransfers = new Map<
+    string,
+    Deferred<void> & {
+      timer: ReturnType<typeof setTimeout>;
+      connectionId: string;
+    }
+  >();
 
   constructor(private readonly input: ChannelNodeClientInput) {
     this.autoReconnect = input.autoReconnect ?? true;
@@ -731,12 +827,16 @@ export class ChannelNodeClient {
     this.socketGeneration += 1;
     this.socket = null;
     this.registered = false;
+    this.registrationReady = false;
     this.boundConnectionIds.clear();
     this.clearHeartbeat();
     this.connectionDeferred?.reject(
       new Error("channel_node_connection_replaced"),
     );
     this.connectionDeferred = null;
+    this.rejectAttachmentTransfers(
+      "channel_node_connection_replaced",
+    );
     if (previous) {
       previous.terminate();
     }
@@ -757,9 +857,10 @@ export class ChannelNodeClient {
     await this.input.outbox.append(frame);
     if (
       this.registered
+      && this.registrationReady
       && this.boundConnectionIds.has(frame.connectionId)
     ) {
-      this.send(frame);
+      this.trySendDurableInbound(frame);
     }
   }
 
@@ -785,11 +886,113 @@ export class ChannelNodeClient {
     );
     if (
       this.registered
+      && this.registrationReady
       && this.boundConnectionIds.has(frame.connectionId)
     ) {
-      this.send(frame);
+      this.trySendDurableInbound(frame);
     }
     return frame;
+  }
+
+  async transferAttachment(input: Readonly<{
+    connectionId: string;
+    externalEventId: string;
+    externalAttachmentId: string;
+    fileName: string;
+    mimeType: string;
+    bytes: Buffer;
+  }>): Promise<Readonly<{ transferId: string }>> {
+    this.assertConfiguredFrame(input);
+    if (
+      !this.registered
+      || !this.boundConnectionIds.has(input.connectionId)
+    ) {
+      throw new Error("node_connection_not_bound");
+    }
+    if (
+      input.bytes.byteLength < 1
+      || input.bytes.byteLength > 10 * 1024 * 1024
+    ) {
+      throw new Error("node_attachment_size_invalid");
+    }
+    const contentSha256 = sha256(input.bytes);
+    const transferId = sha256([
+      this.input.config.nodeId,
+      input.connectionId,
+      input.externalEventId,
+      input.externalAttachmentId,
+      contentSha256,
+    ].join("\u0000"));
+    if (this.attachmentTransfers.has(transferId)) {
+      throw new Error("node_attachment_transfer_in_progress");
+    }
+    const deferred = createDeferred<void>();
+    const timer = setTimeout(() => {
+      const pending = this.attachmentTransfers.get(transferId);
+      if (pending !== transfer) return;
+      this.attachmentTransfers.delete(transferId);
+      deferred.reject(
+        new Error("node_attachment_ack_timeout"),
+      );
+    }, ATTACHMENT_ACK_TIMEOUT_MS);
+    timer.unref();
+    const transfer = {
+      ...deferred,
+      timer,
+      connectionId: input.connectionId,
+    };
+    this.attachmentTransfers.set(transferId, transfer);
+    try {
+      await this.sendRunnerFrame({
+        type: "attachment_start",
+        connectionId: input.connectionId,
+        transferId,
+        externalEventId: input.externalEventId,
+        externalAttachmentId: input.externalAttachmentId,
+        fileName: input.fileName,
+        mimeType: input.mimeType,
+        sizeBytes: input.bytes.byteLength,
+        sha256: contentSha256,
+      });
+      let chunkCount = 0;
+      for (
+        let offset = 0;
+        offset < input.bytes.byteLength;
+        offset += ATTACHMENT_CHUNK_BYTES
+      ) {
+        await this.sendRunnerFrame({
+          type: "attachment_chunk",
+          connectionId: input.connectionId,
+          transferId,
+          chunkIndex: chunkCount,
+          dataBase64: input.bytes
+            .subarray(
+              offset,
+              Math.min(
+                input.bytes.byteLength,
+                offset + ATTACHMENT_CHUNK_BYTES,
+              ),
+            )
+            .toString("base64"),
+        });
+        chunkCount += 1;
+      }
+      await this.sendRunnerFrame({
+        type: "attachment_commit",
+        connectionId: input.connectionId,
+        transferId,
+        chunkCount,
+      });
+      await deferred.promise;
+      return { transferId };
+    } catch (error) {
+      const pending = this.attachmentTransfers.get(transferId);
+      if (pending === transfer) {
+        clearTimeout(timer);
+        this.attachmentTransfers.delete(transferId);
+      }
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -797,16 +1000,21 @@ export class ChannelNodeClient {
     this.cancelReconnect();
     this.clearHeartbeat();
     this.registered = false;
+    this.registrationReady = false;
     this.boundConnectionIds.clear();
     this.socketGeneration += 1;
     this.connectionDeferred?.reject(
       new Error("channel_node_client_stopped"),
     );
     this.connectionDeferred = null;
+    this.rejectAttachmentTransfers(
+      "channel_node_client_stopped",
+    );
     const socket = this.socket;
     this.socket = null;
     if (socket) socket.close(1000, "channel_node_stopped");
     await this.receiveQueue.catch(() => undefined);
+    await this.sendQueue.catch(() => undefined);
     this.health.setState("stopped");
   }
 
@@ -836,6 +1044,9 @@ export class ChannelNodeClient {
       );
     } catch (error) {
       this.connectionDeferred = null;
+      this.rejectAttachmentTransfers(
+        "channel_node_connection_closed",
+      );
       const stableCode = stableErrorCode(error);
       this.health.recordError(stableCode);
       this.health.setState("disconnected");
@@ -884,6 +1095,7 @@ export class ChannelNodeClient {
       this.socketGeneration += 1;
       this.socket = null;
       this.registered = false;
+      this.registrationReady = false;
       this.boundConnectionIds.clear();
       this.clearHeartbeat();
       this.health.setState("disconnected");
@@ -910,10 +1122,24 @@ export class ChannelNodeClient {
     if (frame.nodeId !== this.input.config.nodeId) {
       throw new Error("channel_node_identity_mismatch");
     }
-    if (frame.sequence <= this.lastServerSequence) {
+    const correlatedOutOfOrderFrame =
+      this.registered
+      && (
+        frame.type === "send"
+        || frame.type === "inbound_ack"
+        || frame.type === "attachment_ack"
+      )
+      && frame.sequence <= this.lastServerSequence;
+    if (
+      frame.sequence <= this.lastServerSequence
+      && !correlatedOutOfOrderFrame
+    ) {
       throw new Error("channel_node_server_sequence_replayed");
     }
-    this.lastServerSequence = frame.sequence;
+    this.lastServerSequence = Math.max(
+      this.lastServerSequence,
+      frame.sequence,
+    );
     this.health.recordMessage();
     if (!this.registered) {
       if (frame.type !== "registered") {
@@ -934,13 +1160,40 @@ export class ChannelNodeClient {
       throw new Error("node_connection_not_bound");
     }
     if (frame.type === "inbound_ack") {
-      await this.input.outbox.acknowledge({
+      const acknowledged =
+        await this.input.outbox.acknowledge({
         connectionId: frame.connectionId,
         externalEventId: frame.externalEventId,
       });
+      if (!acknowledged) return;
+      await this.input.onInboundAcknowledged?.(frame);
       return;
     }
-    await this.handleSend(socket, generation, frame);
+    if (frame.type === "attachment_ack") {
+      const transfer = this.attachmentTransfers.get(
+        frame.transferId,
+      );
+      if (
+        !transfer
+        || transfer.connectionId !== frame.connectionId
+      ) {
+        throw new Error("node_attachment_ack_unexpected");
+      }
+      clearTimeout(transfer.timer);
+      this.attachmentTransfers.delete(frame.transferId);
+      if (frame.status === "ready") {
+        transfer.resolve();
+      } else {
+        transfer.reject(
+          new Error(
+            frame.errorCode
+              ?? "node_attachment_rejected",
+          ),
+        );
+      }
+      return;
+    }
+    this.queueSend(socket, generation, frame);
   }
 
   private async acceptRegistration(
@@ -961,10 +1214,32 @@ export class ChannelNodeClient {
       frame.boundConnectionIds,
     );
     this.registered = true;
+    this.registrationReady = false;
     this.reconnectAttempt = 0;
     this.health.setState("registered");
+    void this.finishRegistration(
+      socket,
+      generation,
+      frame,
+    ).catch((error) => {
+      this.failSocket(
+        socket,
+        generation,
+        stableErrorCode(error),
+      );
+    });
+  }
+
+  private async finishRegistration(
+    socket: ChannelNodeSocket,
+    generation: number,
+    frame: RunnerRegisteredFrame,
+  ): Promise<void> {
     await this.ensureLocalChannelsStarted(frame);
     if (!this.isCurrentSocket(socket, generation)) return;
+    await this.input.onBeforeInboundReplay?.(frame);
+    if (!this.isCurrentSocket(socket, generation)) return;
+    this.registrationReady = true;
     const pendingFrames = await this.input.outbox.list();
     if (!this.isCurrentSocket(socket, generation)) return;
     for (const pending of pendingFrames) {
@@ -985,6 +1260,31 @@ export class ChannelNodeClient {
       this.connectionDeferred = null;
       deferred.resolve();
     }
+  }
+
+  private queueSend(
+    socket: ChannelNodeSocket,
+    generation: number,
+    frame: RunnerSendFrame,
+  ): void {
+    const task = this.sendQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await this.localChannelsReconciliation;
+        if (!this.isCurrentSocket(socket, generation)) return;
+        await this.handleSend(socket, generation, frame);
+      });
+    this.sendQueue = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    void task.catch((error) => {
+      this.failSocket(
+        socket,
+        generation,
+        stableErrorCode(error),
+      );
+    });
   }
 
   private async handleSend(
@@ -1078,6 +1378,7 @@ export class ChannelNodeClient {
       sentAt: this.now().toISOString(),
       connectionId: source.connectionId,
       deliveryId: source.deliveryId,
+      requestSequence: source.sequence,
       ...outcome,
     });
   }
@@ -1105,6 +1406,36 @@ export class ChannelNodeClient {
       throw new Error("channel_node_socket_not_open");
     }
     this.sendTo(socket, generation, frame);
+  }
+
+  private trySendDurableInbound(
+    frame: RunnerInboundFrame,
+  ): void {
+    try {
+      this.send(frame);
+    } catch (error) {
+      const socket = this.socket;
+      if (socket) {
+        this.failSocket(
+          socket,
+          this.socketGeneration,
+          stableErrorCode(error),
+        );
+      }
+    }
+  }
+
+  private async sendRunnerFrame(
+    draft: RunnerAttachmentDraft,
+  ): Promise<void> {
+    const sequence = await this.input.outbox.reserveSequence();
+    this.send({
+      ...draft,
+      protocolVersion: RUNNER_PROTOCOL_VERSION,
+      nodeId: this.input.config.nodeId,
+      sequence,
+      sentAt: this.now().toISOString(),
+    } as RunnerFrame);
   }
 
   private sendTo(
@@ -1136,19 +1467,11 @@ export class ChannelNodeClient {
   private async ensureLocalChannelsStarted(
     frame: RunnerRegisteredFrame,
   ): Promise<void> {
-    if (this.localChannelsStarted) return;
-    if (!this.localChannelsStartPromise) {
-      this.localChannelsStartPromise = Promise.resolve(
-        this.input.onRegistered?.(frame),
-      )
-        .then(() => {
-          this.localChannelsStarted = true;
-        })
-        .finally(() => {
-          this.localChannelsStartPromise = null;
-        });
-    }
-    await this.localChannelsStartPromise;
+    const reconciliation = this.localChannelsReconciliation
+      .catch(() => undefined)
+      .then(() => this.input.onRegistered?.(frame));
+    this.localChannelsReconciliation = reconciliation;
+    await reconciliation;
   }
 
   private startHeartbeat(
@@ -1225,15 +1548,25 @@ export class ChannelNodeClient {
     this.socketGeneration += 1;
     this.socket = null;
     this.registered = false;
+    this.registrationReady = false;
     this.boundConnectionIds.clear();
     this.clearHeartbeat();
     this.health.setState("disconnected");
     this.connectionDeferred?.reject(new Error(code));
     this.connectionDeferred = null;
+    this.rejectAttachmentTransfers(code);
     socket.close(1008, boundedCloseReason(code));
     if (!this.stopped && this.autoReconnect) {
       this.scheduleReconnect();
     }
+  }
+
+  private rejectAttachmentTransfers(code: string): void {
+    for (const transfer of this.attachmentTransfers.values()) {
+      clearTimeout(transfer.timer);
+      transfer.reject(new Error(code));
+    }
+    this.attachmentTransfers.clear();
   }
 
   private isCurrentSocket(
@@ -1272,9 +1605,20 @@ function createDeliveryRequestDigest(
     nodeId: frame.nodeId,
     connectionId: frame.connectionId,
     deliveryId: frame.deliveryId,
-    expiresAt: frame.expiresAt,
     payload: frame.payload,
   }));
+}
+
+function deliveryReceiptExpiresAt(
+  frame: RunnerSendFrame,
+  now: Date,
+): string {
+  return new Date(
+    Math.max(
+      new Date(frame.expiresAt).getTime(),
+      now.getTime() + DELIVERY_RECEIPT_TTL_MS,
+    ),
+  ).toISOString();
 }
 
 function createDeliveryRecord(
@@ -1291,6 +1635,7 @@ function deliveryRecordContent(
 ): Omit<DeliveryRecord, "sha256"> {
   const {
     deliveryId,
+    requestSequence,
     requestDigest,
     expiresAt,
     state,
@@ -1298,6 +1643,7 @@ function deliveryRecordContent(
   } = record;
   return {
     deliveryId,
+    requestSequence,
     requestDigest,
     expiresAt,
     state,
@@ -1314,6 +1660,8 @@ function isDeliveryRecord(
     typeof record.deliveryId !== "string"
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
       .test(record.deliveryId)
+    || !Number.isSafeInteger(record.requestSequence)
+    || Number(record.requestSequence) < 1
     || typeof record.requestDigest !== "string"
     || !/^[a-f0-9]{64}$/.test(record.requestDigest)
     || typeof record.expiresAt !== "string"
@@ -1346,7 +1694,7 @@ function isOutboxRecord(value: unknown): value is OutboxRecord {
     && typeof record.frame === "object";
 }
 
-function sha256(value: string): string {
+function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
