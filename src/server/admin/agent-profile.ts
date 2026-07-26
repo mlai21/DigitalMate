@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
@@ -149,6 +150,7 @@ export function createAdminAgentProfileService(
       outerSignal?: AbortSignal,
     ): Promise<AdminAgentProfileUpdateResult> {
       validateOperationId(input.operationId);
+      const inputFingerprint = profileUpdateFingerprint(input);
       const lifecycle = createBoundedLifecycle(
         lifecycleTimeoutMs,
         outerSignal,
@@ -169,6 +171,17 @@ export function createAdminAgentProfileService(
         const before = await lockDefaultProfile(client, input.scope);
         if (!before) {
           throw new AdminAgentProfileError(404, "agent_not_found");
+        }
+        const replay = await recoverProfileUpdateInTransaction(
+          client,
+          input,
+          before,
+          inputFingerprint,
+        );
+        if (replay !== null) {
+          lifecycle.signal.throwIfAborted();
+          await client.query("COMMIT");
+          return { revision: replay };
         }
         if (before.revision !== input.expectedRevision) {
           throw new AdminAgentProfileError(409, "revision_conflict");
@@ -216,7 +229,13 @@ export function createAdminAgentProfileService(
         if (!Number.isSafeInteger(revision)) {
           throw new AdminAgentProfileError(409, "revision_conflict");
         }
-        await insertSafeAudit(client, input, before, revision);
+        await insertSafeAudit(
+          client,
+          input,
+          before,
+          revision,
+          inputFingerprint,
+        );
         lifecycle.signal.throwIfAborted();
         try {
           await client.query("COMMIT");
@@ -225,7 +244,11 @@ export function createAdminAgentProfileService(
           commitOutcomeUnknown = true;
           guard.destroy();
           const recoveredRevision =
-            await recoverCommittedProfileUpdate(pool, input);
+            await recoverCommittedProfileUpdate(
+              pool,
+              input,
+              inputFingerprint,
+            );
           if (recoveredRevision !== null) {
             return { revision: recoveredRevision };
           }
@@ -275,6 +298,7 @@ function validateOperationId(operationId: string): void {
 async function recoverCommittedProfileUpdate(
   pool: Pool,
   input: AdminAgentProfileUpdate,
+  inputFingerprint: string,
 ): Promise<number | null> {
   const lifecycle = createBoundedLifecycle(
     COMMIT_RECOVERY_TIMEOUT_MS,
@@ -304,6 +328,7 @@ async function recoverCommittedProfileUpdate(
          AND error_code IS NULL
          AND confirmation_source->>'type' = 'console'
          AND confirmation_source->>'requestId' = $3
+         AND confirmation_source->>'inputFingerprint' = $5
          AND jsonb_typeof(after_summary->'revision') = 'number'
          AND after_summary->>'revision' = $4
        ORDER BY created_at DESC
@@ -313,6 +338,7 @@ async function recoverCommittedProfileUpdate(
         input.scope.agentId,
         input.operationId,
         String(expectedRevision),
+        inputFingerprint,
       ],
     );
     lifecycle.signal.throwIfAborted();
@@ -453,6 +479,7 @@ async function insertSafeAudit(
   input: AdminAgentProfileUpdate,
   before: LockedProfile,
   revision: number,
+  inputFingerprint: string,
 ): Promise<void> {
   const changedFields = [
     !isJsonEqual(before.display_name, input.displayName)
@@ -497,9 +524,92 @@ async function insertSafeAudit(
       {
         type: "console",
         requestId: input.operationId,
+        inputFingerprint,
       },
     ],
   );
+}
+
+async function recoverProfileUpdateInTransaction(
+  client: PoolClient,
+  input: AdminAgentProfileUpdate,
+  current: LockedProfile,
+  inputFingerprint: string,
+): Promise<number | null> {
+  const expectedRevision = input.expectedRevision + 1;
+  const result = await client.query<{
+    input_fingerprint: string | null;
+    revision: string;
+  }>(
+    `SELECT
+       confirmation_source->>'inputFingerprint'
+         AS input_fingerprint,
+       after_summary->>'revision' AS revision
+     FROM admin_audit_logs
+     WHERE user_id = $1
+       AND agent_id = $2
+       AND action = 'agent_profile.update'
+       AND resource_type = 'digital_agent'
+       AND resource_id = ($2::uuid)::text
+       AND status = 'success'
+       AND error_code IS NULL
+       AND confirmation_source->>'type' = 'console'
+       AND confirmation_source->>'requestId' = $3
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [
+      input.scope.userId,
+      input.scope.agentId,
+      input.operationId,
+    ],
+  );
+  const replay = result.rows[0];
+  if (!replay) return null;
+  if (replay.input_fingerprint === null) return null;
+  if (
+    replay.input_fingerprint !== inputFingerprint ||
+    Number(replay.revision) !== expectedRevision ||
+    current.revision !== expectedRevision ||
+    !profileMatchesUpdate(current, input)
+  ) {
+    throw new AdminAgentProfileError(
+      409,
+      "revision_conflict",
+    );
+  }
+  return expectedRevision;
+}
+
+function profileMatchesUpdate(
+  current: LockedProfile,
+  input: AdminAgentProfileUpdate,
+): boolean {
+  return (
+    isJsonEqual(current.display_name, input.displayName) &&
+    isJsonEqual(current.settings_persona, input.persona) &&
+    isJsonEqual(
+      current.proactivity,
+      input.settings.proactivity,
+    ) &&
+    isJsonEqual(current.cadence, input.settings.cadence) &&
+    isJsonEqual(current.search, input.settings.search)
+  );
+}
+
+function profileUpdateFingerprint(
+  input: AdminAgentProfileUpdate,
+): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        expectedRevision: input.expectedRevision,
+        displayName: input.displayName,
+        persona: input.persona,
+        settings: input.settings,
+      }),
+      "utf8",
+    )
+    .digest("hex");
 }
 
 function isJsonEqual(left: unknown, right: unknown): boolean {

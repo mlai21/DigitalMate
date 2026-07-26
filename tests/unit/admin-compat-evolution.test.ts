@@ -5,10 +5,13 @@ import {
   hasPersistentGoalNetworkAuthorization,
   projectGoalDetail,
   projectInterjectionOverview,
+  projectMemoryEntry,
+  projectReflectionEntry,
   reduceAdminGoalAction,
 } from "@/server/admin/views/evolution";
 import {
   createGoalActionHandler,
+  createReflectionActionHandler,
   createUpdateInterjectionPolicyHandler,
   type AdminEvolutionService,
 } from "@/server/admin/compat/handlers/evolution";
@@ -307,6 +310,131 @@ describe("admin compatibility evolution", () => {
         operationId: body.operation_id,
       },
       context.signal,
+    );
+  });
+
+  it("记忆投影按层级返回来源和时间，但不暴露 embedding", () => {
+    const projected = projectMemoryEntry({
+      id: "10000000-0000-4000-8000-000000000401",
+      kind: "profile",
+      content: "用户喜欢简洁的周报",
+      confidence: 0.9,
+      sourceMessageId:
+        "10000000-0000-4000-8000-000000000402",
+      createdAt: new Date("2026-07-27T03:00:00Z"),
+      expiresAt: null,
+    });
+
+    expect(projected).toEqual({
+      id: "10000000-0000-4000-8000-000000000401",
+      kind: "profile",
+      content: "用户喜欢简洁的周报",
+      confidence: 0.9,
+      source: {
+        type: "message",
+        id: "10000000-0000-4000-8000-000000000402",
+      },
+      created_at: "2026-07-27T03:00:00.000Z",
+      expires_at: null,
+    });
+    expect(JSON.stringify(projected)).not.toMatch(
+      /embedding|vector|storage_key/i,
+    );
+  });
+
+  it("Reflection 只投影建议与状态，不返回 source_window 原始载荷", () => {
+    const projected = projectReflectionEntry({
+      id: "10000000-0000-4000-8000-000000000411",
+      positives: ["解释清晰"],
+      negatives: ["有时偏长"],
+      suggestions: ["回复更紧凑", "少用模板句"],
+      status: "recorded",
+      createdAt: new Date("2026-07-27T04:00:00Z"),
+    });
+
+    expect(projected).toMatchObject({
+      suggestions: ["回复更紧凑", "少用模板句"],
+      status: "recorded",
+    });
+    expect(JSON.stringify(projected)).not.toMatch(
+      /source_window|raw_payload|prompt/i,
+    );
+  });
+
+  it("应用 Reflection 必须明确选择建议、确认并携带人设 revision", async () => {
+    const actOnReflection = vi
+      .fn<AdminEvolutionService["actOnReflection"]>()
+      .mockResolvedValue({
+        id: "10000000-0000-4000-8000-000000000411",
+        status: "applied",
+        profile_revision: 5,
+      });
+    const handler = createReflectionActionHandler({
+      actOnReflection,
+    } as unknown as AdminEvolutionService);
+    const reflectionId =
+      "10000000-0000-4000-8000-000000000411";
+    const operationId =
+      "10000000-0000-4000-8000-000000000419";
+
+    await expect(
+      handler({
+        request: new Request(
+          `https://mate.example/api/admin/compat/reflections/${reflectionId}/actions/apply`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              revision: 4,
+              operation_id: operationId,
+              confirmed: false,
+              suggestion_indexes: [0],
+            }),
+          },
+        ),
+        params: { reflectionId, action: "apply" },
+        scope,
+        csrfVerified: true,
+        resources: {} as AdminCompatContext["resources"],
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "confirmation_required",
+    });
+
+    await handler({
+      request: new Request(
+        `https://mate.example/api/admin/compat/reflections/${reflectionId}/actions/apply`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            revision: 4,
+            operation_id: operationId,
+            confirmed: true,
+            suggestion_indexes: [0],
+          }),
+        },
+      ),
+      params: { reflectionId, action: "apply" },
+      scope,
+      csrfVerified: true,
+      resources: {} as AdminCompatContext["resources"],
+      signal: new AbortController().signal,
+    });
+
+    expect(actOnReflection).toHaveBeenCalledWith(
+      scope,
+      reflectionId,
+      "apply",
+      {
+        expectedRevision: 4,
+        operationId,
+        confirmed: true,
+        suggestionIndexes: [0],
+      },
+      expect.any(AbortSignal),
     );
   });
 });

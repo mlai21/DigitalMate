@@ -7,6 +7,7 @@ import {
 } from "@/server/admin/views/inbox";
 import {
   createApprovalCommandHandler,
+  createCheckCommandHandler,
   createResolveAccessHandler,
   createUpdateAccessMetadataHandler,
   type AdminInboxService,
@@ -309,5 +310,53 @@ describe("admin compatibility inbox", () => {
         pending: [],
       },
     });
+  });
+
+  it("命令检查同时返回当前分身已启用 Skill 的 slash catalog", async () => {
+    const listEnabledForAgent = vi.fn().mockResolvedValue([
+      {
+        id: "10000000-0000-4000-8000-000000000201",
+        name: "Weekly Report",
+        trigger: "整理一周进展",
+      },
+      {
+        id: "10000000-0000-4000-8000-000000000202",
+        name: "会议纪要",
+        trigger: "提取行动项",
+      },
+    ]);
+    const handler = createCheckCommandHandler();
+    const result = await handler({
+      request: new Request(
+        "https://mate.example/api/admin/compat/commands/check",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "/weekly-report" }),
+        },
+      ),
+      params: {},
+      scope: scopeA,
+      csrfVerified: true,
+      resources: {
+        skills: { listEnabledForAgent },
+      } as unknown as AdminCompatContext["resources"],
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      is_control_command: false,
+      commands: [
+        {
+          command: "/weekly-report",
+          name: "Weekly Report",
+        },
+        {
+          command: "/会议纪要",
+          name: "会议纪要",
+        },
+      ],
+    });
+    expect(listEnabledForAgent).toHaveBeenCalledWith(scopeA);
   });
 });

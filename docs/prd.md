@@ -1,11 +1,12 @@
 # DigitalMate 数字伙伴 PRD
 
-- 版本：v0.11
+- 版本：v0.12
 - 日期：2026-07-27
 - 状态：已确认
 
 > 修订记录
 >
+> - v0.12（2026-07-27）：细化 **QwenPaw Console 数据边界**——Workspace 固定投影为 `/AGENT.md`、`/PROACTIVITY.md`、`/CHANNELS.md`、`/RUNTIME.json`，内容即时来自 PostgreSQL，不建立第二套磁盘配置或 Markdown 记忆；前两项以 revision 写回人设/主动性，后两项只读，任意文件上传、代码工作区和 Git 操作保持禁用。Skills/Tools/MCP 只展示当前分身获授权的真实资源，Skill 创建、启用和修订继续经过确认/待审批链路，动态工具/MCP 扩展仍属冻结 P2。Memory 编辑/删除及 Reflection 应用/忽略均按 `user_id + agent_id` 隔离并写安全审计；应用反思时只合并用户明确勾选的建议。
 > - v0.11（2026-07-27）：细化 **P1-13 SIP 媒体节点边界**——① Dev SIP 使用 UDP SIP/RTP、G.711 µ-law 与有界原子端口租约，零配置 registrar 只能绑定回环地址；②生产模式强制使用 LiveKit `wss://` 与随机后缀的 individual dispatch rule，实现独立 room/call 映射；SIP、DashScope、LiveKit 凭据仅驻留节点私有 `0600` 配置和内存，中心拒绝接收；③ DashScope STT 只把 `sentence_end=true` 的最终转写送往中心，TTS 固定按墙钟输出 20 ms 音频帧，barge-in 只中断当前语音播放；④每通电话默认 120 秒、每连接默认最多 5 路并发，第 6 路返回 busy；⑤原始音频、部分转写、供应商帧与 base64 永不进入中心消息、附件或持久队列。
 > - v0.10（2026-07-26）：细化 **P1-13 渠道运行节点与 iMessage 数据边界**——① 中心出站 Delivery 先持久化节点 outbox，在线推送与重连补发共用同一记录，`send_result` 原子回写原 Delivery，不重复运行 Agent；② 每次注册按最新绑定集合启动新增连接并停止已解绑连接；③ iMessage 附件固定为 4 个/单文件 10 MiB/单消息 20 MiB，通过 mTLS 以不超过 512 KiB 分块传输，中心完成统一白名单、真实内容校验和私有存储后才 ACK，Mac 临时副本随后删除；④ 单行坏附件写入不含正文的私有拒绝记录、清理临时文件并推进游标，避免阻塞后续消息；⑤ iMessage 群聊按持久化 `chatType` 显式拒绝，不得退化为对群成员私聊。
 > - v0.9（2026-07-21）：确认 **QwenPaw Console 与全渠道迁移**——① `/admin` 以 QwenPaw `v2.0.0.post3` 为固定基线，保留其导航、页面、组件和交互，聊天仍位于 DigitalMate 首页；② 可见品牌与 Logo 替换为 DigitalMate，布局沿用 QwenPaw，主题沿用现有暖白与珊瑚色；③ 一次性覆盖上游 17 个外部渠道，全部渠道共享唯一 DigitalMate Agent、身份、权限和 PostgreSQL 数据，不引入 QwenPaw Python Runner；④ iMessage 与 SIP 通过无模型、无记忆的渠道运行节点适配专用环境；⑤ 本期只运行一个默认数字分身与一套记忆，但保留 Console 的 Agent 数据通路，并以 `agent_id` 隔离分身级数据，为未来第二分身预留能力；⑥ P2 冻结页面只读或明确禁用。详细规格见 [QwenPaw Console 与全渠道迁移设计](superpowers/specs/2026-07-21-qwenpaw-console-and-channels-design.md)。
@@ -120,7 +121,7 @@ P0 支持基于对话内容的简单提醒（Web 端消息）；P1 扩展到 IM 
 | P0-5 | 稳定人设 | 有名字、性格、语气风格（具体设定见开放问题 10.1）；全渠道一致 |
 | P0-6 | 拟人节奏 | 回复可分段发送、可带表情；避免"秒回长文"的机器感（具体参数见 5.3） |
 | P0-7 | 基础主动消息 | 支持对话中约定的提醒（"周五提醒我…"）；支持简单的主动跟进（如隔天追问未完成事项），频率受限 |
-| P0-8 | 管理后台 | `/admin` 以 QwenPaw `v2.0.0.post3` Console 为固定基线，保留其导航、页面、组件和交互；聊天入口跳转 DigitalMate 首页。可见品牌替换为 DigitalMate，布局沿用上游，主题沿用暖白与珊瑚色；对话、记忆、反思、插话、目标、人设、模型、渠道、安全和用量接入 DigitalMate 真实数据，P2 冻结能力只读或明确禁用 |
+| P0-8 | 管理后台 | `/admin` 以 QwenPaw `v2.0.0.post3` Console 为固定基线，保留其导航、页面、组件和交互；聊天入口跳转 DigitalMate 首页。可见品牌替换为 DigitalMate，布局沿用上游，主题沿用暖白与珊瑚色；对话、记忆、反思、插话、目标、人设、Workspace、Skills、Tools/MCP、模型、渠道、安全和用量接入 DigitalMate 真实数据。Workspace 是四个数据库虚拟文件的即时投影，不建立第二套文件真相；P2 冻结能力只读或明确禁用 |
 | P0-9 | 会话与项目管理 | Web 端支持多会话：新建、重命名、删除、置顶、搜索；支持项目（文件夹）管理——创建/重命名/删除项目、会话移入移出项目；会话标题在首轮对话后由轻量模型自动生成；界面参考 ChatGPT 桌面端侧栏（项目/置顶/最近分区） |
 | P0-10 | 稳定阅读与聊天附件 | 输入框增高不得遮挡消息；阅读历史时新内容不得强制滚到底部，以新消息按钮提示。输入框「+」支持 JPEG/PNG/WebP 与 PDF/TXT/MD/JSON/CSV，附件保存在自有私有存储并真正进入主模型；上传不等于联网授权。携带附件的当前或历史上下文禁止注入或执行联网、Skill 与其他工具。CSV 在本功能中只作为文本上下文，不触发 P2 表格处理。 |
 
@@ -363,7 +364,7 @@ flowchart TB
 ### 7.4 数据模型要点
 
 - 所有业务表带 `user_id`（当前恒为本人，为多用户预留）；分身级业务数据同时带非空 `agent_id`，现有数据归入唯一默认数字分身。
-- 核心实体：`user`、`conversation`（含渠道标识）、`message`（主动消息带唯一 `source_task_id`）、`memory_entry`（分层级）、`skill`、`reflection`、`tool_call_log`、`scheduled_jobs` + `scheduled_job_runs`（提醒/跟进/定时任务的定义与幂等执行账本，见 P0-7、P1-10）。Heartbeat 配置保存在当前分身的 `agent_settings`，默认关闭。
+- 核心实体：`user`、`conversation`（含渠道标识）、`message`（主动消息带唯一 `source_task_id`）、`memory_entry`（分层级）、`skill`（内容版本 + 管理 revision）、`skill_revision`（待审批修订）、`reflection`、`tool_registration`、`tool_call_log`、`scheduled_jobs` + `scheduled_job_runs`（提醒/跟进/定时任务的定义与幂等执行账本，见 P0-7、P1-10）。Heartbeat 配置保存在当前分身的 `agent_settings`，默认关闭。
 - 目标模式（P3）新增：`goal`（目标合同 + 状态机 + 预算消耗 + 下次运行时间 + revision）、`goal_step`（每轮循环的证据账本：意图、动作、证据、验证结论、token 消耗），工具调用继续写 `tool_call_log` 并关联 goal，详见 [docs/goal-mode-design.md](goal-mode-design.md)。目标状态独立于定时任务——前者是"直到达成"的循环，后者是"到点执行"的一次性/周期动作。目标确认时才可把与该目标 ID 绑定的 `goal_contract` 联网授权写入合同；执行器在工具展示和实际调用两层都校验该授权。
 - 会话与记忆云端统一存储，是多端同步（P1-5）的基础。
 - 人设、会话、消息、记忆、反思、目标、定时任务、渠道连接和工具审计按 `user_id + agent_id` 隔离；模型目录、工具定义与 Skill 库为用户级资源，未来可通过授权关系分配给不同数字分身。

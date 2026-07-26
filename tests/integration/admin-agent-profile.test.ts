@@ -266,6 +266,9 @@ describe("admin default-agent profile transaction", () => {
         confirmation_source: {
           type: "console",
           requestId: OPERATION_ID,
+          inputFingerprint: expect.stringMatching(
+            /^[0-9a-f]{64}$/u,
+          ),
         },
       },
     ]);

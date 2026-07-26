@@ -140,21 +140,58 @@ import {
   createPostgresAdminSchedulesService,
 } from "@/server/admin/views/schedules";
 import {
+  createDeleteMemoryHandler,
   createGetGoalHandler,
   createGetInterjectionsHandler,
   createGoalActionHandler,
+  createListMemoriesHandler,
+  createListReflectionsHandler,
   createListGoalsHandler,
+  createReflectionActionHandler,
+  createUpdateMemoryHandler,
   createUpdateInterjectionPolicyHandler,
   type AdminEvolutionService,
 } from "@/server/admin/compat/handlers/evolution";
 import {
   createPostgresAdminEvolutionService,
 } from "@/server/admin/views/evolution";
+import {
+  createDownloadWorkspaceHandler,
+  createGetWorkspaceFileHandler,
+  createGetWorkspacePromptFilesHandler,
+  createListWorkspaceFilesHandler,
+  createPutWorkspaceFileHandler,
+  createWatchWorkspaceHandler,
+  type AdminWorkspaceService,
+} from "@/server/admin/compat/handlers/workspace";
+import {
+  createPostgresAdminWorkspaceService,
+} from "@/server/admin/workspace/service";
+import {
+  createCreateSkillHandler,
+  createGetMcpClientHandler,
+  createGetMcpPolicyHandler,
+  createGetToolConfigHandler,
+  createListMcpAccessPrincipalsHandler,
+  createListMcpClientsHandler,
+  createListMcpToolsHandler,
+  createListSkillPoolHandler,
+  createListSkillsHandler,
+  createListSkillWorkspacesHandler,
+  createListToolsHandler,
+  createRefreshSkillsHandler,
+  createSaveSkillHandler,
+  createSetSkillEnabledHandler,
+  type AdminAgentResourcesService,
+} from "@/server/admin/compat/handlers/agent-resources";
+import {
+  createPostgresAdminAgentResourcesService,
+} from "@/server/admin/views/agent-resources";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-27.3";
+export const adminCompatApiRevision = "2026-07-27.4";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -174,6 +211,8 @@ export type CoreAdminCompatDependencies = Readonly<{
   sessions?: AdminSessionsService;
   schedules?: AdminSchedulesService;
   evolution?: AdminEvolutionService;
+  workspace?: AdminWorkspaceService;
+  agentResources?: AdminAgentResourcesService;
   verifyUpstreamContract?: boolean;
 }>;
 
@@ -681,6 +720,200 @@ export function createCoreAdminCompatRouter(
       createGoalActionHandler(dependencies.evolution),
       evolutionRouteOptions,
     );
+    router.get(
+      "/memories",
+      createListMemoriesHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.put(
+      "/memories/:memoryId",
+      createUpdateMemoryHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.delete(
+      "/memories/:memoryId",
+      createDeleteMemoryHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.get(
+      "/reflections",
+      createListReflectionsHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.post(
+      "/reflections/:reflectionId/actions/:action",
+      createReflectionActionHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+  }
+
+  if (dependencies.workspace) {
+    const workspaceRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/workspace/files",
+      createListWorkspaceFilesHandler(
+        dependencies.workspace,
+      ),
+      workspaceRouteOptions,
+    );
+    router.get(
+      "/workspace/files/:fileName",
+      createGetWorkspaceFileHandler(dependencies.workspace),
+      workspaceRouteOptions,
+    );
+    router.put(
+      "/workspace/files/:fileName",
+      createPutWorkspaceFileHandler(dependencies.workspace),
+      workspaceRouteOptions,
+    );
+    router.get(
+      "/workspace/download",
+      createDownloadWorkspaceHandler(dependencies.workspace),
+      workspaceRouteOptions,
+    );
+    router.get(
+      "/workspace/system-prompt-files",
+      createGetWorkspacePromptFilesHandler(),
+      workspaceRouteOptions,
+    );
+    router.get(
+      "/workspace/watch",
+      createWatchWorkspaceHandler(dependencies.workspace),
+      workspaceRouteOptions,
+    );
+  }
+
+  if (dependencies.agentResources) {
+    const resourceRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/skills",
+      createListSkillsHandler(dependencies.agentResources),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/skills/workspaces",
+      createListSkillWorkspacesHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/skills/pool",
+      createListSkillPoolHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills/refresh",
+      createRefreshSkillsHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills",
+      createCreateSkillHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.put(
+      "/skills/save",
+      createSaveSkillHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills/pool/create",
+      createCreateSkillHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.put(
+      "/skills/pool/save",
+      createSaveSkillHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills/pool/refresh",
+      createRefreshSkillsHandler(
+        dependencies.agentResources,
+        true,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills/:skillName/enable",
+      createSetSkillEnabledHandler(
+        dependencies.agentResources,
+        true,
+      ),
+      resourceRouteOptions,
+    );
+    router.post(
+      "/skills/:skillName/disable",
+      createSetSkillEnabledHandler(
+        dependencies.agentResources,
+        false,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/tools",
+      createListToolsHandler(dependencies.agentResources),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/tools/:toolName/config",
+      createGetToolConfigHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/mcp",
+      createListMcpClientsHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/mcp/access-principals",
+      createListMcpAccessPrincipalsHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/mcp/tools/:clientKey",
+      createListMcpToolsHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/mcp/policy/:clientKey",
+      createGetMcpPolicyHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
+    router.get(
+      "/mcp/:clientKey",
+      createGetMcpClientHandler(
+        dependencies.agentResources,
+      ),
+      resourceRouteOptions,
+    );
   }
 
   for (const path of ["/language", "/settings/language"]) {
@@ -823,6 +1056,9 @@ export async function dispatchAdminCompatRequest(
     ),
     schedules: createPostgresAdminSchedulesService(pool),
     evolution: createPostgresAdminEvolutionService(pool),
+    workspace: createPostgresAdminWorkspaceService(pool),
+    agentResources:
+      createPostgresAdminAgentResourcesService(pool),
     wechatQrAuth,
     verifyUpstreamContract: true,
   });

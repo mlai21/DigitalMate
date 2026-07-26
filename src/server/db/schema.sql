@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS skills (
   source text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'agent', 'task', 'imported')),
   source_url text,
   version integer NOT NULL DEFAULT 1,
+  revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
   scan_report jsonb,
   usage_count integer NOT NULL DEFAULT 0,
   last_used_at timestamptz,
@@ -246,6 +247,23 @@ ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS version integer NOT NULL D
 ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS scan_report jsonb;
 ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS usage_count integer NOT NULL DEFAULT 0;
 ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+ALTER TABLE IF EXISTS skills
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
+
+DO $skills_revision_check$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'skills'::regclass
+      AND conname = 'skills_revision_check'
+  ) THEN
+    ALTER TABLE skills
+      ADD CONSTRAINT skills_revision_check
+      CHECK (revision > 0);
+  END IF;
+END
+$skills_revision_check$;
 
 CREATE TABLE IF NOT EXISTS skill_revisions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

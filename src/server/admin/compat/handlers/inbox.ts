@@ -101,13 +101,34 @@ export function createCheckCommandHandler(): AdminCompatHandler {
       .object({ text: z.string().max(10_000) })
       .strict()
       .parse(await readAdminCompatJson(context.request));
+    const skills =
+      await context.resources.skills.listEnabledForAgent(
+        context.scope,
+      );
     return {
       is_control_command: /^\/(?:approve|deny)\b/iu.test(
         body.text.trim(),
       ),
       command_token: null,
+      commands: skills.map((skill) => ({
+        command: `/${toCommandName(skill.name)}`,
+        name: skill.name,
+        description: skill.trigger,
+        skill_id: skill.id,
+      })),
     };
   };
+}
+
+function toCommandName(value: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 64);
+  return normalized || "skill";
 }
 
 export function createListInboxHandler(

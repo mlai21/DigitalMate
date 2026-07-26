@@ -205,7 +205,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   skills: [
     "id", "user_id", "name", "trigger", "content", "status", "source", "source_url",
-    "version", "scan_report", "usage_count", "last_used_at", "created_at", "updated_at",
+    "version", "revision", "scan_report", "usage_count", "last_used_at",
+    "created_at", "updated_at",
   ],
   skill_revisions: [
     "id", "user_id", "skill_id", "proposed_content", "reason", "status",
@@ -407,6 +408,7 @@ export type DbSkill = {
   source: "manual" | "agent" | "task" | "imported";
   sourceUrl: string | null;
   version: number;
+  revision: number;
   scanReport: unknown;
   usageCount: number;
   lastUsedAt: Date | null;
@@ -2634,7 +2636,7 @@ export function createRepositories(
         return result.rows[0] ?? null;
       },
       async setStatus(userId: string, skillId: string, status: "enabled" | "disabled" | "rejected"): Promise<void> {
-        await pool.query("UPDATE skills SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
+        await pool.query("UPDATE skills SET status = $3, revision = revision + 1, updated_at = now() WHERE user_id = $1 AND id = $2", [
           userId,
           skillId,
           status,
@@ -2669,7 +2671,7 @@ export function createRepositories(
       },
       async applyRevision(userId: string, skillId: string, content: string): Promise<void> {
         await pool.query(
-          "UPDATE skills SET content = $3, version = version + 1, updated_at = now() WHERE user_id = $1 AND id = $2",
+          "UPDATE skills SET content = $3, version = version + 1, revision = revision + 1, updated_at = now() WHERE user_id = $1 AND id = $2",
           [userId, skillId, content],
         );
       },
@@ -2999,7 +3001,7 @@ export function createRepositories(
           }));
       },
       async setStatus(userId: string, id: string, status: "enabled" | "disabled" | "rejected"): Promise<void> {
-        await pool.query("UPDATE tool_registrations SET status = $3, updated_at = now() WHERE user_id = $1 AND id = $2", [
+        await pool.query("UPDATE tool_registrations SET status = $3, revision = revision + 1, updated_at = now() WHERE user_id = $1 AND id = $2", [
           userId,
           id,
           status,
@@ -3650,6 +3652,7 @@ function mapSkillRow(row: Record<string, unknown>): DbSkill {
     source: (row.source ?? "manual") as DbSkill["source"],
     sourceUrl: (row.source_url ?? null) as string | null,
     version: Number(row.version ?? 1),
+    revision: Number(row.revision ?? 1),
     scanReport: row.scan_report ?? null,
     usageCount: Number(row.usage_count ?? 0),
     lastUsedAt: (row.last_used_at ?? null) as Date | null,

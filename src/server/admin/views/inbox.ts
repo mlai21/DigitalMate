@@ -357,6 +357,7 @@ export function createPostgresAdminInboxService(
             await client.query(
               `UPDATE skills
                SET content = $3, version = version + 1,
+                   revision = revision + 1,
                    updated_at = now()
                WHERE user_id = $1 AND id = $2`,
               [scope.userId, row.skill_id, row.proposed_content],

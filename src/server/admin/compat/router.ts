@@ -48,8 +48,11 @@ const METHODS = [
 ] as const;
 const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const SAFE_HANDLER_RESPONSE_HEADERS = new Set([
+  "cache-control",
+  "content-disposition",
   "content-language",
   "content-type",
+  "etag",
 ]);
 const ADMIN_AUDIT_VALIDATION_CODES = new Set([
   "invalid_config_revision",

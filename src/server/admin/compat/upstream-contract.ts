@@ -365,17 +365,19 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   mcp: moduleContract(
     "mapped",
     "agent-resources",
-    disabled(
-      PENDING,
+    mapped(
       "GET /mcp",
       "GET /mcp/:clientKey",
+      "GET /mcp/tools/:clientKey",
+      "GET /mcp/access-principals",
+      "GET /mcp/policy/:clientKey",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.p2Sandbox,
       "POST /mcp",
       "PUT /mcp/:clientKey",
       "PATCH /mcp/toggle/:clientKey",
       "DELETE /mcp/:clientKey",
-      "GET /mcp/tools/:clientKey",
-      "GET /mcp/access-principals",
-      "GET /mcp/policy/:clientKey",
       "PUT /mcp/policy/:clientKey",
       "PUT /mcp/tools/:clientKey",
       "POST /mcp/oauth/start/:clientKey",
@@ -462,25 +464,22 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   skill: moduleContract(
     "mapped",
     "agent-resources",
-    disabled(
-      PENDING,
+    mapped(
       "GET /skills",
       "GET /skills/workspaces",
       "GET /skills/pool",
       "POST /skills/refresh",
       "POST /skills/pool/refresh",
-      "GET /skills/hub/search",
       "POST /skills",
       "PUT /skills/save",
       "POST /skills/pool/create",
       "PUT /skills/pool/save",
       "POST /skills/:skillName/enable",
       "POST /skills/:skillName/disable",
-      "POST /skills/batch-enable",
-      "POST /skills/batch-disable",
-      "POST /skills/batch-delete",
-      "POST /skills/pool/batch-delete",
-      "DELETE /skills/:skillName",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.extensionMarket,
+      "GET /skills/hub/search",
       "POST /skills/hub/install/start",
       "POST /skills/pool/import",
       "GET /skills/hub/install/status/:taskId",
@@ -489,6 +488,14 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
       "GET /skills/pool/builtin-notice",
       "POST /skills/pool/import-builtin",
       "POST /skills/pool/:skillName/update-builtin",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.p2Sandbox,
+      "POST /skills/batch-enable",
+      "POST /skills/batch-disable",
+      "POST /skills/batch-delete",
+      "POST /skills/pool/batch-delete",
+      "DELETE /skills/:skillName",
       "DELETE /skills/pool/:skillName",
       "POST /skills/pool/upload",
       "POST /skills/pool/download",
@@ -519,12 +526,14 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   tools: moduleContract(
     "mapped",
     "agent-resources",
-    disabled(
-      PENDING,
+    mapped(
       "GET /tools",
+      "GET /tools/:toolName/config",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.p2Sandbox,
       "PATCH /tools/:toolName/toggle",
       "PATCH /tools/:toolName/async-execution",
-      "GET /tools/:toolName/config",
       "POST /tools/:toolName/config",
     ),
   ),
@@ -539,22 +548,33 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   workspace: moduleContract(
     "mapped",
     "workspace",
-    disabled(
-      PENDING,
+    mapped(
       "GET /workspace/files",
       "GET /workspace/files/:fileName",
       "PUT /workspace/files/:fileName",
       "GET /workspace/download",
+      "GET /workspace/system-prompt-files",
+      "GET /workspace/watch",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.workspaceUpload,
       "POST /workspace/upload",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.workspaceDailyMemoryFiles,
       "GET /workspace/memory",
       "GET /workspace/memory/:memoryPath",
       "PUT /workspace/memory/:memoryPath",
-      "GET /workspace/system-prompt-files",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.workspaceSystemPromptFiles,
       "PUT /workspace/system-prompt-files",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.workspaceCodeFiles,
       "GET /workspace/code-files",
       "GET /workspace/code-files/:filePath",
       "PUT /workspace/code-files/:filePath",
-      "GET /workspace/watch",
       "GET /workspace/binary-files/:filePath",
     ),
   ),

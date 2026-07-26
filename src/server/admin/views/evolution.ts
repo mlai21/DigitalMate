@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { AgentScope } from "@/server/agents/types";
 import type {
   DbGoal,
@@ -20,6 +20,13 @@ import type { GoalContract } from "@/server/goals/contract";
 import {
   CHANNEL_TYPES,
 } from "@/server/channels/manifests/catalog";
+import {
+  formatPgVector,
+  redactSensitiveMemory,
+  type MemoryKind,
+} from "@/server/agent/memory";
+import { embedText } from "@/server/llm/embeddings";
+import { defaultSettings } from "@/server/settings/defaults";
 
 export type AdminGoalAction =
   | "confirm"
@@ -36,6 +43,30 @@ export type AdminInterjectionDecision = Readonly<{
   shouldInterject: boolean;
   reason: string;
   createdAt: Date;
+}>;
+
+export type AdminMemoryEntry = Readonly<{
+  id: string;
+  kind: MemoryKind;
+  content: string;
+  confidence: number;
+  sourceMessageId: string | null;
+  createdAt: Date;
+  expiresAt: Date | null;
+}>;
+
+export type AdminReflectionEntry = Readonly<{
+  id: string;
+  positives: readonly string[];
+  negatives: readonly string[];
+  suggestions: readonly string[];
+  status: "recorded" | "applied" | "dismissed";
+  createdAt: Date;
+}>;
+
+export type AdminEvolutionMutation = Readonly<{
+  operationId: string;
+  confirmed: boolean;
 }>;
 
 export type AdminEvolutionService = Readonly<{
@@ -69,6 +100,48 @@ export type AdminEvolutionService = Readonly<{
     mutation: Readonly<{
       expectedRevision: number;
       operationId: string;
+    }>,
+    signal?: AbortSignal,
+  ): Promise<unknown | null>;
+  listMemories(
+    scope: AgentScope,
+    filters: Readonly<{ kind?: MemoryKind; limit: number }>,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
+  updateMemory(
+    scope: AgentScope,
+    memoryId: string,
+    input: Readonly<{
+      kind: MemoryKind;
+      content: string;
+      confidence: number;
+    }>,
+    mutation: AdminEvolutionMutation,
+    signal?: AbortSignal,
+  ): Promise<unknown | null>;
+  deleteMemory(
+    scope: AgentScope,
+    memoryId: string,
+    mutation: AdminEvolutionMutation,
+    signal?: AbortSignal,
+  ): Promise<unknown | null>;
+  listReflections(
+    scope: AgentScope,
+    filters: Readonly<{
+      status?: AdminReflectionEntry["status"];
+      limit: number;
+    }>,
+    signal?: AbortSignal,
+  ): Promise<unknown>;
+  actOnReflection(
+    scope: AgentScope,
+    reflectionId: string,
+    action: "apply" | "dismiss",
+    mutation: Readonly<{
+      expectedRevision: number;
+      operationId: string;
+      confirmed: boolean;
+      suggestionIndexes: readonly number[];
     }>,
     signal?: AbortSignal,
   ): Promise<unknown | null>;
@@ -250,6 +323,41 @@ export function projectGoalDetail(
         error_code: step.error ? "goal_step_failed" : null,
         created_at: step.createdAt.toISOString(),
       })),
+  };
+}
+
+export function projectMemoryEntry(
+  entry: AdminMemoryEntry,
+) {
+  return {
+    id: entry.id,
+    kind: entry.kind,
+    content: entry.content,
+    confidence: entry.confidence,
+    source: entry.sourceMessageId
+      ? {
+          type: "message",
+          id: entry.sourceMessageId,
+        }
+      : {
+          type: "system",
+          id: null,
+        },
+    created_at: entry.createdAt.toISOString(),
+    expires_at: entry.expiresAt?.toISOString() ?? null,
+  };
+}
+
+export function projectReflectionEntry(
+  entry: AdminReflectionEntry,
+) {
+  return {
+    id: entry.id,
+    positives: [...entry.positives],
+    negatives: [...entry.negatives],
+    suggestions: [...entry.suggestions],
+    status: entry.status,
+    created_at: entry.createdAt.toISOString(),
   };
 }
 
@@ -528,6 +636,435 @@ export function createPostgresAdminEvolutionService(
         client.release();
       }
     },
+
+    async listMemories(scope, filters, signal) {
+      signal?.throwIfAborted();
+      const result = await pool.query(
+        `SELECT id, kind, content, confidence,
+                source_message_id, created_at, expires_at
+         FROM memory_entries
+         WHERE user_id = $1
+           AND agent_id = $2
+           AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > now())
+           AND ($3::text IS NULL OR kind = $3)
+         ORDER BY created_at DESC, id DESC
+         LIMIT $4`,
+        [
+          scope.userId,
+          scope.agentId,
+          filters.kind ?? null,
+          filters.limit,
+        ],
+      );
+      signal?.throwIfAborted();
+      return {
+        items: result.rows.map((row) =>
+          projectMemoryEntry(mapMemoryRow(row)),
+        ),
+        next_cursor: null,
+      };
+    },
+
+    async updateMemory(
+      scope,
+      memoryId,
+      input,
+      mutation,
+      signal,
+    ) {
+      if (!mutation.confirmed) {
+        throw new AdminEvolutionError(
+          409,
+          "confirmation_required",
+        );
+      }
+      signal?.throwIfAborted();
+      const content = redactSensitiveMemory(input.content);
+      if (!content) {
+        throw new AdminEvolutionError(
+          400,
+          "invalid_memory_content",
+        );
+      }
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const selected = await client.query(
+          `SELECT id, kind, content, confidence,
+                  source_message_id, created_at, expires_at
+           FROM memory_entries
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id = $3
+             AND deleted_at IS NULL
+           FOR UPDATE`,
+          [scope.userId, scope.agentId, memoryId],
+        );
+        const row = selected.rows[0];
+        if (!row) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        if (
+          await hasAuditReplay(
+            client,
+            scope,
+            "memory",
+            memoryId,
+            "memory.update",
+            mutation.operationId,
+          )
+        ) {
+          await client.query("COMMIT");
+          return projectMemoryEntry(mapMemoryRow(row));
+        }
+        const embedding = formatPgVector(
+          await embedText(content, undefined, signal),
+        );
+        signal?.throwIfAborted();
+        const updated = await client.query(
+          `UPDATE memory_entries
+           SET kind = $4,
+               content = $5,
+               confidence = $6,
+               embedding = $7::vector
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id = $3
+             AND deleted_at IS NULL
+           RETURNING id, kind, content, confidence,
+                     source_message_id, created_at, expires_at`,
+          [
+            scope.userId,
+            scope.agentId,
+            memoryId,
+            input.kind,
+            content,
+            input.confidence,
+            embedding,
+          ],
+        );
+        await insertEvolutionAudit(client, {
+          scope,
+          action: "memory.update",
+          resourceType: "memory",
+          resourceId: memoryId,
+          before: {
+            kind: row.kind,
+            confidence: Number(row.confidence),
+          },
+          after: {
+            kind: input.kind,
+            confidence: input.confidence,
+            content_changed: row.content !== content,
+          },
+          operationId: mutation.operationId,
+        });
+        signal?.throwIfAborted();
+        await client.query("COMMIT");
+        return projectMemoryEntry(
+          mapMemoryRow(updated.rows[0]),
+        );
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async deleteMemory(
+      scope,
+      memoryId,
+      mutation,
+      signal,
+    ) {
+      if (!mutation.confirmed) {
+        throw new AdminEvolutionError(
+          409,
+          "confirmation_required",
+        );
+      }
+      signal?.throwIfAborted();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const selected = await client.query(
+          `SELECT id, kind, content, confidence,
+                  source_message_id, created_at, expires_at,
+                  deleted_at
+           FROM memory_entries
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id = $3
+           FOR UPDATE`,
+          [scope.userId, scope.agentId, memoryId],
+        );
+        const row = selected.rows[0];
+        if (!row) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        if (
+          await hasAuditReplay(
+            client,
+            scope,
+            "memory",
+            memoryId,
+            "memory.delete",
+            mutation.operationId,
+          )
+        ) {
+          await client.query("COMMIT");
+          return {
+            id: memoryId,
+            deleted: true,
+          };
+        }
+        if (row.deleted_at !== null) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        await client.query(
+          `UPDATE memory_entries
+           SET deleted_at = now()
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id = $3
+             AND deleted_at IS NULL`,
+          [scope.userId, scope.agentId, memoryId],
+        );
+        await insertEvolutionAudit(client, {
+          scope,
+          action: "memory.delete",
+          resourceType: "memory",
+          resourceId: memoryId,
+          before: {
+            kind: row.kind,
+            confidence: Number(row.confidence),
+          },
+          after: { deleted: true },
+          operationId: mutation.operationId,
+        });
+        signal?.throwIfAborted();
+        await client.query("COMMIT");
+        return {
+          id: memoryId,
+          deleted: true,
+        };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async listReflections(scope, filters, signal) {
+      signal?.throwIfAborted();
+      const [profile, result] = await Promise.all([
+        profileService.read(scope, signal),
+        pool.query(
+          `SELECT id, positives, negatives, suggestions,
+                  status, created_at
+           FROM reflections
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND ($3::text IS NULL OR status = $3)
+           ORDER BY created_at DESC, id DESC
+           LIMIT $4`,
+          [
+            scope.userId,
+            scope.agentId,
+            filters.status ?? null,
+            filters.limit,
+          ],
+        ),
+      ]);
+      signal?.throwIfAborted();
+      return {
+        items: result.rows.map((row) =>
+          projectReflectionEntry(mapReflectionRow(row)),
+        ),
+        profile_revision: profile.revision,
+        next_cursor: null,
+      };
+    },
+
+    async actOnReflection(
+      scope,
+      reflectionId,
+      action,
+      mutation,
+      signal,
+    ) {
+      if (!mutation.confirmed) {
+        throw new AdminEvolutionError(
+          409,
+          "confirmation_required",
+        );
+      }
+      signal?.throwIfAborted();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const selected = await client.query(
+          `SELECT reflection.id, reflection.positives,
+                  reflection.negatives,
+                  reflection.suggestions,
+                  reflection.status,
+                  reflection.created_at,
+                  digital_agents.display_name,
+                  agent_settings.persona,
+                  agent_settings.revision
+           FROM reflections AS reflection
+           JOIN digital_agents
+             ON digital_agents.user_id = reflection.user_id
+            AND digital_agents.id = reflection.agent_id
+            AND digital_agents.status = 'active'
+           JOIN agent_settings
+             ON agent_settings.user_id = digital_agents.user_id
+            AND agent_settings.agent_id = digital_agents.id
+           WHERE reflection.user_id = $1
+             AND reflection.agent_id = $2
+             AND reflection.id = $3
+           FOR UPDATE OF reflection, digital_agents,
+                         agent_settings`,
+          [scope.userId, scope.agentId, reflectionId],
+        );
+        const row = selected.rows[0];
+        if (!row) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        if (
+          await hasAuditReplay(
+            client,
+            scope,
+            "reflection",
+            reflectionId,
+            `reflection.${action}`,
+            mutation.operationId,
+          )
+        ) {
+          await client.query("COMMIT");
+          return {
+            ...projectReflectionEntry(mapReflectionRow(row)),
+            profile_revision: Number(row.revision),
+          };
+        }
+        if (Number(row.revision) !== mutation.expectedRevision) {
+          throw new AdminEvolutionError(
+            409,
+            "revision_conflict",
+          );
+        }
+        if (row.status !== "recorded") {
+          throw new AdminEvolutionError(
+            409,
+            "reflection_already_resolved",
+          );
+        }
+        const suggestions = stringArray(row.suggestions);
+        const selectedSuggestions =
+          action === "apply"
+            ? selectSuggestions(
+                suggestions,
+                mutation.suggestionIndexes,
+              )
+            : [];
+        let revision = Number(row.revision);
+        if (action === "apply") {
+          const persona = mergePersona(row.persona);
+          const nextPersona = {
+            ...persona,
+            style: mergeReflectionSuggestions(
+              persona.style,
+              selectedSuggestions,
+            ),
+          };
+          const updatedSettings = await client.query<{
+            revision: number;
+          }>(
+            `UPDATE agent_settings
+             SET persona = $3::jsonb,
+                 revision = revision + 1,
+                 updated_at = now()
+             WHERE user_id = $1
+               AND agent_id = $2
+               AND revision = $4
+             RETURNING revision`,
+            [
+              scope.userId,
+              scope.agentId,
+              JSON.stringify(nextPersona),
+              mutation.expectedRevision,
+            ],
+          );
+          if (!updatedSettings.rows[0]) {
+            throw new AdminEvolutionError(
+              409,
+              "revision_conflict",
+            );
+          }
+          revision = Number(
+            updatedSettings.rows[0].revision,
+          );
+          await client.query(
+            `UPDATE digital_agents
+             SET persona = $3::jsonb, updated_at = now()
+             WHERE user_id = $1 AND id = $2`,
+            [
+              scope.userId,
+              scope.agentId,
+              JSON.stringify(nextPersona),
+            ],
+          );
+        }
+        const status =
+          action === "apply" ? "applied" : "dismissed";
+        await client.query(
+          `UPDATE reflections
+           SET status = $4
+           WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
+          [scope.userId, scope.agentId, reflectionId, status],
+        );
+        await insertEvolutionAudit(client, {
+          scope,
+          action: `reflection.${action}`,
+          resourceType: "reflection",
+          resourceId: reflectionId,
+          before: {
+            status: row.status,
+            profile_revision: Number(row.revision),
+          },
+          after: {
+            status,
+            profile_revision: revision,
+            applied_suggestion_indexes:
+              action === "apply"
+                ? mutation.suggestionIndexes
+                : [],
+          },
+          operationId: mutation.operationId,
+        });
+        signal?.throwIfAborted();
+        await client.query("COMMIT");
+        return {
+          ...projectReflectionEntry({
+            ...mapReflectionRow(row),
+            status,
+          }),
+          profile_revision: revision,
+        };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
   };
 }
 
@@ -552,6 +1089,186 @@ function projectGoalSummary(goal: DbGoal) {
     created_at: goal.createdAt.toISOString(),
     updated_at: goal.updatedAt.toISOString(),
   };
+}
+
+function mapMemoryRow(
+  row: Record<string, unknown>,
+): AdminMemoryEntry {
+  return {
+    id: String(row.id),
+    kind: row.kind as MemoryKind,
+    content: String(row.content),
+    confidence: Number(row.confidence),
+    sourceMessageId:
+      typeof row.source_message_id === "string"
+        ? row.source_message_id
+        : null,
+    createdAt: new Date(row.created_at as Date | string),
+    expiresAt: dateOrNull(row.expires_at),
+  };
+}
+
+function mapReflectionRow(
+  row: Record<string, unknown>,
+): AdminReflectionEntry {
+  return {
+    id: String(row.id),
+    positives: stringArray(row.positives),
+    negatives: stringArray(row.negatives),
+    suggestions: stringArray(row.suggestions),
+    status:
+      row.status as AdminReflectionEntry["status"],
+    createdAt: new Date(row.created_at as Date | string),
+  };
+}
+
+async function hasAuditReplay(
+  client: PoolClient,
+  scope: AgentScope,
+  resourceType: string,
+  resourceId: string,
+  action: string,
+  operationId: string,
+): Promise<boolean> {
+  const result = await client.query(
+    `SELECT 1
+     FROM admin_audit_logs
+     WHERE user_id = $1
+       AND agent_id = $2
+       AND resource_type = $3
+       AND resource_id = $4
+       AND action = $5
+       AND confirmation_source->>'requestId' = $6
+       AND status = 'success'
+     LIMIT 1`,
+    [
+      scope.userId,
+      scope.agentId,
+      resourceType,
+      resourceId,
+      action,
+      operationId,
+    ],
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function insertEvolutionAudit(
+  client: PoolClient,
+  input: Readonly<{
+    scope: AgentScope;
+    action: string;
+    resourceType: string;
+    resourceId: string;
+    before: Readonly<Record<string, unknown>>;
+    after: Readonly<Record<string, unknown>>;
+    operationId: string;
+  }>,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO admin_audit_logs (
+       user_id, agent_id, action, resource_type,
+       resource_id, before_summary, after_summary,
+       confirmation_source, status, error_code
+     )
+     VALUES (
+       $1, $2, $3, $4, $5,
+       $6::jsonb, $7::jsonb, $8::jsonb,
+       'success', NULL
+     )`,
+    [
+      input.scope.userId,
+      input.scope.agentId,
+      input.action,
+      input.resourceType,
+      input.resourceId,
+      JSON.stringify(input.before),
+      JSON.stringify(input.after),
+      JSON.stringify({
+        type: "console",
+        requestId: input.operationId,
+        confirmed: true,
+      }),
+    ],
+  );
+}
+
+function selectSuggestions(
+  suggestions: readonly string[],
+  indexes: readonly number[],
+): string[] {
+  const unique = [...new Set(indexes)];
+  if (
+    unique.length === 0 ||
+    unique.some(
+      (index) =>
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= suggestions.length,
+    )
+  ) {
+    throw new AdminEvolutionError(
+      400,
+      "invalid_reflection_suggestions",
+    );
+  }
+  return unique.map((index) => suggestions[index]);
+}
+
+function mergePersona(
+  value: unknown,
+): typeof defaultSettings.persona {
+  const record =
+    typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>)
+      : {};
+  return {
+    name:
+      typeof record.name === "string" && record.name.trim()
+        ? record.name.slice(0, 80)
+        : defaultSettings.persona.name,
+    style:
+      typeof record.style === "string" &&
+      record.style.trim()
+        ? record.style.slice(0, 4_000)
+        : defaultSettings.persona.style,
+    emojiHabit:
+      typeof record.emojiHabit === "string"
+        ? record.emojiHabit.slice(0, 500)
+        : defaultSettings.persona.emojiHabit,
+  };
+}
+
+function mergeReflectionSuggestions(
+  currentStyle: string,
+  suggestions: readonly string[],
+): string {
+  const additions = suggestions
+    .map((suggestion) =>
+      suggestion.replace(/[\u0000-\u001f\u007f]+/gu, " ").trim(),
+    )
+    .filter(
+      (suggestion) =>
+        suggestion.length > 0 &&
+        !currentStyle.includes(suggestion),
+    );
+  if (additions.length === 0) return currentStyle;
+  const next = `${currentStyle}\n改进偏好：${additions.join("；")}`;
+  if (next.length > 4_000) {
+    throw new AdminEvolutionError(
+      400,
+      "persona_style_too_long",
+    );
+  }
+  return next;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.slice(0, 4_000))
+    : [];
 }
 
 function mapGoalRow(
