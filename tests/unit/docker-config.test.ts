@@ -38,6 +38,35 @@ describe("docker deployment config", () => {
     expect(caddyfile).toMatch(/request_body @attachmentUpload[\s\S]*max_size 11MB/);
   });
 
+  it("routes only the channel gateway prefix to the agent service", async () => {
+    const [compose, caddyfile] = await Promise.all([
+      readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8"),
+      readFile(path.join(process.cwd(), "Caddyfile"), "utf8"),
+    ]);
+
+    expect(caddyfile).toMatch(
+      /@channelGateway path \/channel-gateway\/\*/,
+    );
+    expect(caddyfile).toMatch(
+      /reverse_proxy @channelGateway agent:3101/,
+    );
+    expect(compose).toMatch(/CHANNEL_GATEWAY_PORT: 3101/);
+    expect(compose).toMatch(/CHANNEL_NODE_PORT: 9443/);
+    expect(compose).toContain(
+      'PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?请设置对应 DOMAIN 的 HTTPS 根地址}"',
+    );
+    expect(
+      compose.match(/^\s+PUBLIC_BASE_URL:/gm),
+    ).toHaveLength(2);
+    expect(compose).toContain(
+      'DOMAIN: "${DOMAIN:?请设置解析到本服务器的 HTTPS 域名}"',
+    );
+    expect(compose).toContain('"${CHANNEL_NODE_PORT:-9443}:9443"');
+    expect(compose).toContain(
+      "${CHANNEL_NODE_TLS_DIR:-./data/channel-node-tls}:/run/digitalmate/channel-node-tls:ro",
+    );
+  });
+
   it("replaces any client original-URI header with Caddy's raw request URI", async () => {
     const caddyfile = await readFile(
       path.join(process.cwd(), "Caddyfile"),
@@ -57,8 +86,12 @@ describe("docker deployment config", () => {
     expect(removeHeader).toBeGreaterThan(proxyStart);
     expect(setHeader).toBeGreaterThan(removeHeader);
     expect(proxyEnd).toBeGreaterThan(setHeader);
-    expect(caddyfile.match(/X-DigitalMate-Original-URI/g)).toHaveLength(
-      2,
+    expect(caddyfile.match(/X-DigitalMate-Original-URI/g)).toHaveLength(3);
+    const gatewayProxy = caddyfile.match(
+      /reverse_proxy @channelGateway agent:3101 \{[\s\S]*?\n\t\}/,
+    )?.[0];
+    expect(gatewayProxy).toContain(
+      "header_up -X-DigitalMate-Original-URI",
     );
   });
 

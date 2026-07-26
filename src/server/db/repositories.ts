@@ -111,10 +111,15 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   channel_runtime_nodes: [
     "id", "user_id", "display_name", "supported_channel_types", "status",
-    "last_heartbeat_at", "created_at", "updated_at",
+    "last_sequence", "last_server_sequence", "last_heartbeat_at",
+    "created_at", "updated_at",
   ],
   channel_node_bindings: [
     "connection_id", "user_id", "agent_id", "node_id", "created_at",
+  ],
+  channel_node_inbound_receipts: [
+    "user_id", "node_id", "connection_id", "client_sequence",
+    "external_event_id", "frame_digest", "ack", "created_at",
   ],
   channel_inbound_events: [
     "id", "user_id", "agent_id", "connection_id", "channel_type",
@@ -235,6 +240,8 @@ const PERSONAL_DATA_EXPORT_ORDER_BY: {
   channel_connections: "id ASC",
   channel_runtime_nodes: "id ASC",
   channel_node_bindings: "connection_id ASC",
+  channel_node_inbound_receipts:
+    "node_id ASC, client_sequence ASC",
   channel_inbound_events: "id ASC",
   channel_execution_steps: "id ASC",
   channel_event_attachments: "id ASC",
@@ -281,6 +288,7 @@ const PERSONAL_DATA_EXPORT_LIMITS = Object.freeze({
   maxSerializedBytes: 32 * 1024 * 1024,
 });
 const PERSONAL_DATA_CLEAR_TABLES = [
+  "channel_node_inbound_receipts",
   "channel_node_outbox",
   "channel_delivery_attempts",
   "channel_deliveries",

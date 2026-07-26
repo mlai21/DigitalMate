@@ -1189,12 +1189,61 @@ CREATE TABLE IF NOT EXISTS channel_runtime_nodes (
   last_sequence bigint NOT NULL DEFAULT 0
     CONSTRAINT channel_runtime_nodes_last_sequence_check
     CHECK (last_sequence >= 0),
+  last_server_sequence bigint NOT NULL DEFAULT 0
+    CONSTRAINT channel_runtime_nodes_last_server_sequence_check
+    CHECK (last_server_sequence >= 0),
   last_heartbeat_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (id, user_id),
   UNIQUE (user_id, certificate_fingerprint)
 );
+
+ALTER TABLE IF EXISTS channel_runtime_nodes
+  ADD COLUMN IF NOT EXISTS
+    last_server_sequence bigint NOT NULL DEFAULT 0;
+
+DO $channel_runtime_nodes_server_sequence_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'channel_runtime_nodes'::regclass
+      AND conname =
+        'channel_runtime_nodes_last_server_sequence_check'
+  ) THEN
+    ALTER TABLE channel_runtime_nodes
+      ADD CONSTRAINT
+        channel_runtime_nodes_last_server_sequence_check
+      CHECK (last_server_sequence >= 0);
+  END IF;
+END
+$channel_runtime_nodes_server_sequence_constraint$;
+
+CREATE OR REPLACE FUNCTION
+  notify_channel_runtime_node_revoked()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $channel_runtime_node_revoked_function$
+BEGIN
+  IF NEW.status = 'revoked'
+     AND OLD.status IS DISTINCT FROM NEW.status THEN
+    PERFORM pg_notify(
+      'channel_runtime_node_revoked',
+      NEW.id::text
+    );
+  END IF;
+  RETURN NEW;
+END
+$channel_runtime_node_revoked_function$;
+
+DROP TRIGGER IF EXISTS
+  channel_runtime_node_revoked_notify
+  ON channel_runtime_nodes;
+CREATE TRIGGER channel_runtime_node_revoked_notify
+AFTER UPDATE OF status ON channel_runtime_nodes
+FOR EACH ROW
+EXECUTE FUNCTION notify_channel_runtime_node_revoked();
 
 DO $channel_connections_runtime_node_constraint$
 BEGIN
@@ -1243,6 +1292,37 @@ CREATE TABLE IF NOT EXISTS channel_node_bindings (
     REFERENCES channel_runtime_nodes(id, user_id)
     ON DELETE CASCADE,
   UNIQUE (node_id, connection_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_node_inbound_receipts (
+  user_id uuid NOT NULL,
+  node_id uuid NOT NULL,
+  connection_id uuid NOT NULL,
+  client_sequence bigint NOT NULL
+    CONSTRAINT channel_node_inbound_receipts_sequence_check
+    CHECK (client_sequence > 0),
+  external_event_id text NOT NULL
+    CONSTRAINT channel_node_inbound_receipts_event_id_check
+    CHECK (btrim(external_event_id) <> ''),
+  frame_digest bytea NOT NULL
+    CONSTRAINT channel_node_inbound_receipts_digest_check
+    CHECK (octet_length(frame_digest) = 32),
+  ack jsonb NOT NULL
+    CONSTRAINT channel_node_inbound_receipts_ack_check
+    CHECK (
+      jsonb_typeof(ack) = 'object'
+      AND pg_column_size(ack) <= 65536
+    ),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT channel_node_inbound_receipts_node_scope_fkey
+    FOREIGN KEY (node_id, user_id)
+    REFERENCES channel_runtime_nodes(id, user_id)
+    ON DELETE CASCADE,
+  CONSTRAINT channel_node_inbound_receipts_connection_scope_fkey
+    FOREIGN KEY (connection_id, user_id)
+    REFERENCES channel_connections(id, user_id)
+    ON DELETE CASCADE,
+  PRIMARY KEY (node_id, client_sequence)
 );
 
 CREATE TABLE IF NOT EXISTS channel_inbound_events (
@@ -1871,6 +1951,19 @@ CREATE TABLE IF NOT EXISTS channel_node_outbox (
   UNIQUE (delivery_id)
 );
 
+UPDATE channel_runtime_nodes AS node
+SET last_server_sequence = GREATEST(
+      node.last_server_sequence,
+      existing.last_sequence
+    )
+FROM (
+  SELECT node_id, MAX(sequence) AS last_sequence
+  FROM channel_node_outbox
+  GROUP BY node_id
+) AS existing
+WHERE node.id = existing.node_id
+  AND node.last_server_sequence < existing.last_sequence;
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1927,6 +2020,8 @@ CREATE INDEX IF NOT EXISTS idx_channel_deliveries_scope_created
   ON channel_deliveries(user_id, agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_channel_runtime_nodes_heartbeat
   ON channel_runtime_nodes(status, last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_channel_node_inbound_receipts_connection
+  ON channel_node_inbound_receipts(connection_id);
 CREATE INDEX IF NOT EXISTS idx_channel_node_outbox_pending
   ON channel_node_outbox(node_id, sequence)
   WHERE status = 'pending';

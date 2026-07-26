@@ -17,12 +17,17 @@ describe("readEnv", () => {
       code: "channel_secrets_key_missing",
     });
     expect(env.channelImportLegacyEnabled).toBe(false);
+    expect(env.channelGatewayPort).toBe(3_101);
+    expect(env.channelNodePort).toBe(9_443);
+    expect(env.channelNodeTls).toEqual({ status: "disabled" });
+    expect(env.publicBaseUrl).toBeNull();
   });
 
   it("keeps channel secret encryption blocked without falling back to APP_SECRET", () => {
     const env = readEnv({
       NODE_ENV: "production",
       APP_SECRET: "production-signing-secret-that-is-at-least-32-bytes",
+      PUBLIC_BASE_URL: "https://mate.example",
     });
 
     expect(env.channelSecretsKey).toEqual({
@@ -36,6 +41,7 @@ describe("readEnv", () => {
       NODE_ENV: "production",
       APP_SECRET: "production-signing-secret-that-is-at-least-32-bytes",
       CHANNEL_SECRETS_KEY: Buffer.alloc(31).toString("base64"),
+      PUBLIC_BASE_URL: "https://mate.example",
     });
 
     expect(env.channelSecretsKey).toEqual({
@@ -97,6 +103,7 @@ describe("readEnv", () => {
       readEnv({
         NODE_ENV: "production",
         APP_SECRET: "1f9eb9813df44927b516cb19171b554fffd1da2a",
+        PUBLIC_BASE_URL: "https://mate.example",
       }).appSecret,
     ).toBe("1f9eb9813df44927b516cb19171b554fffd1da2a");
   });
@@ -130,6 +137,67 @@ describe("readEnv", () => {
     expect(() => readEnv({
       CHANNEL_IMPORT_LEGACY_ENABLED: "true",
     })).toThrow();
+  });
+
+  it("requires complete mTLS paths and normalizes the public root URL", () => {
+    expect(() =>
+      readEnv({
+        CHANNEL_NODE_TLS_CERT_PATH: "./server.crt",
+      }),
+    ).toThrow(/mTLS.*同时配置/);
+
+    const env = readEnv({
+      CHANNEL_GATEWAY_PORT: "0",
+      CHANNEL_NODE_PORT: "10443",
+      CHANNEL_NODE_TLS_CERT_PATH: "./server.crt",
+      CHANNEL_NODE_TLS_KEY_PATH: "./server.key",
+      CHANNEL_NODE_CA_PATH: "./node-ca.crt",
+      PUBLIC_BASE_URL: "https://mate.example/",
+    });
+
+    expect(env.channelGatewayPort).toBe(0);
+    expect(env.channelNodePort).toBe(10_443);
+    expect(env.channelNodeTls).toMatchObject({
+      status: "ready",
+      certificatePath: expect.stringMatching(/server\.crt$/),
+      privateKeyPath: expect.stringMatching(/server\.key$/),
+      certificateAuthorityPath: expect.stringMatching(/node-ca\.crt$/),
+    });
+    expect(env.publicBaseUrl).toBe("https://mate.example");
+    expect(() =>
+      readEnv({
+        PUBLIC_BASE_URL: "https://user:secret@mate.example/",
+      }),
+    ).toThrow(/PUBLIC_BASE_URL/);
+    expect(() =>
+      readEnv({
+        PUBLIC_BASE_URL: "https://mate.example/private",
+      }),
+    ).toThrow(/PUBLIC_BASE_URL/);
+  });
+
+  it("requires HTTPS and nonzero listener ports in production", () => {
+    const production = {
+      NODE_ENV: "production",
+      APP_SECRET:
+        "production-signing-secret-that-is-at-least-32-bytes",
+    } as const;
+
+    expect(() => readEnv({
+      ...production,
+      PUBLIC_BASE_URL: "http://mate.example",
+    })).toThrow(/PUBLIC_BASE_URL.*HTTPS/);
+    expect(() => readEnv(production)).toThrow(
+      /PUBLIC_BASE_URL/,
+    );
+    expect(() => readEnv({
+      ...production,
+      CHANNEL_GATEWAY_PORT: "0",
+    })).toThrow(/CHANNEL_GATEWAY_PORT/);
+    expect(() => readEnv({
+      ...production,
+      CHANNEL_NODE_PORT: "0",
+    })).toThrow(/CHANNEL_NODE_PORT/);
   });
 
   it("reads aliyun iqs search credentials", () => {

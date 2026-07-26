@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { z } from "zod";
 
 import {
@@ -267,6 +269,9 @@ export type NodeFrame = z.infer<typeof nodeFrameSchema>;
 export type NodeInboundFrame = z.infer<
   typeof inboundFrameSchema
 >;
+export type NodeInboundAckFrame = z.infer<
+  typeof inboundAckFrameSchema
+>;
 export type NodeSendFrame = z.infer<typeof sendFrameSchema>;
 export type NodeSendPayload = NodeSendFrame["payload"];
 
@@ -291,6 +296,14 @@ export function parseNodeFrame(value: unknown): NodeFrame {
     throw new Error("node_frame_invalid");
   }
   return parsed.data;
+}
+
+export function createNodeFrameDigest(
+  frame: NodeFrame,
+): Buffer {
+  return createHash("sha256")
+    .update(canonicalJson(frame), "utf8")
+    .digest();
 }
 
 export function createNodeSequenceGuard(
@@ -344,4 +357,33 @@ function assertSequence(value: number): void {
   ) {
     throw new Error("node_sequence_invalid");
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (
+    value === null
+    || typeof value === "string"
+    || typeof value === "boolean"
+  ) {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("node_frame_invalid");
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+      )
+      .join(",")}}`;
+  }
+  throw new Error("node_frame_invalid");
 }

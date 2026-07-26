@@ -4,6 +4,7 @@ import {
   NODE_FRAME_TYPES,
   NODE_MAX_FRAME_BYTES,
   authorizeNodeFrame,
+  createNodeFrameDigest,
   createNodeSequenceGuard,
   parseNodeFrame,
 } from "@/server/channels/nodes/protocol";
@@ -92,6 +93,38 @@ describe("channel node protocol", () => {
       guard.accept(parseNodeFrame(heartbeatFrame(6)))
     ).toThrow("node_sequence_replayed");
     expect(guard.accept(parseNodeFrame(heartbeatFrame(8)))).toBe(8);
+  });
+
+  it("hashes the complete normalized frame with canonical object keys", () => {
+    const first = parseNodeFrame({
+      ...inboundFrame(7),
+      payload: {
+        ...inboundFrame(7).payload,
+        rawSummary: { b: "2", a: "1" },
+      },
+    });
+    const same = parseNodeFrame({
+      ...inboundFrame(7),
+      payload: {
+        ...inboundFrame(7).payload,
+        rawSummary: { a: "1", b: "2" },
+      },
+    });
+    const changed = parseNodeFrame({
+      ...inboundFrame(7),
+      payload: {
+        ...inboundFrame(7).payload,
+        text: "changed",
+        rawSummary: { a: "1", b: "2" },
+      },
+    });
+
+    expect(createNodeFrameDigest(first)).toEqual(
+      createNodeFrameDigest(same),
+    );
+    expect(createNodeFrameDigest(first)).not.toEqual(
+      createNodeFrameDigest(changed),
+    );
   });
 
   it("does not authorize a node for an unbound connection", async () => {

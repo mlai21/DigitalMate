@@ -54,6 +54,22 @@ const envSchema = z.object({
     .enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  CHANNEL_GATEWAY_PORT: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(65_535)
+    .default(3_101),
+  CHANNEL_NODE_PORT: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(65_535)
+    .default(9_443),
+  CHANNEL_NODE_TLS_CERT_PATH: z.string().optional(),
+  CHANNEL_NODE_TLS_KEY_PATH: z.string().optional(),
+  CHANNEL_NODE_CA_PATH: z.string().optional(),
+  PUBLIC_BASE_URL: z.string().optional(),
   ATTACHMENT_STORAGE_DIR: z.string().optional(),
 });
 
@@ -62,7 +78,17 @@ export type AppEnv = ReturnType<typeof readEnv>;
 export function readEnv(source: Record<string, string | undefined> = process.env) {
   const parsed = envSchema.parse(source);
   assertProductionAppSecret(parsed.NODE_ENV, source.APP_SECRET, parsed.APP_SECRET);
+  assertProductionListenerPorts(
+    parsed.NODE_ENV,
+    parsed.CHANNEL_GATEWAY_PORT,
+    parsed.CHANNEL_NODE_PORT,
+  );
   const attachmentStorageDir = parsed.ATTACHMENT_STORAGE_DIR?.trim();
+  const publicBaseUrl = parsePublicBaseUrl(
+    parsed.PUBLIC_BASE_URL,
+    parsed.NODE_ENV,
+  );
+  const channelNodeTls = parseChannelNodeTls(parsed);
 
   return {
     databaseUrl: parsed.DATABASE_URL,
@@ -100,9 +126,101 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     dingTalkRobotCode: parsed.DINGTALK_ROBOT_CODE,
     channelImportLegacyEnabled:
       parsed.CHANNEL_IMPORT_LEGACY_ENABLED,
+    channelGatewayPort: parsed.CHANNEL_GATEWAY_PORT,
+    channelNodePort: parsed.CHANNEL_NODE_PORT,
+    channelNodeTls,
+    publicBaseUrl,
     attachmentStorageDir:
       attachmentStorageDir || path.join(process.cwd(), "data", "attachments"),
   };
+}
+
+function parseChannelNodeTls(parsed: Readonly<{
+  CHANNEL_NODE_TLS_CERT_PATH?: string;
+  CHANNEL_NODE_TLS_KEY_PATH?: string;
+  CHANNEL_NODE_CA_PATH?: string;
+}>):
+  | Readonly<{ status: "disabled" }>
+  | Readonly<{
+      status: "ready";
+      certificatePath: string;
+      privateKeyPath: string;
+      certificateAuthorityPath: string;
+    }> {
+  const values = [
+    parsed.CHANNEL_NODE_TLS_CERT_PATH?.trim(),
+    parsed.CHANNEL_NODE_TLS_KEY_PATH?.trim(),
+    parsed.CHANNEL_NODE_CA_PATH?.trim(),
+  ];
+  if (values.every((value) => !value)) {
+    return { status: "disabled" };
+  }
+  if (values.some((value) => !value)) {
+    throw new Error("渠道节点 mTLS 必须同时配置服务端证书、私钥和客户端 CA。");
+  }
+  return {
+    status: "ready",
+    certificatePath: path.resolve(values[0]!),
+    privateKeyPath: path.resolve(values[1]!),
+    certificateAuthorityPath: path.resolve(values[2]!),
+  };
+}
+
+function parsePublicBaseUrl(
+  value: string | undefined,
+  nodeEnv: "development" | "test" | "production",
+): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    if (nodeEnv === "production") {
+      throw new Error(
+        "生产环境必须配置使用 HTTPS 的 PUBLIC_BASE_URL。",
+      );
+    }
+    return null;
+  }
+  const url = new URL(trimmed);
+  if (
+    url.username
+    || url.password
+    || url.search
+    || url.hash
+    || url.pathname !== "/"
+  ) {
+    throw new Error(
+      "PUBLIC_BASE_URL 必须是无用户名、密码、查询、片段和路径的 HTTP(S) 根地址。",
+    );
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("PUBLIC_BASE_URL 必须使用 HTTP(S)。");
+  }
+  if (
+    nodeEnv === "production"
+    && url.protocol !== "https:"
+  ) {
+    throw new Error(
+      "生产环境 PUBLIC_BASE_URL 必须使用 HTTPS。",
+    );
+  }
+  return url.origin;
+}
+
+function assertProductionListenerPorts(
+  nodeEnv: "development" | "test" | "production",
+  gatewayPort: number,
+  nodePort: number,
+): void {
+  if (nodeEnv !== "production") return;
+  if (gatewayPort === 0) {
+    throw new Error(
+      "生产环境 CHANNEL_GATEWAY_PORT 不能为 0。",
+    );
+  }
+  if (nodePort === 0) {
+    throw new Error(
+      "生产环境 CHANNEL_NODE_PORT 不能为 0。",
+    );
+  }
 }
 
 function assertProductionAppSecret(

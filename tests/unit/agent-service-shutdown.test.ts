@@ -9,6 +9,10 @@ import EmbeddedPostgres from "embedded-postgres";
 import { Pool } from "pg";
 import { afterEach, describe, expect, it } from "vitest";
 
+import {
+  stopAgentServiceResources,
+} from "@/agent-service/index";
+
 const temporaryRoots: string[] = [];
 const children: ChildProcess[] = [];
 
@@ -20,6 +24,71 @@ afterEach(async () => {
 });
 
 describe("agent service shutdown", () => {
+  it("stops gateways before channel workers and database resources", async () => {
+    const order: string[] = [];
+
+    await stopAgentServiceResources({
+      channelGateway: {
+        stop: async () => {
+          order.push("gateway");
+        },
+      },
+      channelRuntime: {
+        stop: async () => {
+          order.push("channel-runtime");
+        },
+      },
+      cleanupScheduler: {
+        stop: async () => {
+          order.push("cleanup");
+        },
+      },
+      closeDatabase: async () => {
+        order.push("database");
+      },
+    });
+
+    expect(order).toEqual([
+      "gateway",
+      "channel-runtime",
+      "cleanup",
+      "database",
+    ]);
+  });
+
+  it("continues releasing resources when gateway shutdown fails", async () => {
+    const order: string[] = [];
+    await expect(
+      stopAgentServiceResources({
+        channelGateway: {
+          stop: async () => {
+            order.push("gateway");
+            throw new Error("gateway_stop_failed");
+          },
+        },
+        channelRuntime: {
+          stop: async () => {
+            order.push("channel-runtime");
+          },
+        },
+        cleanupScheduler: {
+          stop: async () => {
+            order.push("cleanup");
+          },
+        },
+        closeDatabase: async () => {
+          order.push("database");
+        },
+      }),
+    ).rejects.toThrow("gateway_stop_failed");
+    expect(order).toEqual([
+      "gateway",
+      "channel-runtime",
+      "cleanup",
+      "database",
+    ]);
+  });
+
   it("handles SIGTERM, stops cleanup, closes PostgreSQL pools, and exits", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-agent-shutdown-"));
     temporaryRoots.push(root);
@@ -52,6 +121,7 @@ describe("agent service shutdown", () => {
             DATABASE_URL: databaseUrl,
             ATTACHMENT_STORAGE_DIR: path.join(root, "attachments"),
             APP_PASSWORD: "",
+            CHANNEL_GATEWAY_PORT: "0",
           },
           stdio: ["ignore", "pipe", "pipe"],
         },

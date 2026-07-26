@@ -31,6 +31,10 @@ import {
   createChannelNodeRepository,
 } from "@/server/channels/nodes/repository";
 import {
+  createNodeFrameDigest,
+  parseNodeFrame,
+} from "@/server/channels/nodes/protocol";
+import {
   ChannelProcessCrashError,
   createChannelEventWorker,
 } from "@/server/channels/runtime/event-worker";
@@ -782,6 +786,120 @@ describe("channel runtime end-to-end recovery", () => {
     await expect(
       countRows("messages", "role = 'assistant'"),
     ).resolves.toBe(1);
+  });
+
+  it("persists inbound results and reissues ACKs on the shared server sequence", async () => {
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "ACK node",
+      certificateFingerprint: Buffer.alloc(32, 8),
+      supportedChannelTypes: ["telegram"],
+    });
+    await nodes.bindConnection(
+      scope,
+      node.id,
+      CONNECTION_ID,
+    );
+
+    await expect(
+      nodes.allocateServerSequence(USER_ID, node.id),
+    ).resolves.toBe(1);
+    const inbound = parseNodeFrame({
+      type: "inbound",
+      protocolVersion: 1,
+      nodeId: node.id,
+      sequence: 1,
+      sentAt: now.toISOString(),
+      connectionId: CONNECTION_ID,
+      payload: {
+        externalEventId: "node-event-ack-1",
+        externalConversationId: "conversation-1",
+        externalSenderId: "sender-1",
+        chatType: "direct",
+        mentioned: false,
+        text: "hello",
+        thread: {},
+        attachments: [],
+        occurredAt: now.toISOString(),
+        rawSummary: {},
+      },
+    });
+    const frameDigest = createNodeFrameDigest(inbound);
+    const ack = await nodes.recordInboundAck({
+      userId: USER_ID,
+      nodeId: node.id,
+      connectionId: CONNECTION_ID,
+      clientSequence: 1,
+      externalEventId: "node-event-ack-1",
+      disposition: "accepted",
+      eventId: "40000000-0000-4000-8000-000000000001",
+      frameDigest,
+      sentAt: now,
+    });
+
+    expect(ack).toMatchObject({
+      type: "inbound_ack",
+      sequence: 2,
+      externalEventId: "node-event-ack-1",
+      disposition: "accepted",
+    });
+    await expect(nodes.replayInboundAck({
+      userId: USER_ID,
+      nodeId: node.id,
+      clientSequence: 1,
+      frameDigest,
+      sentAt: new Date("2026-07-26T00:01:00.000Z"),
+    })).resolves.toMatchObject({
+      ...ack,
+      sequence: 3,
+      sentAt: "2026-07-26T00:01:00.000Z",
+    });
+    await expect(
+      nodes.allocateServerSequence(USER_ID, node.id),
+    ).resolves.toBe(4);
+    await expect(
+      countRows("channel_node_inbound_receipts", "true"),
+    ).resolves.toBe(1);
+  });
+
+  it("notifies the live node listener when a certificate is revoked", async () => {
+    const nodes = createChannelNodeRepository(pool);
+    const node = await nodes.register({
+      userId: USER_ID,
+      displayName: "Revoked node",
+      certificateFingerprint: Buffer.alloc(32, 10),
+      supportedChannelTypes: ["telegram"],
+    });
+    let notified: ((nodeId: string) => void) | undefined;
+    const notification = new Promise<string>((resolve) => {
+      notified = resolve;
+    });
+    const unsubscribe = await nodes.subscribeToRevocations(
+      (nodeId) => notified?.(nodeId),
+    );
+    try {
+      await pool.query(
+        `UPDATE channel_runtime_nodes
+         SET status = 'revoked'
+         WHERE id = $1`,
+        [node.id],
+      );
+      await expect(Promise.race([
+        notification,
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            () => reject(
+              new Error("node_revocation_notification_timeout"),
+            ),
+            1_000,
+          );
+        }),
+      ])).resolves.toBe(node.id);
+    } finally {
+      await unsubscribe();
+    }
   });
 
   it("retains a delivery without adding outbox rows for a long-offline node", async () => {

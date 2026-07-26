@@ -42,6 +42,7 @@ describe("database schema", () => {
       "channel_access_requests",
       "channel_runtime_nodes",
       "channel_node_bindings",
+      "channel_node_inbound_receipts",
       "channel_node_outbox",
     ]) {
       expect(schema).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
@@ -74,6 +75,19 @@ describe("database schema", () => {
     expect(schema).toContain("channel_deliveries_message_scope_fkey");
     expect(schema).toContain("channel_connections_runtime_node_id_fkey");
     expect(schema).toContain("channel_runtime_node_binding_invalid");
+    expect(schema).toContain("last_server_sequence bigint");
+    expect(schema).toContain(
+      "PRIMARY KEY (node_id, client_sequence)",
+    );
+    expect(schema).toContain(
+      "channel_node_inbound_receipts_digest_check",
+    );
+    expect(schema).toContain(
+      "channel_runtime_node_revoked",
+    );
+    expect(schema).toContain(
+      "SET last_server_sequence = GREATEST(",
+    );
     expect(schema).toContain("pg_column_size(output) <= 65536");
     expect(schema).toContain("pg_column_size(platform_result) <= 65536");
     expect(schema).toContain("idx_channel_inbound_events_claimable");

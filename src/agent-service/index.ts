@@ -1,5 +1,8 @@
 import { pathToFileURL } from "node:url";
 import { createActiveAgentTickRunner } from "@/agent-service/active-agent-tick";
+import {
+  startAgentChannelGateway,
+} from "@/agent-service/channel-gateway";
 import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { buildConversationSummary, shouldCompactConversation } from "@/server/agent/compaction";
 import { extractMemoriesWithLlm } from "@/server/agent/memory-extraction";
@@ -67,6 +70,19 @@ async function main() {
     repositories,
     env,
   });
+  let channelGateway:
+    | Awaited<ReturnType<typeof startAgentChannelGateway>>
+    | undefined;
+  try {
+    channelGateway = await startAgentChannelGateway({ env });
+  } catch (error) {
+    await stopAgentServiceResources({
+      channelRuntime,
+      cleanupScheduler,
+      closeDatabase: closePool,
+    });
+    throw error;
+  }
   const runActiveAgentTick = createActiveAgentTickRunner({
     listActiveAgents: () => repositories.agents.listActive(),
     execute: (scope) => runAgentTickUnderLease(repositories, scope),
@@ -97,13 +113,31 @@ async function main() {
   } finally {
     process.removeListener("SIGINT", requestShutdown);
     process.removeListener("SIGTERM", requestShutdown);
+    await stopAgentServiceResources({
+      channelGateway,
+      channelRuntime,
+      cleanupScheduler,
+      closeDatabase: closePool,
+    });
+  }
+}
+
+export async function stopAgentServiceResources(input: Readonly<{
+  channelGateway?: Readonly<{ stop(): Promise<void> }>;
+  channelRuntime: Readonly<{ stop(): Promise<void> }>;
+  cleanupScheduler: Readonly<{ stop(): Promise<void> }>;
+  closeDatabase(): Promise<void>;
+}>): Promise<void> {
+  try {
+    await input.channelGateway?.stop();
+  } finally {
     try {
-      await channelRuntime.stop();
+      await input.channelRuntime.stop();
     } finally {
       try {
-        await cleanupScheduler.stop();
+        await input.cleanupScheduler.stop();
       } finally {
-        await closePool();
+        await input.closeDatabase();
       }
     }
   }
