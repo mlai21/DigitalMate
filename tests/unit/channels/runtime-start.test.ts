@@ -146,6 +146,130 @@ describe("channel runtime start", () => {
     expect(segments?.prefix).toBe("前");
   });
 
+  it("微信把一条已持久化回复和前缀冻结为一条平台消息", async () => {
+    const send = vi.fn(async () => ({
+      externalMessageId: "wechat-message",
+      sentAt: new Date(),
+      rawSummary: {},
+    }));
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "wechat" as const,
+        enabled: true,
+        revision: 1,
+        config: {
+          bot_token: "secret",
+          base_url: "https://ilinkai.weixin.qq.com",
+          bot_prefix: "前",
+        },
+      })),
+      createAdapter: () => ({
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send,
+      }),
+      loadReplyHandle: vi.fn(async () => ({
+        publicFields: {
+          targetId: "alice@im.wechat",
+        },
+        secretFields: {
+          contextToken: "wechat-context-token",
+        },
+        expiresAt: null,
+      })),
+    });
+    const planned = await transport.segmentBodies!(
+      {
+        ...delivery,
+        body: "第一段。\n\n第二段。",
+      },
+      new AbortController().signal,
+    );
+    expect(planned).toEqual({
+      segments: ["第一段。\n\n第二段。"],
+      prefix: "前",
+    });
+
+    await transport.send({
+      delivery,
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "前第一段。\n\n第二段。",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, new AbortController().signal);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: "前第一段。\n\n第二段。",
+      }),
+      expect.objectContaining({
+        config: expect.objectContaining({
+          bot_prefix: "",
+        }),
+      }),
+    );
+  });
+
+  it("微信拒绝上下文令牌后持久化失效回复句柄", async () => {
+    const invalidateReplyHandle = vi.fn(
+      async () => true,
+    );
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "wechat" as const,
+        enabled: true,
+        revision: 1,
+        config: {
+          bot_token: "secret",
+          base_url: "https://ilinkai.weixin.qq.com",
+        },
+      })),
+      createAdapter: () => ({
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send: vi.fn(async () => {
+          throw Object.assign(
+            new Error("reply_handle_invalid"),
+            { retryable: false },
+          );
+        }),
+      }),
+      loadReplyHandle: vi.fn(async () => ({
+        publicFields: {
+          targetId: "alice@im.wechat",
+        },
+        secretFields: {
+          contextToken: "expired-context-token",
+        },
+        expiresAt: null,
+      })),
+      invalidateReplyHandle,
+    });
+
+    await expect(transport.send({
+      delivery,
+      mode: "segmented",
+      segmentNo: 1,
+      segmentCount: 1,
+      body: "不会重复发送",
+      state: { sequence: 1, final: true },
+      previousResult: null,
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "reply_handle_invalid",
+      retryable: false,
+    });
+    expect(invalidateReplyHandle).toHaveBeenCalledWith(
+      delivery.scope,
+      "reply-1",
+      expect.any(Date),
+    );
+  });
+
   it("发送 Worker 从加密仓储加载配置和回复句柄", async () => {
     const send = vi.fn(async () => ({
       externalMessageId: "platform-1",
@@ -399,6 +523,91 @@ describe("channel runtime start", () => {
         },
       }),
     );
+  });
+
+  it("微信主动任务从数据库复用最近的加密回复句柄", async () => {
+    const enqueueProactive = vi.fn(
+      async () => "delivery-wechat-1",
+    );
+    const query = vi.fn()
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: "connection-wechat" }],
+      })
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: "reply-wechat" }],
+      });
+    const result = await enqueueProactiveChannelDelivery({
+      pool: { query } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-wechat-1",
+      assistantMessageId: "assistant-wechat-1",
+      content: "主动提醒",
+      target: {
+        channel: "wechat",
+        externalConversationId: "alice@im.wechat",
+        externalMessageId: "message-wechat-1",
+        senderId: "alice@im.wechat",
+        chatType: "direct",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: true });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(enqueueProactive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "connection-wechat",
+        replyHandleId: "reply-wechat",
+        recipient: {
+          externalConversationId: "alice@im.wechat",
+          externalUserId: "alice@im.wechat",
+          chatType: "direct",
+        },
+      }),
+    );
+  });
+
+  it("微信没有持久化回复句柄时不靠进程内缓存入队", async () => {
+    const enqueueProactive = vi.fn();
+    const query = vi.fn()
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: "connection-wechat" }],
+      })
+      .mockResolvedValueOnce({
+        rowCount: 0,
+        rows: [],
+      });
+    const result = await enqueueProactiveChannelDelivery({
+      pool: { query } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-wechat-no-handle",
+      assistantMessageId: "assistant-wechat-no-handle",
+      content: "不应入队",
+      target: {
+        channel: "wechat",
+        externalConversationId: "alice@im.wechat",
+        externalMessageId: "message-wechat-no-handle",
+        senderId: "alice@im.wechat",
+        chatType: "direct",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: false });
+    expect(enqueueProactive).not.toHaveBeenCalled();
   });
 
   it("小艺任务句柄过期后不允许退化为主动消息", async () => {

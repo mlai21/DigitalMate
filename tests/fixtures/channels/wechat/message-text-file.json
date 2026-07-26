@@ -1,0 +1,42 @@
+{
+  "from_user_id": "alice@im.wechat",
+  "to_user_id": "bot@im.wechat",
+  "msg_id": "wechat-msg-7001",
+  "message_type": 1,
+  "context_token": "context-secret-7001",
+  "item_list": [
+    {
+      "type": 1,
+      "text_item": {
+        "text": "看看这份记录"
+      }
+    },
+    {
+      "type": 3,
+      "voice_item": {
+        "text_item": {
+          "text": "语音转写内容"
+        }
+      }
+    },
+    {
+      "type": 4,
+      "file_item": {
+        "file_name": "notes.txt",
+        "media": {
+          "encrypt_query_param": "encrypted-query-7001",
+          "aes_key": "MDEyMzQ1Njc4OWFiY2RlZg=="
+        }
+      }
+    },
+    {
+      "type": 5,
+      "video_item": {
+        "media": {
+          "encrypt_query_param": "video-query-ignored",
+          "aes_key": "MDEyMzQ1Njc4OWFiY2RlZg=="
+        }
+      }
+    }
+  ]
+}

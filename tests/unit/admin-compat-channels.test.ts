@@ -17,6 +17,12 @@ import {
   ChannelAdapterRegistry,
   registerStandardChannelAdapters,
 } from "@/server/channels/runtime/registry";
+import {
+  createWechatQrAuthService,
+} from "@/server/admin/wechat-qrcode";
+import {
+  WechatTransportError,
+} from "@/server/channels/adapters/wechat/client";
 
 const USER_ID = "10000000-0000-4000-8000-000000000001";
 const AGENT_ID = "10000000-0000-4000-8000-000000000011";
@@ -161,6 +167,454 @@ describe("admin compatibility channel contract", () => {
         (field) => field.name === "allow_from",
       )?.default,
     ).toBeNull();
+  });
+
+  it("stores confirmed WeChat QR credentials without returning plaintext", async () => {
+    const update = vi.fn<AdminChannelConfigWriter>(
+      async (input) => ({
+        type: input.type,
+        enabled: input.enabled,
+        revision: input.expectedRevision + 1,
+        config: input.config,
+        secrets: {
+          bot_token: {
+            configured: true,
+            lastRotatedAt:
+              "2026-07-26T00:00:00.000Z",
+          },
+        },
+        health: { status: "disabled", detail: {} },
+      }),
+    );
+    const client = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      getQrCode: vi.fn(async () => ({
+        qrcode: "platform-qrcode-secret",
+        qrcode_img_content:
+          Buffer.from("png-fixture").toString("base64"),
+      })),
+      getQrCodeStatus: vi.fn(async () => ({
+        status: "confirmed",
+        bot_token: "wechat-confirmed-secret",
+        baseurl: "https://ilinkai.weixin.qq.com",
+      })),
+      getUpdates: vi.fn(),
+      sendText: vi.fn(),
+      getConfig: vi.fn(),
+      sendTyping: vi.fn(),
+    };
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      clientFactory: () => client,
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+    });
+    const router = createCoreAdminCompatRouter(
+      dependencies({
+        updateChannelConfig: update,
+        wechatQrAuth: qrAuth,
+      }),
+    );
+    const qrResponse = await router.dispatch(
+      await request("/config/channels/wechat/qrcode"),
+      runtime(),
+    );
+    const qr = await qrResponse.json() as {
+      poll_token: string;
+    };
+    expect(JSON.stringify(qr)).not.toContain(
+      "platform-qrcode-secret",
+    );
+
+    const statusResponse = await router.dispatch(
+      await request(
+        `/config/channels/wechat/qrcode/status?token=${
+          encodeURIComponent(qr.poll_token)
+        }`,
+      ),
+      runtime(),
+    );
+    const serialized = JSON.stringify(
+      await statusResponse.json(),
+    );
+    expect(statusResponse.status).toBe(200);
+    expect(JSON.parse(serialized)).toMatchObject({
+      status: "confirmed",
+      credentials: {
+        bot_token: "configured",
+        base_url: "https://ilinkai.weixin.qq.com",
+      },
+    });
+    expect(serialized).not.toContain(
+      "wechat-confirmed-secret",
+    );
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "wechat",
+        secretChanges: [{
+          fieldName: "bot_token",
+          operation: "set",
+          value: "wechat-confirmed-secret",
+        }],
+      }),
+      expect.any(AbortSignal),
+    );
+
+    const replay = await router.dispatch(
+      await request(
+        `/config/channels/wechat/qrcode/status?token=${
+          encodeURIComponent(qr.poll_token)
+        }`,
+      ),
+      runtime(),
+    );
+    await expect(replay.json()).resolves.toEqual({
+      status: "expired",
+    });
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves WeChat QR waiting/scanned/expired states and reports eligibility blocks", async () => {
+    const update = vi.fn<AdminChannelConfigWriter>();
+    const statuses = ["waiting", "scanned", "expired"];
+    const client = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      getQrCode: vi.fn(async () => ({
+        qrcode: "platform-qrcode-secret",
+        qrcode_img_content:
+          Buffer.from("png-fixture").toString("base64"),
+      })),
+      getQrCodeStatus: vi.fn(async () => ({
+        status: statuses.shift(),
+      })),
+      getUpdates: vi.fn(),
+      sendText: vi.fn(),
+      getConfig: vi.fn(),
+      sendTyping: vi.fn(),
+    };
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      clientFactory: () => client,
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+    });
+    const router = createCoreAdminCompatRouter(
+      dependencies({
+        wechatQrAuth: qrAuth,
+      }),
+    );
+    const created = await router.dispatch(
+      await request("/config/channels/wechat/qrcode"),
+      runtime(),
+    );
+    const { poll_token: pollToken } =
+      await created.json() as { poll_token: string };
+    for (const expected of [
+      "waiting",
+      "scanned",
+      "expired",
+    ]) {
+      const response = await router.dispatch(
+        await request(
+          `/config/channels/wechat/qrcode/status?token=${
+            encodeURIComponent(pollToken)
+          }`,
+        ),
+        runtime(),
+      );
+      await expect(response.json()).resolves.toEqual({
+        status: expected,
+      });
+    }
+    expect(update).not.toHaveBeenCalled();
+
+    const blocked = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      clientFactory: () => ({
+        ...client,
+        getQrCode: vi.fn(async () => {
+          throw new WechatTransportError({
+            code: "permission_denied",
+            retryable: false,
+            detail: "wechat_http_403",
+          });
+        }),
+      }),
+    });
+    const blockedRouter = createCoreAdminCompatRouter(
+      dependencies({ wechatQrAuth: blocked }),
+    );
+    const blockedResponse = await blockedRouter.dispatch(
+      await request("/config/channels/wechat/qrcode"),
+      runtime(),
+    );
+    expect(blockedResponse.status).toBe(409);
+    await expect(blockedResponse.json()).resolves.toEqual({
+      error: {
+        code: "channel_blocked",
+        message: "wechat_ilink_eligibility_required",
+      },
+    });
+  });
+
+  it("expires a WeChat QR login session locally after five minutes", async () => {
+    let current = Date.parse("2026-07-26T00:00:00.000Z");
+    const getQrCodeStatus = vi.fn(async () => ({
+      status: "confirmed",
+      bot_token: "must-not-be-read-after-expiry",
+    }));
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: vi.fn(),
+      now: () => new Date(current),
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+      clientFactory: () => ({
+        start: vi.fn(async () => undefined),
+        stop: vi.fn(async () => undefined),
+        getQrCode: vi.fn(async () => ({
+          qrcode: "platform-qrcode-secret",
+          qrcode_img_content:
+            Buffer.from("png-fixture").toString("base64"),
+        })),
+        getQrCodeStatus,
+        getUpdates: vi.fn(),
+        sendText: vi.fn(),
+        getConfig: vi.fn(),
+        sendTyping: vi.fn(),
+      }),
+    });
+    const created = await qrAuth.create({
+      userId: USER_ID,
+      agentId: AGENT_ID,
+    });
+    current += 5 * 60 * 1_000 + 1;
+
+    await expect(qrAuth.poll({
+      userId: USER_ID,
+      agentId: AGENT_ID,
+    }, created.poll_token)).resolves.toEqual({
+      status: "expired",
+    });
+    expect(getQrCodeStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects a WeChat confirmation that crosses the five-minute deadline in flight", async () => {
+    let current = Date.parse("2026-07-26T00:00:00.000Z");
+    let confirm:
+      | ((value: Readonly<Record<string, unknown>>) => void)
+      | undefined;
+    const getQrCodeStatus = vi.fn(() =>
+      new Promise<Readonly<Record<string, unknown>>>(
+        (resolve) => {
+          confirm = resolve;
+        },
+      ));
+    const update = vi.fn<AdminChannelConfigWriter>();
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      now: () => new Date(current),
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+      clientFactory: () => ({
+        start: vi.fn(async () => undefined),
+        stop: vi.fn(async () => undefined),
+        getQrCode: vi.fn(async () => ({
+          qrcode: "platform-qrcode-secret",
+          qrcode_img_content:
+            Buffer.from("png-fixture").toString("base64"),
+        })),
+        getQrCodeStatus,
+        getUpdates: vi.fn(),
+        sendText: vi.fn(),
+        getConfig: vi.fn(),
+        sendTyping: vi.fn(),
+      }),
+    });
+    const scope = {
+      userId: USER_ID,
+      agentId: AGENT_ID,
+    };
+    const created = await qrAuth.create(scope);
+    current += 5 * 60 * 1_000 - 1_000;
+    const polling = qrAuth.poll(
+      scope,
+      created.poll_token,
+    );
+    await vi.waitFor(() => {
+      expect(getQrCodeStatus).toHaveBeenCalledTimes(1);
+    });
+    current += 2_000;
+    confirm?.({
+      status: "confirmed",
+      bot_token: "too-late-secret",
+      baseurl: "https://ilinkai.weixin.qq.com",
+    });
+
+    await expect(polling).resolves.toEqual({
+      status: "expired",
+    });
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("keeps confirmed WeChat credentials until the encrypted config write succeeds", async () => {
+    let updateAttempts = 0;
+    const update = vi.fn<AdminChannelConfigWriter>(
+      async (input) => {
+        updateAttempts += 1;
+        if (updateAttempts === 1) {
+          throw new Error("temporary_database_failure");
+        }
+        return {
+          type: input.type,
+          enabled: input.enabled,
+          revision: input.expectedRevision + 1,
+          config: input.config,
+          secrets: {
+            bot_token: {
+              configured: true,
+              lastRotatedAt:
+                "2026-07-26T00:00:00.000Z",
+            },
+          },
+          health: { status: "disabled", detail: {} },
+        };
+      },
+    );
+    const getQrCodeStatus = vi.fn(async () => ({
+      status: "confirmed",
+      bot_token: "wechat-confirmed-secret",
+      baseurl: "https://ilinkai.weixin.qq.com",
+    }));
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+      clientFactory: () => ({
+        start: vi.fn(async () => undefined),
+        stop: vi.fn(async () => undefined),
+        getQrCode: vi.fn(async () => ({
+          qrcode: "platform-qrcode-secret",
+          qrcode_img_content:
+            Buffer.from("png-fixture").toString("base64"),
+        })),
+        getQrCodeStatus,
+        getUpdates: vi.fn(),
+        sendText: vi.fn(),
+        getConfig: vi.fn(),
+        sendTyping: vi.fn(),
+      }),
+    });
+    const scope = {
+      userId: USER_ID,
+      agentId: AGENT_ID,
+    };
+    const created = await qrAuth.create(scope);
+
+    await expect(
+      qrAuth.poll(scope, created.poll_token),
+    ).rejects.toThrow("temporary_database_failure");
+    await expect(
+      qrAuth.poll(scope, created.poll_token),
+    ).resolves.toMatchObject({
+      status: "confirmed",
+      credentials: {
+        bot_token: "configured",
+      },
+    });
+    expect(getQrCodeStatus).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(
+      update.mock.calls[0]?.[0].operationId,
+    ).toBe(update.mock.calls[1]?.[0].operationId);
+  });
+
+  it("serializes concurrent polls for the same WeChat QR session", async () => {
+    let confirm:
+      | ((value: Readonly<Record<string, unknown>>) => void)
+      | undefined;
+    const getQrCodeStatus = vi.fn(() =>
+      new Promise<Readonly<Record<string, unknown>>>(
+        (resolve) => {
+          confirm = resolve;
+        },
+      ));
+    const update = vi.fn<AdminChannelConfigWriter>(
+      async (input) => ({
+        type: input.type,
+        enabled: input.enabled,
+        revision: input.expectedRevision + 1,
+        config: input.config,
+        secrets: {
+          bot_token: {
+            configured: true,
+            lastRotatedAt:
+              "2026-07-26T00:00:00.000Z",
+          },
+        },
+        health: { status: "disabled", detail: {} },
+      }),
+    );
+    const qrAuth = createWechatQrAuthService({
+      hmacKey: "test-wechat-qr-hmac-key",
+      readChannels,
+      updateChannel: update,
+      randomToken: () =>
+        "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+      clientFactory: () => ({
+        start: vi.fn(async () => undefined),
+        stop: vi.fn(async () => undefined),
+        getQrCode: vi.fn(async () => ({
+          qrcode: "platform-qrcode-secret",
+          qrcode_img_content:
+            Buffer.from("png-fixture").toString("base64"),
+        })),
+        getQrCodeStatus,
+        getUpdates: vi.fn(),
+        sendText: vi.fn(),
+        getConfig: vi.fn(),
+        sendTyping: vi.fn(),
+      }),
+    });
+    const scope = {
+      userId: USER_ID,
+      agentId: AGENT_ID,
+    };
+    const created = await qrAuth.create(scope);
+    const first = qrAuth.poll(scope, created.poll_token);
+    await vi.waitFor(() => {
+      expect(getQrCodeStatus).toHaveBeenCalledTimes(1);
+    });
+
+    await expect(
+      qrAuth.poll(scope, created.poll_token),
+    ).resolves.toEqual({ status: "waiting" });
+    confirm?.({
+      status: "confirmed",
+      bot_token: "wechat-confirmed-secret",
+      baseurl: "https://ilinkai.weixin.qq.com",
+    });
+    await expect(first).resolves.toMatchObject({
+      status: "confirmed",
+      credentials: {
+        bot_token: "configured",
+      },
+    });
+    expect(getQrCodeStatus).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(1);
   });
 
   it("accepts a finite decimal SIP call_timeout through the API contract", async () => {

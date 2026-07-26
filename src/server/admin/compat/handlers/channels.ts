@@ -11,6 +11,9 @@ import {
   isChannelType,
   type ChannelType,
 } from "@/server/channels/manifests/catalog";
+import type {
+  WechatQrAuthService,
+} from "@/server/admin/wechat-qrcode";
 
 const operationIdSchema = z.string().regex(
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -200,6 +203,59 @@ export function createUpdateChannelsHandler(
       ]),
     );
   };
+}
+
+export function createWechatQrCodeHandler(
+  service: WechatQrAuthService,
+): AdminCompatHandler {
+  return async (context) => {
+    try {
+      return await service.create(
+        context.scope,
+        context.signal,
+      );
+    } catch (error) {
+      throw mapWechatQrError(error);
+    }
+  };
+}
+
+export function createWechatQrCodeStatusHandler(
+  service: WechatQrAuthService,
+): AdminCompatHandler {
+  return async (context) => {
+    const pollToken = new URL(
+      context.request.url,
+    ).searchParams.get("token") ?? "";
+    try {
+      return await service.poll(
+        context.scope,
+        pollToken,
+        context.signal,
+      );
+    } catch (error) {
+      throw mapWechatQrError(error);
+    }
+  };
+}
+
+function mapWechatQrError(error: unknown): unknown {
+  if (
+    error
+    && typeof error === "object"
+    && "code" in error
+    && (
+      error.code === "permission_denied"
+      || error.code === "credential_invalid"
+    )
+  ) {
+    return new AdminCompatError(
+      409,
+      "channel_blocked",
+      "wechat_ilink_eligibility_required",
+    );
+  }
+  return error;
 }
 
 function parseChannelWrite(

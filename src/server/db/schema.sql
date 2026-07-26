@@ -1536,6 +1536,7 @@ CREATE TABLE IF NOT EXISTS channel_reply_handles (
     CONSTRAINT channel_reply_handles_key_version_check
     CHECK (key_version > 0),
   expires_at timestamptz,
+  invalidated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT channel_reply_handles_user_agent_fkey
     FOREIGN KEY (user_id, agent_id)
@@ -1548,6 +1549,9 @@ CREATE TABLE IF NOT EXISTS channel_reply_handles (
   UNIQUE (id, user_id, agent_id),
   UNIQUE (event_id)
 );
+
+ALTER TABLE IF EXISTS channel_reply_handles
+  ADD COLUMN IF NOT EXISTS invalidated_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS channel_deliveries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

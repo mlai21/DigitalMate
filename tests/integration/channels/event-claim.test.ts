@@ -25,6 +25,16 @@ import {
   prepareXiaoYiAttachmentBatch,
 } from "@/server/channels/adapters/xiaoyi/transport";
 import {
+  createWechatAdapter,
+} from "@/server/channels/adapters/wechat";
+import {
+  encryptWechatMedia,
+} from "@/server/channels/adapters/wechat/crypto";
+import {
+  createWechatAttachmentFetcher,
+  prepareWechatAttachmentBatch,
+} from "@/server/channels/adapters/wechat/media";
+import {
   createYuanbaoAdapter,
 } from "@/server/channels/adapters/yuanbao";
 import {
@@ -53,6 +63,9 @@ import {
 import {
   createChannelReplyHandleRepository,
 } from "@/server/channels/runtime/reply-handle";
+import {
+  enqueueProactiveChannelDelivery,
+} from "@/server/channels/runtime/start";
 import { createChannelDeliveryRepository } from "@/server/channels/runtime/delivery-repository";
 import type { NormalizedChannelEvent } from "@/server/channels/runtime/types";
 import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
@@ -442,6 +455,238 @@ describe("channel event transaction ledger", () => {
       new Date(firstReceivedAt.getTime() + 1),
     )).resolves.toMatchObject({ kind: "duplicate" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates a retried WeChat message and keeps its reply token private", async () => {
+    await pool.query(
+      `UPDATE channel_connections
+       SET channel_type = 'wechat',
+           enabled = true
+       WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    const keyState = createChannelSecretsKey(
+      Buffer.alloc(32, 61).toString("base64"),
+    );
+    if (keyState.status !== "ready") {
+      throw new Error("test_channel_key_invalid");
+    }
+    const events = createChannelEventRepository(pool);
+    const handles = createChannelReplyHandleRepository(
+      pool,
+      keyState.key,
+    );
+    const locators = createChannelAttachmentLocatorRepository(
+      pool,
+      keyState.key,
+    );
+    const adapter = createWechatAdapter({
+      autoListen: false,
+    });
+    adapter.validateConfig({
+      enabled: true,
+      bot_token: "wechat-bot-secret",
+      base_url: "https://ilinkai.weixin.qq.com",
+      message_merge_enabled: true,
+      message_merge_delay_ms: 0,
+    });
+    const fixture = JSON.parse(
+      await readFile(
+        path.join(
+          process.cwd(),
+          "tests/fixtures/channels/wechat/message-text-file.json",
+        ),
+        "utf8",
+      ),
+    ) as unknown;
+    const aesKey =
+      Buffer.from("0123456789abcdef").toString("base64");
+    const encrypted = encryptWechatMedia(
+      Buffer.from("hello"),
+      aesKey,
+    );
+    const fetchImpl = vi.fn(async () =>
+      new Response(Uint8Array.from(encrypted).buffer, {
+        status: 200,
+      }));
+    const fetcher = createWechatAttachmentFetcher({
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    const access = {
+      evaluate: async () => ({
+        kind: "allowed" as const,
+        allowed: true as const,
+      }),
+      recordPendingRequest: async () => undefined,
+    };
+    const ingest = (receivedAt: Date) => acceptInbound({
+      adapter: adapter as ChannelAdapter<
+        Record<string, unknown>
+      >,
+      payload: fixture,
+      context: {
+        connectionId: CONNECTION_A,
+        agentId: AGENT_ID,
+        receivedAt,
+      },
+      scope,
+      access,
+      events,
+      afterPersist: async (event, normalized) => {
+        await handles.persist(
+          scope,
+          event.id,
+          CONNECTION_A,
+          normalized.replyHandle!,
+          receivedAt,
+        );
+        const pending = await prepareWechatAttachmentBatch({
+          scope,
+          eventId: event.id,
+          connectionId: CONNECTION_A,
+          descriptors: normalized.attachments,
+          expiresAt: new Date(
+            receivedAt.getTime() + 15 * 60 * 1_000,
+          ),
+          receivedAt,
+          locators,
+          fetcher,
+        });
+        for (const descriptor of pending) {
+          const attachmentId =
+            "72000000-0000-4000-8000-000000000001";
+          await pool.query(
+            `INSERT INTO message_attachments (
+               id, user_id, agent_id, kind, file_name,
+               mime_type, size_bytes, storage_key, status
+             )
+             VALUES (
+               $1, $2, $3, 'document', 'notes.txt',
+               'text/plain', 5,
+               '72000000-0000-4000-8000-000000000001',
+               'ready'
+             )`,
+            [attachmentId, USER_ID, AGENT_ID],
+          );
+          await expect(locators.bindPrivateAttachment(
+            scope,
+            event.id,
+            descriptor.externalAttachmentId,
+            attachmentId,
+            receivedAt,
+          )).resolves.toBe(true);
+          fetcher.release(descriptor);
+        }
+      },
+    });
+    const firstReceivedAt =
+      new Date("2026-07-26T00:00:00.000Z");
+
+    const first = await ingest(firstReceivedAt);
+    const duplicate = await ingest(
+      new Date(firstReceivedAt.getTime() + 1),
+    );
+    expect(first).toMatchObject({ kind: "accepted" });
+    expect(duplicate).toMatchObject({ kind: "duplicate" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const stored = await pool.query<{
+      secret_ciphertext: Buffer;
+    }>(
+      `SELECT secret_ciphertext
+       FROM channel_reply_handles
+       WHERE user_id = $1 AND agent_id = $2`,
+      [USER_ID, AGENT_ID],
+    );
+    expect(stored.rows).toHaveLength(1);
+    expect(
+      stored.rows[0]?.secret_ciphertext.toString("utf8"),
+    ).not.toContain("context-secret-7001");
+    if (first.kind !== "accepted") {
+      throw new Error("wechat_first_ingress_not_accepted");
+    }
+    const handleId = await handles.findIdForEvent(
+      scope,
+      first.eventId,
+    );
+    expect(handleId).not.toBeNull();
+    const conversationId =
+      "73000000-0000-4000-8000-000000000001";
+    const taskId =
+      "74000000-0000-4000-8000-000000000001";
+    const assistantMessageId =
+      "75000000-0000-4000-8000-000000000001";
+    await pool.query(
+      `INSERT INTO conversations (
+         id, user_id, agent_id, channel, title
+       )
+       VALUES ($1, $2, $3, 'wechat', 'WeChat reminder')`,
+      [conversationId, USER_ID, AGENT_ID],
+    );
+    await pool.query(
+      `INSERT INTO proactive_tasks (
+         id, user_id, agent_id, conversation_id,
+         kind, content, scheduled_at
+       )
+       VALUES ($1, $2, $3, $4, 'reminder', '喝水', now())`,
+      [taskId, USER_ID, AGENT_ID, conversationId],
+    );
+    await pool.query(
+      `INSERT INTO messages (
+         id, user_id, agent_id, conversation_id,
+         role, content, source_task_id
+       )
+       VALUES (
+         $1, $2, $3, $4, 'assistant', '提醒一下：喝水', $5
+       )`,
+      [
+        assistantMessageId,
+        USER_ID,
+        AGENT_ID,
+        conversationId,
+        taskId,
+      ],
+    );
+    const enqueueReminder = () =>
+      enqueueProactiveChannelDelivery({
+        pool,
+        repositories: {
+          channelDeliveries:
+            createChannelDeliveryRepository(pool),
+        } as never,
+        scope,
+        taskId,
+        assistantMessageId,
+        content: "提醒一下：喝水",
+        target: {
+          channel: "wechat",
+          externalConversationId: "alice@im.wechat",
+          externalMessageId: "wechat-msg-7001",
+          senderId: "alice@im.wechat",
+          chatType: "direct",
+          text: "",
+          occurredAt: firstReceivedAt,
+        },
+      });
+    await expect(enqueueReminder())
+      .resolves.toEqual({ queued: true });
+    await expect(pool.query<{
+      reply_handle_id: string | null;
+    }>(
+      `SELECT reply_handle_id
+       FROM channel_deliveries
+       WHERE source_task_id = $1`,
+      [taskId],
+    )).resolves.toMatchObject({
+      rows: [{ reply_handle_id: handleId }],
+    });
+    await expect(
+      handles.invalidate(scope, handleId!, firstReceivedAt),
+    ).resolves.toBe(true);
+    await expect(
+      handles.load(scope, handleId!, firstReceivedAt),
+    ).resolves.toBeNull();
+    await expect(enqueueReminder())
+      .resolves.toEqual({ queued: false });
   });
 
   it("does not fetch a bound Yuanbao attachment again on platform retry", async () => {

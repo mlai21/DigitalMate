@@ -603,9 +603,10 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
   },
   wechat: {
     label: "微信",
-    description: "连接微信机器人网关",
-    runtime: "gateway",
-    capabilities: ["attachments", "groups", "typing"],
+    description: "连接微信 iLink 机器人",
+    runtime: "central",
+    capabilities: ["attachments", "typing"],
+    prerequisites: ["微信 iLink 机器人内测资格"],
     platformFields: [
       secretField("bot_token", "Bot Token"),
       secretField("bot_token_file", "Bot Token 文件"),

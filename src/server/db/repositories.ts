@@ -136,7 +136,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "created_at",
   ],
   channel_reply_handles: [
-    "id", "user_id", "agent_id", "event_id", "expires_at", "created_at",
+    "id", "user_id", "agent_id", "event_id", "expires_at",
+    "invalidated_at", "created_at",
   ],
   channel_deliveries: [
     "id", "user_id", "agent_id", "event_id", "connection_id",

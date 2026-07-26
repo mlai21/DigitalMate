@@ -154,6 +154,7 @@ export function createChannelReplyHandleRepository(
          WHERE handle.id = $1
            AND handle.user_id = $2
            AND handle.agent_id = $3
+           AND handle.invalidated_at IS NULL
            AND (
              handle.expires_at IS NULL
              OR handle.expires_at > $4
@@ -162,6 +163,28 @@ export function createChannelReplyHandleRepository(
       );
       const row = result.rows[0];
       return row ? unseal(scope, row, key) : null;
+    },
+
+    async invalidate(
+      scope: AgentScope,
+      handleId: string,
+      now = new Date(),
+    ): Promise<boolean> {
+      const result = await pool.query(
+        `UPDATE channel_reply_handles
+         SET invalidated_at = $4
+         WHERE id = $1
+           AND user_id = $2
+           AND agent_id = $3
+           AND invalidated_at IS NULL`,
+        [
+          handleId,
+          scope.userId,
+          scope.agentId,
+          now,
+        ],
+      );
+      return (result.rowCount ?? 0) > 0;
     },
   };
 }

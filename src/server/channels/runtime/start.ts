@@ -91,6 +91,13 @@ import {
   type YuanbaoAttachmentFetcher,
 } from "@/server/channels/adapters/yuanbao/media";
 import {
+  createWechatAdapter,
+} from "@/server/channels/adapters/wechat";
+import {
+  prepareWechatAttachmentBatch,
+  type WechatAttachmentFetcher,
+} from "@/server/channels/adapters/wechat/media";
+import {
   createTelegramTransport,
 } from "@/server/channels/adapters/telegram/transport";
 import { createSlackWebhookAdapter } from "@/server/channels/adapters/webhook/slack";
@@ -400,6 +407,9 @@ export async function startChannelRuntime(input: Readonly<{
     loadReplyHandle: (scope, handleId) =>
       replyHandles?.load(scope, handleId)
       ?? Promise.resolve(null),
+    invalidateReplyHandle: (scope, handleId, at) =>
+      replyHandles?.invalidate(scope, handleId, at)
+      ?? Promise.resolve(false),
   });
   const deliveryWorker = createChannelDeliveryWorker({
     owner: `${owner}:delivery`,
@@ -455,6 +465,7 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
       "matrix",
       "wecom",
       "yuanbao",
+      "wechat",
     ]
       .includes(input.target.channel)
   ) {
@@ -479,12 +490,47 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
   );
   const connectionId = connection.rows[0]?.id;
   if (!connectionId) return { queued: false };
+  let replyHandleId: string | undefined;
+  if (input.target.channel === "wechat") {
+    if (input.target.chatType !== "direct") {
+      return { queued: false };
+    }
+    const handle = await pool.query<{ id: string }>(
+      `SELECT handle.id
+       FROM channel_reply_handles AS handle
+       JOIN channel_inbound_events AS event
+         ON event.id = handle.event_id
+        AND event.user_id = handle.user_id
+        AND event.agent_id = handle.agent_id
+       WHERE handle.user_id = $1
+         AND handle.agent_id = $2
+         AND event.connection_id = $3
+         AND event.channel_type = 'wechat'
+         AND handle.public_fields->>'targetId' = $4
+         AND handle.invalidated_at IS NULL
+         AND (
+           handle.expires_at IS NULL
+           OR handle.expires_at > now()
+         )
+       ORDER BY event.received_at DESC, handle.created_at DESC
+       LIMIT 1`,
+      [
+        input.scope.userId,
+        input.scope.agentId,
+        connectionId,
+        input.target.senderId,
+      ],
+    );
+    replyHandleId = handle.rows[0]?.id;
+    if (!replyHandleId) return { queued: false };
+  }
 
   await input.repositories.channelDeliveries.enqueueProactive({
     scope: input.scope,
     sourceTaskId: input.taskId,
     connectionId,
     assistantMessageId: input.assistantMessageId,
+    ...(replyHandleId ? { replyHandleId } : {}),
     body: input.content,
     recipient: {
       externalConversationId:
@@ -507,6 +553,11 @@ export function createChannelDeliveryTransport(input: Readonly<{
     scope: ClaimedChannelDelivery["scope"],
     handleId: string,
   ): Promise<UnsealedReplyHandle | null>;
+  invalidateReplyHandle?(
+    scope: ClaimedChannelDelivery["scope"],
+    handleId: string,
+    at: Date,
+  ): Promise<boolean>;
   now?: () => Date;
 }>): ChannelDeliveryTransport {
   const now = input.now ?? (() => new Date());
@@ -569,7 +620,17 @@ export function createChannelDeliveryTransport(input: Readonly<{
         delivery,
       );
       if (resolved.channelType !== "yuanbao") {
-        return null;
+        if (resolved.channelType !== "wechat") {
+          return null;
+        }
+        const prefix =
+          typeof resolved.config.bot_prefix === "string"
+            ? resolved.config.bot_prefix
+            : "";
+        return {
+          segments: [delivery.body],
+          prefix,
+        };
       }
       const prefix =
         typeof resolved.config.bot_prefix === "string"
@@ -641,7 +702,10 @@ export function createChannelDeliveryTransport(input: Readonly<{
         return await resolved.adapter.send(
           channelDelivery,
           {
-            config: resolved.channelType === "yuanbao"
+            config: (
+              resolved.channelType === "yuanbao"
+              || resolved.channelType === "wechat"
+            )
               ? {
                   ...resolved.config,
                   bot_prefix: "",
@@ -653,6 +717,17 @@ export function createChannelDeliveryTransport(input: Readonly<{
         );
       } catch (error) {
         if (signal.aborted) throw error;
+        if (
+          part.delivery.replyHandleId
+          && input.invalidateReplyHandle
+          && isReplyHandleInvalid(error)
+        ) {
+          await input.invalidateReplyHandle(
+            part.delivery.scope,
+            part.delivery.replyHandleId,
+            now(),
+          );
+        }
         throw normalizeAdapterSendError(error);
       }
     },
@@ -776,6 +851,11 @@ function createManagedAdapter(
       ) as ChannelAdapter<Record<string, unknown>>;
     case "yuanbao":
       return createManagedYuanbaoAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
+    case "wechat":
+      return createManagedWechatAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
@@ -1296,6 +1376,124 @@ function createManagedYuanbaoAdapter(
                 attachmentFetcher as YuanbaoAttachmentFetcher;
               const pendingAttachments =
                 await prepareYuanbaoAttachmentBatch({
+                  scope: event.scope,
+                  eventId: event.id,
+                  connectionId: event.connectionId,
+                  descriptors: normalized.attachments,
+                  expiresAt,
+                  receivedAt: context.receivedAt,
+                  locators,
+                  fetcher,
+                  signal,
+                });
+              try {
+                for (const descriptor of pendingAttachments) {
+                  await downloadInboundAttachment({
+                    scope: event.scope,
+                    descriptor,
+                    fetcher,
+                    storageRoot:
+                      dependencies.attachmentStorageDir,
+                    repository:
+                      dependencies.repositories.messageAttachments,
+                    bindPrivateAttachment: async (
+                      attachmentId,
+                    ) => {
+                      const bound =
+                        await locators.bindPrivateAttachment(
+                          event.scope,
+                          event.id,
+                          descriptor.externalAttachmentId,
+                          attachmentId,
+                          new Date(),
+                        );
+                      if (!bound) {
+                        throw new Error(
+                          "attachment_bind_transition_failed",
+                        );
+                      }
+                    },
+                    signal,
+                  });
+                }
+              } finally {
+                for (const descriptor of pendingAttachments) {
+                  fetcher.release(descriptor);
+                }
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
+}
+
+function createManagedWechatAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createWechatAdapter({
+    scope: connection.scope,
+    acceptInbound: (
+      payload,
+      context,
+      scope,
+      attachmentFetcher,
+    ) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 15 * 60 * 1_000,
+              );
+              const fetcher =
+                attachmentFetcher as WechatAttachmentFetcher;
+              const pendingAttachments =
+                await prepareWechatAttachmentBatch({
                   scope: event.scope,
                   eventId: event.id,
                   connectionId: event.connectionId,
@@ -2393,6 +2591,11 @@ function normalizeAdapterSendError(
       : code,
     retryable: !nonRetryable,
   });
+}
+
+function isReplyHandleInvalid(error: unknown): boolean {
+  return error instanceof Error
+    && error.message === "reply_handle_invalid";
 }
 
 function stableRuntimeErrorCode(error: unknown): string {

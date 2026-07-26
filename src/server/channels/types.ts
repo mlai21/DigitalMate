@@ -36,6 +36,7 @@ export type ChannelName =
   | "wecom"
   | "xiaoyi"
   | "yuanbao"
+  | "wechat"
   | "web";
 
 export type NormalizedChannelMessage = {

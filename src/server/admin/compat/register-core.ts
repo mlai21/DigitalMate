@@ -51,12 +51,18 @@ import {
   createListChannelsHandler,
   createUpdateChannelHandler,
   createUpdateChannelsHandler,
+  createWechatQrCodeHandler,
+  createWechatQrCodeStatusHandler,
   listChannelSchemas,
   listChannelTypes,
   type AdminChannelConfigReader,
   type AdminChannelConfigBatchWriter,
   type AdminChannelConfigWriter,
 } from "@/server/admin/compat/handlers/channels";
+import {
+  createWechatQrAuthService,
+  type WechatQrAuthService,
+} from "@/server/admin/wechat-qrcode";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
@@ -74,6 +80,7 @@ export type CoreAdminCompatDependencies = Readonly<{
   readChannelConfigs?: AdminChannelConfigReader;
   updateChannelConfig?: AdminChannelConfigWriter;
   updateChannelConfigs?: AdminChannelConfigBatchWriter;
+  wechatQrAuth?: WechatQrAuthService;
 }>;
 
 export function createCoreAdminCompatRouter(
@@ -164,6 +171,22 @@ export function createCoreAdminCompatRouter(
       createUpdateChannelHandler(dependencies.updateChannelConfig),
       channelRouteOptions,
     );
+    if (dependencies.wechatQrAuth) {
+      router.get(
+        "/config/channels/wechat/qrcode",
+        createWechatQrCodeHandler(
+          dependencies.wechatQrAuth,
+        ),
+        channelRouteOptions,
+      );
+      router.get(
+        "/config/channels/wechat/qrcode/status",
+        createWechatQrCodeStatusHandler(
+          dependencies.wechatQrAuth,
+        ),
+        channelRouteOptions,
+      );
+    }
   }
 
   for (const path of ["/language", "/settings/language"]) {
@@ -204,6 +227,13 @@ export async function dispatchAdminCompatRequest(
       : null;
   const getChannelConfigService = () =>
     createAdminChannelConfigService(getPool(), channelSecretKey);
+  const wechatQrAuth = getDefaultWechatQrAuth({
+    hmacKey: env.appSecret,
+    readChannels: (scope, signal) =>
+      getChannelConfigService().read(scope, signal),
+    updateChannel: (input, signal) =>
+      getChannelConfigService().update(input, signal),
+  });
   const securityRepositories = createRepositories();
   const defaultUser = await securityRepositories.users.ensureDefault();
   const security = {
@@ -228,6 +258,7 @@ export async function dispatchAdminCompatRequest(
       getChannelConfigService().update(input, signal),
     updateChannelConfigs: (inputs, signal) =>
       getChannelConfigService().updateMany(inputs, signal),
+    wechatQrAuth,
   });
   const runtime = {
     security,
@@ -265,6 +296,18 @@ export async function dispatchAdminCompatRequest(
   return router.dispatch(request, runtime, {
     routeSegments: route.routeSegments,
   });
+}
+
+let defaultWechatQrAuth:
+  WechatQrAuthService | null = null;
+
+function getDefaultWechatQrAuth(input: Readonly<{
+  hmacKey: string;
+  readChannels: AdminChannelConfigReader;
+  updateChannel: AdminChannelConfigWriter;
+}>): WechatQrAuthService {
+  defaultWechatQrAuth ??= createWechatQrAuthService(input);
+  return defaultWechatQrAuth;
 }
 
 function createRootHandler(

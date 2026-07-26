@@ -482,6 +482,18 @@ function eventPayloadHash(
       replyHandleRequired,
     });
   }
+  if (stored.channelType === "wechat") {
+    const {
+      occurredAt: _localOccurrenceTime,
+      ...stableWechatEvent
+    } = stableEvent;
+    void _localOccurrenceTime;
+    return hashCanonical({
+      normalizedEvent: stableWechatEvent,
+      permission,
+      replyHandleRequired,
+    });
+  }
   return hashCanonical({
     normalizedEvent: stableEvent,
     permission,
