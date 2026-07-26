@@ -16,6 +16,7 @@ node_modules
 .next
 out
 build
+runners/channel-node/dist/
 coverage
 public/_admin-console/
 public/.admin-console-staging*/

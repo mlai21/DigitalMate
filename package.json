@@ -18,6 +18,8 @@
     "console:prepare": "node scripts/qwenpaw-console/prepare.mjs",
     "console:test": "node scripts/qwenpaw-console/test.mjs",
     "console:build": "node scripts/qwenpaw-console/build.mjs",
+    "channel-node:build": "npm --prefix runners/channel-node ci && npm --prefix runners/channel-node run build",
+    "channel-node:test": "npm --prefix runners/channel-node test",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:seed": "tsx src/server/db/seed.ts",
     "agent": "tsx src/agent-service/index.ts"
