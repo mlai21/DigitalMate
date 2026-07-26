@@ -5,6 +5,14 @@ export const STABLE_CAPABILITY_CODES = Object.freeze({
   multiAgentClone: "multi_agent_clone",
   multiAgentImport: "multi_agent_import",
   multiAgentDelete: "multi_agent_delete",
+  adminConsoleMappingPending: "admin_console_mapping_pending",
+  acp: "acp",
+  codingMode: "coding_mode",
+  codingProject: "coding_project",
+  workspaceGit: "workspace_git",
+  localModels: "local_models",
+  extensionMarket: "extension_market",
+  plugins: "plugins",
 } as const);
 
 export type StableCapabilityCode =

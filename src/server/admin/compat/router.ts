@@ -14,7 +14,15 @@ import {
 } from "@/server/admin/compat/types";
 import { readTrustedOriginalRequestPath } from "@/server/admin/compat/original-uri";
 import type { AgentScope } from "@/server/agents/types";
-import { isStableCapabilityCode } from "@/server/capabilities";
+import {
+  isStableCapabilityCode,
+  type StableCapabilityCode,
+} from "@/server/capabilities";
+import type {
+  FlattenedUpstreamEndpointContract,
+  UpstreamEndpointMethod,
+  UpstreamEndpointStatus,
+} from "@/server/admin/compat/upstream-contract";
 import {
   AdminAgentProfileError,
 } from "@/server/admin/agent-profile";
@@ -57,6 +65,16 @@ type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
 export type AdminCompatRouteOptions = Readonly<{
   agentHeader?: "optional" | "required";
+  allowContractOverlap?: boolean;
+  contract?:
+    | Readonly<{
+        status: "disabled";
+        disabledCode: StableCapabilityCode;
+      }>
+    | Readonly<{
+        status: "redirected";
+        redirectTo: string;
+      }>;
 }>;
 
 type PatternSegment =
@@ -70,6 +88,9 @@ type RouteDefinition = Readonly<{
   staticSegments: number;
   access: "scoped" | "session" | "status";
   agentHeader: "optional" | "required";
+  contractStatus: UpstreamEndpointStatus;
+  disabledCode?: StableCapabilityCode;
+  redirectTo?: string;
   handler:
     | AdminCompatHandler
     | AdminCompatSessionHandler
@@ -90,6 +111,14 @@ export type AdminCompatRuntime = Readonly<{
     resources: AdminCompatResources,
     signal: AbortSignal,
   ) => Promise<AgentScope>;
+}>;
+
+export type AdminCompatRegisteredContractRoute = Readonly<{
+  method: UpstreamEndpointMethod;
+  path: string;
+  status: UpstreamEndpointStatus;
+  disabledCode?: StableCapabilityCode;
+  redirectTo?: string;
 }>;
 
 export class AdminCompatRouter {
@@ -141,6 +170,138 @@ export class AdminCompatRouter {
     options?: AdminCompatRouteOptions,
   ): void {
     this.register("DELETE", path, "scoped", handler, options);
+  }
+
+  disabled(
+    method: UpstreamEndpointMethod,
+    path: string,
+    disabledCode: StableCapabilityCode,
+    options?: Omit<AdminCompatRouteOptions, "contract">,
+  ): void {
+    this.register(
+      method,
+      path,
+      "scoped",
+      async () => {
+        throw new AdminCompatError(
+          501,
+          "capability_disabled",
+          "capability_disabled",
+          { capability: disabledCode },
+        );
+      },
+      {
+        ...options,
+        contract: {
+          status: "disabled",
+          disabledCode,
+        },
+      },
+    );
+  }
+
+  redirected(
+    method: UpstreamEndpointMethod,
+    path: string,
+    redirectTo: string,
+    options?: Omit<AdminCompatRouteOptions, "contract">,
+  ): void {
+    if (
+      !redirectTo.startsWith("/") ||
+      redirectTo.startsWith("//") ||
+      /[\u0000-\u001f\u007f]/u.test(redirectTo)
+    ) {
+      throw new Error("admin_compat_redirect_invalid");
+    }
+    this.register(
+      method,
+      path,
+      "scoped",
+      async () =>
+        new Response(null, {
+          status: 303,
+          headers: { location: redirectTo },
+        }),
+      {
+        ...options,
+        contract: {
+          status: "redirected",
+          redirectTo,
+        },
+      },
+    );
+  }
+
+  hasContractRoute(
+    method: UpstreamEndpointMethod,
+    path: string,
+  ): boolean {
+    const key = contractRouteKey(method, path);
+    return this.routes.some(
+      (route) => contractRouteKey(route.method, route.path) === key,
+    );
+  }
+
+  listRegisteredContractRoutes():
+    readonly AdminCompatRegisteredContractRoute[] {
+    return this.routes.map((route) => ({
+      method: route.method,
+      path: route.path,
+      status: route.contractStatus,
+      ...(route.disabledCode
+        ? { disabledCode: route.disabledCode }
+        : {}),
+      ...(route.redirectTo ? { redirectTo: route.redirectTo } : {}),
+    }));
+  }
+
+  assertUpstreamContract(
+    endpoints: readonly FlattenedUpstreamEndpointContract[],
+  ): void {
+    const registrations = new Map(
+      this.listRegisteredContractRoutes().map((route) => [
+        contractRouteKey(route.method, route.path),
+        route,
+      ]),
+    );
+    const expectedKeys = new Set<string>();
+
+    for (const endpoint of endpoints) {
+      const key = contractRouteKey(endpoint.method, endpoint.path);
+      if (expectedKeys.has(key)) {
+        throw new Error(
+          `admin_compat_contract_duplicate:${endpoint.method} ${endpoint.path}`,
+        );
+      }
+      expectedKeys.add(key);
+      const registration = registrations.get(key);
+      if (!registration) {
+        throw new Error(
+          `admin_compat_contract_missing:${endpoint.method} ${endpoint.path}`,
+        );
+      }
+      if (registration.status !== endpoint.status) {
+        throw new Error(
+          `admin_compat_contract_status_mismatch:${endpoint.method} ${endpoint.path}:${registration.status}!=${endpoint.status}`,
+        );
+      }
+      if (
+        endpoint.status === "disabled" &&
+        registration.disabledCode !== endpoint.disabledCode
+      ) {
+        throw new Error(
+          `admin_compat_contract_disabled_code_mismatch:${endpoint.method} ${endpoint.path}`,
+        );
+      }
+      if (
+        endpoint.status === "redirected" &&
+        registration.redirectTo !== endpoint.redirectTo
+      ) {
+        throw new Error(
+          `admin_compat_contract_redirect_mismatch:${endpoint.method} ${endpoint.path}`,
+        );
+      }
+    }
   }
 
   async dispatch(
@@ -203,6 +364,13 @@ export class AdminCompatRouter {
       staticSegments,
       access,
       agentHeader: options?.agentHeader ?? "optional",
+      contractStatus: options?.contract?.status ?? "mapped",
+      ...(options?.contract?.status === "disabled"
+        ? { disabledCode: options.contract.disabledCode }
+        : {}),
+      ...(options?.contract?.status === "redirected"
+        ? { redirectTo: options.contract.redirectTo }
+        : {}),
       handler,
     } satisfies RouteDefinition;
 
@@ -210,9 +378,12 @@ export class AdminCompatRouter {
       if (
         route.method === method &&
         route.staticSegments === staticSegments &&
-        patternsOverlap(route.segments, candidate.segments)
+        patternsOverlap(route.segments, candidate.segments) &&
+        !options?.allowContractOverlap
       ) {
-        throw new Error("admin_compat_route_conflict");
+        throw new Error(
+          `admin_compat_route_conflict:${method} ${route.path}<->${path}`,
+        );
       }
     }
     this.routes.push(candidate);
@@ -511,6 +682,18 @@ function parsePattern(path: string): readonly PatternSegment[] {
     parameterNames.add(name);
     return { kind: "dynamic", name };
   });
+}
+
+function contractRouteKey(
+  method: UpstreamEndpointMethod,
+  path: string,
+): string {
+  const signature = parsePattern(path)
+    .map((segment) =>
+      segment.kind === "static" ? segment.value : ":",
+    )
+    .join("/");
+  return `${method} /${signature}`;
 }
 
 function patternsOverlap(

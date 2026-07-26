@@ -38,6 +38,9 @@ import {
   AdminCompatRouter,
   type AdminCompatRuntime,
 } from "@/server/admin/compat/router";
+import {
+  listUpstreamEndpointContracts,
+} from "@/server/admin/compat/upstream-contract";
 import { withFreshUserDataLease } from "@/server/admin/user-data-lease";
 import { resolveDefaultAgentScope } from "@/server/agents/service";
 import { STABLE_CAPABILITY_CODES } from "@/server/capabilities";
@@ -89,7 +92,7 @@ import {
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-26.1";
+export const adminCompatApiRevision = "2026-07-27.1";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -105,6 +108,7 @@ export type CoreAdminCompatDependencies = Readonly<{
   wechatQrAuth?: WechatQrAuthService;
   resolveChannelHealth?: AdminChannelHealthResolver;
   channelNodes?: AdminChannelNodeService;
+  verifyUpstreamContract?: boolean;
 }>;
 
 export function createCoreAdminCompatRouter(
@@ -121,6 +125,7 @@ export function createCoreAdminCompatRouter(
 
   router.statusGet("/auth/status", authStatus);
   router.sessionGet("/auth/verify", authVerify);
+  router.get("/", root);
   router.get("/root", root);
   router.get("/version", root);
   router.get(
@@ -139,13 +144,22 @@ export function createCoreAdminCompatRouter(
     createUpdateAgentHandler(dependencies.updateAgentProfile),
     { agentHeader: "required" },
   );
-  router.post("/agents", createAgent);
+  router.post("/agents", createAgent, {
+    contract: {
+      status: "disabled",
+      disabledCode: STABLE_CAPABILITY_CODES.multiAgentCreate,
+    },
+  });
   router.post("/agents/import", importAgent);
   router.post("/agents/:agentId/clone", cloneAgent, {
     agentHeader: "required",
   });
   router.delete("/agents/:agentId", deleteAgent, {
     agentHeader: "required",
+    contract: {
+      status: "disabled",
+      disabledCode: STABLE_CAPABILITY_CODES.multiAgentDelete,
+    },
   });
   router.patch("/agents/:agentId/toggle", toggleAgent, {
     agentHeader: "required",
@@ -299,6 +313,12 @@ export function createCoreAdminCompatRouter(
       STABLE_CAPABILITY_CODES.multiAgent,
     ),
   );
+  registerUpstreamContractFallbacks(router);
+  if (dependencies.verifyUpstreamContract) {
+    router.assertUpstreamContract(
+      listUpstreamEndpointContracts(),
+    );
+  }
   return router;
 }
 
@@ -403,6 +423,7 @@ export async function dispatchAdminCompatRequest(
       }),
     channelNodes,
     wechatQrAuth,
+    verifyUpstreamContract: true,
   });
   const runtime = {
     security,
@@ -479,4 +500,37 @@ function createRootHandler(
     },
     compat_api_revision: dependencies.compatApiRevision,
   });
+}
+
+function registerUpstreamContractFallbacks(
+  router: AdminCompatRouter,
+): void {
+  for (const endpoint of listUpstreamEndpointContracts()) {
+    if (router.hasContractRoute(endpoint.method, endpoint.path)) {
+      continue;
+    }
+    if (
+      endpoint.status === "disabled" &&
+      endpoint.disabledCode
+    ) {
+      router.disabled(
+        endpoint.method,
+        endpoint.path,
+        endpoint.disabledCode,
+        { allowContractOverlap: true },
+      );
+      continue;
+    }
+    if (
+      endpoint.status === "redirected" &&
+      endpoint.redirectTo
+    ) {
+      router.redirected(
+        endpoint.method,
+        endpoint.path,
+        endpoint.redirectTo,
+        { allowContractOverlap: true },
+      );
+    }
+  }
 }
