@@ -88,11 +88,43 @@ import {
 import {
   createAdminChannelHealthResolver,
 } from "@/server/admin/channel-prerequisites";
+import {
+  createApprovalCommandHandler,
+  createCheckCommandHandler,
+  createDeleteInboxEventHandler,
+  createGetInboxTraceHandler,
+  createGetPushMessagesHandler,
+  createListAccessControlHandler,
+  createListInboxHandler,
+  createListInboxEventsHandler,
+  createListPendingAccessHandler,
+  createMarkInboxReadHandler,
+  createMutateAccessRulesHandler,
+  createResolveAccessHandler,
+  createUpdateAccessMetadataHandler,
+  type AdminInboxService,
+} from "@/server/admin/compat/handlers/inbox";
+import {
+  createBatchDeleteSessionsHandler,
+  createBatchSetSessionsArchivedHandler,
+  createDeleteSessionHandler,
+  createGetSessionHandler,
+  createListSessionsHandler,
+  createSetSessionArchivedHandler,
+  createUpdateSessionHandler,
+  type AdminSessionsService,
+} from "@/server/admin/compat/handlers/sessions";
+import {
+  createPostgresAdminInboxService,
+} from "@/server/admin/views/inbox";
+import {
+  createPostgresAdminSessionsService,
+} from "@/server/admin/views/sessions";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-27.1";
+export const adminCompatApiRevision = "2026-07-27.2";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -108,6 +140,8 @@ export type CoreAdminCompatDependencies = Readonly<{
   wechatQrAuth?: WechatQrAuthService;
   resolveChannelHealth?: AdminChannelHealthResolver;
   channelNodes?: AdminChannelNodeService;
+  inbox?: AdminInboxService;
+  sessions?: AdminSessionsService;
   verifyUpstreamContract?: boolean;
 }>;
 
@@ -289,6 +323,217 @@ export function createCoreAdminCompatRouter(
     );
   }
 
+  if (dependencies.inbox) {
+    const inboxRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/inbox",
+      createListInboxHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/access-control",
+      createListAccessControlHandler(dependencies.inbox, false),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/access-control/pending/all",
+      createListPendingAccessHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/access-control/:channel",
+      createListAccessControlHandler(dependencies.inbox, true),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/whitelist/add",
+      createMutateAccessRulesHandler(
+        dependencies.inbox,
+        "add",
+        "allow",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/whitelist/remove",
+      createMutateAccessRulesHandler(
+        dependencies.inbox,
+        "remove",
+        "allow",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/blacklist/add",
+      createMutateAccessRulesHandler(
+        dependencies.inbox,
+        "add",
+        "deny",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/blacklist/remove",
+      createMutateAccessRulesHandler(
+        dependencies.inbox,
+        "remove",
+        "deny",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/remark",
+      createUpdateAccessMetadataHandler(
+        dependencies.inbox,
+        "remark",
+        false,
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/pending/approve",
+      createResolveAccessHandler(
+        dependencies.inbox,
+        "approve",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/pending/deny",
+      createResolveAccessHandler(
+        dependencies.inbox,
+        "deny",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/pending/dismiss",
+      createResolveAccessHandler(
+        dependencies.inbox,
+        "dismiss",
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/pending/remark",
+      createUpdateAccessMetadataHandler(
+        dependencies.inbox,
+        "remark",
+        true,
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/access-control/username",
+      createUpdateAccessMetadataHandler(
+        dependencies.inbox,
+        "username",
+        false,
+      ),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/commands/check",
+      createCheckCommandHandler(),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/approval/:action",
+      createApprovalCommandHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/console/push-messages",
+      createGetPushMessagesHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/console/inbox/events",
+      createListInboxEventsHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.post(
+      "/console/inbox/read",
+      createMarkInboxReadHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.delete(
+      "/console/inbox/events/:eventId",
+      createDeleteInboxEventHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+    router.get(
+      "/console/inbox/traces/:runId",
+      createGetInboxTraceHandler(dependencies.inbox),
+      inboxRouteOptions,
+    );
+  }
+
+  if (dependencies.sessions) {
+    const sessionRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/chats",
+      createListSessionsHandler(dependencies.sessions),
+      sessionRouteOptions,
+    );
+    router.get(
+      "/chats/:chatId",
+      createGetSessionHandler(dependencies.sessions),
+      sessionRouteOptions,
+    );
+    router.put(
+      "/chats/:chatId",
+      createUpdateSessionHandler(dependencies.sessions),
+      sessionRouteOptions,
+    );
+    router.delete(
+      "/chats/:chatId",
+      createDeleteSessionHandler(dependencies.sessions),
+      sessionRouteOptions,
+    );
+    router.post(
+      "/chats/batch-delete",
+      createBatchDeleteSessionsHandler(dependencies.sessions),
+      sessionRouteOptions,
+    );
+    router.post(
+      "/chats/:chatId/archive",
+      createSetSessionArchivedHandler(
+        dependencies.sessions,
+        true,
+      ),
+      sessionRouteOptions,
+    );
+    router.post(
+      "/chats/:chatId/unarchive",
+      createSetSessionArchivedHandler(
+        dependencies.sessions,
+        false,
+      ),
+      sessionRouteOptions,
+    );
+    router.post(
+      "/chats/actions/batch-archive",
+      createBatchSetSessionsArchivedHandler(
+        dependencies.sessions,
+        true,
+      ),
+      sessionRouteOptions,
+    );
+    router.post(
+      "/chats/actions/batch-unarchive",
+      createBatchSetSessionsArchivedHandler(
+        dependencies.sessions,
+        false,
+      ),
+      sessionRouteOptions,
+    );
+  }
+
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);
     router.put(path, putLanguage);
@@ -422,6 +667,11 @@ export async function dispatchAdminCompatRequest(
         publicBaseUrl: env.publicBaseUrl ?? null,
       }),
     channelNodes,
+    inbox: createPostgresAdminInboxService(pool),
+    sessions: createPostgresAdminSessionsService(
+      pool,
+      env.attachmentStorageDir,
+    ),
     wechatQrAuth,
     verifyUpstreamContract: true,
   });

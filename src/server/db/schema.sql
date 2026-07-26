@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false;
+ALTER TABLE IF EXISTS conversations ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -345,6 +346,8 @@ CREATE TABLE IF NOT EXISTS tool_registrations (
 
 ALTER TABLE IF EXISTS tool_registrations ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'script';
 ALTER TABLE IF EXISTS tool_registrations ADD COLUMN IF NOT EXISTS mcp_tool_name text;
+ALTER TABLE IF EXISTS tool_registrations
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS llm_usage_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2007,6 +2010,15 @@ CREATE TABLE IF NOT EXISTS channel_access_rules (
   )
 );
 
+ALTER TABLE IF EXISTS channel_access_rules
+  ADD COLUMN IF NOT EXISTS remark text NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS channel_access_rules
+  ADD COLUMN IF NOT EXISTS username text NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS channel_access_rules
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
+ALTER TABLE IF EXISTS channel_access_rules
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
 CREATE TABLE IF NOT EXISTS channel_access_requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,
@@ -2042,12 +2054,24 @@ CREATE TABLE IF NOT EXISTS channel_access_requests (
   UNIQUE (event_id)
 );
 
+ALTER TABLE IF EXISTS channel_access_requests
+  ADD COLUMN IF NOT EXISTS remark text NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS channel_access_requests
+  ADD COLUMN IF NOT EXISTS username text NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS channel_access_requests
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
+ALTER TABLE IF EXISTS channel_access_requests
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_access_requests_pending
   ON channel_access_requests(
     connection_id, chat_type, external_sender_id,
     external_conversation_id
   )
   WHERE status = 'pending';
+
+ALTER TABLE IF EXISTS skill_revisions
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS channel_node_outbox (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2151,6 +2175,29 @@ CREATE TABLE IF NOT EXISTS admin_audit_logs (
     REFERENCES digital_agents(user_id, id)
     ON DELETE SET NULL (agent_id)
 );
+
+CREATE TABLE IF NOT EXISTS admin_inbox_states (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  source_type text NOT NULL
+    CONSTRAINT admin_inbox_states_source_type_check
+    CHECK (btrim(source_type) <> ''),
+  source_id text NOT NULL
+    CONSTRAINT admin_inbox_states_source_id_check
+    CHECK (btrim(source_id) <> ''),
+  read_at timestamptz,
+  dismissed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT admin_inbox_states_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE,
+  UNIQUE (user_id, agent_id, source_type, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_inbox_states_scope
+  ON admin_inbox_states(user_id, agent_id, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_channel_connections_scope_type_active
   ON channel_connections(user_id, agent_id, channel_type, created_at)

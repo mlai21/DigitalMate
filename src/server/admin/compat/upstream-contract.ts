@@ -79,8 +79,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   accessControl: moduleContract(
     "mapped",
     "inbox",
-    disabled(
-      PENDING,
+    mapped(
       "GET /access-control",
       "GET /access-control/:channel",
       "POST /access-control/whitelist/add",
@@ -204,12 +203,8 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   chat: moduleContract(
     "redirected",
     "home-chat",
-    redirected(
-      "/",
-      "POST /console/upload",
-      "GET /files/preview/:filename",
+    mapped(
       "GET /chats",
-      "POST /chats",
       "GET /chats/:chatId",
       "PUT /chats/:chatId",
       "DELETE /chats/:chatId",
@@ -218,6 +213,12 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
       "POST /chats/:chatId/unarchive",
       "POST /chats/actions/batch-archive",
       "POST /chats/actions/batch-unarchive",
+    ),
+    redirected(
+      "/",
+      "POST /console/upload",
+      "GET /files/preview/:filename",
+      "POST /chats",
       "POST /console/chat/stop",
     ),
   ),
@@ -248,8 +249,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   commands: moduleContract(
     "mapped",
     "inbox",
-    disabled(
-      PENDING,
+    mapped(
       "POST /commands/check",
       "POST /approval/:action",
     ),
@@ -257,8 +257,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   console: moduleContract(
     "redirected",
     "inbox",
-    disabled(
-      PENDING,
+    mapped(
       "GET /console/push-messages",
       "GET /console/inbox/events",
       "POST /console/inbox/read",

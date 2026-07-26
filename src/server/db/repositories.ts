@@ -81,7 +81,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   projects: ["id", "user_id", "agent_id", "name", "description", "created_at", "updated_at"],
   conversations: [
-    "id", "user_id", "agent_id", "channel", "title", "project_id", "pinned", "created_at", "updated_at",
+    "id", "user_id", "agent_id", "channel", "title", "project_id", "pinned",
+    "archived_at", "created_at", "updated_at",
   ],
   messages: [
     "id", "user_id", "agent_id", "conversation_id", "role", "content",
@@ -161,12 +162,13 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   channel_access_rules: [
     "id", "user_id", "agent_id", "connection_id", "chat_type",
-    "target_kind", "target_id", "effect", "created_at",
+    "target_kind", "target_id", "effect", "remark", "username", "revision",
+    "created_at", "updated_at",
   ],
   channel_access_requests: [
     "id", "user_id", "agent_id", "connection_id", "event_id", "chat_type",
     "external_sender_id", "external_conversation_id", "status",
-    "created_at", "resolved_at",
+    "remark", "username", "revision", "created_at", "updated_at", "resolved_at",
   ],
   channel_node_outbox: [
     "id", "user_id", "agent_id", "node_id", "connection_id",
@@ -190,7 +192,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "version", "scan_report", "usage_count", "last_used_at", "created_at", "updated_at",
   ],
   skill_revisions: [
-    "id", "user_id", "skill_id", "proposed_content", "reason", "status", "created_at", "updated_at",
+    "id", "user_id", "skill_id", "proposed_content", "reason", "status",
+    "revision", "created_at", "updated_at",
   ],
   skill_usage_logs: [
     "id", "user_id", "agent_id", "skill_id", "conversation_id", "triggered_by", "created_at",
@@ -204,7 +207,7 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   tool_registrations: [
     "id", "user_id", "name", "description", "kind", "status",
-    "requires_confirmation", "created_at", "updated_at",
+    "requires_confirmation", "revision", "created_at", "updated_at",
   ],
   llm_usage_logs: [
     "id", "user_id", "agent_id", "conversation_id", "purpose", "model",
@@ -225,6 +228,10 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   admin_audit_logs: [
     "id", "user_id", "agent_id", "action", "resource_type", "resource_id",
     "status", "error_code", "created_at",
+  ],
+  admin_inbox_states: [
+    "id", "user_id", "agent_id", "source_type", "source_id",
+    "read_at", "dismissed_at", "updated_at",
   ],
 } as const;
 const PERSONAL_DATA_EXPORT_ORDER_BY: {
@@ -271,6 +278,7 @@ const PERSONAL_DATA_EXPORT_ORDER_BY: {
   goals: "id ASC",
   settings: "id ASC",
   admin_audit_logs: "id ASC",
+  admin_inbox_states: "id ASC",
 };
 const GOAL_STEP_EXPORT_COLUMNS = [
   "id", "agent_id", "goal_id", "round", "phase", "intent", "evidence", "candidate",
@@ -303,6 +311,7 @@ const PERSONAL_DATA_CLEAR_TABLES = [
   "channel_execution_steps",
   "channel_access_requests",
   "channel_access_rules",
+  "admin_inbox_states",
   "channel_inbound_events",
   "channel_node_bindings",
   "channel_node_enrollments",
@@ -349,6 +358,8 @@ export type DbConversation = {
   title: string;
   projectId: string | null;
   pinned: boolean;
+  archivedAt: Date | null;
+  createdAt: Date;
   updatedAt: Date;
 };
 
@@ -926,13 +937,23 @@ export function createRepositories(
       async update(
         scope: AgentScope,
         conversationId: string,
-        input: { title?: string; pinned?: boolean; projectId?: string | null },
+        input: {
+          title?: string;
+          pinned?: boolean;
+          projectId?: string | null;
+          archived?: boolean;
+        },
       ): Promise<DbConversation | null> {
         const result = await pool.query(
           `UPDATE conversations SET
              title = COALESCE($4, title),
              pinned = COALESCE($5, pinned),
              project_id = CASE WHEN $6 THEN $7::uuid ELSE project_id END,
+             archived_at = CASE
+               WHEN $8::boolean IS NULL THEN archived_at
+               WHEN $8 = true THEN COALESCE(archived_at, now())
+               ELSE NULL
+             END,
              updated_at = now()
            WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND (
@@ -952,6 +973,7 @@ export function createRepositories(
             input.pinned ?? null,
             input.projectId !== undefined,
             input.projectId ?? null,
+            input.archived ?? null,
           ],
         );
         return result.rows[0] ? mapConversation(result.rows[0]) : null;
@@ -3589,6 +3611,8 @@ function mapConversation(row: Record<string, unknown>): DbConversation {
     title: String(row.title),
     projectId: row.project_id ? String(row.project_id) : null,
     pinned: Boolean(row.pinned),
+    archivedAt: (row.archived_at as Date | null) ?? null,
+    createdAt: row.created_at as Date,
     updatedAt: row.updated_at as Date,
   };
 }

@@ -259,6 +259,14 @@ describe("QwenPaw Console upstream API contract", () => {
       readChannelConfigs: unavailable,
       updateChannelConfig: unavailable,
       updateChannelConfigs: unavailable,
+      inbox:
+        {} as NonNullable<
+          CoreAdminCompatDependencies["inbox"]
+        >,
+      sessions:
+        {} as NonNullable<
+          CoreAdminCompatDependencies["sessions"]
+        >,
       verifyUpstreamContract: true,
     } satisfies CoreAdminCompatDependencies;
 
