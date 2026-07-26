@@ -1,0 +1,8 @@
+REGISTER sip:127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.1:5070;branch=z9hG4bK-register
+From: <sip:alice@127.0.0.1>;tag=alice-tag
+To: <sip:alice@127.0.0.1>
+Call-ID: register-call
+CSeq: 1 REGISTER
+Contact: <sip:alice@127.0.0.1:5070>
+Content-Length: 0

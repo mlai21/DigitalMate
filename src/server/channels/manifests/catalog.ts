@@ -164,6 +164,19 @@ const secretField = (
     { required },
   );
 
+const nodeOnlyCredentialField = (
+  name: string,
+  label: string,
+) =>
+  field(
+    name,
+    `${label}（仅节点配置）`,
+    "string",
+    z.literal("").default(""),
+    "",
+    { readonly: true },
+  );
+
 const booleanField = (
   name: string,
   label: string,
@@ -526,12 +539,15 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
       stringField("sip_host", "SIP 主机", "0.0.0.0"),
       numberField("sip_port", "SIP 端口", 5_061, 1, 65_535),
       stringField("sip_username", "SIP 用户名"),
-      secretField("sip_password", "SIP 密码"),
+      nodeOnlyCredentialField("sip_password", "SIP 密码"),
       stringField("sip_server", "SIP 服务器"),
       selectField("sip_transport", "SIP 传输", ["UDP", "TCP", "TLS"], "UDP"),
       numberField("rtp_port_low", "RTP 起始端口", 10_000, 1, 65_535),
       numberField("rtp_port_high", "RTP 结束端口", 20_000, 1, 65_535),
-      secretField("dashscope_api_key", "DashScope API Key"),
+      nodeOnlyCredentialField(
+        "dashscope_api_key",
+        "DashScope API Key",
+      ),
       stringField("tts_provider", "TTS 服务", "aliyun"),
       stringField("tts_voice", "TTS 音色"),
       stringField("stt_provider", "STT 服务", "aliyun"),
@@ -539,8 +555,14 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
       stringField("welcome_greeting", "欢迎语", "你好，我是DigitalMate"),
       positiveNumberField("call_timeout", "呼叫超时（秒）", 120, 3_600),
       urlField("livekit_url", "LiveKit URL"),
-      secretField("livekit_api_key", "LiveKit API Key"),
-      secretField("livekit_api_secret", "LiveKit API Secret"),
+      nodeOnlyCredentialField(
+        "livekit_api_key",
+        "LiveKit API Key",
+      ),
+      nodeOnlyCredentialField(
+        "livekit_api_secret",
+        "LiveKit API Secret",
+      ),
       stringField("livekit_sip_trunk_id", "LiveKit SIP Trunk ID"),
       stringField("livekit_room_name", "LiveKit 房间名", "sip-inbound"),
       numberField("livekit_output_sample_rate", "LiveKit 输出采样率", 24_000, 8_000, 192_000),

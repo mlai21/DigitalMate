@@ -429,13 +429,15 @@ export function registerProtocolChannelAdapters(
 export function registerNodeProxyChannelAdapters(
   registry: ChannelAdapterRegistry,
 ): void {
-  registry.register("imessage", () =>
-    createNodeProxyBoundaryAdapter("imessage")
-  );
+  for (const type of ["imessage", "sip"] as const) {
+    registry.register(type, () =>
+      createNodeProxyBoundaryAdapter(type)
+    );
+  }
 }
 
 function createNodeProxyBoundaryAdapter(
-  type: "imessage",
+  type: "imessage" | "sip",
 ): ChannelAdapter<Record<string, unknown>> {
   return {
     manifest: getChannelManifest(type),

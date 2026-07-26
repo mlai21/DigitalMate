@@ -213,12 +213,7 @@ const SECRET_FIELDS = {
   matrix: ["access_token", "password"],
   slack: ["bot_token", "app_token", "signing_secret"],
   voice: ["twilio_auth_token"],
-  sip: [
-    "sip_password",
-    "dashscope_api_key",
-    "livekit_api_key",
-    "livekit_api_secret",
-  ],
+  sip: [],
   wecom: ["secret"],
   xiaoyi: ["sk"],
   yuanbao: ["app_secret"],

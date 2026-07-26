@@ -6,7 +6,7 @@ describe("Vitest resource isolation", () => {
   it("只扫描 DigitalMate 当前工作区测试", () => {
     const exclude = config.test?.exclude ?? [];
     expect(exclude).toEqual([
-      "node_modules/**",
+      "**/node_modules/**",
       "tests/e2e/**",
       ".worktrees/**",
       "vendor/**",

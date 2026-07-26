@@ -162,12 +162,15 @@ describe("admin compatibility channel contract", () => {
     );
   });
 
-  it("registers iMessage as a node proxy instead of a server-local adapter", () => {
+  it("registers iMessage and SIP as node proxies instead of server-local adapters", () => {
     const registry = new ChannelAdapterRegistry();
 
     registerNodeProxyChannelAdapters(registry);
 
-    expect(registry.registeredTypes()).toEqual(["imessage"]);
+    expect(registry.registeredTypes()).toEqual([
+      "imessage",
+      "sip",
+    ]);
     expect(() =>
       registerNodeProxyChannelAdapters(registry)
     ).toThrow("duplicate_channel_adapter:imessage");
@@ -700,6 +703,35 @@ describe("admin compatibility channel contract", () => {
       }),
       expect.any(AbortSignal),
     );
+  });
+
+  it("rejects node-only SIP credentials at the center boundary", async () => {
+    const update = vi.fn<AdminChannelConfigWriter>();
+    const router = createCoreAdminCompatRouter(
+      dependencies({ updateChannelConfig: update }),
+    );
+    for (const key of [
+      "sip_password",
+      "dashscope_api_key",
+      "livekit_api_key",
+      "livekit_api_secret",
+    ]) {
+      const response = await router.dispatch(
+        await request("/config/channels/sip", {
+          method: "PUT",
+          body: {
+            operation_id: OPERATION_ID,
+            revision: 0,
+            [key]: "runner-only-secret",
+          },
+        }),
+        runtime(),
+      );
+      expect(response.status).toBe(400);
+      expect(JSON.stringify(await response.json()))
+        .not.toContain("runner-only-secret");
+    }
+    expect(update).not.toHaveBeenCalled();
   });
 
   it("returns safe issue paths for URL, number, and nested Matrix fields", async () => {

@@ -22,6 +22,24 @@ import {
 import {
   createIMessageRejectionLog,
 } from "./imessage/rejections.js";
+import {
+  createDevSipBackend,
+} from "./sip/backend.js";
+import {
+  loadSipRunnerConfigs,
+} from "./sip/config.js";
+import {
+  createLiveKitSipBackend,
+} from "./sip/livekit.js";
+import {
+  createDashScopeSpeechRecognizer,
+} from "./sip/stt.js";
+import {
+  createSipTransport,
+} from "./sip/transport.js";
+import {
+  createDashScopeSpeechSynthesizer,
+} from "./sip/tts.js";
 
 export async function startChannelNode(
   environment: Readonly<
@@ -46,7 +64,14 @@ export async function startChannelNode(
       nodeConfigPath: configPath,
       connectionIds: config.connectionIds,
     });
-  if (imessageConfigs.length === 0) {
+  const sipConfigs = await loadSipRunnerConfigs({
+    nodeConfigPath: configPath,
+    connectionIds: config.connectionIds,
+  });
+  if (
+    imessageConfigs.length === 0
+    && sipConfigs.length === 0
+  ) {
     throw new Error(
       "channel_node_local_channel_config_required",
     );
@@ -62,18 +87,53 @@ export async function startChannelNode(
     string,
     ReturnType<typeof createIMessageTransport>
   >();
+  const channelTransports = new Map<
+    string,
+    Readonly<{
+      start(): Promise<void>;
+      stop(): Promise<void>;
+      send(
+        frame: Parameters<
+          ReturnType<typeof createSipTransport>["send"]
+        >[0],
+      ): ReturnType<
+        ReturnType<typeof createSipTransport>["send"]
+      >;
+    }>
+  >();
   const startedTransports = new Set<string>();
+  const configuredConnectionIds = new Set<string>();
+  for (const localConfig of [
+    ...imessageConfigs,
+    ...sipConfigs,
+  ]) {
+    if (
+      configuredConnectionIds.has(localConfig.connectionId)
+    ) {
+      throw new Error(
+        "channel_node_connection_config_duplicate",
+      );
+    }
+    configuredConnectionIds.add(localConfig.connectionId);
+  }
   const client = new ChannelNodeClient({
     config,
     tls,
     health,
     outbox,
-    supportedChannelTypes: ["imessage"],
+    supportedChannelTypes: [
+      ...(imessageConfigs.length > 0
+        ? ["imessage" as const]
+        : []),
+      ...(sipConfigs.length > 0
+        ? ["sip" as const]
+        : []),
+    ],
     clientVersion: "0.1.0",
     onRegistered: async (frame) => {
       await reconcileChannelTransports({
         boundConnectionIds: frame.boundConnectionIds,
-        transports: imessageTransports,
+        transports: channelTransports,
         startedConnectionIds: startedTransports,
       });
     },
@@ -93,7 +153,7 @@ export async function startChannelNode(
     },
     onSend: async (frame) => {
       const transport =
-        imessageTransports.get(frame.connectionId);
+        channelTransports.get(frame.connectionId);
       return transport
         ? transport.send(frame)
         : {
@@ -109,34 +169,57 @@ export async function startChannelNode(
         "rejected.jsonl",
       ),
     );
+    const transport = createIMessageTransport({
+      config: imessageConfig,
+      database: createIMessageDatabase({
+        dbPath: imessageConfig.dbPath,
+      }),
+      enqueueInbound: (draft) =>
+        client.enqueueInbound(draft),
+      transferAttachment: (attachment) =>
+        client.transferAttachment(attachment),
+      listPendingInboundEventIds: async () =>
+        new Set(
+          (await outbox.list())
+            .filter((frame) =>
+              frame.connectionId
+                === imessageConfig.connectionId
+            )
+            .map((frame) =>
+              frame.payload.externalEventId
+            ),
+        ),
+      onRowRejected: async (rowId, errorCode) => {
+        await rejectionLog.record(rowId, errorCode);
+        health.recordError(errorCode);
+      },
+    });
     imessageTransports.set(
       imessageConfig.connectionId,
-      createIMessageTransport({
-        config: imessageConfig,
-        database: createIMessageDatabase({
-          dbPath: imessageConfig.dbPath,
-        }),
-        enqueueInbound: (draft) =>
-          client.enqueueInbound(draft),
-        transferAttachment: (attachment) =>
-          client.transferAttachment(attachment),
-        listPendingInboundEventIds: async () =>
-          new Set(
-            (await outbox.list())
-              .filter((frame) =>
-                frame.connectionId
-                  === imessageConfig.connectionId
-              )
-              .map((frame) =>
-                frame.payload.externalEventId
-              ),
-          ),
-        onRowRejected: async (rowId, errorCode) => {
-          await rejectionLog.record(rowId, errorCode);
-          health.recordError(errorCode);
-        },
-      }),
+      transport,
     );
+    channelTransports.set(
+      imessageConfig.connectionId,
+      transport,
+    );
+  }
+  for (const sipConfig of sipConfigs) {
+    const backend = sipConfig.mode === "livekit"
+      ? createLiveKitSipBackend(sipConfig)
+      : createDevSipBackend(sipConfig);
+    const transport = createSipTransport({
+      config: sipConfig,
+      backend,
+      recognizer: createDashScopeSpeechRecognizer({
+        apiKey: sipConfig.dashScopeApiKey,
+      }),
+      synthesizer: createDashScopeSpeechSynthesizer({
+        apiKey: sipConfig.dashScopeApiKey,
+      }),
+      enqueueInbound: (draft) =>
+        client.enqueueInbound(draft),
+    });
+    channelTransports.set(sipConfig.connectionId, transport);
   }
   void client.connect().catch((error) => {
     health.recordError(
@@ -149,7 +232,7 @@ export async function startChannelNode(
     client,
     async stop() {
       await Promise.allSettled(
-        [...imessageTransports.values()].map(
+        [...channelTransports.values()].map(
           (transport) => transport.stop(),
         ),
       );
