@@ -18,6 +18,8 @@ const AGENT_SCOPED_TABLES = [
   "memory_entries",
   "tool_call_logs",
   "proactive_tasks",
+  "scheduled_jobs",
+  "scheduled_job_runs",
   "channel_identities",
   "channel_messages",
   "interjection_decisions",
@@ -30,6 +32,10 @@ const AGENT_SCOPED_TABLES = [
   "goals",
   "goal_steps",
 ] as const;
+
+const LEGACY_AGENT_SCOPED_TABLES = AGENT_SCOPED_TABLES.filter(
+  (table) => table !== "scheduled_jobs" && table !== "scheduled_job_runs",
+);
 
 const USER_A = "10000000-0000-4000-8000-000000000001";
 const USER_B = "20000000-0000-4000-8000-000000000002";
@@ -269,7 +275,7 @@ describe("default digital agent PostgreSQL migration", () => {
     for (const userId of [USER_A, USER_B]) {
       const expectedAgent = secondAgents.find((row) => row.user_id === userId)?.id;
       expect(expectedAgent).toBeDefined();
-      for (const table of AGENT_SCOPED_TABLES.filter((table) => table !== "goal_steps")) {
+      for (const table of LEGACY_AGENT_SCOPED_TABLES.filter((table) => table !== "goal_steps")) {
         const result = await databasePool.query<{ agent_ids: string[] }>(
           `SELECT array_agg(DISTINCT agent_id::text ORDER BY agent_id::text) AS agent_ids
            FROM ${table}

@@ -268,8 +268,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   cronjob: moduleContract(
     "mapped",
     "schedules",
-    disabled(
-      PENDING,
+    mapped(
       "GET /cron/jobs",
       "POST /cron/jobs",
       "GET /cron/jobs/:jobId",
@@ -319,8 +318,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   heartbeat: moduleContract(
     "mapped",
     "schedules",
-    disabled(
-      PENDING,
+    mapped(
       "GET /config/heartbeat",
       "PUT /config/heartbeat",
       "POST /config/heartbeat/run",

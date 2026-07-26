@@ -407,9 +407,13 @@ CREATE TABLE IF NOT EXISTS goals (
   conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
   next_run_at timestamptz,
   finished_at timestamptz,
+  revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS goals
+  ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS goal_steps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -472,14 +476,93 @@ CREATE TABLE IF NOT EXISTS agent_settings (
   cadence jsonb NOT NULL DEFAULT '{}'::jsonb,
   search jsonb NOT NULL DEFAULT '{}'::jsonb,
   model_routing_override jsonb NOT NULL DEFAULT '{}'::jsonb,
+  heartbeat jsonb NOT NULL DEFAULT '{"enabled":false,"every":"6h","target":"inbox","timeoutSeconds":300,"activeHours":null,"authorization":null}'::jsonb,
   revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, agent_id),
   CONSTRAINT agent_settings_user_agent_fkey
     FOREIGN KEY (user_id, agent_id)
     REFERENCES digital_agents(user_id, id)
+  ON DELETE CASCADE
+);
+
+ALTER TABLE IF EXISTS agent_settings
+  ADD COLUMN IF NOT EXISTS heartbeat jsonb NOT NULL
+  DEFAULT '{"enabled":false,"every":"6h","target":"inbox","timeoutSeconds":300,"activeHours":null,"authorization":null}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  name text NOT NULL CHECK (btrim(name) <> ''),
+  enabled boolean NOT NULL DEFAULT false,
+  kind text NOT NULL
+    CHECK (kind IN (
+      'reminder', 'follow_up', 'scheduled_digest',
+      'topic_subscription'
+    )),
+  schedule jsonb NOT NULL,
+  task_type text NOT NULL CHECK (task_type IN ('text', 'agent')),
+  content text NOT NULL,
+  request jsonb,
+  dispatch jsonb NOT NULL,
+  runtime jsonb NOT NULL DEFAULT '{}'::jsonb,
+  meta jsonb NOT NULL DEFAULT '{}'::jsonb,
+  save_result_to_inbox boolean NOT NULL DEFAULT true,
+  network_enabled boolean NOT NULL DEFAULT false,
+  authorization_type text
+    CHECK (
+      authorization_type IS NULL
+      OR authorization_type IN (
+        'scheduled_digest', 'subscription', 'goal_contract'
+      )
+    ),
+  authorization_source_id uuid,
+  revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
+  next_run_at timestamptz,
+  last_run_at timestamptz,
+  status text NOT NULL DEFAULT 'idle'
+    CHECK (status IN ('idle', 'running', 'success', 'error', 'paused')),
+  last_error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT scheduled_jobs_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
     ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_job_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  job_id uuid NOT NULL REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+  proactive_task_id uuid REFERENCES proactive_tasks(id) ON DELETE SET NULL,
+  scheduled_for timestamptz,
+  run_at timestamptz NOT NULL,
+  status text NOT NULL
+    CHECK (status IN (
+      'success', 'error', 'running', 'skipped', 'cancelled'
+    )),
+  trigger text NOT NULL CHECK (trigger IN ('scheduled', 'manual')),
+  error_code text,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT scheduled_job_runs_user_agent_fkey
+    FOREIGN KEY (user_id, agent_id)
+    REFERENCES digital_agents(user_id, id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+  ON scheduled_jobs(enabled, next_run_at)
+  WHERE enabled = true;
+CREATE INDEX IF NOT EXISTS idx_scheduled_job_runs_job
+  ON scheduled_job_runs(user_id, agent_id, job_id, run_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_job_runs_source
+  ON scheduled_job_runs(job_id, scheduled_for)
+  WHERE trigger = 'scheduled' AND scheduled_for IS NOT NULL;
 
 INSERT INTO digital_agents (user_id, slug, display_name, persona, is_default)
 SELECT users.id, 'digitalmate', 'DigitalMate', COALESCE(settings.persona, '{}'::jsonb), true

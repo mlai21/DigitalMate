@@ -363,8 +363,8 @@ flowchart TB
 ### 7.4 数据模型要点
 
 - 所有业务表带 `user_id`（当前恒为本人，为多用户预留）；分身级业务数据同时带非空 `agent_id`，现有数据归入唯一默认数字分身。
-- 核心实体：`user`、`conversation`（含渠道标识）、`message`（主动消息带唯一 `source_task_id`）、`memory_entry`（分层级）、`skill`、`reflection`、`tool_call_log`、`scheduled_task`（提醒/跟进/定时任务统一调度，见 P0-7、P1-10）。
-- 目标模式（P3）新增：`goal`（目标合同 + 状态机 + 预算消耗 + 下次运行时间）、`goal_step`（每轮循环的证据账本：意图、动作、证据、验证结论、token 消耗），工具调用继续写 `tool_call_log` 并关联 goal，详见 [docs/goal-mode-design.md](goal-mode-design.md)。目标状态独立于 `scheduled_task`——前者是"直到达成"的循环，后者是"到点执行"的一次性/周期动作。
+- 核心实体：`user`、`conversation`（含渠道标识）、`message`（主动消息带唯一 `source_task_id`）、`memory_entry`（分层级）、`skill`、`reflection`、`tool_call_log`、`scheduled_jobs` + `scheduled_job_runs`（提醒/跟进/定时任务的定义与幂等执行账本，见 P0-7、P1-10）。Heartbeat 配置保存在当前分身的 `agent_settings`，默认关闭。
+- 目标模式（P3）新增：`goal`（目标合同 + 状态机 + 预算消耗 + 下次运行时间 + revision）、`goal_step`（每轮循环的证据账本：意图、动作、证据、验证结论、token 消耗），工具调用继续写 `tool_call_log` 并关联 goal，详见 [docs/goal-mode-design.md](goal-mode-design.md)。目标状态独立于定时任务——前者是"直到达成"的循环，后者是"到点执行"的一次性/周期动作。目标确认时才可把与该目标 ID 绑定的 `goal_contract` 联网授权写入合同；执行器在工具展示和实际调用两层都校验该授权。
 - 会话与记忆云端统一存储，是多端同步（P1-5）的基础。
 - 人设、会话、消息、记忆、反思、目标、定时任务、渠道连接和工具审计按 `user_id + agent_id` 隔离；模型目录、工具定义与 Skill 库为用户级资源，未来可通过授权关系分配给不同数字分身。
 

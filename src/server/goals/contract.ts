@@ -29,6 +29,11 @@ export type GoalContract = {
     format: "report";
     milestones?: string[];
   };
+  authorization?: {
+    type: "goal_contract";
+    sourceId: string;
+    networkEnabled: boolean;
+  };
 };
 
 export type GoalBudgetUsed = {
@@ -38,6 +43,18 @@ export type GoalBudgetUsed = {
 };
 
 export const DEFAULT_GOAL_BUDGET_USED: GoalBudgetUsed = { rounds: 0, tokens: 0, costUsd: 0 };
+
+export function hasPersistentGoalNetworkAuthorization(input: {
+  id: string;
+  contract: GoalContract;
+}): boolean {
+  const authorization = input.contract.authorization;
+  return (
+    authorization?.type === "goal_contract" &&
+    authorization.networkEnabled === true &&
+    authorization.sourceId === input.id
+  );
+}
 
 /** Minutes to defer next_run_at between rounds, derived from contract cadence. */
 export function cadenceIntervalMinutes(contract: GoalContract): number {

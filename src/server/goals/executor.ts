@@ -3,6 +3,7 @@ import type { ToolLogInput } from "@/server/agent/run-agent";
 import type { DbGoal, DbGoalStep } from "@/server/db/repositories";
 import {
   formatGoalEvidence,
+  hasPersistentGoalNetworkAuthorization,
   isGoalEvidenceItem,
   type GoalEvidenceItem,
 } from "@/server/goals/contract";
@@ -111,7 +112,12 @@ export async function executeGoalStep(input: ExecuteGoalStepInput): Promise<Goal
 function buildWhitelistedTools(goal: DbGoal): LlmTool[] {
   const allowed = goal.contract.scope?.allowedTools ?? [];
   const tools: LlmTool[] = [];
-  if (allowed.includes("web_search")) tools.push(webSearchTool);
+  if (
+    allowed.includes("web_search") &&
+    hasPersistentGoalNetworkAuthorization(goal)
+  ) {
+    tools.push(webSearchTool);
+  }
   if (allowed.includes("memory_search")) tools.push(memorySearchTool);
   return tools;
 }
@@ -180,6 +186,21 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
     toolName: toolCall.name,
     inputSummary: query || "(缺少查询词)",
   };
+
+  const toolIsAllowed = buildWhitelistedTools(input.goal).some(
+    (tool) => tool.name === toolCall.name,
+  );
+  if (!toolIsAllowed) {
+    await input.toolLogs.create({
+      ...logBase,
+      toolName: `goal_tool:${toolCall.name}`,
+      outputSummary: "工具不在目标白名单内",
+      status: "error",
+      durationMs: Date.now() - startedAt,
+      error: "Tool not whitelisted",
+    });
+    return "该工具不在本目标的白名单内，只能使用给定的工具。";
+  }
 
   if (!query) {
     await input.toolLogs.create({
@@ -250,15 +271,7 @@ async function executeGoalToolCall(input: ExecuteGoalStepInput, toolCall: LlmToo
     }
   }
 
-  await input.toolLogs.create({
-    ...logBase,
-    toolName: `goal_tool:${toolCall.name}`,
-    outputSummary: "工具不在目标白名单内",
-    status: "error",
-    durationMs: Date.now() - startedAt,
-    error: "Tool not whitelisted",
-  });
-  return "该工具不在本目标的白名单内，只能使用给定的工具。";
+  return "该工具当前不可用。";
 }
 
 function parseCandidate(text: string): Omit<GoalStepCandidate, "tokensUsed"> {

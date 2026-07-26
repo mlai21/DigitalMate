@@ -12,6 +12,7 @@ const contract: GoalContract = {
   budget: { maxRounds: 10, maxTokens: 100_000 },
   stopConditions: { maxNoProgressRounds: 3, escalation: [] },
   deliverable: { format: "report" },
+  authorization: { type: "goal_contract", sourceId: "goal-1", networkEnabled: true },
 };
 
 const goal: DbGoal = {
@@ -30,6 +31,7 @@ const goal: DbGoal = {
   conversationId: null,
   nextRunAt: null,
   finishedAt: null,
+  revision: 1,
   createdAt: new Date(),
   updatedAt: new Date(),
 };
@@ -107,6 +109,86 @@ describe("executeGoalStep", () => {
     });
 
     expect(seenTools[0].map((tool) => tool.name)).toEqual(["web_search"]);
+  });
+
+  it("does not expose web search without the confirmed goal contract source", async () => {
+    const { llm, seenTools } = buildLlm([[{ type: "text", text: finalJson }]]);
+    const unauthorizedGoal: DbGoal = {
+      ...goal,
+      contract: {
+        objective: contract.objective,
+        successCriteria: contract.successCriteria,
+        cadence: contract.cadence,
+        scope: contract.scope,
+        budget: contract.budget,
+        stopConditions: contract.stopConditions,
+        deliverable: contract.deliverable,
+      },
+    };
+
+    await executeGoalStep({
+      goal: unauthorizedGoal,
+      recentSteps: [],
+      llm,
+      model: "main-model",
+      search: { run: vi.fn(async () => ({ summary: "" })) },
+      memories: { findRelevant: vi.fn(async () => []) },
+      toolLogs: { create: vi.fn(async () => undefined) },
+    });
+
+    expect(seenTools[0].map((tool) => tool.name)).toEqual(["memory_search"]);
+  });
+
+  it("rejects an undeclared web search call at execution time", async () => {
+    const { llm } = buildLlm([
+      [
+        {
+          type: "tool_call",
+          toolCall: {
+            id: "t1",
+            name: "web_search",
+            arguments: '{"query":"主题 X"}',
+          },
+        },
+      ],
+      [{ type: "text", text: finalJson }],
+    ]);
+    const search = {
+      run: vi.fn(async () => ({ summary: "不应执行" })),
+    };
+    const toolLogs = {
+      create: vi.fn(async () => undefined),
+    };
+    const unauthorizedGoal: DbGoal = {
+      ...goal,
+      contract: {
+        objective: contract.objective,
+        successCriteria: contract.successCriteria,
+        cadence: contract.cadence,
+        scope: contract.scope,
+        budget: contract.budget,
+        stopConditions: contract.stopConditions,
+        deliverable: contract.deliverable,
+      },
+    };
+
+    await executeGoalStep({
+      goal: unauthorizedGoal,
+      recentSteps: [],
+      llm,
+      model: "main-model",
+      search,
+      memories: { findRelevant: vi.fn(async () => []) },
+      toolLogs,
+    });
+
+    expect(search.run).not.toHaveBeenCalled();
+    expect(toolLogs.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "goal_tool:web_search",
+        status: "error",
+      }),
+    );
   });
 
   it("rejects tool calls outside the whitelist and tells the model", async () => {

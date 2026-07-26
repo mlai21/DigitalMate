@@ -32,6 +32,7 @@ function buildGoal(overrides: Partial<DbGoal>): DbGoal {
     conversationId: null,
     nextRunAt: new Date("2026-07-09T00:00:00Z"),
     finishedAt: null,
+    revision: 1,
     createdAt: new Date("2026-07-08T00:00:00Z"),
     updatedAt: new Date("2026-07-08T00:00:00Z"),
     ...overrides,

@@ -34,6 +34,7 @@ const goal: DbGoal = {
   conversationId: null,
   nextRunAt: null,
   finishedAt: null,
+  revision: 1,
   createdAt: new Date(),
   updatedAt: new Date(),
 };

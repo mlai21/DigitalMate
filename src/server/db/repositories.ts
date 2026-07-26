@@ -64,6 +64,9 @@ import type {
 import {
   MAX_USER_SECRET_EXPOSURE_FINGERPRINTS,
 } from "@/server/admin/secret-exposure-store";
+import {
+  processDueScheduledJobs,
+} from "@/server/admin/views/schedules";
 
 const EPISODIC_MEMORY_TTL_DAYS = 180;
 const ACTIVE_MEMORY_CONDITION = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())";
@@ -74,7 +77,7 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   ],
   agent_settings: [
     "user_id", "agent_id", "persona", "proactivity", "cadence", "search",
-    "model_routing_override", "revision", "updated_at",
+    "model_routing_override", "heartbeat", "revision", "updated_at",
   ],
   agent_resource_grants: [
     "user_id", "agent_id", "resource_type", "resource_id", "enabled", "created_at",
@@ -102,6 +105,19 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   proactive_tasks: [
     "id", "user_id", "agent_id", "conversation_id", "kind", "content",
     "scheduled_at", "status", "metadata", "sent_at", "created_at", "updated_at",
+  ],
+  scheduled_jobs: [
+    "id", "user_id", "agent_id", "conversation_id", "name", "enabled",
+    "kind", "schedule", "task_type", "content", "request", "dispatch",
+    "runtime", "meta", "save_result_to_inbox", "network_enabled",
+    "authorization_type", "authorization_source_id", "revision",
+    "next_run_at", "last_run_at", "status", "last_error_code",
+    "created_at", "updated_at",
+  ],
+  scheduled_job_runs: [
+    "id", "user_id", "agent_id", "job_id", "proactive_task_id",
+    "scheduled_for", "run_at", "status", "trigger", "error_code",
+    "completed_at", "created_at",
   ],
   channel_identities: [
     "id", "user_id", "agent_id", "channel", "external_user_id", "display_name", "created_at", "updated_at",
@@ -219,7 +235,7 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
   goals: [
     "id", "user_id", "agent_id", "title", "contract", "status", "progress_summary",
     "report_draft", "budget_used", "no_progress_rounds", "needs_human_prompt",
-    "conversation_id", "next_run_at", "finished_at", "created_at", "updated_at",
+    "conversation_id", "next_run_at", "finished_at", "revision", "created_at", "updated_at",
   ],
   settings: [
     "id", "user_id", "persona", "proactivity", "model_routing", "cadence", "search",
@@ -248,6 +264,8 @@ const PERSONAL_DATA_EXPORT_ORDER_BY: {
   memory_entries: "id ASC",
   tool_call_logs: "id ASC",
   proactive_tasks: "id ASC",
+  scheduled_jobs: "id ASC",
+  scheduled_job_runs: "id ASC",
   channel_identities: "id ASC",
   channel_connections: "id ASC",
   channel_runtime_nodes: "id ASC",
@@ -327,6 +345,8 @@ const PERSONAL_DATA_CLEAR_TABLES = [
   "interjection_decisions",
   "channel_messages",
   "channel_identities",
+  "scheduled_job_runs",
+  "scheduled_jobs",
   "proactive_tasks",
   "tool_call_logs",
   "llm_usage_logs",
@@ -461,6 +481,7 @@ export type DbGoal = {
   finishedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  revision: number;
 };
 
 export type GoalStepPhase = "collecting" | "drafting" | "verifying" | "committed" | "failed";
@@ -1968,19 +1989,85 @@ export function createRepositories(
       },
       async markSent(scope: AgentScope, taskId: string): Promise<void> {
         await pool.query(
-          "UPDATE proactive_tasks SET status = 'sent', sent_at = now(), updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          `WITH updated_task AS (
+             UPDATE proactive_tasks
+             SET status = 'sent', sent_at = now(), updated_at = now()
+             WHERE user_id = $1 AND agent_id = $2 AND id = $3
+             RETURNING id
+           ),
+           updated_run AS (
+             UPDATE scheduled_job_runs
+             SET status = 'success',
+                 completed_at = now(),
+                 error_code = NULL
+             WHERE user_id = $1
+               AND agent_id = $2
+               AND proactive_task_id IN (SELECT id FROM updated_task)
+             RETURNING job_id
+           )
+           UPDATE scheduled_jobs
+           SET status = 'success',
+               last_error_code = NULL,
+               updated_at = now()
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id IN (SELECT job_id FROM updated_run)`,
           [scope.userId, scope.agentId, taskId],
         );
       },
       async markCancelled(scope: AgentScope, taskId: string): Promise<void> {
         await pool.query(
-          "UPDATE proactive_tasks SET status = 'cancelled', updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          `WITH updated_task AS (
+             UPDATE proactive_tasks
+             SET status = 'cancelled', updated_at = now()
+             WHERE user_id = $1 AND agent_id = $2 AND id = $3
+             RETURNING id
+           ),
+           updated_run AS (
+             UPDATE scheduled_job_runs
+             SET status = 'cancelled',
+                 completed_at = now(),
+                 error_code = 'proactive_task_cancelled'
+             WHERE user_id = $1
+               AND agent_id = $2
+               AND proactive_task_id IN (SELECT id FROM updated_task)
+             RETURNING job_id
+           )
+           UPDATE scheduled_jobs
+           SET status = 'error',
+               last_error_code = 'proactive_task_cancelled',
+               updated_at = now()
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id IN (SELECT job_id FROM updated_run)`,
           [scope.userId, scope.agentId, taskId],
         );
       },
       async markFailed(scope: AgentScope, taskId: string): Promise<void> {
         await pool.query(
-          "UPDATE proactive_tasks SET status = 'failed', updated_at = now() WHERE user_id = $1 AND agent_id = $2 AND id = $3",
+          `WITH updated_task AS (
+             UPDATE proactive_tasks
+             SET status = 'failed', updated_at = now()
+             WHERE user_id = $1 AND agent_id = $2 AND id = $3
+             RETURNING id
+           ),
+           updated_run AS (
+             UPDATE scheduled_job_runs
+             SET status = 'error',
+                 completed_at = now(),
+                 error_code = 'proactive_delivery_failed'
+             WHERE user_id = $1
+               AND agent_id = $2
+               AND proactive_task_id IN (SELECT id FROM updated_task)
+             RETURNING job_id
+           )
+           UPDATE scheduled_jobs
+           SET status = 'error',
+               last_error_code = 'proactive_delivery_failed',
+               updated_at = now()
+           WHERE user_id = $1
+             AND agent_id = $2
+             AND id IN (SELECT job_id FROM updated_run)`,
           [scope.userId, scope.agentId, taskId],
         );
       },
@@ -2027,6 +2114,18 @@ export function createRepositories(
           [scope.userId, scope.agentId],
         );
         return Number(result.rows[0]?.count ?? 0);
+      },
+    },
+    scheduledJobs: {
+      async processDue(
+        scope: AgentScope,
+        signal?: AbortSignal,
+      ) {
+        return processDueScheduledJobs({
+          pool,
+          scope,
+          signal,
+        });
       },
     },
     goals: {
@@ -2090,6 +2189,7 @@ export function createRepositories(
              needs_human_prompt = CASE WHEN $5 THEN $6 ELSE needs_human_prompt END,
              next_run_at = CASE WHEN $7 THEN $8 ELSE next_run_at END,
              finished_at = CASE WHEN $9 THEN now() ELSE finished_at END,
+             revision = revision + 1,
              updated_at = now()
            WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
           [
@@ -2110,7 +2210,10 @@ export function createRepositories(
       // as interrupted rounds and may be taken over (restart recovery).
       async claimRunningStep(scope: AgentScope, goalId: string, stepId: string): Promise<boolean> {
         const result = await pool.query(
-          `UPDATE goals SET running_step = $4, updated_at = now()
+          `UPDATE goals SET
+             running_step = $4,
+             revision = revision + 1,
+             updated_at = now()
            WHERE user_id = $1 AND agent_id = $2 AND id = $3
              AND (running_step IS NULL OR updated_at < now() - interval '30 minutes')
            RETURNING id`,
@@ -2120,7 +2223,11 @@ export function createRepositories(
       },
       async releaseRunningStep(scope: AgentScope, goalId: string, nextRunAt: Date | null): Promise<void> {
         await pool.query(
-          `UPDATE goals SET running_step = NULL, next_run_at = $4, updated_at = now()
+          `UPDATE goals SET
+             running_step = NULL,
+             next_run_at = $4,
+             revision = revision + 1,
+             updated_at = now()
            WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
           [scope.userId, scope.agentId, goalId, nextRunAt],
         );
@@ -2136,6 +2243,7 @@ export function createRepositories(
              report_draft = COALESCE($5, report_draft),
              budget_used = COALESCE($6, budget_used),
              no_progress_rounds = COALESCE($7, no_progress_rounds),
+             revision = revision + 1,
              updated_at = now()
            WHERE user_id = $1 AND agent_id = $2 AND id = $3`,
           [
@@ -3690,6 +3798,7 @@ function mapGoal(row: Record<string, unknown>): DbGoal {
     finishedAt: (row.finished_at as Date | null) ?? null,
     createdAt: row.created_at as Date,
     updatedAt: row.updated_at as Date,
+    revision: Number(row.revision ?? 1),
   };
 }
 

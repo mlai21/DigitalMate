@@ -183,6 +183,8 @@ async function processAgentTick(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
+  await repositories.scheduledJobs?.processDue(scope, signal);
+  signal.throwIfAborted();
   await processDueProactiveTasks({
     scope,
     repositories,

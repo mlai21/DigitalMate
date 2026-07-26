@@ -120,11 +120,41 @@ import {
 import {
   createPostgresAdminSessionsService,
 } from "@/server/admin/views/sessions";
+import {
+  createCreateCronJobHandler,
+  createDeleteCronJobHandler,
+  createGetCronJobHandler,
+  createGetCronJobHistoryHandler,
+  createGetCronJobStateHandler,
+  createGetHeartbeatHandler,
+  createListCronDispatchTargetsHandler,
+  createListCronJobsHandler,
+  createReplaceCronJobHandler,
+  createRunCronJobHandler,
+  createRunHeartbeatHandler,
+  createSetCronJobEnabledHandler,
+  createUpdateHeartbeatHandler,
+  type AdminSchedulesService,
+} from "@/server/admin/compat/handlers/schedules";
+import {
+  createPostgresAdminSchedulesService,
+} from "@/server/admin/views/schedules";
+import {
+  createGetGoalHandler,
+  createGetInterjectionsHandler,
+  createGoalActionHandler,
+  createListGoalsHandler,
+  createUpdateInterjectionPolicyHandler,
+  type AdminEvolutionService,
+} from "@/server/admin/compat/handlers/evolution";
+import {
+  createPostgresAdminEvolutionService,
+} from "@/server/admin/views/evolution";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-27.2";
+export const adminCompatApiRevision = "2026-07-27.3";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -142,6 +172,8 @@ export type CoreAdminCompatDependencies = Readonly<{
   channelNodes?: AdminChannelNodeService;
   inbox?: AdminInboxService;
   sessions?: AdminSessionsService;
+  schedules?: AdminSchedulesService;
+  evolution?: AdminEvolutionService;
   verifyUpstreamContract?: boolean;
 }>;
 
@@ -534,6 +566,123 @@ export function createCoreAdminCompatRouter(
     );
   }
 
+  if (dependencies.schedules) {
+    const scheduleRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/cron/jobs",
+      createListCronJobsHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.post(
+      "/cron/jobs",
+      createCreateCronJobHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.get(
+      "/cron/jobs/:jobId",
+      createGetCronJobHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.put(
+      "/cron/jobs/:jobId",
+      createReplaceCronJobHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.delete(
+      "/cron/jobs/:jobId",
+      createDeleteCronJobHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.post(
+      "/cron/jobs/:jobId/pause",
+      createSetCronJobEnabledHandler(
+        dependencies.schedules,
+        false,
+      ),
+      scheduleRouteOptions,
+    );
+    router.post(
+      "/cron/jobs/:jobId/resume",
+      createSetCronJobEnabledHandler(
+        dependencies.schedules,
+        true,
+      ),
+      scheduleRouteOptions,
+    );
+    router.post(
+      "/cron/jobs/:jobId/run",
+      createRunCronJobHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.get(
+      "/cron/jobs/:jobId/state",
+      createGetCronJobStateHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.get(
+      "/cron/jobs/:jobId/history",
+      createGetCronJobHistoryHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.get(
+      "/cron/dispatch-targets",
+      createListCronDispatchTargetsHandler(
+        dependencies.schedules,
+      ),
+      scheduleRouteOptions,
+    );
+    router.get(
+      "/config/heartbeat",
+      createGetHeartbeatHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.put(
+      "/config/heartbeat",
+      createUpdateHeartbeatHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+    router.post(
+      "/config/heartbeat/run",
+      createRunHeartbeatHandler(dependencies.schedules),
+      scheduleRouteOptions,
+    );
+  }
+
+  if (dependencies.evolution) {
+    const evolutionRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/interjections",
+      createGetInterjectionsHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.put(
+      "/interjections/policy",
+      createUpdateInterjectionPolicyHandler(
+        dependencies.evolution,
+      ),
+      evolutionRouteOptions,
+    );
+    router.get(
+      "/goals",
+      createListGoalsHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.get(
+      "/goals/:goalId",
+      createGetGoalHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+    router.post(
+      "/goals/:goalId/actions/:action",
+      createGoalActionHandler(dependencies.evolution),
+      evolutionRouteOptions,
+    );
+  }
+
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);
     router.put(path, putLanguage);
@@ -672,6 +821,8 @@ export async function dispatchAdminCompatRequest(
       pool,
       env.attachmentStorageDir,
     ),
+    schedules: createPostgresAdminSchedulesService(pool),
+    evolution: createPostgresAdminEvolutionService(pool),
     wechatQrAuth,
     verifyUpstreamContract: true,
   });

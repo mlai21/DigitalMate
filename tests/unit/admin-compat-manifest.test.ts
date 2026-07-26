@@ -267,6 +267,10 @@ describe("QwenPaw Console upstream API contract", () => {
         {} as NonNullable<
           CoreAdminCompatDependencies["sessions"]
         >,
+      schedules:
+        {} as NonNullable<
+          CoreAdminCompatDependencies["schedules"]
+        >,
       verifyUpstreamContract: true,
     } satisfies CoreAdminCompatDependencies;
 
