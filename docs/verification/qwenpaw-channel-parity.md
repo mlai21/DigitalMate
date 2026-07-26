@@ -2,23 +2,29 @@
 
 基线固定为 QwenPaw `v2.0.0.post3`，commit
 `fef7e64d984f4332d0b84a343cd209bd3ea5d316`。本账本覆盖 M4-A
-七个标准渠道，以及 M4-B 的 MQTT、Matrix、企业微信、小艺、腾讯元宝
-和微信 iLink。它不是实际平台可用性声明；标准渠道外部联调见
+七个标准渠道、M4-B 的 MQTT、Matrix、企业微信、小艺、腾讯元宝和微信
+iLink，以及 M4-C 的 OneBot v11、iMessage、Voice/Twilio 和 SIP。它不是
+实际平台可用性声明；标准渠道外部联调见
 [`channels-standard-m4a.md`](./channels-standard-m4a.md)，协议渠道验收见
-[`channels-protocol-m4b.md`](./channels-protocol-m4b.md)。
+[`channels-protocol-m4b.md`](./channels-protocol-m4b.md)，特殊渠道验收见
+[`channels-edge-m4c.md`](./channels-edge-m4c.md)。
 
 `source_sha256` 的计算方式是：先由 M1 校验整个只读快照和
 `SHA256SUMS`，再取该渠道目录下全部文件的已验证清单行，按 POSIX
 路径排序、保留 `SHA256SUMS` 行格式后计算 SHA-256。配置字段由固定
 `config.py` 中 `BaseChannelConfig` 与渠道子类合并得到；第二份固定配置
-路由文件也纳入证据边界。`config_decisions.default` 适用于全部上游字段，
-`exceptions` 只记录有意收紧或兼容处理的字段。
+路由文件也纳入证据边界。`digitalmate.evidence_sha256` 对账本列出的本地
+Adapter 或 runner、测试和渠道文档逐文件计算 SHA-256，再对排序后的清单
+计算集合摘要，防止路径仍在但实现或测试内容被清空、替换。
+`config_decisions.default` 适用于全部上游字段，`exceptions` 只记录有意
+收紧或兼容处理的字段。
 
-M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测试会把该
-集合与运行时 manifest 及 Console 返回的 `password` 字段做精确比较，防止
-凭据字段退化为普通配置。JSON 中的 `status` 只表示代码自动化状态，本阶段
-必须是 `automated_verified`；真实平台状态由单独 smoke 矩阵维护，无外部
-证据不能写成 `smoke_verified`。
+M4-B 与 M4-C 中由中心保存密钥的渠道还固定记录
+`digitalmate.secret_fields`；审计测试会把该集合与运行时 manifest 及
+Console 返回的 `password` 字段做精确比较，防止凭据字段退化为普通配置。
+SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON 中的 `status`
+只表示代码自动化状态，本阶段必须是 `automated_verified`；真实平台状态由
+单独 smoke 矩阵维护，无外部证据不能写成 `smoke_verified`。
 
 | 渠道 | 上游源集合 SHA-256 | 上游 unit / contract | DigitalMate 状态 | 外部状态 |
 | --- | --- | --- | --- | --- |
@@ -35,6 +41,10 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
 | 小艺 | `056120d5f5cabd7af04032e620ed559e1ac52574c027b924e5792146ae74c2d7` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
 | 腾讯元宝 | `3f258fc31991f91ba71f60a5d4a6fec8a801468f9d25c4a92735a7928cd50537` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
 | 微信 iLink | `1b3a247a53540b0d3da1e39f89ab7ee29c62ab865a77c1d552a3b8a75e7bf26d` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
+| OneBot v11 | `1b7712c4526a662061a03e034edd54570202631bc78ec797f9a9d3b7bffe03b8` | unit 存在；contract 缺失 | `automated_verified` | `pending_external` |
+| iMessage | `6ee63192f22f69ba164e27361b6d9b8f2d494c3791e0b2d877ed83d150462fb5` | 均存在 | `automated_verified` | `pending_external` |
+| Voice / Twilio | `7ae18ed389a648ebcfb1e858c9a89b4241838df0474496fc4f89a21592267ab6` | 均存在 | `automated_verified` | `pending_external` |
+| SIP | `12b2b81a99beb266f6cb0a0f7bf1f616c3e876cecf15fc7450b6243b0eb600a3` | unit、contract 均缺失 | `automated_verified` | `pending_external` |
 
 以下 JSON 是审计脚本读取的规范证据；不得手工删减为空或用“同上”替代。
 
@@ -89,6 +99,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "c3038d5d641ee0036c923bb287903614c07b97a12848e5b503e76c9dfde65f63",
       "adapter_files": [
         "src/server/channels/adapters/telegram/config.ts",
         "src/server/channels/adapters/telegram/index.ts",
@@ -158,6 +169,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "051e01b4e5f94be13942e3d28a5115232f3a73c26605768be3a8f7a2db45a8b9",
       "adapter_files": [
         "src/server/channels/adapters/discord/config.ts",
         "src/server/channels/adapters/discord/index.ts",
@@ -232,6 +244,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "1d9176bd46a59b40e8578a27bf9b1ecf606d2fd5fa737d215ff76f91b52bddf4",
       "adapter_files": [
         "src/server/channels/adapters/slack/config.ts",
         "src/server/channels/adapters/slack/index.ts",
@@ -301,6 +314,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "eb3e6ffc2b234d09326619c4442ea6fa8c47e7b8059d0796f2b24066a90ea512",
       "adapter_files": [
         "src/server/channels/adapters/mattermost/config.ts",
         "src/server/channels/adapters/mattermost/index.ts",
@@ -381,6 +395,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "87905612341af282d85bcc60f25fefd12c42c75436913d4515ef6732f0935d06",
       "adapter_files": [
         "src/server/channels/adapters/feishu/config.ts",
         "src/server/channels/adapters/feishu/index.ts",
@@ -465,6 +480,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "eeb1f701f9b3a9813ac3f41ee75dbc206f17ee1942667b879ceb09728e832f65",
       "adapter_files": [
         "src/server/channels/adapters/dingtalk/config.ts",
         "src/server/channels/adapters/dingtalk/index.ts",
@@ -538,6 +554,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "88d4bb616a5e865e0dc57c260b117e893af2ea76bd5c26b438c661bbc44418b1",
       "adapter_files": [
         "src/server/channels/adapters/qq/config.ts",
         "src/server/channels/adapters/qq/index.ts",
@@ -615,6 +632,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "c6fda41a977e2784d70c19e680a56e14e9757ffd0399c29b15514b429ec90701",
       "secret_fields": [
         "password",
         "tls_keyfile"
@@ -698,6 +716,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "eec705abc1378b7ef1ebe987caf9624b5f6a2a7303c14271713873eb5e73c183",
       "secret_fields": [
         "access_token",
         "password"
@@ -777,6 +796,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "b1e15f7649ce39775a720604250b229bc04908c02804db8c983cab2da4f3f16b",
       "secret_fields": [
         "secret"
       ],
@@ -851,6 +871,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "71f63d5ecf1d059e34016385ce2b857f2c76e164149f1043f6ae579a28902dd1",
       "secret_fields": [
         "sk"
       ],
@@ -930,6 +951,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "35d8293a7bd1dbcb0bbd8c29d1dcb72007b4fba5e031d685e10de7b8c9bb42b4",
       "secret_fields": [
         "app_secret"
       ],
@@ -1011,6 +1033,7 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "2e6c45dcefdb82bfec0ffb3915e54471e9a98c6ffced6c4a79bc7708f479a527",
       "secret_fields": [
         "bot_token",
         "bot_token_file"
@@ -1050,6 +1073,338 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
       "Bot Token 与 context token 只进入加密配置或 reply handle；ret=-2 持久失效句柄，主动任务和重启恢复都不会再次选择。"
     ],
     "status": "automated_verified"
+  },
+  {
+    "channel": "onebot",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/onebot/__init__.py",
+        "reference/src/qwenpaw/app/channels/onebot/channel.py"
+      ],
+      "source_sha256": "1b7712c4526a662061a03e034edd54570202631bc78ec797f9a9d3b7bffe03b8",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "ws_host",
+        "ws_port",
+        "access_token",
+        "share_session_in_group"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_onebot_channel.py"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "5e1a89d81e1b002e3576c546733dd2a52024e895a89d2c33764c2436c6399831",
+      "secret_fields": [
+        "access_token"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/onebot/config.ts",
+        "src/server/channels/adapters/onebot/index.ts",
+        "src/server/channels/adapters/onebot/normalize.ts",
+        "src/server/channels/adapters/onebot/protocol.ts",
+        "src/server/channels/adapters/onebot/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/onebot.test.ts",
+        "tests/unit/channels/gateway/router.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/onebot.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "ws_host": "compatibility_field_gateway_listener_is_authoritative",
+          "ws_port": "compatibility_field_gateway_listener_is_authoritative"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游缺少 OneBot contract 测试，DigitalMate 合同补齐 NapCat、go-cqhttp、Lagrange fixture、Bearer 鉴权、echo、事件上限与 watchdog。",
+      "TypeScript Adapter 只处理协议边界，反向 WebSocket 由受限公网 gateway 托管；平台风控状态不会伪装为 connected。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "imessage",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/imessage/__init__.py",
+        "reference/src/qwenpaw/app/channels/imessage/channel.py"
+      ],
+      "source_sha256": "6ee63192f22f69ba164e27361b6d9b8f2d494c3791e0b2d877ed83d150462fb5",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "db_path",
+        "poll_sec",
+        "media_dir",
+        "max_decoded_size"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_imessage.py"
+      ],
+      "contract_tests": [
+        "reference/tests/contract/channels/test_imessage_contract.py"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "1f9f595db7807aa47e3edc0e2808bd7f26f889d53d882ecb55ede8bee64e9269",
+      "adapter_files": [
+        "runners/channel-node/src/imessage/config.ts",
+        "runners/channel-node/src/imessage/database.ts",
+        "runners/channel-node/src/imessage/normalize.ts",
+        "runners/channel-node/src/imessage/rejections.ts",
+        "runners/channel-node/src/imessage/transport.ts"
+      ],
+      "tests": [
+        "tests/unit/channel-node/imessage.test.ts",
+        "tests/unit/channel-node/client.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/imessage.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "media_dir": "compatibility_field_private_node_storage_is_authoritative"
+        }
+      }
+    },
+    "intentional_differences": [
+      "Python 本机实现迁为无 Agent 权限的 TypeScript macOS runner，只读查询 chat.db，并通过 mTLS 节点协议交换规范化文本与附件 locator。",
+      "完全磁盘访问、imsg、启动游标和 10 MiB 解码边界由本地 health 与合同校验；群聊能力明确保持 blocked。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "voice",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/voice/__init__.py",
+        "reference/src/qwenpaw/app/channels/voice/channel.py",
+        "reference/src/qwenpaw/app/channels/voice/conversation_relay.py",
+        "reference/src/qwenpaw/app/channels/voice/session.py",
+        "reference/src/qwenpaw/app/channels/voice/twilio_manager.py",
+        "reference/src/qwenpaw/app/channels/voice/twiml.py"
+      ],
+      "source_sha256": "7ae18ed389a648ebcfb1e858c9a89b4241838df0474496fc4f89a21592267ab6",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "twilio_account_sid",
+        "twilio_auth_token",
+        "phone_number",
+        "phone_number_sid",
+        "tts_provider",
+        "tts_voice",
+        "stt_provider",
+        "language",
+        "welcome_greeting"
+      ],
+      "unit_tests": [
+        "reference/tests/unit/channels/test_voice.py"
+      ],
+      "contract_tests": [
+        "reference/tests/contract/channels/test_voice_contract.py"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "55bcc33e5b560323b59fa4b9350e7b4e9a189486e8b6979d6294a9126462e25c",
+      "secret_fields": [
+        "twilio_auth_token"
+      ],
+      "adapter_files": [
+        "src/server/channels/adapters/voice/config.ts",
+        "src/server/channels/adapters/voice/index.ts",
+        "src/server/channels/adapters/voice/relay.ts",
+        "src/server/channels/adapters/voice/signature.ts",
+        "src/server/channels/adapters/voice/transport.ts",
+        "src/server/channels/adapters/voice/twiml.ts"
+      ],
+      "tests": [
+        "tests/unit/channels/adapters/voice.test.ts",
+        "tests/unit/channels/gateway/router.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/voice.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "welcome_greeting": "digitalmate_brand_default"
+        }
+      }
+    },
+    "intentional_differences": [
+      "ConversationRelay、TwiML 与签名校验迁为 TypeScript gateway；电话音频只在 Twilio 侧完成 STT/TTS，中心 Agent 仅接收转写文本。",
+      "新增最大并发通话配置与持久化 callSid 幂等边界；这不改变固定上游字段的 Console 兼容语义。"
+    ],
+    "status": "automated_verified"
+  },
+  {
+    "channel": "sip",
+    "upstream": {
+      "source_files": [
+        "reference/src/qwenpaw/app/channels/sip/__init__.py",
+        "reference/src/qwenpaw/app/channels/sip/_audioop_compat.py",
+        "reference/src/qwenpaw/app/channels/sip/backend.py",
+        "reference/src/qwenpaw/app/channels/sip/livekit_backend.py",
+        "reference/src/qwenpaw/app/channels/sip/mini_registrar.py",
+        "reference/src/qwenpaw/app/channels/sip/pyvoip_backend.py",
+        "reference/src/qwenpaw/app/channels/sip/session.py",
+        "reference/src/qwenpaw/app/channels/sip/sip_client.py",
+        "reference/src/qwenpaw/app/channels/sip/stt_engine.py",
+        "reference/src/qwenpaw/app/channels/sip/stt_tts.py"
+      ],
+      "source_sha256": "12b2b81a99beb266f6cb0a0f7bf1f616c3e876cecf15fc7450b6243b0eb600a3",
+      "config_files": [
+        "reference/src/qwenpaw/config/config.py",
+        "reference/src/qwenpaw/app/routers/config.py"
+      ],
+      "config_fields": [
+        "enabled",
+        "bot_prefix",
+        "filter_tool_messages",
+        "filter_thinking",
+        "dm_policy",
+        "group_policy",
+        "allow_from",
+        "deny_message",
+        "require_mention",
+        "no_text_debounce",
+        "access_control_dm",
+        "access_control_group",
+        "dm_disabled",
+        "group_disabled",
+        "sip_mode",
+        "sip_host",
+        "sip_port",
+        "sip_username",
+        "sip_password",
+        "sip_server",
+        "sip_transport",
+        "rtp_port_low",
+        "rtp_port_high",
+        "dashscope_api_key",
+        "tts_provider",
+        "tts_voice",
+        "stt_provider",
+        "language",
+        "welcome_greeting",
+        "call_timeout",
+        "livekit_url",
+        "livekit_api_key",
+        "livekit_api_secret",
+        "livekit_sip_trunk_id",
+        "livekit_room_name",
+        "livekit_output_sample_rate",
+        "max_concurrent_calls"
+      ],
+      "unit_tests": [
+        "missing_upstream"
+      ],
+      "contract_tests": [
+        "missing_upstream"
+      ]
+    },
+    "digitalmate": {
+      "manifest": "src/server/channels/manifests/catalog.ts",
+      "evidence_sha256": "5a43863a795817c0db6243553c6dd62816469ae9ff54dd4f508b7854f751a9b3",
+      "adapter_files": [
+        "runners/channel-node/src/sip/backend.ts",
+        "runners/channel-node/src/sip/config.ts",
+        "runners/channel-node/src/sip/livekit.ts",
+        "runners/channel-node/src/sip/registrar.ts",
+        "runners/channel-node/src/sip/rtp.ts",
+        "runners/channel-node/src/sip/session.ts",
+        "runners/channel-node/src/sip/stt.ts",
+        "runners/channel-node/src/sip/transport.ts",
+        "runners/channel-node/src/sip/tts.ts"
+      ],
+      "tests": [
+        "tests/unit/channel-node/sip.test.ts",
+        "tests/unit/channel-node/client.test.ts",
+        "tests/unit/channels/runtime-start.test.ts"
+      ],
+      "document": "docs/channels/sip.md",
+      "config_decisions": {
+        "default": "supported",
+        "exceptions": {
+          "filter_tool_messages": "forced_true_safety_boundary",
+          "filter_thinking": "forced_true_safety_boundary",
+          "sip_password": "node_only_credential",
+          "dashscope_api_key": "node_only_credential",
+          "livekit_api_key": "node_only_credential",
+          "livekit_api_secret": "node_only_credential",
+          "welcome_greeting": "digitalmate_brand_default"
+        }
+      }
+    },
+    "intentional_differences": [
+      "固定上游同时缺少 SIP unit 与 contract 测试，DigitalMate 合同补齐 registrar、RTP、STT/TTS、超时、并发、pyVoIP 与 LiveKit 双后端。",
+      "SIP、RTP、DashScope 与 LiveKit 凭据只存在于无 Agent 权限的 TypeScript 媒体节点；中心只接收转写文本并通过 mTLS 发送回复文本。"
+    ],
+    "status": "automated_verified"
   }
 ]
 ```
@@ -1060,11 +1415,13 @@ M4-B 六个协议渠道还固定记录 `digitalmate.secret_fields`；审计测�
 运行：
 
 ```bash
-node scripts/qwenpaw-console/audit-channel-parity.mjs --require telegram,discord,slack,mattermost,feishu,dingtalk,qq,mqtt,matrix,wecom,xiaoyi,yuanbao,wechat
+node scripts/qwenpaw-console/audit-channel-parity.mjs --require-all
 ```
 
-脚本先执行 M1 快照校验，再验证固定身份、十三个渠道集合、逐文件哈希、
-继承后的配置字段、上游 unit/contract 证据、本地 manifest/Adapter/测试/
-文档、密钥字段和差异说明。未知渠道、重复渠道、空证据、错误哈希、漏字段、
-无证据 smoke 或缺文件都会退出 1。若未来固定上游确实没有某类测试，该数组必须明确写
-`missing_upstream`，并继续保留 DigitalMate 的本地补齐测试。
+脚本先执行 M1 快照校验，再验证固定身份、十七个渠道集合、固定上游目录、
+manifest 与运行时注册快照、逐文件哈希、继承后的配置字段、上游
+unit/contract 证据、本地 Adapter 或受限 runner、测试与文档的内容摘要、
+生产 Adapter switch、密钥字段和差异说明。未知渠道、重复渠道、空证据、
+错误哈希、漏字段、无证据 smoke 或缺文件都会退出 1。若固定上游确实没有
+某类测试，该数组必须明确写 `missing_upstream`，并继续保留 DigitalMate
+的本地补齐测试。

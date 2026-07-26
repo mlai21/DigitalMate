@@ -26,6 +26,26 @@ export type ChannelAdapterFactory = (
   dependencies: AdapterDependencies,
 ) => ChannelAdapter<Record<string, unknown>>;
 
+export const BUILT_IN_CHANNEL_ADAPTER_TYPES = [
+  "imessage",
+  "discord",
+  "dingtalk",
+  "feishu",
+  "qq",
+  "telegram",
+  "mattermost",
+  "mqtt",
+  "matrix",
+  "slack",
+  "voice",
+  "sip",
+  "wecom",
+  "xiaoyi",
+  "yuanbao",
+  "wechat",
+  "onebot",
+] as const satisfies readonly ChannelType[];
+
 export class ChannelAdapterRegistry {
   readonly #factories = new Map<ChannelType, ChannelAdapterFactory>();
 
@@ -433,6 +453,21 @@ export function registerNodeProxyChannelAdapters(
     registry.register(type, () =>
       createNodeProxyBoundaryAdapter(type)
     );
+  }
+}
+
+export function registerBuiltInChannelAdapters(
+  registry: ChannelAdapterRegistry,
+): void {
+  registerStandardChannelAdapters(registry);
+  registerProtocolChannelAdapters(registry);
+  registerNodeProxyChannelAdapters(registry);
+  registry.assertComplete();
+  if (
+    JSON.stringify(registry.registeredTypes())
+    !== JSON.stringify(BUILT_IN_CHANNEL_ADAPTER_TYPES)
+  ) {
+    throw new Error("built_in_channel_adapter_types_mismatch");
   }
 }
 

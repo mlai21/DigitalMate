@@ -50,6 +50,7 @@ import {
 } from "../../scripts/qwenpaw-console/audit-channel-parity.mjs";
 import { verifySnapshot } from "../../scripts/qwenpaw-console/verify-upstream.mjs";
 import {
+  CHANNEL_TYPES,
   getChannelManifest,
   isChannelType,
 } from "../../src/server/channels/manifests/catalog";
@@ -1766,21 +1767,7 @@ describe("QwenPaw channel parity audit", () => {
   const ledgerPath = path.resolve(
     "docs/verification/qwenpaw-channel-parity.md",
   );
-  const requiredChannels = [
-    "telegram",
-    "discord",
-    "slack",
-    "mattermost",
-    "feishu",
-    "dingtalk",
-    "qq",
-    "mqtt",
-    "matrix",
-    "wecom",
-    "xiaoyi",
-    "yuanbao",
-    "wechat",
-  ];
+  const requiredChannels = [...CHANNEL_TYPES];
 
   type LedgerFixture = {
     channel: string;
@@ -1790,6 +1777,7 @@ describe("QwenPaw channel parity audit", () => {
       source_sha256: string;
     };
     digitalmate: {
+      evidence_sha256: string;
       secret_fields?: string[];
     };
     intentional_differences: string[];
@@ -1830,15 +1818,44 @@ describe("QwenPaw channel parity audit", () => {
     }
   }
 
-  it("核验固定快照与十三个非空渠道证据", async () => {
+  it("核验固定快照与十七个非空渠道证据", async () => {
     await expect(
       auditChannelParity({ requiredChannels }),
     ).resolves.toMatchObject({
-      channels: 13,
-      required: 13,
+      channels: 17,
+      required: 17,
       tag: "v2.0.0.post3",
       commit: "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
     });
+  });
+
+  it("支持显式要求全部十七个渠道", () => {
+    expect(
+      channelParityTesting.parseRequiredChannels([
+        "--require-all",
+      ]),
+    ).toEqual(requiredChannels);
+  });
+
+  it("生产 Adapter switch 穷尽覆盖十七个渠道", async () => {
+    const source = await readFile(
+      "src/server/channels/runtime/start.ts",
+      "utf8",
+    );
+
+    expect(
+      channelParityTesting
+        .parseManagedAdapterCases(source)
+        .sort(),
+    ).toEqual([...CHANNEL_TYPES].sort());
+    expect(() =>
+      channelParityTesting.parseManagedAdapterCases(
+        source.replace(
+          "return assertNeverManagedChannel(channelType);",
+          "return unavailableAdapter(channelType);",
+        ),
+      ),
+    ).toThrow("production managed adapter switch is not exhaustive");
   });
 
   it("每个上游配置字段都由本地严格 manifest 接受", async () => {
@@ -1894,6 +1911,14 @@ describe("QwenPaw channel parity audit", () => {
       expected: "source_sha256 mismatch",
       update: (ledger: LedgerFixture[]) => {
         ledger[0].upstream.source_sha256 = "0".repeat(64);
+      },
+    },
+    {
+      variant: "错误本地证据哈希",
+      expected: "evidence_sha256 mismatch",
+      update: (ledger: LedgerFixture[]) => {
+        ledger[0].digitalmate.evidence_sha256 =
+          "0".repeat(64);
       },
     },
     {

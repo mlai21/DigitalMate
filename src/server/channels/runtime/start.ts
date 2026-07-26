@@ -950,13 +950,13 @@ function createManagedAdapter(
   connection: RuntimeChannelConnection,
   dependencies: ManagedAdapterDependencies,
 ): ChannelAdapter<Record<string, unknown>> {
-  if (
-    connection.runtimeNodeId
-    && ["imessage", "sip"].includes(connection.channelType)
-  ) {
-    return nodeManagedAdapter(connection.channelType);
-  }
-  switch (connection.channelType) {
+  const channelType = connection.channelType;
+  switch (channelType) {
+    case "imessage":
+    case "sip":
+      return connection.runtimeNodeId
+        ? nodeManagedAdapter(channelType)
+        : unavailableAdapter(channelType);
     case "discord":
       return createManagedDiscordAdapter(
         connection,
@@ -1035,8 +1035,12 @@ function createManagedAdapter(
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
     default:
-      return unavailableAdapter(connection.channelType);
+      return assertNeverManagedChannel(channelType);
   }
+}
+
+function assertNeverManagedChannel(value: never): never {
+  throw new Error(`unsupported_managed_channel:${String(value)}`);
 }
 
 function createManagedVoiceAdapter(

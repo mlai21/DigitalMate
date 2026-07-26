@@ -75,6 +75,11 @@ SIP 密码、DashScope 与 LiveKit 密钥只存在于这个私有文件和节点
 
 ## 停止、回滚与验收
 
-在 Console 解绑连接或吊销节点证书后，节点停止 SIP/LiveKit transport、关闭 room/socket、清空 TTS 队列并释放 RTP 端口；中心已经持久化的文字账本仍保留。
+在 Console 解绑连接后，中心立即拒绝该 connection 的后续收发并清空关联，
+但不会吊销整台节点的证书或停止其他绑定的 transport。runner 会在下次
+注册时同步最新绑定；若要求立即停止本地 SIP/LiveKit transport，应停止
+runner，或撤销节点证书以断开整台节点。停止 transport 时会关闭
+room/socket、清空 TTS 队列并释放 RTP 端口；中心已经持久化的文字账本仍
+保留。
 
 仓库自动化覆盖私有配置、CRLF 信令、REGISTER 生命周期与 401/407 鉴权、registrar 转发、dialog ACK/BYE、RTP sequence/timestamp、µ-law golden、端口耗尽、120 秒超时、5 路并发与 busy、LiveKit 独立房间预检/销毁、Dev/LiveKit 共用媒体合同、DashScope final-only、20 ms TTS 与 barge-in。没有真实 SIP 服务、LiveKit trunk 和 DashScope 账号时，外部状态必须保持 `pending_external`。

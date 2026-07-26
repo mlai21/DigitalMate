@@ -27,6 +27,25 @@ const LEDGER_START = "<!-- qwenpaw-channel-parity-ledger:start -->";
 const LEDGER_END = "<!-- qwenpaw-channel-parity-ledger:end -->";
 const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPOSITORY_ROOT = path.resolve(SCRIPT_DIRECTORY, "../..");
+const EXPECTED_CHANNEL_TYPES = Object.freeze([
+  "imessage",
+  "discord",
+  "dingtalk",
+  "feishu",
+  "qq",
+  "telegram",
+  "mattermost",
+  "mqtt",
+  "matrix",
+  "slack",
+  "voice",
+  "sip",
+  "wecom",
+  "xiaoyi",
+  "yuanbao",
+  "wechat",
+  "onebot",
+]);
 
 export const STANDARD_CHANNEL_AUDIT = Object.freeze({
   telegram: Object.freeze({
@@ -144,10 +163,58 @@ export const STANDARD_CHANNEL_AUDIT = Object.freeze({
       "tests/unit/channels/runtime-start.test.ts",
     ]),
   }),
+  onebot: Object.freeze({
+    upstreamDirectory: "onebot",
+    configClass: "OneBotConfig",
+    upstreamUnitTest: "test_onebot_channel.py",
+    upstreamContractTest: "test_onebot_contract.py",
+    localSecretFields: Object.freeze(["access_token"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/onebot.test.ts",
+      "tests/unit/channels/gateway/router.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  imessage: Object.freeze({
+    upstreamDirectory: "imessage",
+    configClass: "IMessageChannelConfig",
+    upstreamUnitTest: "test_imessage.py",
+    upstreamContractTest: "test_imessage_contract.py",
+    localEvidenceRoot: "runners/channel-node/src/imessage",
+    localTests: Object.freeze([
+      "tests/unit/channel-node/imessage.test.ts",
+      "tests/unit/channel-node/client.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  voice: Object.freeze({
+    upstreamDirectory: "voice",
+    configClass: "VoiceChannelConfig",
+    upstreamUnitTest: "test_voice.py",
+    upstreamContractTest: "test_voice_contract.py",
+    localSecretFields: Object.freeze(["twilio_auth_token"]),
+    localTests: Object.freeze([
+      "tests/unit/channels/adapters/voice.test.ts",
+      "tests/unit/channels/gateway/router.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
+  sip: Object.freeze({
+    upstreamDirectory: "sip",
+    configClass: "SIPChannelConfig",
+    upstreamUnitTest: "test_sip.py",
+    upstreamContractTest: "test_sip_contract.py",
+    localEvidenceRoot: "runners/channel-node/src/sip",
+    localTests: Object.freeze([
+      "tests/unit/channel-node/sip.test.ts",
+      "tests/unit/channel-node/client.test.ts",
+      "tests/unit/channels/runtime-start.test.ts",
+    ]),
+  }),
 });
 
 const STANDARD_CHANNELS = Object.freeze(
-  Object.keys(STANDARD_CHANNEL_AUDIT),
+  [...EXPECTED_CHANNEL_TYPES],
 );
 
 function comparePaths(left, right) {
@@ -352,6 +419,29 @@ function sourceCollectionHash(sourceFiles, checksums) {
     .digest("hex");
 }
 
+async function localEvidenceHash(repositoryRoot, relativePaths) {
+  const entries = await Promise.all(
+    [...relativePaths]
+      .sort(comparePaths)
+      .map(async (relativePath) => ({
+        path: relativePath,
+        sha256: createHash("sha256")
+          .update(
+            await readFile(
+              path.join(
+                repositoryRoot,
+                ...relativePath.split("/"),
+              ),
+            ),
+          )
+          .digest("hex"),
+      })),
+  );
+  return createHash("sha256")
+    .update(renderChecksums(entries))
+    .digest("hex");
+}
+
 function extractLedger(markdown) {
   const startCount = markdown.split(LEDGER_START).length - 1;
   const endCount = markdown.split(LEDGER_END).length - 1;
@@ -375,18 +465,143 @@ function extractLedger(markdown) {
   return parsed;
 }
 
+function parseTypeScriptStringArray(source, exportName) {
+  const match = new RegExp(
+    `export const ${exportName} = \\[([\\s\\S]*?)\\] as const`,
+  ).exec(source);
+  if (!match) {
+    throw new Error(`channel type snapshot missing:${exportName}`);
+  }
+  const body = match[1].replace(/,\s*$/, "");
+  const value = JSON.parse(`[${body}]`);
+  return assertNonEmptyStringArray(value, exportName);
+}
+
+function parseManagedAdapterCases(source) {
+  const start = source.indexOf("function createManagedAdapter(");
+  const end = source.indexOf(
+    "\nfunction assertNeverManagedChannel(",
+    start,
+  );
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("production managed adapter switch missing");
+  }
+  const body = source.slice(start, end);
+  if (
+    !/default:\s*return assertNeverManagedChannel\(channelType\);/.test(
+      body,
+    )
+  ) {
+    throw new Error("production managed adapter switch is not exhaustive");
+  }
+  return assertNonEmptyStringArray(
+    [...body.matchAll(/case "([^"]+)":/g)].map(
+      (match) => match[1],
+    ),
+    "production managed adapter cases",
+  );
+}
+
+async function assertRepositoryChannelSets(
+  repositoryRoot,
+  snapshotRoot,
+) {
+  const [
+    catalogSource,
+    registrySource,
+    runtimeSource,
+    upstreamEntries,
+  ] =
+    await Promise.all([
+      readFile(
+        path.join(
+          repositoryRoot,
+          "src/server/channels/manifests/catalog.ts",
+        ),
+        "utf8",
+      ),
+      readFile(
+        path.join(
+          repositoryRoot,
+          "src/server/channels/runtime/registry.ts",
+        ),
+        "utf8",
+      ),
+      readFile(
+        path.join(
+          repositoryRoot,
+          "src/server/channels/runtime/start.ts",
+        ),
+        "utf8",
+      ),
+      readdir(
+        path.join(
+          snapshotRoot,
+          "reference/src/qwenpaw/app/channels",
+        ),
+        { withFileTypes: true },
+      ),
+    ]);
+
+  assertExactArray(
+    parseTypeScriptStringArray(catalogSource, "CHANNEL_TYPES"),
+    EXPECTED_CHANNEL_TYPES,
+    "manifest channel types",
+  );
+  assertExactArray(
+    parseTypeScriptStringArray(
+      registrySource,
+      "BUILT_IN_CHANNEL_ADAPTER_TYPES",
+    ),
+    EXPECTED_CHANNEL_TYPES,
+    "registry channel types",
+  );
+  assertExactArray(
+    Object.keys(STANDARD_CHANNEL_AUDIT).sort(comparePaths),
+    [...EXPECTED_CHANNEL_TYPES].sort(comparePaths),
+    "channel audit definitions",
+  );
+  assertExactArray(
+    parseManagedAdapterCases(runtimeSource).sort(comparePaths),
+    [...EXPECTED_CHANNEL_TYPES].sort(comparePaths),
+    "production managed adapter cases",
+  );
+
+  const upstreamChannels = upstreamEntries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => name !== "console")
+    .map((name) => name === "discord_" ? "discord" : name)
+    .sort(comparePaths);
+  assertExactArray(
+    upstreamChannels,
+    [...EXPECTED_CHANNEL_TYPES].sort(comparePaths),
+    "upstream channel directories",
+  );
+}
+
 function parseRequiredChannels(argv) {
   let value;
+  let requireAll = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === "--require") {
-      if (value !== undefined || index + 1 >= argv.length) {
+    if (argument === "--require-all") {
+      if (requireAll || value !== undefined) {
+        throw new Error("duplicate required channel argument");
+      }
+      requireAll = true;
+    } else if (argument === "--require") {
+      if (
+        requireAll
+        || value !== undefined
+        || index + 1 >= argv.length
+      ) {
         throw new Error("invalid --require argument");
       }
       value = argv[index + 1];
       index += 1;
     } else if (argument.startsWith("--require=")) {
-      if (value !== undefined) {
+      if (requireAll || value !== undefined) {
         throw new Error("duplicate --require argument");
       }
       value = argument.slice("--require=".length);
@@ -395,7 +610,10 @@ function parseRequiredChannels(argv) {
     }
   }
 
-  const channels = (value ?? STANDARD_CHANNELS.join(","))
+  const channels = (
+    requireAll ? STANDARD_CHANNELS.join(",") : value
+      ?? STANDARD_CHANNELS.join(",")
+  )
     .split(",")
     .map((channel) => channel.trim());
   return validateRequiredChannels(channels);
@@ -420,6 +638,20 @@ async function collectExpectedEvidence(repositoryRoot, checksumMap) {
     const sourceRoot =
       `reference/src/qwenpaw/app/channels/${definition.upstreamDirectory}`;
     const sourceFiles = await listRegularFiles(snapshotRoot, sourceRoot);
+    const adapterFiles = await listRegularFiles(
+      repositoryRoot,
+      definition.localEvidenceRoot
+        ?? `src/server/channels/adapters/${channel}`,
+    );
+    const localTests = definition.localTests ?? [
+      "tests/unit/channels/adapter-boundary.test.ts",
+      `tests/unit/channels/adapters/${channel}.test.ts`,
+      "tests/integration/channels/end-to-end.test.ts",
+    ];
+    const localDocument = `docs/channels/${channel}.md`;
+    for (const relativePath of [...localTests, localDocument]) {
+      await assertRegularFile(repositoryRoot, relativePath);
+    }
     evidence[channel] = {
       sourceFiles,
       sourceSha256: sourceCollectionHash(sourceFiles, checksumMap),
@@ -437,17 +669,14 @@ async function collectExpectedEvidence(repositoryRoot, checksumMap) {
         "contract",
         definition.upstreamContractTest,
       ),
-      adapterFiles: await listRegularFiles(
-        repositoryRoot,
-        `src/server/channels/adapters/${channel}`,
-      ),
-      localTests: definition.localTests ?? [
-        "tests/unit/channels/adapter-boundary.test.ts",
-        `tests/unit/channels/adapters/${channel}.test.ts`,
-        "tests/integration/channels/end-to-end.test.ts",
-      ],
+      adapterFiles,
+      localTests,
       localSecretFields: definition.localSecretFields,
-      localDocument: `docs/channels/${channel}.md`,
+      localDocument,
+      localEvidenceSha256: await localEvidenceHash(
+        repositoryRoot,
+        [...adapterFiles, ...localTests, localDocument],
+      ),
     };
   }
   return evidence;
@@ -523,6 +752,14 @@ async function validateEntry(
   );
   if (manifest !== "src/server/channels/manifests/catalog.ts") {
     throw new Error(`${channel}.digitalmate.manifest mismatch`);
+  }
+  if (
+    assertNonEmptyString(
+      digitalMate.evidence_sha256,
+      `${channel}.digitalmate.evidence_sha256`,
+    ) !== expected.localEvidenceSha256
+  ) {
+    throw new Error(`${channel}.digitalmate.evidence_sha256 mismatch`);
   }
   assertExactArray(
     assertNonEmptyStringArray(
@@ -612,6 +849,7 @@ export async function auditChannelParity(options = {}) {
     "vendor/qwenpaw-console",
   );
   await verifySnapshot(snapshotRoot);
+  await assertRepositoryChannelSets(repositoryRoot, snapshotRoot);
   if (
     UPSTREAM.tag !== EXPECTED_UPSTREAM.tag ||
     UPSTREAM.commit !== EXPECTED_UPSTREAM.commit
@@ -690,9 +928,13 @@ export async function auditChannelParity(options = {}) {
 
 export const __testing = Object.freeze({
   assertRealPathWithin,
+  assertRepositoryChannelSets,
   collectExpectedEvidence,
   extractLedger,
+  localEvidenceHash,
+  parseManagedAdapterCases,
   parseRequiredChannels,
+  parseTypeScriptStringArray,
   validateRequiredChannels,
 });
 

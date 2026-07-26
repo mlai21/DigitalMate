@@ -13,9 +13,13 @@ import type {
   AdminChannelHealthResolver,
 } from "@/server/admin/compat/handlers/channels";
 import { createAdminAuthStatusResponse } from "@/server/admin/compat/security";
-import { CHANNEL_TYPES } from "@/server/channels/manifests/catalog";
+import {
+  CHANNEL_MANIFESTS,
+  CHANNEL_TYPES,
+} from "@/server/channels/manifests/catalog";
 import {
   ChannelAdapterRegistry,
+  registerBuiltInChannelAdapters,
   registerNodeProxyChannelAdapters,
   registerProtocolChannelAdapters,
   registerStandardChannelAdapters,
@@ -121,6 +125,39 @@ async function request(
 }
 
 describe("admin compatibility channel contract", () => {
+  it("keeps all 17 manifests and runtime adapters in exact lockstep", () => {
+    const expected = [
+      "dingtalk",
+      "discord",
+      "feishu",
+      "imessage",
+      "matrix",
+      "mattermost",
+      "mqtt",
+      "onebot",
+      "qq",
+      "sip",
+      "slack",
+      "telegram",
+      "voice",
+      "wechat",
+      "wecom",
+      "xiaoyi",
+      "yuanbao",
+    ];
+    const registry = new ChannelAdapterRegistry();
+
+    registerBuiltInChannelAdapters(registry);
+
+    expect([...CHANNEL_TYPES].sort()).toEqual(expected);
+    expect(Object.keys(CHANNEL_MANIFESTS).sort()).toEqual(expected);
+    expect([...registry.registeredTypes()].sort()).toEqual(expected);
+    expect(() => registry.assertComplete()).not.toThrow();
+    expect(() => registerBuiltInChannelAdapters(registry)).toThrow(
+      "duplicate_channel_adapter:telegram",
+    );
+  });
+
   it("registers every M4-A standard channel adapter exactly once", () => {
     const registry = new ChannelAdapterRegistry();
 
