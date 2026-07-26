@@ -130,6 +130,10 @@ export function createChannelTurnExecutor(input: Readonly<{
     conversationId: string,
     reason: string,
   ): Promise<void>;
+  typing?(
+    claim: ClaimedChannelEvent,
+    active: boolean,
+  ): MaybePromise<void>;
   faultInjector?(
     point: ChannelTurnFaultPoint,
   ): MaybePromise<void>;
@@ -232,26 +236,35 @@ export function createChannelTurnExecutor(input: Readonly<{
         options.signal?.throwIfAborted();
         let body: string;
         let degraded = false;
+        await Promise.resolve(
+          input.typing?.(claim, true),
+        ).catch(() => undefined);
         try {
-          body = normalizeAssistantBody(
-            await collectReply(input.runAgentTurn({
-              claim,
-              conversationId,
-              journal,
-              signal: options.signal,
-            })),
-            CHANNEL_AGENT_FAILED_REPLY,
-          );
-          degraded = body === CHANNEL_AGENT_FAILED_REPLY;
-        } catch (error) {
-          if (
-            isProcessCrash(error)
-            || options.signal?.aborted === true
-          ) {
-            throw error;
+          try {
+            body = normalizeAssistantBody(
+              await collectReply(input.runAgentTurn({
+                claim,
+                conversationId,
+                journal,
+                signal: options.signal,
+              })),
+              CHANNEL_AGENT_FAILED_REPLY,
+            );
+            degraded = body === CHANNEL_AGENT_FAILED_REPLY;
+          } catch (error) {
+            if (
+              isProcessCrash(error)
+              || options.signal?.aborted === true
+            ) {
+              throw error;
+            }
+            body = CHANNEL_AGENT_FAILED_REPLY;
+            degraded = true;
           }
-          body = CHANNEL_AGENT_FAILED_REPLY;
-          degraded = true;
+        } finally {
+          await Promise.resolve(
+            input.typing?.(claim, false),
+          ).catch(() => undefined);
         }
         options.signal?.throwIfAborted();
         const persisted = await persist(

@@ -26,6 +26,11 @@ export type ChannelDeliveryPart = Readonly<{
   previousResult: SendResult | null;
 }>;
 
+export type ChannelDeliverySegmentPlan = Readonly<{
+  segments: readonly string[];
+  prefix: string;
+}>;
+
 export type ChannelDeliveryTransport = Readonly<{
   mode(
     delivery: ClaimedChannelDelivery,
@@ -35,6 +40,10 @@ export type ChannelDeliveryTransport = Readonly<{
     delivery: ClaimedChannelDelivery,
     signal: AbortSignal,
   ): Promise<number>;
+  segmentBodies?(
+    delivery: ClaimedChannelDelivery,
+    signal: AbortSignal,
+  ): Promise<ChannelDeliverySegmentPlan | null>;
   send(
     part: ChannelDeliveryPart,
     signal: AbortSignal,
@@ -51,6 +60,11 @@ type DeliveryRepository = Readonly<{
     claim: ClaimedChannelDelivery,
     now?: Date,
   ): Promise<Date | null>;
+  freezeSegments(
+    claim: ClaimedChannelDelivery,
+    segments: readonly string[],
+    now?: Date,
+  ): Promise<string[]>;
   beginSegment(
     claim: ClaimedChannelDelivery,
     segmentNo: number,
@@ -298,7 +312,7 @@ async function processDelivery(input: {
     input.claim,
     input.signal,
   );
-  const segments = mode === "task-streaming"
+  const computedSegments = mode === "task-streaming"
     ? segmentTaskDeliveryBody(
         input.claim.body,
         await input.transport.taskSegmentCodePointLimit?.(
@@ -306,10 +320,19 @@ async function processDelivery(input: {
           input.signal,
         ) ?? 4_000,
       )
-    : segmentDeliveryBody(
-        input.claim.body,
-        input.cadence,
-      );
+    : mode === "segmented"
+      ? await segmentedDeliveryBodies(input)
+      : segmentDeliveryBody(
+          input.claim.body,
+          input.cadence,
+        );
+  const segments = computedSegments.length > 0
+    ? await input.deliveries.freezeSegments(
+        input.claim,
+        computedSegments,
+        input.now(),
+      )
+    : computedSegments;
   if (segments.length === 0) {
     await requireClaimMutation(
       input.deliveries.deadLetter(
@@ -440,6 +463,41 @@ async function processDelivery(input: {
   await requireClaimMutation(
     input.deliveries.markSent(input.claim, input.now()),
   );
+}
+
+async function segmentedDeliveryBodies(input: {
+  claim: ClaimedChannelDelivery;
+  transport: ChannelDeliveryTransport;
+  cadence: DeliveryCadence;
+  signal: AbortSignal;
+}): Promise<string[]> {
+  const custom = await input.transport.segmentBodies?.(
+    input.claim,
+    input.signal,
+  );
+  if (custom === undefined || custom === null) {
+    return segmentDeliveryBody(
+      input.claim.body,
+      input.cadence,
+    );
+  }
+  const { segments, prefix } = custom;
+  if (
+    typeof prefix !== "string"
+    || segments.length === 0
+    || segments.length > 10_000
+    || segments.some((segment) =>
+      typeof segment !== "string"
+      || segment.length === 0
+    )
+    || segments.join("") !== input.claim.body
+  ) {
+    throw new Error("channel_delivery_segments_invalid");
+  }
+  return [
+    `${prefix}${segments[0]}`,
+    ...segments.slice(1),
+  ];
 }
 
 function normalizeCadence(value: unknown): DeliveryCadence {

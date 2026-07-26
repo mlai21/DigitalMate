@@ -948,6 +948,10 @@ describe("XiaoYi delivery idempotency", () => {
         renew: vi.fn(async () =>
           new Date(NOW.getTime() + 30_000)
         ),
+        freezeSegments: vi.fn(async (
+          _claim,
+          segments,
+        ) => [...segments]),
         beginSegment: vi.fn(async () => ({
           action: "send" as const,
           previousResult: null,

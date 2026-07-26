@@ -591,7 +591,8 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     label: "腾讯元宝",
     description: "连接腾讯元宝智能体",
     runtime: "central",
-    capabilities: ["attachments", "typing"],
+    capabilities: ["attachments", "groups", "typing"],
+    prerequisites: ["腾讯元宝智能体机器人接入资格"],
     platformFields: [
       stringField("app_id", "App ID"),
       secretField("app_secret", "App Secret", false, true),

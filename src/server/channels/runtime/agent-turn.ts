@@ -246,6 +246,7 @@ export function toLegacyChannelMessage(
       "matrix",
       "wecom",
       "xiaoyi",
+      "yuanbao",
     ]
       .includes(event.channelType)
   ) {

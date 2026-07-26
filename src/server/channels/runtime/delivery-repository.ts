@@ -30,6 +30,7 @@ type DeliveryRow = {
   assistant_message_id: string;
   reply_handle_id: string | null;
   body: string;
+  frozen_segments: unknown | null;
   recipient: ChannelRecipient;
   status: DeliveryStatus;
   claim_owner: string | null;
@@ -310,6 +311,42 @@ export function createChannelDeliveryRepository(
         ],
       );
       return result.rows[0]?.claim_expires_at ?? null;
+    },
+
+    async freezeSegments(
+      claim: ClaimedChannelDelivery,
+      segments: readonly string[],
+      now = new Date(),
+    ): Promise<string[]> {
+      const serialized = serializeFrozenSegments(segments);
+      const result = await pool.query<{
+        frozen_segments: unknown;
+      }>(
+        `UPDATE channel_deliveries
+         SET frozen_segments =
+               COALESCE(frozen_segments, $6::jsonb),
+             updated_at = $5
+         WHERE id = $1
+           AND user_id = $2
+           AND agent_id = $3
+           AND claim_owner = $4
+           AND status = 'running'
+           AND claim_expires_at > $5
+         RETURNING frozen_segments`,
+        [
+          claim.id,
+          claim.scope.userId,
+          claim.scope.agentId,
+          claim.claimOwner,
+          now,
+          serialized,
+        ],
+      );
+      const frozen = result.rows[0]?.frozen_segments;
+      if (frozen === undefined) {
+        throw new Error("channel_delivery_claim_lost");
+      }
+      return parseFrozenSegments(frozen);
     },
 
     async beginSegment(
@@ -632,6 +669,41 @@ function mapDeliveryRow(row: DeliveryRow): ChannelDeliveryRecord {
     lastErrorCode: row.last_error_code,
     sentAt: nullableDate(row.sent_at),
   };
+}
+
+function serializeFrozenSegments(
+  segments: readonly string[],
+): string {
+  validateFrozenSegments(segments);
+  const serialized = JSON.stringify(segments);
+  if (Buffer.byteLength(serialized, "utf8") > 2 * 1024 * 1024) {
+    throw new Error("channel_delivery_segments_invalid");
+  }
+  return serialized;
+}
+
+function parseFrozenSegments(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error("channel_delivery_segments_invalid");
+  }
+  validateFrozenSegments(value);
+  return [...value];
+}
+
+function validateFrozenSegments(
+  segments: readonly unknown[],
+): asserts segments is readonly string[] {
+  if (
+    segments.length === 0
+    || segments.length > 10_000
+    || segments.every((segment) => segment === "")
+    || segments.some((segment) =>
+      typeof segment !== "string"
+      || Buffer.byteLength(segment, "utf8") > 1024 * 1024
+    )
+  ) {
+    throw new Error("channel_delivery_segments_invalid");
+  }
 }
 
 function asClaim(

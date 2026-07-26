@@ -84,6 +84,13 @@ import {
   prepareXiaoYiAttachmentBatch,
 } from "@/server/channels/adapters/xiaoyi/transport";
 import {
+  createYuanbaoAdapter,
+} from "@/server/channels/adapters/yuanbao";
+import {
+  prepareYuanbaoAttachmentBatch,
+  type YuanbaoAttachmentFetcher,
+} from "@/server/channels/adapters/yuanbao/media";
+import {
   createTelegramTransport,
 } from "@/server/channels/adapters/telegram/transport";
 import { createSlackWebhookAdapter } from "@/server/channels/adapters/webhook/slack";
@@ -330,6 +337,40 @@ export async function startChannelRuntime(input: Readonly<{
       createExecutionJournal(pool, claim.scope, claim.id),
     decideTurn: agentTurn.decideTurn,
     runAgentTurn: agentTurn.runAgentTurn,
+    typing: async (claim, active) => {
+      const connection = await store.get(
+        claim.connectionId,
+      );
+      if (
+        !connection
+        || !connection.enabled
+        || connection.scope.userId
+          !== claim.scope.userId
+        || connection.scope.agentId
+          !== claim.scope.agentId
+      ) {
+        return;
+      }
+      const adapter = connectionManager.getAdapter(
+        connection.id,
+        connection.revision,
+      );
+      if (!adapter?.typing) return;
+      const event = claim.normalizedEvent;
+      const recipient = await adapter.resolveRecipient({
+        externalConversationId:
+          event.externalConversationId,
+        externalUserId: event.externalSenderId,
+        chatType: event.chatType,
+        ...(event.thread.externalThreadId
+          ? {
+              externalThreadId:
+                event.thread.externalThreadId,
+            }
+          : {}),
+      });
+      await adapter.typing(recipient, active);
+    },
     persistReply: createAtomicChannelReplyPersister(pool),
     completeWithoutReply:
       createAtomicChannelNoReplyPersister(pool),
@@ -413,6 +454,7 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
       "mqtt",
       "matrix",
       "wecom",
+      "yuanbao",
     ]
       .includes(input.target.channel)
   ) {
@@ -520,6 +562,33 @@ export function createChannelDeliveryTransport(input: Readonly<{
       }
     },
 
+    async segmentBodies(delivery, signal) {
+      signal.throwIfAborted();
+      const resolved = await resolveDeliveryTarget(
+        input,
+        delivery,
+      );
+      if (resolved.channelType !== "yuanbao") {
+        return null;
+      }
+      const prefix =
+        typeof resolved.config.bot_prefix === "string"
+          ? resolved.config.bot_prefix
+          : "";
+      const firstLimit = Math.max(
+        1,
+        2_800 - Array.from(prefix).length,
+      );
+      return {
+        segments: segmentCodePoints(
+          delivery.body,
+          firstLimit,
+          2_800,
+        ),
+        prefix,
+      };
+    },
+
     async send(part, signal): Promise<SendResult> {
       signal.throwIfAborted();
       try {
@@ -572,7 +641,12 @@ export function createChannelDeliveryTransport(input: Readonly<{
         return await resolved.adapter.send(
           channelDelivery,
           {
-            config: resolved.config,
+            config: resolved.channelType === "yuanbao"
+              ? {
+                  ...resolved.config,
+                  bot_prefix: "",
+                }
+              : resolved.config,
             signal,
             now,
           },
@@ -628,6 +702,30 @@ async function resolveDeliveryTarget(
   };
 }
 
+function segmentCodePoints(
+  value: string,
+  firstLimit: number,
+  followingLimit: number,
+): string[] {
+  const codePoints = Array.from(value);
+  if (codePoints.length === 0) return [];
+  const segments = [
+    codePoints.slice(0, firstLimit).join(""),
+  ];
+  for (
+    let index = firstLimit;
+    index < codePoints.length;
+    index += followingLimit
+  ) {
+    segments.push(
+      codePoints
+        .slice(index, index + followingLimit)
+        .join(""),
+    );
+  }
+  return segments;
+}
+
 type ManagedAdapterDependencies = Readonly<{
   pool: Pool;
   repositories: Repositories;
@@ -673,6 +771,11 @@ function createManagedAdapter(
       ) as ChannelAdapter<Record<string, unknown>>;
     case "xiaoyi":
       return createManagedXiaoYiAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
+    case "yuanbao":
+      return createManagedYuanbaoAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
@@ -1118,6 +1221,124 @@ function createManagedXiaoYiAdapter(
               } finally {
                 for (const descriptor of pendingAttachments) {
                   attachmentFetcher.release(descriptor);
+                }
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 30_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
+}
+
+function createManagedYuanbaoAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const adapter = createYuanbaoAdapter({
+    scope: connection.scope,
+    acceptInbound: (
+      payload,
+      context,
+      scope,
+      attachmentFetcher,
+    ) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 15 * 60 * 1_000,
+              );
+              const fetcher =
+                attachmentFetcher as YuanbaoAttachmentFetcher;
+              const pendingAttachments =
+                await prepareYuanbaoAttachmentBatch({
+                  scope: event.scope,
+                  eventId: event.id,
+                  connectionId: event.connectionId,
+                  descriptors: normalized.attachments,
+                  expiresAt,
+                  receivedAt: context.receivedAt,
+                  locators,
+                  fetcher,
+                  signal,
+                });
+              try {
+                for (const descriptor of pendingAttachments) {
+                  await downloadInboundAttachment({
+                    scope: event.scope,
+                    descriptor,
+                    fetcher,
+                    storageRoot:
+                      dependencies.attachmentStorageDir,
+                    repository:
+                      dependencies.repositories.messageAttachments,
+                    bindPrivateAttachment: async (
+                      attachmentId,
+                    ) => {
+                      const bound =
+                        await locators.bindPrivateAttachment(
+                          event.scope,
+                          event.id,
+                          descriptor.externalAttachmentId,
+                          attachmentId,
+                          new Date(),
+                        );
+                      if (!bound) {
+                        throw new Error(
+                          "attachment_bind_transition_failed",
+                        );
+                      }
+                    },
+                    signal,
+                  });
+                }
+              } finally {
+                for (const descriptor of pendingAttachments) {
+                  fetcher.release(descriptor);
                 }
               }
             },

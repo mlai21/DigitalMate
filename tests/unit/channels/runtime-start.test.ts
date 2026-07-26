@@ -110,6 +110,42 @@ describe("channel runtime start", () => {
     ).resolves.toBe(4_000);
   });
 
+  it("腾讯元宝按首段前缀余量生成可恢复的 2800 字分片", async () => {
+    const transport = createChannelDeliveryTransport({
+      loadConnection: vi.fn(async () => ({
+        id: "connection-1",
+        scope: delivery.scope,
+        channelType: "yuanbao" as const,
+        enabled: true,
+        revision: 1,
+        config: {
+          app_id: "app",
+          app_secret: "secret",
+          api_domain: "bot.yuanbao.tencent.com",
+          bot_prefix: "前",
+        },
+      })),
+      createAdapter: () => ({
+        validateConfig: (config) =>
+          config as Record<string, unknown>,
+        send: vi.fn(),
+      }),
+      loadReplyHandle: vi.fn(),
+    });
+
+    const segments = await transport.segmentBodies!(
+      {
+        ...delivery,
+        body: "😀".repeat(2_800),
+      },
+      new AbortController().signal,
+    );
+    expect(segments?.segments.map((segment) =>
+      Array.from(segment).length
+    )).toEqual([2_799, 1]);
+    expect(segments?.prefix).toBe("前");
+  });
+
   it("发送 Worker 从加密仓储加载配置和回复句柄", async () => {
     const send = vi.fn(async () => ({
       externalMessageId: "platform-1",
@@ -313,6 +349,49 @@ describe("channel runtime start", () => {
     expect(enqueueProactive).toHaveBeenCalledWith(
       expect.objectContaining({
         connectionId: "connection-wecom",
+        recipient: {
+          externalConversationId: "group-product",
+          externalUserId: "user-alice",
+          chatType: "group",
+        },
+      }),
+    );
+  });
+
+  it("允许腾讯元宝已授权任务复用原会话目标", async () => {
+    const enqueueProactive = vi.fn(
+      async () => "delivery-yuanbao-1",
+    );
+    const result = await enqueueProactiveChannelDelivery({
+      pool: {
+        query: vi.fn(async () => ({
+          rowCount: 1,
+          rows: [{ id: "connection-yuanbao" }],
+        })),
+      } as never,
+      repositories: {
+        channelDeliveries: { enqueueProactive },
+      } as never,
+      scope: delivery.scope,
+      taskId: "task-yuanbao-1",
+      assistantMessageId: "assistant-yuanbao-1",
+      content: "主动提醒",
+      target: {
+        channel: "yuanbao",
+        externalConversationId: "group-product",
+        externalMessageId: "message-yuanbao-1",
+        senderId: "user-alice",
+        chatType: "group",
+        text: "",
+        occurredAt:
+          new Date("2026-07-26T00:00:00.000Z"),
+      },
+    });
+
+    expect(result).toEqual({ queued: true });
+    expect(enqueueProactive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "connection-yuanbao",
         recipient: {
           externalConversationId: "group-product",
           externalUserId: "user-alice",

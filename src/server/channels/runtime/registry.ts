@@ -16,6 +16,7 @@ import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
 import { createWeComAdapter } from "../adapters/wecom";
 import { createXiaoYiAdapter } from "../adapters/xiaoyi";
+import { createYuanbaoAdapter } from "../adapters/yuanbao";
 
 export type ChannelAdapterFactory = (
   dependencies: AdapterDependencies,
@@ -288,6 +289,32 @@ export function registerXiaoYiChannelAdapter(
 ): void {
   registry.register("xiaoyi", (dependencies) =>
     createXiaoYiAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? {
+            acceptInbound: (
+              payload,
+              context,
+              scope,
+            ) => dependencies.acceptInbound!(
+              payload,
+              context,
+              scope,
+            ),
+          }
+        : {}),
+    })
+  );
+}
+
+export function registerYuanbaoChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("yuanbao", (dependencies) =>
+    createYuanbaoAdapter({
       now: dependencies.now,
       ...(dependencies.scope
         ? { scope: dependencies.scope }

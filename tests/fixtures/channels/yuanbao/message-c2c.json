@@ -1,0 +1,23 @@
+{
+  "callback_command": "C2C.Message",
+  "from_account": "user-alice",
+  "to_account": "bot-fixture",
+  "sender_nickname": "Alice",
+  "group_code": "",
+  "group_name": "",
+  "msg_seq": 71,
+  "msg_time": 1784995200,
+  "msg_key": "key-c2c-7001",
+  "msg_id": "msg-c2c-7001",
+  "msg_body": [
+    {
+      "msg_type": "TIMTextElem",
+      "msg_content": {
+        "text": "你好，DigitalMate"
+      }
+    }
+  ],
+  "cloud_custom_data": "",
+  "bot_owner_id": "owner-1",
+  "claw_msg_type": 0
+}

@@ -7,6 +7,7 @@ import {
   ChannelSendError,
   createChannelDeliveryWorker,
   segmentDeliveryBody,
+  type ChannelDeliverySegmentPlan,
   type ChannelDeliveryTransport,
   type DeliverySegmentStart,
 } from "@/server/channels/runtime/delivery-worker";
@@ -217,6 +218,38 @@ describe("channel delivery retry", () => {
     expect(harness.state.status).toBe("sent");
   });
 
+  it("freezes visible segment boundaries and prefix across retries", async () => {
+    let changed = false;
+    const harness = deliveryHarness({
+      body: "abcdef",
+      mode: "segmented",
+      segmentBodies: () =>
+        changed
+          ? ["abcd", "ef"]
+          : ["ab", "cdef"],
+      segmentPrefix: () =>
+        changed ? "[new]" : "[old]",
+    });
+    harness.transport.send
+      .mockResolvedValueOnce(sendResult("platform-1"))
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce(sendResult("platform-2"));
+
+    await harness.worker.runOne();
+    changed = true;
+    harness.advanceToRetry();
+    await harness.worker.runOne();
+
+    expect(harness.transport.send.mock.calls.map(
+      ([part]) => part.body,
+    )).toEqual([
+      "[old]ab",
+      "cdef",
+      "cdef",
+    ]);
+    expect(harness.state.status).toBe("sent");
+  });
+
   it("does not resend a segment whose prior platform outcome is ambiguous", async () => {
     const harness = deliveryHarness({
       beginOverride: async () => ({
@@ -280,6 +313,8 @@ function deliveryHarness(options: {
     claim: ClaimedChannelDelivery,
     segmentNo: number,
   ) => Promise<DeliverySegmentStart>;
+  segmentBodies?: () => readonly string[] | null;
+  segmentPrefix?: () => string;
 } = {}) {
   let currentTime = new Date("2026-07-26T00:00:00.000Z");
   const state = {
@@ -289,6 +324,7 @@ function deliveryHarness(options: {
     lastErrorCode: null as string | null,
   };
   const sentSegments = new Map<number, SendResult>();
+  let frozenSegments: string[] | null = null;
   const claim = (): ClaimedChannelDelivery => ({
     id: "delivery-1",
     scope: {
@@ -332,6 +368,13 @@ function deliveryHarness(options: {
     renew: vi.fn(async () =>
       new Date(currentTime.getTime() + 30_000)
     ),
+    freezeSegments: vi.fn(async (
+      _claim: ClaimedChannelDelivery,
+      segments: readonly string[],
+    ) => {
+      frozenSegments ??= [...segments];
+      return [...frozenSegments];
+    }),
     beginSegment: vi.fn(async (
       claimed: ClaimedChannelDelivery,
       segmentNo: number,
@@ -382,6 +425,19 @@ function deliveryHarness(options: {
   };
   const transport = {
     mode: vi.fn(async () => options.mode ?? "segmented"),
+    segmentBodies: options.segmentBodies
+      ? vi.fn(async (): Promise<
+          ChannelDeliverySegmentPlan | null
+        > => {
+          const segments = options.segmentBodies!();
+          return segments
+            ? {
+                segments,
+                prefix: options.segmentPrefix?.() ?? "",
+              }
+            : null;
+        })
+      : undefined,
     send: vi.fn(),
   } satisfies ChannelDeliveryTransport;
   const worker = createChannelDeliveryWorker({

@@ -1637,6 +1637,31 @@ ALTER TABLE IF EXISTS channel_deliveries
   ADD COLUMN IF NOT EXISTS source_task_id uuid;
 
 ALTER TABLE IF EXISTS channel_deliveries
+  ADD COLUMN IF NOT EXISTS frozen_segments jsonb;
+
+DO $channel_deliveries_frozen_segments_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname =
+      'channel_deliveries_frozen_segments_check'
+  ) THEN
+    ALTER TABLE channel_deliveries
+      ADD CONSTRAINT
+        channel_deliveries_frozen_segments_check
+      CHECK (
+        frozen_segments IS NULL
+        OR (
+          jsonb_typeof(frozen_segments) = 'array'
+          AND pg_column_size(frozen_segments) <= 2097152
+        )
+      );
+  END IF;
+END
+$channel_deliveries_frozen_segments_constraint$;
+
+ALTER TABLE IF EXISTS channel_deliveries
   ALTER COLUMN event_id DROP NOT NULL;
 
 DO $channel_delivery_source_constraints$

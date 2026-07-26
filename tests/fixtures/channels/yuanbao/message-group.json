@@ -1,0 +1,38 @@
+{
+  "callback_command": "Group.Message",
+  "from_account": "user-bob",
+  "to_account": "bot-fixture",
+  "sender_nickname": "Bob",
+  "group_code": "group-product",
+  "group_name": "产品群",
+  "msg_seq": 72,
+  "msg_time": 1784995201,
+  "msg_key": "key-group-7002",
+  "msg_id": "msg-group-7002",
+  "msg_body": [
+    {
+      "msg_type": "TIMCustomElem",
+      "msg_content": {
+        "data": "{\"elem_type\":1002,\"user_id\":\"bot-fixture\"}"
+      }
+    },
+    {
+      "msg_type": "TIMTextElem",
+      "msg_content": {
+        "text": "@bot-fixture 看看这份记录"
+      }
+    },
+    {
+      "msg_type": "TIMFileElem",
+      "msg_content": {
+        "uuid": "fixture-file",
+        "file_name": "notes.txt",
+        "file_size": 5,
+        "url": "https://bot.yuanbao.tencent.com/resource/file?resourceId=resource-7002"
+      }
+    }
+  ],
+  "cloud_custom_data": "{\"quote\":{\"type\":3,\"desc\":\"history.csv\"}}",
+  "bot_owner_id": "owner-1",
+  "claw_msg_type": 0
+}

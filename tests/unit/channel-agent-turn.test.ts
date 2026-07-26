@@ -269,6 +269,32 @@ describe("channel agent turn", () => {
         }),
       );
   });
+
+  it("腾讯元宝事件复用唯一 DigitalMate Agent 与记忆", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("元宝渠道回复"),
+    );
+    const context = createContext({
+      channelType: "yuanbao",
+    });
+
+    await expect(runner.decideTurn(context))
+      .resolves.toEqual({ kind: "proceed" });
+    await expect(
+      collect(runner.runAgentTurn(context)),
+    ).resolves.toBe("元宝渠道回复");
+    expect(repositories.channels.createChannelMessage)
+      .toHaveBeenCalledWith(
+        scope,
+        expect.objectContaining({
+          message: expect.objectContaining({
+            channel: "yuanbao",
+          }),
+        }),
+      );
+  });
 });
 
 function createRunner(
@@ -293,7 +319,7 @@ function createContext(
     skillPermission?: "none" | "explicit_slash";
     attachmentsPresent?: boolean;
     rawSummary?: Record<string, string>;
-    channelType?: "telegram" | "xiaoyi";
+    channelType?: "telegram" | "xiaoyi" | "yuanbao";
   } = {},
   journal = memoryJournal(),
 ): ChannelAgentTurnContext {

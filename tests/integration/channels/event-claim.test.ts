@@ -25,6 +25,16 @@ import {
   prepareXiaoYiAttachmentBatch,
 } from "@/server/channels/adapters/xiaoyi/transport";
 import {
+  createYuanbaoAdapter,
+} from "@/server/channels/adapters/yuanbao";
+import {
+  createYuanbaoCodec,
+} from "@/server/channels/adapters/yuanbao/codec";
+import {
+  createYuanbaoAttachmentFetcher,
+  prepareYuanbaoAttachmentBatch,
+} from "@/server/channels/adapters/yuanbao/media";
+import {
   createChannelAccessControl,
 } from "@/server/channels/runtime/access";
 import type {
@@ -432,6 +442,167 @@ describe("channel event transaction ledger", () => {
       new Date(firstReceivedAt.getTime() + 1),
     )).resolves.toMatchObject({ kind: "duplicate" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fetch a bound Yuanbao attachment again on platform retry", async () => {
+    await pool.query(
+      `UPDATE channel_connections
+       SET channel_type = 'yuanbao'
+       WHERE id = $1`,
+      [CONNECTION_A],
+    );
+    const keyState = createChannelSecretsKey(
+      Buffer.alloc(32, 59).toString("base64"),
+    );
+    if (keyState.status !== "ready") {
+      throw new Error("test_channel_key_invalid");
+    }
+    const events = createChannelEventRepository(pool);
+    const locators = createChannelAttachmentLocatorRepository(
+      pool,
+      keyState.key,
+    );
+    const adapter = createYuanbaoAdapter({
+      autoListen: false,
+    });
+    adapter.validateConfig({
+      enabled: true,
+      app_id: "yuanbao-app",
+      app_secret: "yuanbao-secret",
+      api_domain: "bot.yuanbao.tencent.com",
+      accept_bot_messages: false,
+    });
+    const token = {
+      botId: "bot-fixture",
+      token: "token-fixture",
+      source: "bot",
+      durationSeconds: 600,
+      product: "yuanbao",
+    };
+    const tokenManager = {
+      getToken: vi.fn(async () => token),
+      forceRefresh: vi.fn(async () => token),
+      getAuthHeaders: vi.fn(async () => ({
+        "X-ID": token.botId,
+        "X-Token": token.token,
+        "X-Source": token.source,
+      })),
+      stop: vi.fn(async () => undefined),
+    };
+    const fetchImpl = vi.fn(async (
+      input: string | URL | Request,
+    ) => {
+      const url = String(input);
+      if (url.includes("/api/resource/v1/download")) {
+        return new Response(JSON.stringify({
+          data: {
+            url:
+              "https://fixture.cos.ap-shanghai.myqcloud.com/notes.txt",
+          },
+        }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+          },
+        });
+      }
+      return new Response("hello", {
+        status: 200,
+        headers: {
+          "content-length": "5",
+          "content-type": "text/plain",
+        },
+      });
+    });
+    const fetcher = createYuanbaoAttachmentFetcher({
+      apiDomain: "bot.yuanbao.tencent.com",
+      tokenManager,
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    const fixture = JSON.parse(
+      await readFile(
+        path.join(
+          process.cwd(),
+          "tests/fixtures/channels/yuanbao/message-group.json",
+        ),
+        "utf8",
+      ),
+    ) as unknown;
+    const payload = createYuanbaoCodec().decodeInbound(
+      new TextEncoder().encode(JSON.stringify(fixture)),
+    );
+    const access = {
+      evaluate: async () => ({
+        kind: "allowed" as const,
+        allowed: true as const,
+      }),
+      recordPendingRequest: async () => undefined,
+    };
+    const ingest = (receivedAt: Date) => acceptInbound({
+      adapter: adapter as ChannelAdapter<
+        Record<string, unknown>
+      >,
+      payload,
+      context: {
+        connectionId: CONNECTION_A,
+        agentId: AGENT_ID,
+        receivedAt,
+      },
+      scope,
+      access,
+      events,
+      afterPersist: async (event, normalized) => {
+        const pending =
+          await prepareYuanbaoAttachmentBatch({
+            scope,
+            eventId: event.id,
+            connectionId: CONNECTION_A,
+            descriptors: normalized.attachments,
+            expiresAt: new Date(
+              receivedAt.getTime() + 15 * 60 * 1_000,
+            ),
+            receivedAt,
+            locators,
+            fetcher,
+          });
+        for (const descriptor of pending) {
+          const attachmentId =
+            "71000000-0000-4000-8000-000000000001";
+          await pool.query(
+            `INSERT INTO message_attachments (
+               id, user_id, agent_id, kind, file_name,
+               mime_type, size_bytes, storage_key, status
+             )
+             VALUES (
+               $1, $2, $3, 'document', 'notes.txt',
+               'text/plain', 5,
+               '71000000-0000-4000-8000-000000000001',
+               'ready'
+             )`,
+            [attachmentId, USER_ID, AGENT_ID],
+          );
+          await expect(locators.bindPrivateAttachment(
+            scope,
+            event.id,
+            descriptor.externalAttachmentId,
+            attachmentId,
+            receivedAt,
+          )).resolves.toBe(true);
+          fetcher.release(descriptor);
+        }
+      },
+    });
+    const firstReceivedAt =
+      new Date("2026-07-26T00:00:00.000Z");
+
+    await expect(ingest(firstReceivedAt))
+      .resolves.toMatchObject({ kind: "accepted" });
+    await expect(ingest(
+      new Date(firstReceivedAt.getTime() + 1),
+    )).resolves.toMatchObject({ kind: "duplicate" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(tokenManager.getAuthHeaders)
+      .toHaveBeenCalledTimes(1);
   });
 
   it("permits the same external event id on different connections", async () => {

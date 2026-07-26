@@ -216,6 +216,35 @@ describe("channel turn execution contract", () => {
     expect(harness.releaseLock).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps platform typing active for the Agent execution lifecycle", async () => {
+    const harness = turnHarness();
+    let releaseAgent: (() => void) | undefined;
+    harness.runAgentTurn.mockImplementationOnce(
+      () => new Promise<string>((resolve) => {
+        releaseAgent = () => resolve("正常回复");
+      }),
+    );
+
+    const execution =
+      harness.executor.execute(claimedEvent());
+    await vi.waitFor(() => {
+      expect(harness.typing).toHaveBeenCalledWith(
+        expect.anything(),
+        true,
+      );
+    });
+    expect(harness.typing).not.toHaveBeenCalledWith(
+      expect.anything(),
+      false,
+    );
+    releaseAgent?.();
+    await execution;
+
+    expect(harness.typing.mock.calls.map(
+      ([, active]) => active,
+    )).toEqual([true, false]);
+  });
+
   it("does not rerun the Agent after execution was already claimed", async () => {
     const harness = turnHarness({ executionClaimed: false });
 
@@ -482,6 +511,10 @@ function turnHarness(options: {
     created: true,
   }));
   const completeWithoutReply = vi.fn(async () => undefined);
+  const typing = vi.fn<(
+    claim: ClaimedChannelEvent,
+    active: boolean,
+  ) => Promise<void>>(async () => undefined);
   const executor = createChannelTurnExecutor({
     messages,
     resolveConversationId: vi.fn(async () => "conversation-1"),
@@ -496,6 +529,7 @@ function turnHarness(options: {
     runAgentTurn,
     persistReply,
     completeWithoutReply,
+    typing,
   });
   return {
     executor,
@@ -503,6 +537,7 @@ function turnHarness(options: {
     runAgentTurn,
     persistReply,
     completeWithoutReply,
+    typing,
     releaseLock,
   };
 }
