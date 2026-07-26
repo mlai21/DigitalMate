@@ -52,6 +52,14 @@ import {
   createMqttAdapter,
 } from "@/server/channels/adapters/mqtt";
 import {
+  createOneBotAdapter,
+} from "@/server/channels/adapters/onebot";
+import {
+  createOneBotAttachmentFetcher,
+  inspectOneBotAttachmentBatch,
+  oneBotGatewayHub,
+} from "@/server/channels/adapters/onebot/transport";
+import {
   createQQAdapter,
 } from "@/server/channels/adapters/qq";
 import {
@@ -466,6 +474,7 @@ export async function enqueueProactiveChannelDelivery(input: Readonly<{
       "wecom",
       "yuanbao",
       "wechat",
+      "onebot",
     ]
       .includes(input.target.channel)
   ) {
@@ -839,6 +848,11 @@ function createManagedAdapter(
         connection,
         dependencies,
       ) as ChannelAdapter<Record<string, unknown>>;
+    case "onebot":
+      return createManagedOneBotAdapter(
+        connection,
+        dependencies,
+      ) as ChannelAdapter<Record<string, unknown>>;
     case "wecom":
       return createManagedWeComAdapter(
         connection,
@@ -889,6 +903,139 @@ function createManagedAdapter(
     default:
       return unavailableAdapter(connection.channelType);
   }
+}
+
+function createManagedOneBotAdapter(
+  connection: RuntimeChannelConnection,
+  dependencies: ManagedAdapterDependencies,
+) {
+  const transport = oneBotGatewayHub.createTransport();
+  const attachmentFetcher =
+    createOneBotAttachmentFetcher(transport);
+  const adapter = createOneBotAdapter({
+    transport,
+    scope: connection.scope,
+    acceptInbound: (payload, context, scope) =>
+      withUserDataLease(
+        dependencies.repositories,
+        scope.userId,
+        async (_lease, signal) => {
+          signal.throwIfAborted();
+          return acceptInbound({
+            adapter: adapter as ChannelAdapter<
+              Record<string, unknown>
+            >,
+            payload,
+            context,
+            scope,
+            access: createChannelAccessControl(
+              dependencies.pool,
+            ),
+            events:
+              dependencies.repositories.channelEvents,
+            afterPersist: async (event, normalized) => {
+              if (normalized.replyHandle) {
+                if (!dependencies.replyHandles) {
+                  throw new Error(
+                    "channel_secret_storage_blocked",
+                  );
+                }
+                await dependencies.replyHandles.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  normalized.replyHandle,
+                  context.receivedAt,
+                );
+              }
+              if (normalized.attachments.length === 0) {
+                return;
+              }
+              const locators = dependencies.attachmentLocators;
+              if (!locators) {
+                throw new Error(
+                  "channel_secret_storage_blocked",
+                );
+              }
+              const expiresAt = new Date(
+                context.receivedAt.getTime()
+                  + 60 * 60 * 1_000,
+              );
+              const pending = [];
+              for (const descriptor of normalized.attachments) {
+                const persisted = await locators.persist(
+                  event.scope,
+                  event.id,
+                  event.connectionId,
+                  descriptor,
+                  expiresAt,
+                  context.receivedAt,
+                );
+                if (persisted) pending.push(descriptor);
+              }
+              await inspectOneBotAttachmentBatch(
+                attachmentFetcher,
+                pending,
+                signal,
+              );
+              try {
+                for (const descriptor of pending) {
+                  await downloadInboundAttachment({
+                    scope: event.scope,
+                    descriptor,
+                    fetcher: attachmentFetcher,
+                    storageRoot:
+                      dependencies.attachmentStorageDir,
+                    repository:
+                      dependencies.repositories.messageAttachments,
+                    bindPrivateAttachment: async (
+                      attachmentId,
+                    ) => {
+                      const bound =
+                        await locators.bindPrivateAttachment(
+                          event.scope,
+                          event.id,
+                          descriptor.externalAttachmentId,
+                          attachmentId,
+                          new Date(),
+                        );
+                      if (!bound) {
+                        throw new Error(
+                          "attachment_bind_transition_failed",
+                        );
+                      }
+                    },
+                    signal,
+                  });
+                }
+              } finally {
+                for (const descriptor of pending) {
+                  attachmentFetcher.release(descriptor);
+                }
+              }
+            },
+            onAttachmentPreparationFailure: async (event) => {
+              const failed = await dependencies.repositories
+                .channelEvents.failPendingAttachments(
+                  event.scope,
+                  event.id,
+                  "channel_attachment_prepare_failed",
+                );
+              if (!failed) {
+                throw new Error(
+                  "channel_attachment_failure_transition_failed",
+                );
+              }
+            },
+          });
+        },
+        {
+          timeoutMs: 45_000,
+          timeoutCode: "channel_ingress_timeout",
+        },
+      ),
+  });
+  return adapter;
 }
 
 function createManagedMatrixAdapter(

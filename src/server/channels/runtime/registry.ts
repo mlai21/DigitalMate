@@ -11,6 +11,7 @@ import { createFeishuAdapter } from "../adapters/feishu";
 import { createMattermostAdapter } from "../adapters/mattermost";
 import { createMatrixAdapter } from "../adapters/matrix";
 import { createMqttAdapter } from "../adapters/mqtt";
+import { createOneBotAdapter } from "../adapters/onebot";
 import { createQQAdapter } from "../adapters/qq";
 import { createSlackAdapter } from "../adapters/slack";
 import { createTelegramAdapter } from "../adapters/telegram";
@@ -243,6 +244,22 @@ export function registerMqttChannelAdapter(
   );
 }
 
+export function registerOneBotChannelAdapter(
+  registry: ChannelAdapterRegistry,
+): void {
+  registry.register("onebot", (dependencies) =>
+    createOneBotAdapter({
+      now: dependencies.now,
+      ...(dependencies.scope
+        ? { scope: dependencies.scope }
+        : {}),
+      ...(dependencies.acceptInbound
+        ? { acceptInbound: dependencies.acceptInbound }
+        : {}),
+    })
+  );
+}
+
 export function registerMatrixChannelAdapter(
   registry: ChannelAdapterRegistry,
 ): void {
@@ -384,4 +401,5 @@ export function registerProtocolChannelAdapters(
   registerXiaoYiChannelAdapter(registry);
   registerYuanbaoChannelAdapter(registry);
   registerWechatChannelAdapter(registry);
+  registerOneBotChannelAdapter(registry);
 }

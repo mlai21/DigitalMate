@@ -60,6 +60,10 @@ export type AcceptInboundInput = Readonly<{
     event: ChannelEventRecord,
     normalized: NormalizedChannelEvent,
   ) => Promise<void>;
+  onAttachmentPreparationFailure?: (
+    event: ChannelEventRecord,
+    error: unknown,
+  ) => Promise<void>;
 }>;
 
 export async function acceptInbound(
@@ -108,7 +112,17 @@ export async function acceptInboundWithAcknowledgement(
     accepted.event.status === "accepted"
     || accepted.event.status === "pending_attachments"
   ) {
-    await input.afterPersist?.(accepted.event, normalized);
+    try {
+      await input.afterPersist?.(accepted.event, normalized);
+    } catch (error) {
+      if (accepted.event.status === "pending_attachments") {
+        await input.onAttachmentPreparationFailure?.(
+          accepted.event,
+          error,
+        );
+      }
+      throw error;
+    }
   }
   if (accepted.event.status === "pending_attachments") {
     if (!input.events.markAttachmentsReady) {

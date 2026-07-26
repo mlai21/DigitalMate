@@ -628,8 +628,22 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     runtime: "gateway",
     capabilities: ["attachments", "groups"],
     platformFields: [
-      stringField("ws_host", "WebSocket 主机", "0.0.0.0"),
-      numberField("ws_port", "WebSocket 端口", 6_199, 1, 65_535),
+      stringField(
+        "ws_host",
+        "WebSocket 主机（由 Gateway 托管）",
+        "0.0.0.0",
+        { readonly: true },
+      ),
+      {
+        ...numberField(
+          "ws_port",
+          "WebSocket 端口（由 Gateway 托管）",
+          6_199,
+          1,
+          65_535,
+        ),
+        readonly: true,
+      },
       secretField("access_token", "Access Token"),
       booleanField("share_session_in_group", "群聊共享会话", false),
     ],

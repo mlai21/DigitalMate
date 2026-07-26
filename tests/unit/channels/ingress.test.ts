@@ -5,6 +5,9 @@ import {
   evaluateChannelAccess,
   type ChannelAccessSnapshot,
 } from "@/server/channels/runtime/access";
+import type {
+  ChannelEventRecord,
+} from "@/server/channels/runtime/event-repository";
 import { acceptInbound } from "@/server/channels/runtime/ingress";
 import type { ChannelAdapter } from "@/server/channels/runtime/adapter";
 import type {
@@ -149,6 +152,121 @@ describe("channel ingress", () => {
       "ready",
       "ack",
     ]);
+  });
+
+  it("converges failed attachment preparation to a terminal event", async () => {
+    const attachmentEvent = normalizedEvent({
+      attachments: [{
+        externalAttachmentId: "onebot-file-1",
+        fileName: "photo.png",
+        mimeType: "image/png",
+        sizeBytes: null,
+        source: { fileId: "platform-file-1" },
+      }],
+      permission: {
+        webSearch: false,
+        backgroundNetwork: false,
+        tools: false,
+        skills: "none",
+        attachmentsPresent: true,
+      },
+    });
+    const acknowledge = vi.fn();
+    const markAttachmentsReady = vi.fn();
+    const failPendingAttachments = vi.fn(async (
+      failureScope: AgentScope,
+      eventId: string,
+      failureCode: string,
+    ) => {
+      void failureScope;
+      void eventId;
+      void failureCode;
+      return true;
+    });
+    const onAttachmentPreparationFailure = vi.fn(
+      async (event: ChannelEventRecord) => {
+        await failPendingAttachments(
+          event.scope,
+          event.id,
+          "channel_attachment_prepare_failed",
+        );
+      },
+    );
+
+    await expect(
+      acceptInbound({
+        adapter: fakeAdapter({
+          normalizeInbound: vi.fn(async () => attachmentEvent),
+          acknowledge,
+        }),
+        payload: {},
+        context: inboundContext(),
+        scope,
+        access: fakeAccess({ kind: "allowed", allowed: true }),
+        events: {
+          accept: vi.fn(async () => ({
+            created: true,
+            event: persistedEvent("pending_attachments"),
+          })),
+          markAttachmentsReady,
+        },
+        afterPersist: vi.fn(async () => {
+          throw new Error("attachment_download_failed");
+        }),
+        onAttachmentPreparationFailure,
+      }),
+    ).rejects.toThrow("attachment_download_failed");
+
+    expect(onAttachmentPreparationFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "event-id" }),
+      expect.objectContaining({
+        message: "attachment_download_failed",
+      }),
+    );
+    expect(failPendingAttachments).toHaveBeenCalledWith(
+      scope,
+      "event-id",
+      "channel_attachment_prepare_failed",
+    );
+    expect(markAttachmentsReady).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("leaves attachment failures retryable when no terminal policy is configured", async () => {
+    const attachmentEvent = normalizedEvent({
+      attachments: [{
+        externalAttachmentId: "telegram-file-1",
+        fileName: "photo.png",
+        mimeType: "image/png",
+        sizeBytes: null,
+        source: { fileId: "platform-file-1" },
+      }],
+    });
+    const markAttachmentsReady = vi.fn();
+
+    await expect(
+      acceptInbound({
+        adapter: fakeAdapter({
+          normalizeInbound: vi.fn(async () => attachmentEvent),
+        }),
+        payload: {},
+        context: inboundContext(),
+        scope,
+        access: fakeAccess({ kind: "allowed", allowed: true }),
+        events: {
+          accept: vi.fn(async () => ({
+            created: true,
+            event: persistedEvent("pending_attachments"),
+          })),
+          markAttachmentsReady,
+        },
+        afterPersist: vi.fn(async () => {
+          throw new Error("temporary_platform_failure");
+        }),
+      }),
+    ).rejects.toThrow("temporary_platform_failure");
+
+    expect(markAttachmentsReady).not.toHaveBeenCalled();
   });
 
   it("acknowledges a duplicate without creating a second access request", async () => {

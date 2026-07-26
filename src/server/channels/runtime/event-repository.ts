@@ -309,6 +309,36 @@ export function createChannelEventRepository(
       return result.rowCount === 1;
     },
 
+    async failPendingAttachments(
+      scope: AgentScope,
+      eventId: string,
+      failureCode: string,
+      now = new Date(),
+    ): Promise<boolean> {
+      assertFailureCode(failureCode);
+      const result = await pool.query(
+        `UPDATE channel_inbound_events
+         SET status = 'failed',
+             failure_code = $3,
+             claim_owner = NULL,
+             claim_expires_at = NULL,
+             completed_at = $4,
+             updated_at = $4
+         WHERE id = $1
+           AND user_id = $2
+           AND agent_id = $5
+           AND status = 'pending_attachments'`,
+        [
+          eventId,
+          scope.userId,
+          failureCode,
+          now,
+          scope.agentId,
+        ],
+      );
+      return result.rowCount === 1;
+    },
+
     async complete(
       claim: ClaimedChannelEvent,
       assistantMessageId: string | null,
@@ -535,6 +565,15 @@ function assertOwner(owner: string): void {
   }
 }
 
+function assertFailureCode(failureCode: string): void {
+  if (
+    failureCode.trim().length === 0
+    || failureCode.length > 256
+  ) {
+    throw new Error("channel_event_failure_code_invalid");
+  }
+}
+
 function assertAcceptOptions(options: AcceptChannelEventOptions): void {
   if (
     options.initialStatus === "accepted"
@@ -542,14 +581,10 @@ function assertAcceptOptions(options: AcceptChannelEventOptions): void {
   ) {
     throw new Error("channel_event_failure_code_unexpected");
   }
-  if (
-    options.initialStatus === "failed"
-    && (
-      options.failureCode === null
-      || options.failureCode.trim().length === 0
-      || options.failureCode.length > 256
-    )
-  ) {
-    throw new Error("channel_event_failure_code_invalid");
+  if (options.initialStatus === "failed") {
+    if (options.failureCode === null) {
+      throw new Error("channel_event_failure_code_invalid");
+    }
+    assertFailureCode(options.failureCode);
   }
 }

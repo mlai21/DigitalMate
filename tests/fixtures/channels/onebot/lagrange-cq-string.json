@@ -1,0 +1,12 @@
+{
+  "time": 1785031320,
+  "self_id": "10001",
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "message_id": "9000003",
+  "group_id": "30001",
+  "user_id": "20003",
+  "message": "[CQ:at,qq=10001] 帮我读文件[CQ:file,file=file-9003,name=notes%2Emd]",
+  "raw_message": "[CQ:at,qq=10001] 帮我读文件[CQ:file,file=file-9003,name=notes%2Emd]"
+}

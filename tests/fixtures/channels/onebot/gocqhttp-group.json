@@ -1,0 +1,38 @@
+{
+  "time": 1785031260,
+  "self_id": 10001,
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "message_id": 9000002,
+  "group_id": 30001,
+  "user_id": 20002,
+  "message": [
+    {
+      "type": "at",
+      "data": {
+        "qq": "10001"
+      }
+    },
+    {
+      "type": "text",
+      "data": {
+        "text": " 看一下这张图"
+      }
+    },
+    {
+      "type": "image",
+      "data": {
+        "file": "image-9002.jpg",
+        "url": "https://gchat.qpic.cn/image-9002.jpg"
+      }
+    },
+    {
+      "type": "record",
+      "data": {
+        "file": "voice-ignored.silk"
+      }
+    }
+  ],
+  "raw_message": "[CQ:at,qq=10001] 看一下这张图"
+}

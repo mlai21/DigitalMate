@@ -21,6 +21,9 @@ import {
   buildNodeTlsOptions,
 } from "@/server/channels/gateway/tls";
 import {
+  oneBotGatewayHub,
+} from "@/server/channels/adapters/onebot/transport";
+import {
   createChannelNodeRepository,
 } from "@/server/channels/nodes/repository";
 
@@ -30,9 +33,15 @@ type PublicUpgradeHandler = (
   request: IncomingMessage,
 ) => void | Promise<void>;
 
+type PublicUpgradeAuthorizer = (
+  route: ChannelGatewayUpgradeRoute,
+  request: IncomingMessage,
+) => boolean | number | Promise<boolean | number>;
+
 export function createPublicChannelGateway(input: Readonly<{
   port: number;
   host?: string;
+  authorizeUpgrade?: PublicUpgradeAuthorizer;
   onUpgrade?: PublicUpgradeHandler;
   idleTimeoutMs?: number;
 }>) {
@@ -73,6 +82,14 @@ export function createPublicChannelGateway(input: Readonly<{
     socket.once("close", () => sockets.delete(socket));
   });
   server.on("upgrade", (request, socket, head) => {
+    void handleUpgrade(request, socket, head);
+  });
+
+  async function handleUpgrade(
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+  ): Promise<void> {
     try {
       if (!accepting) {
         rejectUpgrade(socket, 503);
@@ -91,6 +108,28 @@ export function createPublicChannelGateway(input: Readonly<{
         rejectUpgrade(socket, 503);
         return;
       }
+      socket.pause();
+      const authorization = input.authorizeUpgrade
+        ? await input.authorizeUpgrade(route, request)
+        : true;
+      if (authorization !== true) {
+        const status = typeof authorization === "number"
+          && Number.isSafeInteger(authorization)
+          && authorization >= 400
+          && authorization <= 599
+          ? authorization
+          : 403;
+        rejectUpgrade(
+          socket,
+          status,
+        );
+        return;
+      }
+      if (!accepting || socket.destroyed) {
+        rejectUpgrade(socket, 503);
+        return;
+      }
+      socket.resume();
       webSocketServer.handleUpgrade(
         request,
         socket,
@@ -119,7 +158,7 @@ export function createPublicChannelGateway(input: Readonly<{
     } catch {
       rejectUpgrade(socket, 400);
     }
-  });
+  }
   const idleTimer = setInterval(
     () => {
       const now = Date.now();
@@ -221,6 +260,10 @@ export async function startAgentChannelGateway(input: Readonly<{
 }>): Promise<Readonly<{ stop(): Promise<void> }>> {
   const publicGateway = createPublicChannelGateway({
     port: input.env.channelGatewayPort,
+    authorizeUpgrade: (route, request) =>
+      oneBotGatewayHub.authorize(route, request),
+    onUpgrade: (route, socket, request) =>
+      oneBotGatewayHub.accept(route, socket, request),
   });
   let nodeServer:
     | ReturnType<typeof createChannelNodeServer>

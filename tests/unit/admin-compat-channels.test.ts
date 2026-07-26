@@ -141,7 +141,7 @@ describe("admin compatibility channel contract", () => {
     );
   });
 
-  it("registers every M4-B protocol channel adapter exactly once", () => {
+  it("registers every protocol and gateway channel adapter exactly once", () => {
     const registry = new ChannelAdapterRegistry();
 
     registerProtocolChannelAdapters(registry);
@@ -153,6 +153,7 @@ describe("admin compatibility channel contract", () => {
       "xiaoyi",
       "yuanbao",
       "wechat",
+      "onebot",
     ]);
     expect(() => registerProtocolChannelAdapters(registry)).toThrow(
       "duplicate_channel_adapter:mqtt",
