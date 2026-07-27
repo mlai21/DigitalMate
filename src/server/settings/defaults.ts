@@ -19,8 +19,8 @@ export const defaultSettings = {
     light: "gemini-3-5-flash-openai",
   },
   cadence: {
-    responseDelayMs: 480,
-    segmentDelayMs: 240,
+    responseDelayMs: 0,
+    segmentDelayMs: 400,
     maxSegments: 5,
   },
   search: {

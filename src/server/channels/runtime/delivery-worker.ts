@@ -9,6 +9,13 @@ import type { SendResult, StreamingState } from "./types";
 
 const DEFAULT_MAX_ATTEMPTS = 8;
 
+// Separate messages are paced by how long the text would take to type, so a
+// short line lands quickly and a long one keeps the reader waiting. Streaming
+// modes edit one message instead and keep the flat configured interval.
+const SEGMENT_TYPING_MS_PER_CHARACTER = 40;
+const SEGMENT_TYPING_MAX_MS = 4_000;
+const SEGMENT_TYPING_JITTER = 0.3;
+
 export type { DeliverySegmentStart };
 
 export type ChannelDeliveryMode =
@@ -356,7 +363,12 @@ async function processDelivery(input: {
     input.signal.throwIfAborted();
     const delayMs = index === 0
       ? input.cadence.responseDelayMs
-      : input.cadence.segmentDelayMs;
+      : segmentPacingDelayMs({
+          segment,
+          mode,
+          cadence: input.cadence,
+          random: input.random(),
+        });
     if (delayMs > 0) {
       await input.delay(delayMs, input.signal);
       input.signal.throwIfAborted();
@@ -519,6 +531,30 @@ function normalizeCadence(value: unknown): DeliveryCadence {
     segmentDelayMs: boundedDelay(cadence.segmentDelayMs),
     maxSegments: normalizeMaxSegments(cadence.maxSegments),
   };
+}
+
+function segmentPacingDelayMs(input: Readonly<{
+  segment: string;
+  mode: ChannelDeliveryMode;
+  cadence: DeliveryCadence;
+  random: number;
+}>): number {
+  if (
+    input.mode !== "segmented"
+    || input.cadence.segmentDelayMs <= 0
+  ) {
+    return input.cadence.segmentDelayMs;
+  }
+  const characters = Array.from(input.segment).length;
+  const jitter =
+    1 + (input.random - 0.5) * SEGMENT_TYPING_JITTER;
+  const typingMs = Math.round(
+    characters * SEGMENT_TYPING_MS_PER_CHARACTER * jitter,
+  );
+  return Math.min(
+    Math.max(typingMs, input.cadence.segmentDelayMs),
+    SEGMENT_TYPING_MAX_MS,
+  );
 }
 
 function boundedDelay(value: unknown): number {

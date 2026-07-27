@@ -267,6 +267,123 @@ describe("channel delivery retry", () => {
     );
   });
 
+  it("paces separate messages by how long each one takes to type", async () => {
+    const delays: number[] = [];
+    const harness = deliveryHarness({
+      body: `第一段。\n\n${"二".repeat(10)}\n\n${"三".repeat(60)}`,
+      mode: "segmented",
+      cadence: {
+        responseDelayMs: 0,
+        segmentDelayMs: 400,
+        maxSegments: 5,
+      },
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-1")
+    );
+
+    await harness.worker.runOne();
+
+    expect(harness.transport.send).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([400, 2_400]);
+  });
+
+  it("caps the typing delay so a long message still arrives", async () => {
+    const delays: number[] = [];
+    const harness = deliveryHarness({
+      body: `第一段。\n\n${"字".repeat(200)}`,
+      mode: "segmented",
+      cadence: {
+        responseDelayMs: 0,
+        segmentDelayMs: 400,
+        maxSegments: 5,
+      },
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-1")
+    );
+
+    await harness.worker.runOne();
+
+    expect(delays).toEqual([4_000]);
+  });
+
+  it("sends without pacing when the segment interval is zero", async () => {
+    const delays: number[] = [];
+    const harness = deliveryHarness({
+      body: `第一段。\n\n${"三".repeat(60)}`,
+      mode: "segmented",
+      cadence: {
+        responseDelayMs: 0,
+        segmentDelayMs: 0,
+        maxSegments: 5,
+      },
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-1")
+    );
+
+    await harness.worker.runOne();
+
+    expect(harness.transport.send).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([]);
+  });
+
+  it("keeps the configured interval as the floor for a short message", async () => {
+    const delays: number[] = [];
+    const harness = deliveryHarness({
+      body: "第一段。\n\n好。",
+      mode: "segmented",
+      cadence: {
+        responseDelayMs: 0,
+        segmentDelayMs: 400,
+        maxSegments: 5,
+      },
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-1")
+    );
+
+    await harness.worker.runOne();
+
+    expect(delays).toEqual([400]);
+  });
+
+  it("keeps a flat interval when streaming edits one message", async () => {
+    const delays: number[] = [];
+    const harness = deliveryHarness({
+      body: `第一段。\n\n${"三".repeat(60)}`,
+      mode: "streaming",
+      cadence: {
+        responseDelayMs: 0,
+        segmentDelayMs: 400,
+        maxSegments: 5,
+      },
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    });
+    harness.transport.send.mockImplementation(async () =>
+      sendResult("platform-stream")
+    );
+
+    await harness.worker.runOne();
+
+    expect(delays).toEqual([400]);
+  });
+
   it("does not start a platform send after shutdown aborts a cadence delay", async () => {
     const controller = new AbortController();
     const harness = deliveryHarness({
