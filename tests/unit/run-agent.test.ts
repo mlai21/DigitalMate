@@ -1131,7 +1131,7 @@ describe("runAgent", () => {
     const systemPrompt = seenInputs[0]?.messages[0]?.content ?? "";
     expect(systemPrompt).toContain("/create-skill");
     expect(createSkill).toHaveBeenCalledWith(
-      "user-1",
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({ name: "会议纪要整理", status: "enabled", source: "manual" }),
     );
     expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "create_skill", status: "success" }));
@@ -1185,7 +1185,7 @@ describe("runAgent", () => {
 
     expect(seenInputs[0]?.tools?.some((tool) => tool.name === "save_skill")).toBe(true);
     expect(createSkill).toHaveBeenCalledWith(
-      "user-1",
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({ name: "周报整理流程", status: "pending", source: "agent" }),
     );
     expect(logTool).toHaveBeenCalledWith(expect.objectContaining({ toolName: "save_skill", status: "success" }));

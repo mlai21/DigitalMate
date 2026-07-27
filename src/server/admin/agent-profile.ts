@@ -194,7 +194,6 @@ export function createAdminAgentProfileService(
                updated_at = now()
            WHERE user_id = $1
              AND id = $2
-             AND is_default = true
              AND status = 'active'`,
           [
             input.scope.userId,
@@ -378,7 +377,6 @@ async function ensureDefaultProfileSettings(
      FROM digital_agents
      WHERE digital_agents.user_id = $1
        AND digital_agents.id = $2
-       AND digital_agents.is_default = true
        AND digital_agents.status = 'active'
      ON CONFLICT (user_id, agent_id) DO NOTHING`,
     [
@@ -410,7 +408,6 @@ async function readDefaultProfileSnapshot(
       AND agent_settings.agent_id = digital_agents.id
      WHERE digital_agents.user_id = $1
        AND digital_agents.id = $2
-       AND digital_agents.is_default = true
        AND digital_agents.status = 'active'`,
     [scope.userId, scope.agentId],
   );
@@ -466,7 +463,6 @@ async function lockDefaultProfile(
       AND agent_settings.agent_id = digital_agents.id
      WHERE digital_agents.user_id = $1
        AND digital_agents.id = $2
-       AND digital_agents.is_default = true
        AND digital_agents.status = 'active'
      FOR UPDATE OF digital_agents, agent_settings`,
     [scope.userId, scope.agentId],

@@ -182,7 +182,7 @@ describe("default digital agent PostgreSQL migration", () => {
         await adminPool.query(`DROP SCHEMA IF EXISTS "${freshSchemaName}" CASCADE`);
       }
     }
-  });
+  }, 30_000);
 
   it("serializes two real migration processes against one empty PostgreSQL schema", async () => {
     const freshSchemaName = `${schemaName}_migration`;

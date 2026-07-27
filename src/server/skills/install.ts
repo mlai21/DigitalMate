@@ -2,6 +2,7 @@ import { discoverSkillsFromGitHub, parseGitHubUrl, type DiscoveredSkill, type Fe
 import { scanSkillContent, type ScanReport } from "@/server/skills/security-scan";
 import type { SkillDraft } from "@/server/evolution/skills";
 import type { LlmClient } from "@/server/llm/types";
+import type { AgentScope } from "@/server/agents/types";
 
 export type InstalledSkillSummary = {
   name: string;
@@ -20,7 +21,10 @@ export type SkillInstallOutcome = {
 
 type InstallRepositories = {
   skills: {
-    create(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
+    create(
+      target: string | AgentScope,
+      draft: SkillDraft,
+    ): Promise<unknown> | unknown;
   };
 };
 
@@ -36,6 +40,7 @@ const MAX_AUTO_INSTALL = 5;
 export async function installSkillsFromGitHub(input: {
   url: string;
   userId: string;
+  agentId?: string;
   repositories: InstallRepositories;
   scanner?: { llm: LlmClient; model: string };
   token?: string;
@@ -87,7 +92,11 @@ export async function installSkillsFromGitHub(input: {
     // immediately; warnings still require review in the admin console.
     const status = report.verdict === "safe" ? "enabled" : "pending";
     input.signal?.throwIfAborted();
-    await input.repositories.skills.create(input.userId, {
+    await input.repositories.skills.create(
+      input.agentId
+        ? { userId: input.userId, agentId: input.agentId }
+        : input.userId,
+      {
       name: skill.document.name,
       trigger: skill.document.description,
       content: skill.raw,
@@ -95,7 +104,8 @@ export async function installSkillsFromGitHub(input: {
       source: "imported",
       sourceUrl: skill.webUrl,
       scanReport: report,
-    });
+      },
+    );
 
     outcome.installed.push({
       name: skill.document.name,

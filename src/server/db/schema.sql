@@ -664,10 +664,13 @@ ON CONFLICT (user_id, agent_id) DO NOTHING;
 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS context_key text;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE conversation_summaries ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS context_key text;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS origin_agent_id uuid;
 ALTER TABLE tool_call_logs ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE proactive_tasks ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE channel_identities ADD COLUMN IF NOT EXISTS agent_id uuid;
@@ -2400,6 +2403,9 @@ ALTER TABLE channel_messages
   DROP CONSTRAINT IF EXISTS channel_messages_channel_external_message_id_key;
 
 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_agent_context
+  ON conversations(user_id, agent_id, context_key)
+  WHERE context_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
@@ -2407,6 +2413,9 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachment
 CREATE INDEX IF NOT EXISTS idx_message_attachments_stale ON message_attachments(status, created_at) WHERE message_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation_created ON conversation_summaries(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_user_active ON memory_entries(user_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_entries_agent_context
+  ON memory_entries(user_id, agent_id, context_key, created_at DESC)
+  WHERE context_key IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_memory_entries_embedding ON memory_entries USING ivfflat (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tool_call_logs_user_created ON tool_call_logs(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_proactive_tasks_due ON proactive_tasks(status, scheduled_at);
@@ -2414,6 +2423,8 @@ CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_conversation ON channel_
 CREATE INDEX IF NOT EXISTS idx_interjection_decisions_conversation ON interjection_decisions(channel, external_conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reflections_user_created ON reflections(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skills_user_status ON skills(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skills_origin_agent_status
+  ON skills(user_id, origin_agent_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_revisions_user_status ON skill_revisions(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_usage_logs_skill_created ON skill_usage_logs(skill_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_runs_user_status ON task_runs(user_id, status, created_at DESC);

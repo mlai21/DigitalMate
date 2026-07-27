@@ -523,17 +523,24 @@ export class AdminCompatRouter {
     }
     return withLease(userId, async (resources, signal) => {
       signal.throwIfAborted();
-      const scope = await runtime.resolveDefaultScope(
+      const requestedAgentId = validateAgentHeaderSyntax(
+        request,
+        selected.route.agentHeader,
+      );
+      const defaultScope = await runtime.resolveDefaultScope(
         userId,
         resources,
         signal,
       );
+      const scope = requestedAgentId === null
+        || requestedAgentId === defaultScope.agentId
+        ? defaultScope
+        : await resolveRequestedAgentScope(
+            resources,
+            userId,
+            requestedAgentId,
+          );
       signal.throwIfAborted();
-      validateAgentHeader(
-        request,
-        scope,
-        selected.route.agentHeader,
-      );
       const result = await (
         selected.route.handler as AdminCompatHandler
       )({
@@ -583,19 +590,23 @@ export const digitalMateAgentIdHeader =
 const CANONICAL_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-function validateAgentHeader(
-  request: Request,
-  scope: AgentScope,
-  policy: "optional" | "required",
-): void {
-  const agentId = validateAgentHeaderSyntax(request, policy);
-  if (agentId !== null && agentId !== scope.agentId) {
+async function resolveRequestedAgentScope(
+  resources: AdminCompatResources,
+  userId: string,
+  agentId: string,
+): Promise<AgentScope> {
+  const agent = await resources.agents.getActive({
+    userId,
+    agentId,
+  });
+  if (!agent) {
     throw new AdminCompatError(
       404,
       "not_found",
       "agent_not_found",
     );
   }
+  return { userId, agentId: agent.id };
 }
 
 function validateAgentHeaderSyntax(

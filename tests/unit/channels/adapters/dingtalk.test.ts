@@ -35,6 +35,7 @@ const CONTEXT = {
 };
 const CONFIG = {
   enabled: true,
+  admin_from: ["staff-1"],
   client_id: "ding-client-id",
   client_secret: "ding-client-secret",
   message_type: "markdown",
@@ -109,6 +110,9 @@ defineChannelContract({
       chatType: "direct",
       mentioned: true,
       text: "你好",
+      permission: {
+        manageGlobalAssets: true,
+      },
       replyHandle: {
         publicFields: {
           conversationId: "cid-direct-1",
@@ -144,6 +148,7 @@ defineChannelContract({
       webSearch: false,
       tools: false,
       attachmentsPresent: true,
+      manageGlobalAssets: false,
     });
     expect(JSON.stringify(group?.rawSummary))
       .not.toContain("secret-session");

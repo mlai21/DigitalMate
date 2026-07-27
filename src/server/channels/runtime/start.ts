@@ -135,7 +135,10 @@ import type {
 } from "@/server/security/encrypted-secret";
 
 import type { ChannelAdapter } from "./adapter";
-import { createChannelAgentTurnRunner } from "./agent-turn";
+import {
+  channelContextKey,
+  createChannelAgentTurnRunner,
+} from "./agent-turn";
 import {
   createChannelConnectionManager,
   createPostgresChannelConnectionRuntimeStore,
@@ -291,6 +294,7 @@ export async function startChannelRuntime(input: Readonly<{
         return installSkillsFromGitHub({
           url,
           userId: scope.userId,
+          agentId: scope.agentId,
           repositories: input.repositories,
           scanner: {
             llm: light.client,
@@ -317,6 +321,7 @@ export async function startChannelRuntime(input: Readonly<{
             claim.normalizedEvent.externalEventId,
           senderId: claim.normalizedEvent.externalSenderId,
           chatType: claim.normalizedEvent.chatType,
+          contextKey: channelContextKey(claim.normalizedEvent),
           text: claim.normalizedEvent.text,
           occurredAt: claim.normalizedEvent.occurredAt,
           raw: claim.normalizedEvent.rawSummary,

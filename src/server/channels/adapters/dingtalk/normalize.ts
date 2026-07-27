@@ -48,6 +48,11 @@ export function normalizeDingTalkInbound(
     : null;
   const attachmentPresent = attachments.length > 0;
   const robotCode = payloadRobotCode ?? config.robot_code;
+  const adminFrom = Array.isArray(config.admin_from)
+    ? config.admin_from.filter((value): value is string =>
+        typeof value === "string"
+      )
+    : [];
   return {
     connectionId: context.connectionId,
     agentId: context.agentId,
@@ -76,6 +81,7 @@ export function normalizeDingTalkInbound(
         ? "explicit_slash"
         : "none",
       attachmentsPresent: attachmentPresent,
+      manageGlobalAssets: direct && adminFrom.includes(senderId),
     },
     rawSummary: {
       eventType: type,

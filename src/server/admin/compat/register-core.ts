@@ -328,12 +328,7 @@ export function createCoreAdminCompatRouter(
     createUpdateAgentHandler(dependencies.updateAgentProfile),
     { agentHeader: "required" },
   );
-  router.post("/agents", createAgent, {
-    contract: {
-      status: "disabled",
-      disabledCode: STABLE_CAPABILITY_CODES.multiAgentCreate,
-    },
-  });
+  router.post("/agents", createAgent);
   router.post("/agents/import", importAgent);
   router.post("/agents/:agentId/clone", cloneAgent, {
     agentHeader: "required",

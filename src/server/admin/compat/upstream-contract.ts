@@ -152,14 +152,11 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
     mapped(
       "GET /agents",
       "GET /agents/:agentId",
+      "POST /agents",
       "PUT /agents/:agentId",
       "PUT /agents/order",
       "PATCH /agents/:agentId/toggle",
       "PATCH /agents/:agentId/pin",
-    ),
-    disabled(
-      STABLE_CAPABILITY_CODES.multiAgentCreate,
-      "POST /agents",
     ),
     disabled(
       STABLE_CAPABILITY_CODES.multiAgentDelete,

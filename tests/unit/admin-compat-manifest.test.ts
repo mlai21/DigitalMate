@@ -125,20 +125,20 @@ const EXPECTED_MODULE_STATUS_COUNTS = {
 } as const;
 
 const EXPECTED_ENDPOINT_STATUS_COUNTS = {
-  mapped: 118,
-  disabled: 143,
+  mapped: 119,
+  disabled: 142,
   redirected: 5,
 } as const;
 
 const EXPECTED_ENDPOINT_CONTRACT_SHA256 =
-  "9e1f9a7285b85b1ef062bf968a7b237a37468bfa62010174a9a0047c9a4c8420";
+  "33fe6f32f9f7f3198bc6c93c872c6cd54fe4ef7237748a8d5e0d713ac8ca91f2";
 
 const EXPECTED_ENDPOINT_STATUS_COUNTS_BY_MODULE = {
   accessControl: [13, 0, 0],
   acp: [0, 6, 0],
   agent: [7, 10, 1],
   agentStats: [1, 0, 0],
-  agents: [6, 2, 0],
+  agents: [7, 1, 0],
   auth: [1, 3, 0],
   backup: [7, 0, 0],
   channel: [6, 2, 0],

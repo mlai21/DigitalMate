@@ -24,7 +24,7 @@ describe("completeTaskWithSkillDraft", () => {
       ["artifact-1", "artifact-2"],
     );
     expect(repositories.skills.create).toHaveBeenCalledWith(
-      "user-1",
+      { userId: "user-1", agentId: "agent-1" },
       expect.objectContaining({
         name: "表格汇总任务流程",
         status: "pending",

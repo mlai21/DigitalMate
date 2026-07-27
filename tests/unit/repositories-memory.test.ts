@@ -54,7 +54,11 @@ describe("memory repository", () => {
         }
       });
     }));
-    const query = vi.fn(async () => ({ rows: [] }));
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void sql;
+      void params;
+      return { rows: [] };
+    });
     const repositories = createRepositories({ query } as unknown as Pool);
     const abortController = new AbortController();
 
@@ -95,6 +99,93 @@ describe("memory repository", () => {
     expect(String(query.mock.calls[1]?.[0])).toContain("ORDER BY created_at DESC LIMIT 80");
     // High vector similarity outranks a weak lexical hit; zero-score memories are dropped.
     expect(memories.map((memory) => memory.id)).toEqual(["semantic", "keyword"]);
+  });
+
+  it("scopes direct-message recall to one channel participant", async () => {
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void sql;
+      void params;
+      return { rows: [] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.memories.findRelevantInContext(
+      scope,
+      "direct:connection-1:sales-1",
+      "客户预算",
+    );
+
+    expect(String(query.mock.calls[0]?.[0])).toContain("context_key = $3");
+    expect(String(query.mock.calls[0]?.[0])).toContain(
+      "embedding <=> $4::vector",
+    );
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      scope.userId,
+      scope.agentId,
+      "direct:connection-1:sales-1",
+      expect.stringMatching(/^\[/),
+    ]);
+    expect(String(query.mock.calls[1]?.[0])).toContain("context_key = $3");
+  });
+
+  it("persists the source conversation context on extracted memories", async () => {
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void sql;
+      void params;
+      return { rows: [] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.memories.createMany(scope, "message-1", [
+      { kind: "profile", content: "销售偏好先讨论预算", confidence: 0.8 },
+    ]);
+
+    expect(String(query.mock.calls[0]?.[0])).toContain("context_key");
+    expect(String(query.mock.calls[0]?.[0])).toContain(
+      "JOIN conversations AS source_conversation",
+    );
+    expect(String(query.mock.calls[0]?.[0])).toContain(
+      "IS NOT DISTINCT FROM",
+    );
+  });
+
+  it("uses the stable channel context key to reopen a conversation", async () => {
+    const existing = {
+      id: "conversation-1",
+      user_id: scope.userId,
+      agent_id: scope.agentId,
+      channel: "dingtalk",
+      title: "旧标题",
+      project_id: null,
+      pinned: false,
+      archived_at: null,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void sql;
+      void params;
+      return { rows: [existing] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.channels.ensureConversation(scope, {
+      channel: "dingtalk",
+      externalConversationId: "cid-direct-1",
+      externalMessageId: "message-1",
+      senderId: "sales-1",
+      chatType: "direct",
+      contextKey: "direct:connection-1:sales-1",
+      text: "你好",
+      occurredAt: new Date(),
+    });
+
+    expect(String(query.mock.calls[0]?.[0])).toContain("context_key = $3");
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      scope.userId,
+      scope.agentId,
+      "direct:connection-1:sales-1",
+    ]);
   });
 
   it("filters expired memories from recall and admin lists", async () => {

@@ -12,7 +12,10 @@ type TaskSkillDraftRepositories = {
     ): Promise<unknown> | unknown;
   };
   skills: {
-    create(userId: string, draft: ReturnType<typeof createTaskSkillDraft>): Promise<unknown> | unknown;
+    create(
+      scope: AgentScope,
+      draft: ReturnType<typeof createTaskSkillDraft>,
+    ): Promise<unknown> | unknown;
   };
 };
 
@@ -43,7 +46,7 @@ export async function completeTaskWithSkillDraft(
   }
 
   try {
-    await repositories.skills.create(input.scope.userId, createTaskSkillDraft(input));
+    await repositories.skills.create(input.scope, createTaskSkillDraft(input));
   } catch {
     return;
   }

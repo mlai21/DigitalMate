@@ -10,6 +10,7 @@ export type PermissionEnvelope = Readonly<{
   skills: "none" | "explicit_slash";
   attachmentsPresent: boolean;
   explicitSkillName?: string;
+  manageGlobalAssets?: boolean;
 }>;
 
 export type InboundAttachmentDescriptor = Readonly<{

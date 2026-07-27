@@ -61,7 +61,7 @@ export type RunAgentInput = AgentScope & {
     skills?: {
       findEnabled(scope: AgentScope, query: string): Promise<SkillContext[]>;
       findByIds?(scope: AgentScope, skillIds: string[]): Promise<SkillContext[]>;
-      create?(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
+      create?(scope: AgentScope, draft: SkillDraft): Promise<unknown> | unknown;
       recordUsage?(
         scope: AgentScope,
         skillIds: string[],
@@ -815,7 +815,10 @@ async function saveSkillFromToolCall(context: {
 
   try {
     const draft = createSkillDraft({ name, trigger: description, steps, notes, source: "agent" });
-    await input.repositories.skills.create(input.userId, draft);
+    await input.repositories.skills.create(
+      { userId: input.userId, agentId: input.agentId },
+      draft,
+    );
     throwIfAborted(input.signal);
     await input.repositories.toolLogs.create({
       ...logBase,
@@ -880,7 +883,10 @@ async function createSkillFromToolCall(context: {
     // User already confirmed the draft preview in chat (/create-skill flow),
     // so the skill is enabled directly instead of entering the pending queue.
     const draft = createSkillDraft({ name, trigger: description, steps, notes, source: "manual", status: "enabled" });
-    await input.repositories.skills.create(input.userId, draft);
+    await input.repositories.skills.create(
+      { userId: input.userId, agentId: input.agentId },
+      draft,
+    );
     throwIfAborted(input.signal);
     await input.repositories.toolLogs.create({
       ...logBase,

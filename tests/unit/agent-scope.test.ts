@@ -21,9 +21,10 @@ const scopeA = { userId: "user-1", agentId: "agent-a" } satisfies AgentScope;
 const scopeB = { userId: "user-1", agentId: "agent-b" } satisfies AgentScope;
 
 describe("AgentScope", () => {
-  it("keeps multi-agent mutations disabled behind one stable capability error", () => {
-    expect(AGENT_FEATURES.multiAgent).toBe(false);
-    for (const action of ["create", "clone", "import", "delete"] as const) {
+  it("allows only the controlled Alvin creation mutation", () => {
+    expect(AGENT_FEATURES.multiAgent).toBe(true);
+    expect(() => assertMultiAgentMutationAllowed("create")).not.toThrow();
+    for (const action of ["clone", "import", "delete"] as const) {
       expect(() => assertMultiAgentMutationAllowed(action)).toThrow(
         expect.objectContaining({
           status: 501,
@@ -60,6 +61,45 @@ describe("AgentScope", () => {
     expect(String(query.mock.calls[0]?.[0])).toContain("user_id = $1");
     expect(String(query.mock.calls[0]?.[0])).toContain("is_default = true");
     expect(String(query.mock.calls[1]?.[0])).toContain("status = 'active'");
+  });
+
+  it("creates Alvin with six isolated MVP presales skills", async () => {
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void sql;
+      void params;
+      return { rows: [{
+        id: "agent-b",
+        user_id: "user-1",
+        slug: "alvin",
+        display_name: "Alvin",
+        persona: {},
+        status: "active",
+        is_default: false,
+        inherits_user_resources: false,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }] };
+    });
+    const repository = createAgentRepository(
+      { query } as unknown as Pool,
+    );
+
+    await repository.createAlvin("user-1");
+
+    const sql = String(query.mock.calls[0]?.[0]);
+    const skills = JSON.parse(
+      String((query.mock.calls[0]?.[1] as unknown[])[5]),
+    ) as Array<{ name: string }>;
+    expect(sql).toContain("jsonb_to_recordset");
+    expect(sql).toContain("origin_agent_id");
+    expect(skills.map((skill) => skill.name)).toEqual([
+      "客户需求发现与商机资格判断",
+      "模型 API、RAG 与 Agent 方案架构",
+      "容量、性能、成本与 TCO 估算",
+      "POC 设计、指标与退出标准",
+      "安全治理、风险与异议处理",
+      "方案结构与分层表达",
+    ]);
   });
 
   it("rejects a disabled or archived default agent consistently in both resolvers", async () => {
@@ -204,6 +244,37 @@ describe("AgentScope", () => {
 
     expect(repository.getActive).toHaveBeenCalledTimes(2);
     expect(listResourceGrants).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps agent-originated skills inside their owning agent", async () => {
+    const query = vi.fn(async (sql: unknown, params?: unknown) => {
+      void params;
+      return { rows: String(sql).includes("RETURNING id")
+        ? [{ id: "skill-alvin" }]
+        : [] };
+    });
+    const repositories = createRepositories({ query } as unknown as Pool);
+
+    await repositories.skills.create(scopeB, {
+      name: "Alvin 专属 Skill",
+      trigger: "售前方案",
+      content: "只属于 Alvin",
+      status: "enabled",
+      source: "manual",
+    });
+    await repositories.skills.findByIds(scopeA, ["skill-alvin"]);
+
+    const createSql = String(query.mock.calls[0]?.[0]);
+    expect(createSql).toContain("origin_agent_id");
+    expect(createSql).toContain("agent_resource_grants");
+    expect(query.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["user-1", "agent-b"]),
+    );
+
+    const lookupSql = String(query.mock.calls[1]?.[0]);
+    expect(lookupSql).toMatch(
+      /skill\.origin_agent_id = agent\.id[\s\S]*skill\.origin_agent_id IS NULL[\s\S]*agent\.is_default/,
+    );
   });
 
   it("uses the shared AgentScope type throughout the run-agent execution contracts", async () => {

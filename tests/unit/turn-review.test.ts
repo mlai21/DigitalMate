@@ -79,7 +79,10 @@ describe("recordTurnReview", () => {
         sourceWindow: { event: "turn_review", conversationId: "c1" },
       }),
     );
-    expect(skills.create).toHaveBeenCalledWith("u1", expect.objectContaining({ status: "pending" }));
+    expect(skills.create).toHaveBeenCalledWith(
+      { userId: "u1", agentId: "a1" },
+      expect.objectContaining({ status: "pending" }),
+    );
   });
 
   it("writes nothing when the review is not worth recording", async () => {

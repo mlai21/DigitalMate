@@ -24,6 +24,11 @@ const reorderBodySchema = z
 const canonicalUuidSchema = z.string().regex(
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
+const createAgentBodySchema = z
+  .object({
+    operation_id: canonicalUuidSchema,
+  })
+  .strict();
 const clockSchema = z.string().regex(
   /^(?:[01]\d|2[0-3]):[0-5]\d$/,
 );
@@ -88,8 +93,25 @@ export function createListAgentsHandler(
     createAdminAgentProfileService(getPool()).read(scope, signal),
 ): AdminCompatHandler {
   return async (context) => {
-    const profile = await readProfile(context.scope, context.signal);
-    return { agents: [toAgentSummary(profile)] };
+    const agents = await context.resources.agents.listActive(
+      context.scope.userId,
+    );
+    return {
+      agents: await Promise.all(
+        agents.map(async (agent) =>
+          toAgentSummary(
+            await readProfile(
+              {
+                userId: context.scope.userId,
+                agentId: agent.id,
+              },
+              context.signal,
+            ),
+            agent.isDefault,
+          )
+        ),
+      ),
+    };
   };
 }
 
@@ -98,12 +120,16 @@ export function createGetAgentHandler(
     createAdminAgentProfileService(getPool()).read(scope, signal),
 ): AdminCompatHandler {
   return async (context) => {
-    assertDefaultAgentPath(
+    assertSelectedAgentPath(
       context.params.agentId,
       context.scope.agentId,
     );
+    const agent = await context.resources.agents.getActive(
+      context.scope,
+    );
+    if (!agent) throwAgentNotFound();
     const profile = await readProfile(context.scope, context.signal);
-    return toAgentProfile(profile);
+    return toAgentProfile(profile, agent.isDefault);
   };
 }
 
@@ -112,7 +138,7 @@ export function createUpdateAgentHandler(
     createAdminAgentProfileService(getPool()).update(input, signal),
 ): AdminCompatHandler {
   return async (context) => {
-    assertDefaultAgentPath(
+    assertSelectedAgentPath(
       context.params.agentId,
       context.scope.agentId,
     );
@@ -133,6 +159,10 @@ export function createUpdateAgentHandler(
       },
       context.signal,
     );
+    const agent = await context.resources.agents.getActive(
+      context.scope,
+    );
+    if (!agent) throwAgentNotFound();
     return {
       id: context.scope.agentId,
       name: input.name,
@@ -143,12 +173,12 @@ export function createUpdateAgentHandler(
       pinned: true,
       startup_status: "running",
       active_model: null,
-      is_default: true,
+      is_default: agent.isDefault,
       persona: input.persona,
       settings: input.settings,
       revision: updated.revision,
       capabilities: {
-        multi_agent: false,
+        multi_agent: true,
         create: false,
         import: false,
         clone: false,
@@ -158,8 +188,33 @@ export function createUpdateAgentHandler(
   };
 }
 
-export const createAgent: AdminCompatHandler = async () => {
+export const createAgent: AdminCompatHandler = async (context) => {
   assertMultiAgentMutationAllowed("create");
+  createAgentBodySchema.parse(
+    await readAdminCompatJson(context.request),
+  );
+  const agent = await context.resources.agents.createAlvin(
+    context.scope.userId,
+  );
+  return {
+    id: agent.id,
+    name: agent.displayName,
+    display_name: agent.displayName,
+    description: "独立的 MaaS 售前解决方案架构师。",
+    workspace_dir: "",
+    enabled: true,
+    pinned: true,
+    startup_status: "running",
+    active_model: null,
+    is_default: false,
+    capabilities: {
+      multi_agent: true,
+      create: false,
+      import: false,
+      clone: false,
+      delete: false,
+    },
+  };
 };
 
 export const importAgent: AdminCompatHandler = async () => {
@@ -167,17 +222,17 @@ export const importAgent: AdminCompatHandler = async () => {
 };
 
 export const cloneAgent: AdminCompatHandler = async (context) => {
-  assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
+  assertSelectedAgentPath(context.params.agentId, context.scope.agentId);
   assertMultiAgentMutationAllowed("clone");
 };
 
 export const deleteAgent: AdminCompatHandler = async (context) => {
-  assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
+  assertSelectedAgentPath(context.params.agentId, context.scope.agentId);
   assertMultiAgentMutationAllowed("delete");
 };
 
 export const toggleAgent: AdminCompatHandler = async (context) => {
-  assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
+  assertSelectedAgentPath(context.params.agentId, context.scope.agentId);
   const input = toggleBodySchema.parse(
     await readAdminCompatJson(context.request),
   );
@@ -190,7 +245,7 @@ export const toggleAgent: AdminCompatHandler = async (context) => {
 };
 
 export const pinAgent: AdminCompatHandler = async (context) => {
-  assertDefaultAgentPath(context.params.agentId, context.scope.agentId);
+  assertSelectedAgentPath(context.params.agentId, context.scope.agentId);
   const input = pinBodySchema.parse(
     await readAdminCompatJson(context.request),
   );
@@ -220,6 +275,7 @@ export const reorderAgents: AdminCompatHandler = async (context) => {
 
 function toAgentSummary(
   profile: AdminAgentProfileSnapshot,
+  isDefault: boolean,
 ) {
   return {
     id: profile.id,
@@ -231,16 +287,17 @@ function toAgentSummary(
     pinned: true,
     startup_status: "running",
     active_model: null,
-    is_default: true,
+    is_default: isDefault,
     revision: profile.revision,
   };
 }
 
 function toAgentProfile(
   profile: AdminAgentProfileSnapshot,
+  isDefault: boolean,
 ) {
   return {
-    ...toAgentSummary(profile),
+    ...toAgentSummary(profile, isDefault),
     persona: profile.persona,
     settings: {
       proactivity: profile.proactivity,
@@ -248,7 +305,7 @@ function toAgentProfile(
       search: profile.search,
     },
     capabilities: {
-      multi_agent: false,
+      multi_agent: true,
       create: false,
       import: false,
       clone: false,
@@ -257,7 +314,7 @@ function toAgentProfile(
   };
 }
 
-function assertDefaultAgentPath(
+function assertSelectedAgentPath(
   requestedAgentId: string | undefined,
   defaultAgentId: string,
 ): void {

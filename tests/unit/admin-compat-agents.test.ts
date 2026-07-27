@@ -14,7 +14,6 @@ const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
 const OTHER_AGENT_ID = "10000000-0000-4000-8000-000000000012";
 const OPERATION_ID = "30000000-0000-4000-8000-000000000031";
 const DISABLED_AGENT_MUTATIONS = [
-  ["POST", "/agents", "multi_agent_create"],
   ["POST", "/agents/import", "multi_agent_import"],
   [
     "POST",
@@ -56,13 +55,21 @@ function dependencies(
     upstreamCommit:
       "fef7e64d984f4332d0b84a343cd209bd3ea5d316",
     compatApiRevision: "test",
-    readAgentProfile: async () => ({
-      id: DEFAULT_AGENT_ID,
-      displayName: "DigitalMate",
+    readAgentProfile: async (scope: { agentId: string }) => ({
+      id: scope.agentId,
+      displayName:
+        scope.agentId === OTHER_AGENT_ID ? "Alvin" : "DigitalMate",
       persona: {
-        name: "DigitalMate",
-        style: "温暖自然",
-        emojiHabit: "少量使用",
+        name:
+          scope.agentId === OTHER_AGENT_ID ? "Alvin" : "DigitalMate",
+        style:
+          scope.agentId === OTHER_AGENT_ID
+            ? "MaaS 售前解决方案架构师"
+            : "温暖自然",
+        emojiHabit:
+          scope.agentId === OTHER_AGENT_ID
+            ? "不主动使用"
+            : "少量使用",
       },
       proactivity: {
         quietStart: "23:00",
@@ -86,18 +93,66 @@ function dependencies(
 function resources(): AdminCompatResources {
   return {
     agents: {
-      getActive: async () => ({
-        id: DEFAULT_AGENT_ID,
+      createAlvin: async () => ({
+        id: OTHER_AGENT_ID,
         userId: USER_ID,
-        slug: "digitalmate",
-        displayName: "DigitalMate",
+        slug: "alvin",
+        displayName: "Alvin",
+        persona: {
+          name: "Alvin",
+          style: "MaaS 售前解决方案架构师",
+          emojiHabit: "不主动使用",
+        },
+        status: "active",
+        isDefault: false,
+        inheritsUserResources: false,
+        createdAt: new Date("2026-07-27T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-27T00:00:00.000Z"),
+      }),
+      getActive: async (scope: { agentId: string }) =>
+        ![DEFAULT_AGENT_ID, OTHER_AGENT_ID].includes(scope.agentId)
+          ? null
+          : ({
+        id: scope.agentId,
+        userId: USER_ID,
+        slug:
+          scope.agentId === OTHER_AGENT_ID ? "alvin" : "digitalmate",
+        displayName:
+          scope.agentId === OTHER_AGENT_ID ? "Alvin" : "DigitalMate",
         persona: {},
         status: "active",
-        isDefault: true,
-        inheritsUserResources: true,
+        isDefault: scope.agentId === DEFAULT_AGENT_ID,
+        inheritsUserResources:
+          scope.agentId === DEFAULT_AGENT_ID,
         createdAt: new Date("2026-07-24T00:00:00.000Z"),
         updatedAt: new Date("2026-07-24T00:00:00.000Z"),
       }),
+      listActive: async () => [
+        {
+          id: DEFAULT_AGENT_ID,
+          userId: USER_ID,
+          slug: "digitalmate",
+          displayName: "DigitalMate",
+          persona: {},
+          status: "active",
+          isDefault: true,
+          inheritsUserResources: true,
+          createdAt: new Date("2026-07-24T00:00:00.000Z"),
+          updatedAt: new Date("2026-07-24T00:00:00.000Z"),
+        },
+        {
+          id: OTHER_AGENT_ID,
+          userId: USER_ID,
+          slug: "alvin",
+          displayName: "Alvin",
+          persona: {},
+          status: "active",
+          isDefault: false,
+          inheritsUserResources: false,
+          createdAt: new Date("2026-07-27T00:00:00.000Z"),
+          updatedAt: new Date("2026-07-27T00:00:00.000Z"),
+        },
+      ],
     },
     settings: {
       get: async () => ({
@@ -235,7 +290,7 @@ async function mutationRequest(
 }
 
 describe("admin compatibility agents contract", () => {
-  it("lists the real default DigitalMate agent with the upstream envelope", async () => {
+  it("lists DigitalMate and the independent Alvin agent", async () => {
     const router = createCoreAdminCompatRouter(dependencies());
     const response = await router.dispatch(
       new Request("http://localhost/api/admin/compat/agents"),
@@ -252,7 +307,35 @@ describe("admin compatibility agents contract", () => {
           pinned: true,
           revision: 1,
         }),
+        expect.objectContaining({
+          id: OTHER_AGENT_ID,
+          name: "Alvin",
+          enabled: true,
+          is_default: false,
+        }),
       ],
+    });
+  });
+
+  it("selects Alvin with its canonical agent header", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const response = await router.dispatch(
+      new Request(
+        `http://localhost/api/admin/compat/agents/${OTHER_AGENT_ID}`,
+        {
+          headers: {
+            "x-digitalmate-agent-id": OTHER_AGENT_ID,
+          },
+        },
+      ),
+      runtime(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      id: OTHER_AGENT_ID,
+      name: "Alvin",
+      is_default: false,
     });
   });
 
@@ -368,10 +451,9 @@ describe("admin compatibility agents contract", () => {
     });
   });
 
-  it("does not enumerate another, non-default or missing UUID", async () => {
+  it("does not enumerate another user's or missing UUID", async () => {
     const router = createCoreAdminCompatRouter(dependencies());
     const candidates = [
-      "10000000-0000-4000-8000-000000000012",
       "20000000-0000-4000-8000-000000000011",
       "30000000-0000-4000-8000-000000000011",
     ];
@@ -422,7 +504,6 @@ describe("admin compatibility agents contract", () => {
   });
 
   it.each([
-    ["POST", "/agents", "multi_agent_create"],
     ["POST", "/agents/import", "multi_agent_import"],
     [
       "POST",
@@ -449,6 +530,30 @@ describe("admin compatibility agents contract", () => {
         code: "capability_disabled",
         message: "capability_disabled",
         details: { capability },
+      },
+    });
+  });
+
+  it("creates the fixed Alvin agent idempotently", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const response = await router.dispatch(
+      await mutationRequest("POST", "/agents", {
+        operation_id: OPERATION_ID,
+      }, { agentId: null }),
+      runtime(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      id: OTHER_AGENT_ID,
+      name: "Alvin",
+      display_name: "Alvin",
+      is_default: false,
+      enabled: true,
+      capabilities: {
+        create: false,
+        clone: false,
+        import: false,
       },
     });
   });
@@ -529,18 +634,14 @@ describe("admin compatibility agents contract", () => {
       runtime(),
     );
 
-    for (const response of [
-      headerScopeMismatch,
-      pathScopeMismatch,
-    ]) {
-      expect(response.status).toBe(404);
-      await expect(response.json()).resolves.toEqual({
-        error: {
-          code: "not_found",
-          message: "agent_not_found",
-        },
-      });
-    }
+    expect(headerScopeMismatch.status).toBe(501);
+    expect(pathScopeMismatch.status).toBe(404);
+    await expect(pathScopeMismatch.json()).resolves.toEqual({
+      error: {
+        code: "not_found",
+        message: "agent_not_found",
+      },
+    });
   });
 
   it("keeps default toggle, pin and one-element ordering idempotent", async () => {

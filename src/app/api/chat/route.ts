@@ -404,6 +404,7 @@ async function handleLeasedChatRequest(
                 installSkillsFromGitHub({
                   url,
                   userId: user.id,
+                  agentId: scope.agentId,
                   repositories,
                   scanner: { llm: light.client, model: light.model },
                   token: env.githubToken,

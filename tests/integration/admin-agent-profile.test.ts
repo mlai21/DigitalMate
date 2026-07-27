@@ -136,6 +136,19 @@ describe("admin default-agent profile transaction", () => {
     }
   });
 
+  it("reads a selected non-default agent profile", async () => {
+    await expect(
+      createAdminAgentProfileService(primaryPool).read({
+        userId: USER_A,
+        agentId: AGENT_A2,
+      }),
+    ).resolves.toMatchObject({
+      id: AGENT_A2,
+      displayName: "Agent A2",
+      revision: 1,
+    });
+  });
+
   it.each([
     "default",
     "30000000-0000-4000-8000-00000000003A",
@@ -352,6 +365,18 @@ describe("admin default-agent profile transaction", () => {
         request,
         agentRouterRuntime({
           agents: {
+            listActive: async () => [{
+              id: AGENT_A,
+              userId: USER_A,
+              slug: "default-a",
+              displayName: "Agent A",
+              persona: {},
+              status: "active" as const,
+              isDefault: true,
+              inheritsUserResources: true,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }],
             getActive: async () => {
               const result = await primaryPool.query<{
                 display_name: string;

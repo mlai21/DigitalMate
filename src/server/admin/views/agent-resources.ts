@@ -243,6 +243,13 @@ export function createPostgresAdminAgentResourcesService(
         AND resource_grant.resource_type = 'skill'
         AND resource_grant.resource_id = skill.id::text
        WHERE skill.user_id = $1
+         AND (
+           skill.origin_agent_id = agent.id
+           OR (
+             skill.origin_agent_id IS NULL
+             AND agent.is_default
+           )
+         )
        ORDER BY skill.updated_at DESC, skill.id DESC
        LIMIT 500`,
       [scope.userId, scope.agentId],
@@ -352,10 +359,12 @@ export function createPostgresAdminAgentResourcesService(
             `SELECT id, name, status, revision
              FROM skills
              WHERE user_id = $1
-               AND id = $2::uuid`,
+               AND id = $2::uuid
+               AND origin_agent_id = $3`,
             [
               scope.userId,
               replay.rows[0].resource_id,
+              scope.agentId,
             ],
           );
           if (existing.rows[0]) {
@@ -379,9 +388,10 @@ export function createPostgresAdminAgentResourcesService(
           `SELECT 1
            FROM skills
            WHERE user_id = $1
+             AND origin_agent_id = $3
              AND lower(name) = lower($2)
            LIMIT 1`,
-          [scope.userId, input.name],
+          [scope.userId, input.name, scope.agentId],
         );
         if (duplicate.rows[0]) {
           throw new AdminAgentResourcesError(
@@ -393,11 +403,11 @@ export function createPostgresAdminAgentResourcesService(
           ? "enabled"
           : "pending";
         const inserted = await client.query(
-          `INSERT INTO skills (
+           `INSERT INTO skills (
              user_id, name, trigger, content,
-             status, source
+             status, source, origin_agent_id
            )
-           VALUES ($1, $2, $3, $4, $5, 'manual')
+           VALUES ($1, $2, $3, $4, $5, 'manual', $6)
            RETURNING id, name, status, revision`,
           [
             scope.userId,
@@ -405,6 +415,7 @@ export function createPostgresAdminAgentResourcesService(
             document.description,
             input.content,
             status,
+            scope.agentId,
           ],
         );
         const row = inserted.rows[0];
@@ -496,6 +507,13 @@ export function createPostgresAdminAgentResourcesService(
             AND agent.id = $2
             AND agent.status = 'active'
            WHERE skill.user_id = $1
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND lower(skill.name) = lower($3)
            LIMIT 1
            FOR UPDATE OF skill`,
@@ -688,6 +706,13 @@ export function createPostgresAdminAgentResourcesService(
             AND resource_grant.resource_type = 'skill'
             AND resource_grant.resource_id = skill.id::text
            WHERE skill.user_id = $1
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND lower(skill.name) = lower($3)
            LIMIT 1
            FOR UPDATE OF skill`,

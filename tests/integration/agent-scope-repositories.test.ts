@@ -71,12 +71,14 @@ describe("agent-scoped repositories on PostgreSQL", () => {
   it("enforces inherited and explicit resource grants in the real execution path", async () => {
     const repositories = createRepositories(pool);
     const skills = await pool.query<{ id: string; name: string }>(
-      `INSERT INTO skills (user_id, name, trigger, content, status)
+      `INSERT INTO skills (
+         user_id, origin_agent_id, name, trigger, content, status
+       )
        VALUES
-         ($1, 'allowed-skill', 'resource matrix', 'A_ONLY_SKILL_CONTENT', 'enabled'),
-         ($1, 'inherited-skill', 'resource matrix', 'B_ONLY_SKILL_CONTENT', 'enabled')
+         ($1, $2, 'allowed-skill', 'resource matrix', 'A_ONLY_SKILL_CONTENT', 'enabled'),
+         ($1, $3, 'inherited-skill', 'resource matrix', 'B_ONLY_SKILL_CONTENT', 'enabled')
        RETURNING id, name`,
-      [USER_ID],
+      [USER_ID, AGENT_A, AGENT_B],
     );
     const tools = await pool.query<{ id: string; name: string }>(
       `INSERT INTO tool_registrations (
@@ -169,6 +171,166 @@ describe("agent-scoped repositories on PostgreSQL", () => {
         [skillA.id, skillB.id],
       ),
     ).resolves.toEqual([skillB.id]);
+  }, 30_000);
+
+  it("isolates DingTalk direct memories by participant context", async () => {
+    const repositories = createRepositories(pool);
+    const conversationA = await repositories.channels.ensureConversation(
+      scopeA,
+      {
+        channel: "dingtalk",
+        externalConversationId: "cid-admin",
+        externalMessageId: "msg-admin",
+        senderId: "admin-1",
+        chatType: "direct",
+        contextKey: "direct:connection-alvin:admin-1",
+        text: "管理员偏好技术细节",
+        occurredAt: new Date(),
+      },
+    );
+    const conversationB = await repositories.channels.ensureConversation(
+      scopeA,
+      {
+        channel: "dingtalk",
+        externalConversationId: "cid-sales",
+        externalMessageId: "msg-sales",
+        senderId: "sales-1",
+        chatType: "direct",
+        contextKey: "direct:connection-alvin:sales-1",
+        text: "销售偏好商业结论",
+        occurredAt: new Date(),
+      },
+    );
+    const messageA = await repositories.messages.create(scopeA, {
+      conversationId: conversationA.id,
+      role: "user",
+      content: "管理员偏好技术细节",
+    });
+    const messageB = await repositories.messages.create(scopeA, {
+      conversationId: conversationB.id,
+      role: "user",
+      content: "销售偏好商业结论",
+    });
+    await repositories.memories.createMany(scopeA, messageA.id, [{
+      kind: "profile",
+      content: "管理员偏好技术细节",
+      confidence: 0.9,
+    }]);
+    await repositories.memories.createMany(scopeA, messageB.id, [{
+      kind: "profile",
+      content: "销售偏好商业结论",
+      confidence: 0.9,
+    }]);
+
+    const adminMemories = await repositories.memories
+      .findRelevantInContext(
+        scopeA,
+        "direct:connection-alvin:admin-1",
+        "偏好技术",
+      );
+    const salesMemories = await repositories.memories
+      .findRelevantInContext(
+        scopeA,
+        "direct:connection-alvin:sales-1",
+        "偏好商业",
+      );
+
+    expect(adminMemories.map((memory) => memory.content))
+      .toContain("管理员偏好技术细节");
+    expect(adminMemories.map((memory) => memory.content))
+      .not.toContain("销售偏好商业结论");
+    expect(salesMemories.map((memory) => memory.content))
+      .toContain("销售偏好商业结论");
+    expect(salesMemories.map((memory) => memory.content))
+      .not.toContain("管理员偏好技术细节");
+    await pool.query(
+      `DELETE FROM memory_entries
+       WHERE user_id = $1 AND agent_id = $2
+         AND context_key = ANY($3::text[])`,
+      [
+        USER_ID,
+        AGENT_A,
+        [
+          "direct:connection-alvin:admin-1",
+          "direct:connection-alvin:sales-1",
+        ],
+      ],
+    );
+    await pool.query(
+      `DELETE FROM conversations
+       WHERE user_id = $1 AND agent_id = $2
+         AND context_key = ANY($3::text[])`,
+      [
+        USER_ID,
+        AGENT_A,
+        [
+          "direct:connection-alvin:admin-1",
+          "direct:connection-alvin:sales-1",
+        ],
+      ],
+    );
+  }, 30_000);
+
+  it("rejects a cross-agent grant for an agent-originated skill", async () => {
+    const repositories = createRepositories(pool);
+    const created = await repositories.skills.create(scopeB, {
+      name: "Agent B private skill",
+      trigger: "private isolation marker",
+      content: "AGENT_B_PRIVATE_SKILL",
+      status: "enabled",
+      source: "manual",
+    });
+    await pool.query(
+      `INSERT INTO agent_resource_grants (
+         user_id, agent_id, resource_type, resource_id, enabled
+       )
+       VALUES ($1, $2, 'skill', $3, true)
+       ON CONFLICT (agent_id, resource_type, resource_id)
+       DO UPDATE SET enabled = true`,
+      [USER_ID, AGENT_A, created],
+    );
+
+    await expect(repositories.skills.findByIds(scopeA, [created]))
+      .resolves.toEqual([]);
+    await expect(repositories.skills.findByIds(scopeB, [created]))
+      .resolves.toEqual([
+        expect.objectContaining({ id: created }),
+      ]);
+  }, 30_000);
+
+  it("creates the fixed Alvin agent and its six isolated skills atomically", async () => {
+    const repositories = createRepositories(pool);
+    const alvin = await repositories.agents.createAlvin(USER_ID);
+    const alvinScope = {
+      userId: USER_ID,
+      agentId: alvin.id,
+    } satisfies AgentScope;
+    const skills = await repositories.skills.listEnabledForAgent(
+      alvinScope,
+    );
+
+    expect(alvin).toMatchObject({
+      slug: "alvin",
+      displayName: "Alvin",
+      isDefault: false,
+      inheritsUserResources: false,
+    });
+    expect(skills).toHaveLength(6);
+    await expect(
+      repositories.skills.findByIds(
+        scopeA,
+        skills.map((skill) => skill.id),
+      ),
+    ).resolves.toEqual([]);
+
+    await pool.query(
+      "DELETE FROM skills WHERE user_id = $1 AND origin_agent_id = $2",
+      [USER_ID, alvin.id],
+    );
+    await pool.query(
+      "DELETE FROM digital_agents WHERE user_id = $1 AND id = $2",
+      [USER_ID, alvin.id],
+    );
   }, 30_000);
 
   it("isolates two agents across domain APIs and converges clear to one canonical default", async () => {

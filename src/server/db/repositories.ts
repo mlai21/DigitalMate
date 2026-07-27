@@ -1753,6 +1753,52 @@ export function createRepositories(
           })),
         );
       },
+      async findRelevantInContext(
+        scope: AgentScope,
+        contextKey: string,
+        query: string,
+        signal?: AbortSignal,
+      ): Promise<RankableMemory[]> {
+        signal?.throwIfAborted();
+        const queryEmbedding = formatPgVector(
+          await embedText(query, undefined, signal),
+        );
+        signal?.throwIfAborted();
+        const semanticResult = await pool.query(
+          `SELECT id, content, created_at,
+                  1 - (embedding <=> $4::vector) AS similarity
+           FROM memory_entries
+           WHERE user_id = $1 AND agent_id = $2 AND context_key = $3
+             AND ${ACTIVE_MEMORY_CONDITION} AND embedding IS NOT NULL
+           ORDER BY embedding <=> $4::vector
+           LIMIT 12`,
+          [scope.userId, scope.agentId, contextKey, queryEmbedding],
+        );
+        signal?.throwIfAborted();
+        const lexicalResult = await pool.query(
+          `SELECT id, content, created_at
+           FROM memory_entries
+           WHERE user_id = $1 AND agent_id = $2 AND context_key = $3
+             AND ${ACTIVE_MEMORY_CONDITION}
+           ORDER BY created_at DESC LIMIT 80`,
+          [scope.userId, scope.agentId, contextKey],
+        );
+        signal?.throwIfAborted();
+        return mergeMemoryCandidates(
+          query,
+          lexicalResult.rows.map((row) => ({
+            id: row.id,
+            content: row.content,
+            createdAt: row.created_at,
+          })),
+          semanticResult.rows.map((row) => ({
+            id: row.id,
+            content: row.content,
+            createdAt: row.created_at,
+            similarity: Number(row.similarity ?? 0),
+          })),
+        );
+      },
       async createMany(
         scope: AgentScope,
         sourceMessageId: string | null,
@@ -1768,20 +1814,32 @@ export function createRepositories(
           signal?.throwIfAborted();
           const expiresAt = memoryExpiresAt(memory);
           await pool.query(
-            `INSERT INTO memory_entries (
-               user_id, agent_id, kind, content, confidence, source_message_id, embedding, expires_at
+            `WITH source_context AS (
+               SELECT source_message.id AS found_message_id,
+                      source_conversation.context_key
+               FROM messages AS source_message
+               JOIN conversations AS source_conversation
+                 ON source_conversation.id = source_message.conversation_id
+                AND source_conversation.user_id = source_message.user_id
+                AND source_conversation.agent_id = source_message.agent_id
+               WHERE source_message.user_id = $1
+                 AND source_message.agent_id = $2
+                 AND source_message.id = $6
              )
-             SELECT $1, $2, $3, $4, $5, $6, $7::vector, $8
-             WHERE (
-               $6::uuid IS NULL
-               OR EXISTS (
-                 SELECT 1 FROM messages
-                 WHERE messages.user_id = $1 AND messages.agent_id = $2 AND messages.id = $6
-               )
+             INSERT INTO memory_entries (
+               user_id, agent_id, kind, content, confidence,
+               source_message_id, embedding, expires_at, context_key
              )
+             SELECT $1, $2, $3, $4, $5, $6, $7::vector, $8,
+                    source_context.context_key
+             FROM (SELECT 1) AS seed
+             LEFT JOIN source_context ON true
+             WHERE ($6::uuid IS NULL OR source_context.found_message_id IS NOT NULL)
              AND NOT EXISTS (
                SELECT 1 FROM memory_entries
-               WHERE user_id = $1 AND agent_id = $2 AND content = $4 AND ${ACTIVE_MEMORY_CONDITION}
+               WHERE user_id = $1 AND agent_id = $2 AND content = $4
+                 AND context_key IS NOT DISTINCT FROM source_context.context_key
+                 AND ${ACTIVE_MEMORY_CONDITION}
              )`,
             [scope.userId, scope.agentId, memory.kind, memory.content, memory.confidence, sourceMessageId, embedding, expiresAt],
           );
@@ -1792,7 +1850,8 @@ export function createRepositories(
         const result = await pool.query(
           `SELECT id, kind, content, confidence, created_at
            FROM memory_entries
-           WHERE user_id = $1 AND agent_id = $2 AND kind = $3 AND ${ACTIVE_MEMORY_CONDITION}
+           WHERE user_id = $1 AND agent_id = $2 AND kind = $3
+             AND context_key IS NULL AND ${ACTIVE_MEMORY_CONDITION}
            ORDER BY created_at ASC`,
           [scope.userId, scope.agentId, kind],
         );
@@ -2322,17 +2381,39 @@ export function createRepositories(
     },
     channels: {
       async ensureConversation(scope: AgentScope, message: NormalizedChannelMessage): Promise<DbConversation> {
-        const existing = await pool.query(
-          `SELECT * FROM conversations
-           WHERE user_id = $1 AND agent_id = $2 AND channel = $3 AND title = $4
-           ORDER BY updated_at DESC LIMIT 1`,
-          [scope.userId, scope.agentId, message.channel, channelConversationTitle(message)],
-        );
+        const existing = message.contextKey
+          ? await pool.query(
+              `SELECT * FROM conversations
+               WHERE user_id = $1 AND agent_id = $2 AND context_key = $3
+               ORDER BY updated_at DESC LIMIT 1`,
+              [scope.userId, scope.agentId, message.contextKey],
+            )
+          : await pool.query(
+              `SELECT * FROM conversations
+               WHERE user_id = $1 AND agent_id = $2
+                 AND channel = $3 AND title = $4
+               ORDER BY updated_at DESC LIMIT 1`,
+              [
+                scope.userId,
+                scope.agentId,
+                message.channel,
+                channelConversationTitle(message),
+              ],
+            );
         if (existing.rows[0]) return mapConversation(existing.rows[0]);
 
         const created = await pool.query(
-          "INSERT INTO conversations (user_id, agent_id, channel, title) VALUES ($1, $2, $3, $4) RETURNING *",
-          [scope.userId, scope.agentId, message.channel, channelConversationTitle(message)],
+          `INSERT INTO conversations
+             (user_id, agent_id, channel, title, context_key)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *`,
+          [
+            scope.userId,
+            scope.agentId,
+            message.channel,
+            channelConversationTitle(message),
+            message.contextKey ?? null,
+          ],
         );
         return mapConversation(created.rows[0]);
       },
@@ -2511,11 +2592,36 @@ export function createRepositories(
       },
     },
     skills: {
-      async create(userId: string, draft: SkillDraft): Promise<string> {
+      async create(
+        target: string | AgentScope,
+        draft: SkillDraft,
+      ): Promise<string> {
+        const userId = typeof target === "string"
+          ? target
+          : target.userId;
+        const originAgentId = typeof target === "string"
+          ? null
+          : target.agentId;
         const result = await pool.query(
-          `INSERT INTO skills (user_id, name, trigger, content, status, source, source_url, scan_report)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           RETURNING id`,
+          `WITH inserted AS (
+             INSERT INTO skills (
+               user_id, name, trigger, content, status,
+               source, source_url, scan_report, origin_agent_id
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id
+           ),
+           granted AS (
+             INSERT INTO agent_resource_grants (
+               user_id, agent_id, resource_type, resource_id, enabled
+             )
+             SELECT $1, $9, 'skill', inserted.id::text, true
+             FROM inserted
+             WHERE $9::uuid IS NOT NULL
+             ON CONFLICT (agent_id, resource_type, resource_id)
+             DO UPDATE SET enabled = true
+           )
+           SELECT id FROM inserted`,
           [
             userId,
             draft.name,
@@ -2525,6 +2631,7 @@ export function createRepositories(
             draft.source ?? "manual",
             draft.sourceUrl ?? null,
             draft.scanReport ? JSON.stringify(draft.scanReport) : null,
+            originAgentId,
           ],
         );
         return result.rows[0].id;
@@ -2555,6 +2662,13 @@ export function createRepositories(
             AND resource_grant.resource_id = skill.id::text
            WHERE skill.user_id = $1
              AND skill.status = 'enabled'
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
            ORDER BY skill.updated_at DESC
            LIMIT 100`,
@@ -2577,6 +2691,13 @@ export function createRepositories(
             AND resource_grant.resource_id = skill.id::text
            WHERE skill.user_id = $1
              AND skill.status = 'enabled'
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
            ORDER BY skill.updated_at DESC
            LIMIT 50`,
@@ -2608,6 +2729,13 @@ export function createRepositories(
            WHERE skill.user_id = $1
              AND skill.id = ANY($3::uuid[])
              AND skill.status = 'enabled'
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)`,
           [scope.userId, scope.agentId, skillIds],
         );
@@ -2629,6 +2757,13 @@ export function createRepositories(
            WHERE skill.user_id = $1
              AND lower(skill.name) = lower($3)
              AND skill.status = 'enabled'
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
              AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
            LIMIT 1`,
           [scope.userId, scope.agentId, name],

@@ -480,7 +480,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "eeb1f701f9b3a9813ac3f41ee75dbc206f17ee1942667b879ceb09728e832f65",
+      "evidence_sha256": "c2a8b929ae70dd70e1db50cb587bea59c0f84d82f6c1f887b9c0f04814dc95e2",
       "adapter_files": [
         "src/server/channels/adapters/dingtalk/config.ts",
         "src/server/channels/adapters/dingtalk/index.ts",
@@ -503,6 +503,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
       }
     },
     "intentional_differences": [
+      "DigitalMate 增加 admin_from 配置，仅用于识别可在私聊中批准 Alvin 全局资产的管理员。",
       "钉钉 SDK 只用于协议能力，DigitalMate 的安全封装禁止其打印 secret 或原始 frame。",
       "Markdown、卡片和定时卡片都消费既有 Delivery，不在 Adapter 内创建第二条 assistant 消息。"
     ],

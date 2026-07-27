@@ -82,7 +82,7 @@ type TurnReviewRepositories = {
     create(scope: AgentScope, input: { reflection: ReflectionRecord; sourceWindow?: unknown }): Promise<unknown> | unknown;
   };
   skills: {
-    create(userId: string, draft: SkillDraft): Promise<unknown> | unknown;
+    create(scope: AgentScope, draft: SkillDraft): Promise<unknown> | unknown;
   };
 };
 
@@ -110,7 +110,7 @@ export async function recordTurnReview(
     input.signal?.throwIfAborted();
   }
   if (result.skillDraft) {
-    await repositories.skills.create(input.scope.userId, result.skillDraft);
+    await repositories.skills.create(input.scope, result.skillDraft);
     input.signal?.throwIfAborted();
   }
   return result;

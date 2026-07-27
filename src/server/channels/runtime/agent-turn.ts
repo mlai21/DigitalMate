@@ -24,6 +24,7 @@ import type {
   ChannelAgentTurnContext,
   ChannelTurnDecision,
 } from "./turn-executor";
+import type { NormalizedChannelEvent } from "./types";
 
 type Repositories = ReturnType<typeof createRepositories>;
 
@@ -170,6 +171,8 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         hasAttachmentContext
           ? "none"
           : context.claim.normalizedEvent.permission.skills,
+        context.claim.normalizedEvent.permission
+          .manageGlobalAssets === true,
       );
       const searchGate = hasAttachmentContext
         ? denyAttachmentSearch()
@@ -193,6 +196,9 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         repositories: channelAgentRepositories(
           input.repositories,
           invocation.createSkillMode,
+          message.chatType === "direct"
+            ? message.contextKey ?? null
+            : null,
         ),
         explicitSkillIds: invocation.explicitSkillIds,
         createSkillMode: invocation.createSkillMode,
@@ -259,6 +265,7 @@ export function toLegacyChannelMessage(
     externalMessageId: event.externalEventId,
     senderId: event.externalSenderId,
     chatType: event.chatType,
+    contextKey: channelContextKey(event),
     text: event.text,
     occurredAt: event.occurredAt,
     raw: event.rawSummary,
@@ -278,17 +285,11 @@ async function decideGroupInterjection(
   );
   const [
     settings,
-    memories,
     recentBotMessageAt,
     counts,
     recentMessageCount,
   ] = await Promise.all([
     repositories.settings.get(scope),
-    repositories.memories.findRelevant(
-      scope,
-      message.text,
-      signal,
-    ),
     repositories.channels.recentBotMessageAt(
       scope,
       message.channel,
@@ -310,7 +311,7 @@ async function decideGroupInterjection(
   signal?.throwIfAborted();
   const decision = shouldInterject({
     message,
-    memories: memories.map((memory) => memory.content),
+    memories: [],
     now,
     policy: {
       minIntervalMinutes:
@@ -396,6 +397,13 @@ async function recordDissatisfaction(
   context: ChannelAgentTurnContext,
   message: NormalizedChannelMessage,
 ): Promise<void> {
+  if (
+    message.chatType !== "direct"
+    || context.claim.normalizedEvent.permission
+      .manageGlobalAssets !== true
+  ) {
+    return;
+  }
   const stepKey = "tool:record_dissatisfaction";
   const action = await context.journal.begin({
     key: stepKey,
@@ -433,6 +441,7 @@ async function resolveSkillInvocation(
   scope: AgentScope,
   text: string,
   permission: "none" | "explicit_slash",
+  allowGlobalAssetMutation: boolean,
 ): Promise<{
   message: string;
   createSkillMode: boolean;
@@ -449,6 +458,7 @@ async function resolveSkillInvocation(
 
   const command = parseSlashCommand(text);
   if (command?.kind === "create_skill") {
+    if (!allowGlobalAssetMutation) return blocked;
     return {
       message: command.rest || text,
       createSkillMode: true,
@@ -462,6 +472,7 @@ async function resolveSkillInvocation(
         .includes(command.name.toLowerCase())
       && /^https:\/\/github\.com\//i.test(command.rest)
     ) {
+      if (!allowGlobalAssetMutation) return blocked;
       return {
         message: `请安装这个 Skill：${command.rest}`,
         createSkillMode: false,
@@ -490,9 +501,22 @@ async function resolveSkillInvocation(
 function channelAgentRepositories(
   repositories: Repositories,
   createSkillMode: boolean,
+  memoryContextKey: string | null,
 ): Parameters<typeof runAgent>[0]["repositories"] {
   return {
-    memories: repositories.memories,
+    memories: memoryContextKey === null
+      ? {
+          findRelevant: async () => [],
+        }
+      : {
+          findRelevant: (scope, query, signal) =>
+            repositories.memories.findRelevantInContext(
+              scope,
+              memoryContextKey,
+              query,
+              signal,
+            ),
+        },
     conversationSummaries: repositories.conversationSummaries,
     reflections: repositories.reflections,
     llmUsage: repositories.llmUsage,
@@ -506,6 +530,25 @@ function channelAgentRepositories(
         : {}),
     },
   };
+}
+
+export function channelContextKey(
+  event: Pick<
+    NormalizedChannelEvent,
+    | "chatType"
+    | "connectionId"
+    | "externalConversationId"
+    | "externalSenderId"
+  >,
+): string {
+  const target = event.chatType === "direct"
+    ? event.externalSenderId
+    : event.externalConversationId;
+  return [
+    event.chatType,
+    encodeURIComponent(event.connectionId),
+    encodeURIComponent(target),
+  ].join(":");
 }
 
 function denyAttachmentSearch(): SearchGate {

@@ -45,6 +45,7 @@ export type NormalizedChannelMessage = {
   externalConversationId: string;
   senderId: string;
   chatType: ChatType;
+  contextKey?: string;
   text: string;
   occurredAt: Date;
   raw?: unknown;

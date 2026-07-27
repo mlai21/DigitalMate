@@ -217,6 +217,7 @@ describe("channel agent turn", () => {
 
     await collect(runner.runAgentTurn(createContext({
       text: "你刚才理解错了，不是这个意思",
+      manageGlobalAssets: true,
     })));
 
     expect(repositories.reflections.create).toHaveBeenCalledWith(
@@ -228,6 +229,63 @@ describe("channel agent turn", () => {
         }),
       }),
     );
+  });
+
+  it("销售私聊只检索当前发送者的记忆", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("这是只属于你的上下文。"),
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      externalSenderId: "sales-1",
+    })));
+
+    expect(repositories.memories.findRelevantInContext)
+      .toHaveBeenCalledWith(
+        scope,
+        "direct:connection-1:sales-1",
+        "你好",
+        undefined,
+      );
+    expect(repositories.memories.findRelevant)
+      .not.toHaveBeenCalled();
+  });
+
+  it("群聊不检索任何成员的私聊记忆", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("只根据本群上下文回答。"),
+    );
+    const context = createContext({
+      chatType: "group",
+      externalSenderId: "sales-1",
+    });
+
+    await collect(runner.runAgentTurn(context));
+
+    expect(repositories.memories.findRelevantInContext)
+      .not.toHaveBeenCalled();
+    expect(repositories.memories.findRelevant)
+      .not.toHaveBeenCalled();
+  });
+
+  it("销售的纠正不会创建全局反思", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("我重新回答。"),
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "你刚才理解错了，不是这个意思",
+      externalSenderId: "sales-1",
+      manageGlobalAssets: false,
+    })));
+
+    expect(repositories.reflections.create).not.toHaveBeenCalled();
   });
 
   it("传给旧会话索引的 raw 只包含脱敏摘要", () => {
@@ -320,6 +378,8 @@ function createContext(
     attachmentsPresent?: boolean;
     rawSummary?: Record<string, string>;
     channelType?: "telegram" | "xiaoyi" | "yuanbao";
+    externalSenderId?: string;
+    manageGlobalAssets?: boolean;
   } = {},
   journal = memoryJournal(),
 ): ChannelAgentTurnContext {
@@ -334,7 +394,8 @@ function createContext(
       externalEventId:
         overrides.externalEventId ?? "event-1",
       externalConversationId: "chat-1",
-      externalSenderId: "sender-1",
+      externalSenderId:
+        overrides.externalSenderId ?? "sender-1",
       chatType: overrides.chatType ?? "direct",
       mentioned: false,
       text: overrides.text ?? "你好",
@@ -349,6 +410,8 @@ function createContext(
         skills: overrides.skillPermission ?? "none",
         attachmentsPresent:
           overrides.attachmentsPresent ?? false,
+        manageGlobalAssets:
+          overrides.manageGlobalAssets ?? false,
       },
       rawSummary: overrides.rawSummary ?? {
         eventType: "message",
@@ -396,6 +459,11 @@ function fakeRepositories(
       findRelevant: vi.fn(async () => [{
         id: "memory-1",
         content: "用户喜欢周末爬山",
+        createdAt: now,
+      }]),
+      findRelevantInContext: vi.fn(async () => [{
+        id: "memory-context-1",
+        content: "当前发送者的私有记忆",
         createdAt: now,
       }]),
     },

@@ -336,6 +336,7 @@ const DEFINITIONS: Record<ChannelType, ManifestDefinition> = {
     runtime: "central",
     capabilities: ["attachments", "groups", "streaming"],
     platformFields: [
+      listField("admin_from", "管理员来源"),
       stringField("client_id", "Client ID"),
       secretField("client_secret", "Client Secret", false, true),
       selectField("message_type", "消息类型", ["markdown", "card"], "markdown"),
