@@ -343,6 +343,344 @@ index b8b1dbd..5e745fa 100644
        </div>
        <div className={styles.agentOptionId}>{`ID: ${agent.id}`}</div>
      </div>
+diff --git a/src/pages/Settings/Agents/components/AgentTable.test.tsx b/src/pages/Settings/Agents/components/AgentTable.test.tsx
+index df062a4..f6d9485 100644
+--- a/src/pages/Settings/Agents/components/AgentTable.test.tsx
++++ b/src/pages/Settings/Agents/components/AgentTable.test.tsx
+@@ -1,7 +1,11 @@
+ import { act, screen, within } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
+ import { describe, expect, it, vi } from "vitest";
+-import type { AgentSummary } from "@/api/types/agents";
++import {
++  DISABLED_AGENT_CAPABILITIES,
++  type AgentCapabilities,
++  type AgentSummary,
++} from "@/api/types/agents";
+ import { renderWithProviders } from "@/test/common_setup";
+ import { AgentTable } from "./AgentTable";
+
+@@ -37,6 +41,13 @@ const agent = (id: string, pinned: boolean): AgentSummary => ({
+   startup_status: "running",
+ });
+ const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
++const capabilities = (
++  overrides: Partial<AgentCapabilities> = {},
++): AgentCapabilities => ({
++  ...DISABLED_AGENT_CAPABILITIES,
++  multi_agent: true,
++  ...overrides,
++});
+
+ describe("AgentTable", { timeout: 15_000 }, () => {
+   it("uses click-specific labels for pin actions", () => {
+@@ -50,6 +61,7 @@ describe("AgentTable", { timeout: 15_000 }, () => {
+         onToggle={vi.fn()}
+         onPin={vi.fn()}
+         onReorder={vi.fn()}
++        capabilities={capabilities({ pin: true })}
+       />,
+     );
+
+@@ -84,18 +96,20 @@ describe("AgentTable", { timeout: 15_000 }, () => {
+         onToggle={onToggle}
+         onPin={onPin}
+         onReorder={vi.fn()}
+-        secondaryAgentActionsDisabled
++        capabilities={capabilities()}
+       />,
+     );
+
+     expect(screen.getByTitle("agent.defaultNotDeletable")).toBeDisabled();
+     const secondaryRow = screen.getAllByText("secondary")[0].closest("tr");
+     expect(secondaryRow).not.toBeNull();
+-    const secondaryButtons = within(secondaryRow as HTMLElement).getAllByRole(
+-      "button",
+-    );
+-    expect(secondaryButtons.length).toBeGreaterThanOrEqual(5);
+-    for (const button of secondaryButtons) {
++    const gatedButtons = within(secondaryRow as HTMLElement)
++      .getAllByRole("button")
++      .filter(
++        (button) => button.getAttribute("aria-label") !== "agent.edit",
++      );
++    expect(gatedButtons.length).toBeGreaterThanOrEqual(4);
++    for (const button of gatedButtons) {
+       expect(
+         button.hasAttribute("disabled") ||
+           button.getAttribute("aria-disabled") === "true",
+@@ -108,6 +122,45 @@ describe("AgentTable", { timeout: 15_000 }, () => {
+     expect(onPin).not.toHaveBeenCalled();
+   });
+
++  it("disables capability-gated actions but keeps editing available", async () => {
++    const user = userEvent.setup();
++    const onEdit = vi.fn();
++    const secondaryAgent = {
++      ...agent("secondary", false),
++      name: "Alvin",
++      is_default: false,
++    };
++    renderWithProviders(
++      <AgentTable
++        agents={[secondaryAgent]}
++        loading={false}
++        reordering={false}
++        onEdit={onEdit}
++        onDelete={vi.fn()}
++        onToggle={vi.fn()}
++        onPin={vi.fn()}
++        onReorder={vi.fn()}
++        capabilities={capabilities()}
++      />,
++    );
++
++    const row = screen.getAllByText("Alvin")[0].closest("tr");
++    expect(row).not.toBeNull();
++    const edit = within(row as HTMLElement).getByRole("button", {
++      name: "agent.edit",
++    });
++    expect(edit).not.toBeDisabled();
++    await user.click(edit);
++    expect(onEdit).toHaveBeenCalledWith(secondaryAgent);
++    const gated = within(row as HTMLElement).getAllByTitle(
++      "agent.secondaryAgentUnsupported",
++    );
++    expect(gated.length).toBeGreaterThanOrEqual(2);
++    for (const button of gated) {
++      expect(button).toBeDisabled();
++    }
++  });
++
+   it("does not reorder secondary agents", () => {
+     const onReorder = vi.fn();
+     renderWithProviders(
+@@ -124,7 +177,7 @@ describe("AgentTable", { timeout: 15_000 }, () => {
+         onToggle={vi.fn()}
+         onPin={vi.fn()}
+         onReorder={onReorder}
+-        secondaryAgentActionsDisabled
++        capabilities={capabilities()}
+       />,
+     );
+
+@@ -155,7 +208,7 @@ describe("AgentTable", { timeout: 15_000 }, () => {
+         onToggle={vi.fn()}
+         onPin={vi.fn()}
+         onReorder={vi.fn()}
+-        secondaryAgentActionsDisabled
++        capabilities={capabilities()}
+       />,
+     );
+
+diff --git a/src/pages/Settings/Agents/components/AgentTable.tsx b/src/pages/Settings/Agents/components/AgentTable.tsx
+index 64f6b69..3314f1b 100644
+--- a/src/pages/Settings/Agents/components/AgentTable.tsx
++++ b/src/pages/Settings/Agents/components/AgentTable.tsx
+@@ -15,7 +15,10 @@ import {
+ } from "@dnd-kit/sortable";
+ import { EditOutlined, DeleteOutlined, RobotOutlined } from "@ant-design/icons";
+ import { EyeOff, Eye, Pin, PinOff } from "lucide-react";
+-import type { AgentSummary } from "../../../../api/types/agents";
++import type {
++  AgentCapabilities,
++  AgentSummary,
++} from "../../../../api/types/agents";
+ import { useTheme } from "../../../../contexts/ThemeContext";
+ import { getAgentDisplayName } from "../../../../utils/agentDisplayName";
+ import { SortableAgentRow, DragHandle } from "./SortableAgentRow";
+@@ -32,7 +35,7 @@ interface AgentTableProps {
+   onToggle: (agentId: string, currentEnabled: boolean) => void;
+   onPin: (agentId: string, currentPinned: boolean) => void;
+   onReorder: (activeId: string, overId: string) => void;
+-  secondaryAgentActionsDisabled?: boolean;
++  capabilities: AgentCapabilities;
+ }
+
+ function isDefaultAgent(agent: AgentSummary): boolean {
+@@ -48,7 +51,7 @@ export function AgentTable({
+   onToggle,
+   onPin,
+   onReorder,
+-  secondaryAgentActionsDisabled = false,
++  capabilities,
+ }: AgentTableProps) {
+   const { t } = useTranslation();
+   const { isDark } = useTheme();
+@@ -69,7 +72,7 @@ export function AgentTable({
+     : {};
+
+   const handleDragEnd = (event: DragEndEvent) => {
+-    if (secondaryAgentActionsDisabled) {
++    if (!capabilities.reorder) {
+       return;
+     }
+     const { active, over } = event;
+@@ -94,7 +97,7 @@ export function AgentTable({
+                 reordering ||
+                 loading ||
+                 isDefaultAgent(record) ||
+-                secondaryAgentActionsDisabled
++                !capabilities.reorder
+               }
+             />
+           </span>
+@@ -176,21 +179,22 @@ export function AgentTable({
+         const startupInProgress =
+           record.startup_status === "pending" ||
+           record.startup_status === "starting";
+-        const secondaryActionsDisabled =
+-          secondaryAgentActionsDisabled && !isDefaultAgent(record);
+         const toggleDisabled =
+           isDefaultAgent(record) ||
+           startupInProgress ||
+-          secondaryActionsDisabled;
+-        const deleteDisabled = toggleDisabled;
+-        const pinActionLabel =
+-          isDefaultAgent(record)
+-            ? t("agent.defaultPinned")
+-            : secondaryActionsDisabled
+-            ? t("agent.secondaryAgentUnsupported")
+-            : record.pinned
+-            ? t("agent.unpinAgent")
+-            : t("agent.pinAgent");
++          !capabilities.toggle;
++        const deleteDisabled =
++          isDefaultAgent(record) ||
++          startupInProgress ||
++          !capabilities.delete;
++        const pinDisabled = isDefaultAgent(record) || !capabilities.pin;
++        const pinActionLabel = isDefaultAgent(record)
++          ? t("agent.defaultPinned")
++          : !capabilities.pin
++          ? t("agent.secondaryAgentUnsupported")
++          : record.pinned
++          ? t("agent.unpinAgent")
++          : t("agent.pinAgent");
+
+         return (
+           <Space>
+@@ -207,12 +211,8 @@ export function AgentTable({
+                   )
+                 }
+                 onClick={() => onPin(record.id, Boolean(record.pinned))}
+-                disabled={isDefaultAgent(record) || secondaryActionsDisabled}
+-                style={
+-                  isDefaultAgent(record) || secondaryActionsDisabled
+-                    ? disabledStyle
+-                    : iconStyle
+-                }
++                disabled={pinDisabled}
++                style={pinDisabled ? disabledStyle : iconStyle}
+               />
+             </Tooltip>
+             <Button
+@@ -221,17 +221,7 @@ export function AgentTable({
+               icon={<EditOutlined />}
+               aria-label={t("agent.edit")}
+               onClick={() => onEdit(record)}
+-              disabled={secondaryActionsDisabled}
+-              style={
+-                secondaryActionsDisabled
+-                  ? disabledStyle
+-                  : iconStyle
+-              }
+-              title={
+-                secondaryActionsDisabled
+-                  ? t("agent.secondaryAgentUnsupported")
+-                  : undefined
+-              }
++              style={iconStyle}
+             />
+             <Popconfirm
+               title={
+@@ -260,7 +250,7 @@ export function AgentTable({
+                     ? t("agent.defaultNotDisablable")
+                     : startupInProgress
+                     ? t("agent.status.waitUntilStarted")
+-                    : secondaryActionsDisabled
++                    : !capabilities.toggle
+                     ? t("agent.secondaryAgentUnsupported")
+                     : undefined
+                 }
+@@ -286,7 +276,7 @@ export function AgentTable({
+                     ? t("agent.defaultNotDeletable")
+                     : startupInProgress
+                     ? t("agent.status.waitUntilStarted")
+-                    : secondaryActionsDisabled
++                    : !capabilities.delete
+                     ? t("agent.secondaryAgentUnsupported")
+                     : undefined
+                 }
+diff --git a/src/pages/Settings/Agents/index.tsx b/src/pages/Settings/Agents/index.tsx
+index a030400..588bc4b 100644
+--- a/src/pages/Settings/Agents/index.tsx
++++ b/src/pages/Settings/Agents/index.tsx
+@@ -16,8 +16,6 @@ import {
+ } from "./profileForm";
+ import styles from "./index.module.less";
+
+-const SECONDARY_AGENT_CAPABILITY = "unsupported";
+-
+ export default function AgentsPage() {
+   const { t } = useTranslation();
+   const {
+@@ -29,14 +27,12 @@ export default function AgentsPage() {
+     loadAgents,
+     setAgents,
+   } = useAgents();
+-  const { selectedAgent, setSelectedAgent } = useAgentStore();
++  const { selectedAgent, capabilities, setSelectedAgent } = useAgentStore();
+   const [modalVisible, setModalVisible] = useState(false);
+   const [editingAgent, setEditingAgent] = useState<AgentSummary | null>(null);
+   const [reordering, setReordering] = useState(false);
+   const [form] = Form.useForm();
+   const { message } = useAppMessage();
+-  const secondaryAgentActionsDisabled =
+-    SECONDARY_AGENT_CAPABILITY === "unsupported";
+
+   const handleEdit = async (agent: AgentSummary) => {
+     try {
+@@ -111,6 +107,9 @@ export default function AgentsPage() {
+   };
+
+   const handleReorder = async (activeId: string, overId: string) => {
++    if (!capabilities.reorder) {
++      return;
++    }
+     const nextAgents = reorderAgents(agents, activeId, overId);
+     if (nextAgents === agents) {
+       return;
+@@ -139,12 +138,18 @@ export default function AgentsPage() {
+         current={t("agent.agents")}
+         extra={
+           <div className={styles.headerRight}>
+-            <Tooltip title={t("agent.secondaryAgentUnsupported")}>
++            <Tooltip
++              title={
++                capabilities.create
++                  ? undefined
++                  : t("agent.secondaryAgentUnsupported")
++              }
++            >
+               <span>
+                 <Button
+                   type="primary"
+                   icon={<PlusOutlined />}
+-                  disabled={secondaryAgentActionsDisabled}
++                  disabled={!capabilities.create}
+                 >
+                   {t("agent.create")}
+                 </Button>
+@@ -171,7 +176,7 @@ export default function AgentsPage() {
+           onToggle={handleToggle}
+           onPin={handlePin}
+           onReorder={handleReorder}
+-          secondaryAgentActionsDisabled={secondaryAgentActionsDisabled}
++          capabilities={capabilities}
+         />
+       </Card>
+
 diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
 index 331cf37..e3a19b2 100644
 --- a/src/stores/agentStore.test.ts

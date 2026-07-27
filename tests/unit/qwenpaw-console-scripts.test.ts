@@ -2360,11 +2360,11 @@ describe("QwenPaw Console patch preparation", () => {
       expect.soft(pluginLoaderSource).not.toContain("Bearer");
       expect.soft(pluginLoaderSource).not.toContain("getApiToken");
       expect.soft(chatApiSource).not.toContain("getApiToken");
-      expect(agentsPageSource).toContain(
-        'const SECONDARY_AGENT_CAPABILITY = "unsupported"',
-      );
-      expect(agentsPageSource).toContain("disabled");
-      expect(agentTableSource).toContain("secondaryAgentActionsDisabled");
+      expect(agentsPageSource).toContain("disabled={!capabilities.create}");
+      expect(agentsPageSource).toContain("if (!capabilities.reorder)");
+      expect(agentTableSource).toContain("capabilities: AgentCapabilities");
+      expect(agentTableSource).toContain("!capabilities.toggle");
+      expect(agentTableSource).toContain("!capabilities.delete");
       expect(agentTableSource).toContain("disabled={deleteDisabled}");
       expect
         .soft(agentTableSource)
