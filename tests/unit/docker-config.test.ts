@@ -72,21 +72,17 @@ describe("docker deployment config", () => {
       path.join(process.cwd(), "Caddyfile"),
       "utf8",
     );
-    const proxyStart = caddyfile.indexOf("reverse_proxy web:3000 {");
-    const removeHeader = caddyfile.indexOf(
-      "header_up -X-DigitalMate-Original-URI",
-      proxyStart,
-    );
-    const setHeader = caddyfile.indexOf(
+    const webProxy = caddyfile.match(
+      /reverse_proxy web:3000 \{[\s\S]*?\n\t\}/,
+    )?.[0];
+    expect(webProxy).toContain(
       "header_up X-DigitalMate-Original-URI {http.request.orig_uri}",
-      removeHeader,
     );
-    const proxyEnd = caddyfile.indexOf("\n\t}", setHeader);
-    expect(proxyStart).toBeGreaterThanOrEqual(0);
-    expect(removeHeader).toBeGreaterThan(proxyStart);
-    expect(setHeader).toBeGreaterThan(removeHeader);
-    expect(proxyEnd).toBeGreaterThan(setHeader);
-    expect(caddyfile.match(/X-DigitalMate-Original-URI/g)).toHaveLength(3);
+    // Caddy 在设置之后才执行删除，因此 web 块里不能有删除指令，
+    // 否则可信值会被抹掉；set 已覆盖客户端伪造的同名头。
+    expect(webProxy).not.toContain(
+      "header_up -X-DigitalMate-Original-URI",
+    );
     const gatewayProxy = caddyfile.match(
       /reverse_proxy @channelGateway agent:3101 \{[\s\S]*?\n\t\}/,
     )?.[0];

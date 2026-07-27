@@ -13,6 +13,8 @@ const eslintConfig = defineConfig([
     "build/**",
     "public/_admin-console/**",
     "vendor/qwenpaw-console/**",
+    // 与 tsconfig 的 exclude 保持一致：worktree 内含各分支的构建产物
+    ".worktrees/**",
     "next-env.d.ts",
   ]),
 ]);

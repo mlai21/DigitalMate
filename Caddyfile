@@ -14,8 +14,9 @@
 	reverse_proxy @channelGateway agent:3101 {
 		header_up -X-DigitalMate-Original-URI
 	}
+	# 不能再加 header_up -X-DigitalMate-Original-URI：Caddy 的删除操作在设置之后
+	# 执行，会把下面这行设置的可信值一并抹掉。set 本身已覆盖客户端伪造的同名头。
 	reverse_proxy web:3000 {
-		header_up -X-DigitalMate-Original-URI
 		header_up X-DigitalMate-Original-URI {http.request.orig_uri}
 	}
 }
