@@ -303,6 +303,8 @@ describe("admin compatibility agents contract", () => {
         expect.objectContaining({
           id: DEFAULT_AGENT_ID,
           name: "DigitalMate",
+          description:
+            "DigitalMate 默认数字分身，全渠道共享同一身份与记忆。",
           enabled: true,
           pinned: true,
           revision: 1,
@@ -310,11 +312,50 @@ describe("admin compatibility agents contract", () => {
         expect.objectContaining({
           id: OTHER_AGENT_ID,
           name: "Alvin",
+          description: "独立的 MaaS 售前解决方案架构师。",
           enabled: true,
           is_default: false,
         }),
       ],
+      capabilities: {
+        multi_agent: true,
+        create: false,
+        import: false,
+        clone: false,
+        delete: false,
+        toggle: false,
+        pin: false,
+        reorder: false,
+      },
     });
+  });
+
+  it("keeps the profile capabilities identical to the list capabilities", async () => {
+    const router = createCoreAdminCompatRouter(dependencies());
+    const list = await router.dispatch(
+      new Request("http://localhost/api/admin/compat/agents"),
+      runtime(),
+    );
+    const profile = await router.dispatch(
+      new Request(
+        `http://localhost/api/admin/compat/agents/${OTHER_AGENT_ID}`,
+        {
+          headers: { "x-digitalmate-agent-id": OTHER_AGENT_ID },
+        },
+      ),
+      runtime(),
+    );
+
+    const listBody = (await list.json()) as { capabilities: unknown };
+    const profileBody = (await profile.json()) as {
+      capabilities: unknown;
+      description: unknown;
+    };
+
+    expect(profileBody.capabilities).toEqual(listBody.capabilities);
+    expect(profileBody.description).toBe(
+      "独立的 MaaS 售前解决方案架构师。",
+    );
   });
 
   it("selects Alvin with its canonical agent header", async () => {

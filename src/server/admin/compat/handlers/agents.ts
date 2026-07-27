@@ -14,6 +14,23 @@ import { getPool } from "@/server/db/client";
 
 const DEFAULT_AGENT_DESCRIPTION =
   "DigitalMate 默认数字分身，全渠道共享同一身份与记忆。";
+const ALVIN_AGENT_DESCRIPTION = "独立的 MaaS 售前解决方案架构师。";
+const AGENT_DESCRIPTIONS: Readonly<Record<string, string>> = Object.freeze({
+  digitalmate: DEFAULT_AGENT_DESCRIPTION,
+  alvin: ALVIN_AGENT_DESCRIPTION,
+});
+// "create" reports whether the console may create arbitrary agents. The fixed
+// Alvin instance is provisioned by an idempotent ops script, not by the UI.
+const AGENT_CAPABILITIES = Object.freeze({
+  multi_agent: true,
+  create: false,
+  import: false,
+  clone: false,
+  delete: false,
+  toggle: false,
+  pin: false,
+  reorder: false,
+});
 const toggleBodySchema = z.object({ enabled: z.boolean() }).strict();
 const pinBodySchema = z.object({ pinned: z.boolean() }).strict();
 const reorderBodySchema = z
@@ -107,10 +124,11 @@ export function createListAgentsHandler(
               },
               context.signal,
             ),
-            agent.isDefault,
+            agent,
           )
         ),
       ),
+      capabilities: AGENT_CAPABILITIES,
     };
   };
 }
@@ -129,7 +147,7 @@ export function createGetAgentHandler(
     );
     if (!agent) throwAgentNotFound();
     const profile = await readProfile(context.scope, context.signal);
-    return toAgentProfile(profile, agent.isDefault);
+    return toAgentProfile(profile, agent);
   };
 }
 
@@ -167,7 +185,7 @@ export function createUpdateAgentHandler(
       id: context.scope.agentId,
       name: input.name,
       display_name: input.name,
-      description: DEFAULT_AGENT_DESCRIPTION,
+      description: describeAgent(agent.slug, input.name),
       workspace_dir: "",
       enabled: true,
       pinned: true,
@@ -177,13 +195,7 @@ export function createUpdateAgentHandler(
       persona: input.persona,
       settings: input.settings,
       revision: updated.revision,
-      capabilities: {
-        multi_agent: true,
-        create: false,
-        import: false,
-        clone: false,
-        delete: false,
-      },
+      capabilities: AGENT_CAPABILITIES,
     };
   };
 }
@@ -200,20 +212,14 @@ export const createAgent: AdminCompatHandler = async (context) => {
     id: agent.id,
     name: agent.displayName,
     display_name: agent.displayName,
-    description: "独立的 MaaS 售前解决方案架构师。",
+    description: describeAgent(agent.slug, agent.displayName),
     workspace_dir: "",
     enabled: true,
     pinned: true,
     startup_status: "running",
     active_model: null,
     is_default: false,
-    capabilities: {
-      multi_agent: true,
-      create: false,
-      import: false,
-      clone: false,
-      delete: false,
-    },
+    capabilities: AGENT_CAPABILITIES,
   };
 };
 
@@ -273,44 +279,42 @@ export const reorderAgents: AdminCompatHandler = async (context) => {
   };
 };
 
+function describeAgent(slug: string, displayName: string): string {
+  return AGENT_DESCRIPTIONS[slug] ?? displayName;
+}
+
 function toAgentSummary(
   profile: AdminAgentProfileSnapshot,
-  isDefault: boolean,
+  agent: { slug: string; isDefault: boolean },
 ) {
   return {
     id: profile.id,
     name: profile.displayName,
     display_name: profile.displayName,
-    description: DEFAULT_AGENT_DESCRIPTION,
+    description: describeAgent(agent.slug, profile.displayName),
     workspace_dir: "",
     enabled: true,
     pinned: true,
     startup_status: "running",
     active_model: null,
-    is_default: isDefault,
+    is_default: agent.isDefault,
     revision: profile.revision,
   };
 }
 
 function toAgentProfile(
   profile: AdminAgentProfileSnapshot,
-  isDefault: boolean,
+  agent: { slug: string; isDefault: boolean },
 ) {
   return {
-    ...toAgentSummary(profile, isDefault),
+    ...toAgentSummary(profile, agent),
     persona: profile.persona,
     settings: {
       proactivity: profile.proactivity,
       cadence: profile.cadence,
       search: profile.search,
     },
-    capabilities: {
-      multi_agent: true,
-      create: false,
-      import: false,
-      clone: false,
-      delete: false,
-    },
+    capabilities: AGENT_CAPABILITIES,
   };
 }
 
