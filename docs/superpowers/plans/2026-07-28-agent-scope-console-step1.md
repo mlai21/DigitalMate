@@ -268,7 +268,7 @@ git commit -m "feat(P1-14): 后台按 slug 描述智能体并上报可用写能�
 **Files:**
 - Create: `patches/qwenpaw-console/0005-agent-scope.patch`
 - Modify: `scripts/qwenpaw-console/prepare.mjs:22-27`
-- Modify: `tests/unit/qwenpaw-console-scripts.test.ts:2003-2013`、`tests/unit/qwenpaw-console-scripts.test.ts:2038-2045`、`tests/unit/qwenpaw-console-scripts.test.ts:2100`（用例标题中的"四个补丁"改为"五个补丁"）
+- Modify: `tests/unit/qwenpaw-console-scripts.test.ts:2003-2013`、`tests/unit/qwenpaw-console-scripts.test.ts:2038-2045`、`tests/unit/qwenpaw-console-scripts.test.ts:2100`（用例标题中的"四个补丁"改为"五个补丁"）、`tests/unit/qwenpaw-console-scripts.test.ts:2345`（`authHeaders.ts` 的符号断言由 `getValidatedDefaultAgent` 改为 `isValidatedAgent`）
 - 补丁内改动：`src/api/agentScope.ts`、`src/api/authHeaders.ts:1-39`、`src/api/authHeaders.test.ts:1-48`
 
 **Interfaces:**
@@ -456,15 +456,20 @@ Expected: PASS。
 
 - [ ] **Step 6: 导出 0005 补丁并登记**
 
+快照里没有 `.gitignore` 忽略 `node_modules`，所以导出前必须先排除它；仓库约定补丁不含任何行尾空白（`tests/unit/qwenpaw-console-scripts.test.ts` 有断言），而 `git diff` 会把空行的上下文写成单个空格，因此导出后要统一去掉行尾空白。以下命令即"重新导出补丁"的标准动作，Task 3 至 Task 5 每次导出都照此执行：
+
 ```bash
 cd /tmp/dm-console-work
+grep -qx 'node_modules/' .git/info/exclude || printf 'node_modules/\n' >> .git/info/exclude
 git add -A
+git status --porcelain
 git diff HEAD > /Users/tang/Documents/DigitalMate/patches/qwenpaw-console/0005-agent-scope.patch
+perl -i -pe 's/[ \t]+$//' /Users/tang/Documents/DigitalMate/patches/qwenpaw-console/0005-agent-scope.patch
 grep -c "^+++ b/" /Users/tang/Documents/DigitalMate/patches/qwenpaw-console/0005-agent-scope.patch
-grep -n " $" /Users/tang/Documents/DigitalMate/patches/qwenpaw-console/0005-agent-scope.patch || echo "no trailing whitespace"
+grep -n "[ \t]$" /Users/tang/Documents/DigitalMate/patches/qwenpaw-console/0005-agent-scope.patch || echo "no trailing whitespace"
 ```
 
-Expected: 3 个目标文件（`agentScope.ts`、`authHeaders.ts`、`authHeaders.test.ts`），且无行尾空白。
+Expected: `git status --porcelain` 只列出 `src/` 下的目标文件（不含 `node_modules`）；本任务为 3 个目标文件（`agentScope.ts`、`authHeaders.ts`、`authHeaders.test.ts`），且无行尾空白。
 
 把 `scripts/qwenpaw-console/prepare.mjs:22-27` 改为：
 

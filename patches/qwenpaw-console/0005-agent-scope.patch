@@ -1,0 +1,156 @@
+diff --git a/src/api/agentScope.ts b/src/api/agentScope.ts
+index 029aec5..e25290a 100644
+--- a/src/api/agentScope.ts
++++ b/src/api/agentScope.ts
+@@ -1,20 +1,35 @@
+ const CANONICAL_UUID =
+   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
++let validatedAgentIds: ReadonlySet<string> = new Set<string>();
+ let validatedDefaultAgentId: string | null = null;
+
+ export function isCanonicalAgentId(value: unknown): value is string {
+   return typeof value === "string" && CANONICAL_UUID.test(value);
+ }
+
+-export function markValidatedDefaultAgent(agentId: string): void {
+-  validatedDefaultAgentId = isCanonicalAgentId(agentId) ? agentId : null;
++/** Records the agent ids the server listed for this account. */
++export function markValidatedAgents(
++  agentIds: readonly string[],
++  defaultAgentId: string | null,
++): void {
++  validatedAgentIds = new Set(agentIds.filter(isCanonicalAgentId));
++  validatedDefaultAgentId =
++    isCanonicalAgentId(defaultAgentId) &&
++    validatedAgentIds.has(defaultAgentId)
++      ? defaultAgentId
++      : null;
+ }
+
+-export function clearValidatedDefaultAgent(): void {
++export function clearValidatedAgents(): void {
++  validatedAgentIds = new Set<string>();
+   validatedDefaultAgentId = null;
+ }
+
++export function isValidatedAgent(agentId: unknown): agentId is string {
++  return isCanonicalAgentId(agentId) && validatedAgentIds.has(agentId);
++}
++
+ export function getValidatedDefaultAgent(): string | null {
+   return validatedDefaultAgentId;
+ }
+diff --git a/src/api/authHeaders.test.ts b/src/api/authHeaders.test.ts
+index a877f42..465de7d 100644
+--- a/src/api/authHeaders.test.ts
++++ b/src/api/authHeaders.test.ts
+@@ -1,18 +1,16 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { buildAuthHeaders, buildMutationHeaders } from "./authHeaders";
+ import { setCsrfToken } from "./config";
+-import {
+-  clearValidatedDefaultAgent,
+-  markValidatedDefaultAgent,
+-} from "./agentScope";
++import { clearValidatedAgents, markValidatedAgents } from "./agentScope";
+
+ const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
++const SECONDARY_AGENT_ID = "10000000-0000-4000-8000-000000000012";
+
+ describe("auth headers", () => {
+   beforeEach(() => {
+     sessionStorage.clear();
+     localStorage.clear();
+-    clearValidatedDefaultAgent();
++    clearValidatedAgents();
+     sessionStorage.setItem(
+       "qwenpaw-agent-storage",
+       JSON.stringify({ state: { selectedAgent: "default" } }),
+@@ -33,20 +31,47 @@ describe("auth headers", () => {
+   });
+
+   it("sends the real selected UUID through both compatibility headers", () => {
+-    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
+     sessionStorage.setItem(
+       "qwenpaw-agent-storage",
+       JSON.stringify({
+         state: { selectedAgent: DEFAULT_AGENT_ID },
+       }),
+     );
+-    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
++    markValidatedAgents([DEFAULT_AGENT_ID], DEFAULT_AGENT_ID);
+     expect(buildAuthHeaders()).toEqual({
+       "X-Agent-Id": DEFAULT_AGENT_ID,
+       "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
+     });
+   });
+
++  it("scopes requests to a listed non-default agent", () => {
++    sessionStorage.setItem(
++      "qwenpaw-agent-storage",
++      JSON.stringify({
++        state: { selectedAgent: SECONDARY_AGENT_ID },
++      }),
++    );
++    markValidatedAgents(
++      [DEFAULT_AGENT_ID, SECONDARY_AGENT_ID],
++      DEFAULT_AGENT_ID,
++    );
++    expect(buildAuthHeaders()).toEqual({
++      "X-Agent-Id": SECONDARY_AGENT_ID,
++      "x-digitalmate-agent-id": SECONDARY_AGENT_ID,
++    });
++  });
++
++  it("drops a selection that the agent list never returned", () => {
++    sessionStorage.setItem(
++      "qwenpaw-agent-storage",
++      JSON.stringify({
++        state: { selectedAgent: SECONDARY_AGENT_ID },
++      }),
++    );
++    markValidatedAgents([DEFAULT_AGENT_ID], DEFAULT_AGENT_ID);
++    expect(buildAuthHeaders()).toEqual({});
++  });
++
+   it.each(["GET", "HEAD", "OPTIONS"])(
+     "does not attach CSRF to %s",
+     async (method) => {
+@@ -74,7 +99,7 @@ describe("auth headers", () => {
+         state: { selectedAgent: DEFAULT_AGENT_ID },
+       }),
+     );
+-    markValidatedDefaultAgent(DEFAULT_AGENT_ID);
++    markValidatedAgents([DEFAULT_AGENT_ID], DEFAULT_AGENT_ID);
+     global.fetch = vi.fn().mockResolvedValue(
+       Response.json({
+         authenticated: true,
+diff --git a/src/api/authHeaders.ts b/src/api/authHeaders.ts
+index 6ee9d49..5e3f81c 100644
+--- a/src/api/authHeaders.ts
++++ b/src/api/authHeaders.ts
+@@ -4,10 +4,7 @@ import {
+   hasFreshCsrfToken,
+   setCsrfToken,
+ } from "./config";
+-import {
+-  getValidatedDefaultAgent,
+-  isCanonicalAgentId,
+-} from "./agentScope";
++import { isValidatedAgent } from "./agentScope";
+
+ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+ const CSRF_REFRESH_TIMEOUT_MS = 10_000;
+@@ -24,10 +21,7 @@ export function buildAuthHeaders(): Record<string, string> {
+     if (agentStorage) {
+       const parsed = JSON.parse(agentStorage);
+       const selectedAgent = parsed?.state?.selectedAgent;
+-      if (
+-        isCanonicalAgentId(selectedAgent) &&
+-        selectedAgent === getValidatedDefaultAgent()
+-      ) {
++      if (isValidatedAgent(selectedAgent)) {
+         headers["X-Agent-Id"] = selectedAgent;
+         headers["x-digitalmate-agent-id"] = selectedAgent;
+       }

@@ -2000,19 +2000,20 @@ describe("QwenPaw channel parity audit", () => {
 });
 
 describe("QwenPaw Console patch preparation", () => {
-  it("固定四个补丁的不可变应用顺序", () => {
+  it("固定五个补丁的不可变应用顺序", () => {
     expect(PATCHES).toEqual([
       "0001-brand.patch",
       "0002-theme.patch",
       "0003-route-auth.patch",
       "0004-api-compat.patch",
+      "0005-agent-scope.patch",
     ]);
     expect(Object.isFrozen(PATCHES)).toBe(true);
     expect(Reflect.set(PATCHES, 0, "changed.patch")).toBe(false);
     expect(PATCHES[0]).toBe("0001-brand.patch");
   });
 
-  it("四个补丁使用普通 unified diff 上下文且没有行尾空白", async () => {
+  it("五个补丁使用普通 unified diff 上下文且没有行尾空白", async () => {
     for (const patchName of PATCHES) {
       const patchSource = await readFile(
         path.resolve("patches/qwenpaw-console", patchName),
@@ -2035,11 +2036,12 @@ describe("QwenPaw Console patch preparation", () => {
     }
   });
 
-  it("0004 对每个目标文件只保留一个 canonical diff header", async () => {
+  it.each([
+    "0004-api-compat.patch",
+    "0005-agent-scope.patch",
+  ])("%s 对每个目标文件只保留一个 canonical diff header", async (patchName) => {
     const patchSource = await readFile(
-      path.resolve(
-        "patches/qwenpaw-console/0004-api-compat.patch",
-      ),
+      path.resolve("patches/qwenpaw-console", patchName),
       "utf8",
     );
     const counts = new Map<string, number>();
@@ -2097,7 +2099,7 @@ describe("QwenPaw Console patch preparation", () => {
     });
   }, 120_000);
 
-  it("真实验证并应用四个补丁，生成 DigitalMate Console 集成树", async () => {
+  it("真实验证并应用五个补丁，生成 DigitalMate Console 集成树", async () => {
     const result = await prepareConsole({ keep: true });
     if (!result.workdir) {
       throw new Error("keep=true did not preserve the prepared directory");
@@ -2340,7 +2342,7 @@ describe("QwenPaw Console patch preparation", () => {
       );
       expect(requestSource).not.toContain('window.location.href = "/login"');
       expect.soft(authHeadersSource).toContain("buildMutationHeaders");
-      expect.soft(authHeadersSource).toContain("getValidatedDefaultAgent");
+      expect.soft(authHeadersSource).toContain("isValidatedAgent");
       expect
         .soft(authHeadersSource)
         .toContain('headers["x-digitalmate-agent-id"] = selectedAgent');

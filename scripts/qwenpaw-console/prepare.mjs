@@ -24,6 +24,7 @@ export const PATCHES = Object.freeze([
   "0002-theme.patch",
   "0003-route-auth.patch",
   "0004-api-compat.patch",
+  "0005-agent-scope.patch",
 ]);
 
 const DEFAULT_PATCH_PATHS = Object.freeze(
