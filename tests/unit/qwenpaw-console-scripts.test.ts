@@ -2380,7 +2380,7 @@ describe("QwenPaw Console patch preparation", () => {
         .not.toContain('.filter((agent) => agent.id === "default")');
       expect
         .soft(agentSelectorTestSource)
-        .toContain("does not show secondary agent");
+        .toContain("lists a non-default agent and switches scope to it");
       expect
         .soft(agentTableTestSource)
         .toContain("does not invoke secondary agent actions");

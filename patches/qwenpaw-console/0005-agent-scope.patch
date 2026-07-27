@@ -184,6 +184,165 @@ index 56e9df5..1f39ad5 100644
  }
 
  export interface ReorderAgentsResponse {
+diff --git a/src/components/AgentSelector/AgentSelector.test.tsx b/src/components/AgentSelector/AgentSelector.test.tsx
+index d6615d0..979b1e7 100644
+--- a/src/components/AgentSelector/AgentSelector.test.tsx
++++ b/src/components/AgentSelector/AgentSelector.test.tsx
+@@ -14,6 +14,16 @@ const mocks = vi.hoisted(() => ({
+   storeState: {
+     selectedAgent: "default",
+     agents: [] as Array<Record<string, unknown>>,
++    capabilities: {
++      multi_agent: true,
++      create: false,
++      import: false,
++      clone: false,
++      delete: false,
++      toggle: false,
++      pin: false,
++      reorder: false,
++    },
+   },
+ }));
+
+@@ -104,27 +114,41 @@ describe("AgentSelector", () => {
+     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+   });
+
+-  it("does not show secondary agent", async () => {
++  it("lists a non-default agent and switches scope to it", async () => {
+     const user = userEvent.setup();
+     renderWithProviders(<AgentSelector />);
+
+     await user.click(screen.getByRole("combobox"));
+     expect(screen.getAllByText("DigitalMate").length).toBeGreaterThan(0);
+-    expect(screen.queryByText("Agent One")).not.toBeInTheDocument();
+-    expect(screen.queryByText("Agent Two")).not.toBeInTheDocument();
++    expect(screen.getByText("Agent One")).toBeInTheDocument();
++
++    await user.click(screen.getByText("Agent One"));
++    expect(mocks.setSelectedAgent).toHaveBeenCalledWith("agent-1");
+     expect(mocks.toggleAgentEnabled).not.toHaveBeenCalled();
+     expect(mocks.setAgentPinned).not.toHaveBeenCalled();
+   });
+
+-  it("resets a previously selected secondary agent to default", async () => {
++  it("hides inline enable and disable controls while the toggle capability is off", async () => {
++    const user = userEvent.setup();
++    renderWithProviders(<AgentSelector />);
++
++    await user.click(screen.getByRole("combobox"));
++    expect(
++      screen.queryByLabelText("agent.enableAgent"),
++    ).not.toBeInTheDocument();
++    expect(
++      screen.queryByLabelText("agent.disableAgent"),
++    ).not.toBeInTheDocument();
++  });
++
++  it("keeps a listed non-default selection instead of forcing the default", async () => {
+     mocks.storeState.selectedAgent = "agent-1";
+     renderWithProviders(<AgentSelector />);
+
+     await waitFor(() => {
+-      expect(mocks.setSelectedAgent).toHaveBeenCalledWith(
+-        "10000000-0000-4000-8000-000000000011",
+-      );
++      expect(mocks.refreshAgents).toHaveBeenCalledOnce();
+     });
++    expect(mocks.setSelectedAgent).not.toHaveBeenCalled();
+     expect(mocks.toggleAgentEnabled).not.toHaveBeenCalled();
+     expect(mocks.setAgentPinned).not.toHaveBeenCalled();
+   });
+diff --git a/src/components/AgentSelector/index.tsx b/src/components/AgentSelector/index.tsx
+index b8b1dbd..5e745fa 100644
+--- a/src/components/AgentSelector/index.tsx
++++ b/src/components/AgentSelector/index.tsx
+@@ -32,8 +32,14 @@ export default function AgentSelector({
+ }: AgentSelectorProps) {
+   const { t } = useTranslation();
+   const navigate = useNavigate();
+-  const { selectedAgent, agents, setSelectedAgent, setAgents, refreshAgents } =
+-    useAgentStore();
++  const {
++    selectedAgent,
++    agents,
++    capabilities,
++    setSelectedAgent,
++    setAgents,
++    refreshAgents,
++  } = useAgentStore();
+   const { message } = useAppMessage();
+   const messageRef = useRef(message);
+   const translationRef = useRef(t);
+@@ -70,10 +76,7 @@ export default function AgentSelector({
+     void loadAgents();
+   }, [loadAgents]);
+
+-  const visibleAgents = useMemo(
+-    () => agents.filter((agent) => agent.is_default === true),
+-    [agents],
+-  );
++  const visibleAgents = useMemo(() => agents, [agents]);
+   const enabledAgents = useMemo(
+     () => visibleAgents.filter((agent) => agent.enabled),
+     [visibleAgents],
+@@ -107,13 +110,6 @@ export default function AgentSelector({
+     message.success(t("agent.switchSuccess"));
+   };
+
+-  useEffect(() => {
+-    const defaultAgent = agents.find((agent) => agent.is_default === true);
+-    if (!defaultAgent || selectedAgent === defaultAgent.id) return;
+-
+-    setSelectedAgent(defaultAgent.id);
+-  }, [agents, message, selectedAgent, setSelectedAgent, t]);
+-
+   const stopSelectorAction = (event: MouseEvent<HTMLElement>) => {
+     event.preventDefault();
+     event.stopPropagation();
+@@ -163,7 +159,12 @@ export default function AgentSelector({
+
+   const handlePinAgent = useCallback(
+     async (agent: AgentSummary) => {
+-      if (agent.is_default === true || pinningAgentId !== null) return;
++      if (
++        !capabilities.pin ||
++        agent.is_default === true ||
++        pinningAgentId !== null
++      )
++        return;
+       const nextPinned = !agent.pinned;
+       setPinningAgentId(agent.id);
+       setAgents(
+@@ -186,7 +187,15 @@ export default function AgentSelector({
+         setPinningAgentId(null);
+       }
+     },
+-    [agents, loadAgents, message, pinningAgentId, setAgents, t],
++    [
++      agents,
++      capabilities.pin,
++      loadAgents,
++      message,
++      pinningAgentId,
++      setAgents,
++      t,
++    ],
+   );
+   const { getLongPressProps, pressingId, feedbackId } = useAgentLongPress(
+     (agent) => {
+@@ -324,7 +333,9 @@ export default function AgentSelector({
+             </div>
+           )}
+         </div>
+-        {agent.is_default !== true && renderToggleButton(agent, !agent.enabled)}
++        {agent.is_default !== true &&
++          capabilities.toggle &&
++          renderToggleButton(agent, !agent.enabled)}
+       </div>
+       <div className={styles.agentOptionId}>{`ID: ${agent.id}`}</div>
+     </div>
 diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
 index 331cf37..e3a19b2 100644
 --- a/src/stores/agentStore.test.ts
