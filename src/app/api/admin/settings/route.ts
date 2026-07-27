@@ -13,7 +13,9 @@ export async function POST(request: Request) {
     const current = await repositories.settings.get(scope);
     await repositories.settings.update(scope, buildSettingsUpdate(current, form));
     const requested = String(form.get("redirectTo") ?? "");
-    const target = requested === "/admin/models" ? requested : "/admin/settings";
+    const target = requested === "/admin-legacy/models"
+      ? requested
+      : "/admin-legacy/settings";
     return NextResponse.redirect(redirectUrl(request, target), { status: 303 });
   });
 }

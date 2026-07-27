@@ -29,7 +29,7 @@ export default async function ConversationsPage() {
         {conversations.map((conversation) => (
           <Link
             className="admin-card conversation-list-card"
-            href={`/admin/conversations/${conversation.id}`}
+            href={`/admin-legacy/conversations/${conversation.id}`}
             key={conversation.id}
           >
             <div className="conversation-list-main">

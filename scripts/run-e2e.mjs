@@ -9,7 +9,12 @@ if (dryRun) {
   process.stdout.write(JSON.stringify(plan));
 } else {
   for (const step of plan) {
-    const script = step.suite === "app" ? "test:e2e:app" : "test:e2e:scroll";
+    const script =
+      step.suite === "app"
+        ? "test:e2e:app"
+        : step.suite === "admin-cutover"
+          ? "test:e2e:admin-cutover"
+          : "test:e2e:scroll";
     const result = spawnSync("npm", ["run", script, "--", ...step.args], {
       stdio: "inherit",
       shell: process.platform === "win32",
@@ -25,14 +30,26 @@ function createPlan(args) {
   if (specFiles.length === 0) {
     return [
       { suite: "app", args: sharedArgs },
+      { suite: "admin-cutover", args: sharedArgs },
       { suite: "scroll", args: sharedArgs },
     ];
   }
 
-  const appFiles = specFiles.filter((file) => !isScrollSpec(file));
+  const appFiles = specFiles.filter(
+    (file) =>
+      !isScrollSpec(file)
+      && !isAdminCutoverSpec(file),
+  );
+  const adminCutoverFiles = specFiles.filter(isAdminCutoverSpec);
   const scrollFiles = specFiles.filter(isScrollSpec);
   return [
     ...(appFiles.length > 0 ? [{ suite: "app", args: [...sharedArgs, ...appFiles] }] : []),
+    ...(adminCutoverFiles.length > 0
+      ? [{
+          suite: "admin-cutover",
+          args: [...sharedArgs, ...adminCutoverFiles],
+        }]
+      : []),
     ...(scrollFiles.length > 0 ? [{ suite: "scroll", args: [...sharedArgs, ...scrollFiles] }] : []),
   ];
 }
@@ -43,4 +60,10 @@ function isSpecFile(arg) {
 
 function isScrollSpec(file) {
   return /(^|[/\\])chat-scroll\.spec\.[cm]?[jt]sx?$/.test(file);
+}
+
+function isAdminCutoverSpec(file) {
+  return /(^|[/\\])admin-console-cutover\.spec\.[cm]?[jt]sx?$/.test(
+    file,
+  );
 }

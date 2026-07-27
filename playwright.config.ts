@@ -23,7 +23,8 @@ const e2eServerCommand =
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testIgnore: /chat-scroll\.spec\.ts/,
+  testIgnore:
+    /(?:chat-scroll|admin-console-cutover)\.spec\.ts/,
   fullyParallel: true,
   reporter: "list",
   use: {

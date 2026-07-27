@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import playwrightConfig from "../../playwright.config";
+import adminCutoverConfig from "../../playwright.admin-cutover.config";
 
 function getProject(projectName: string) {
   const project = playwrightConfig.projects?.find(
@@ -36,6 +37,9 @@ describe("Playwright app project selection", () => {
 
   it("keeps the desktop project on the full app E2E suite", () => {
     expect(getProject("Desktop Chrome").testMatch).toBeUndefined();
+    expect(String(playwrightConfig.testIgnore)).toContain(
+      "admin-console-cutover",
+    );
   });
 
   it.each(["iPad Mini", "Mobile Chrome"])(
@@ -48,4 +52,21 @@ describe("Playwright app project selection", () => {
       ]);
     },
   );
+
+  it("runs the enabled admin cutover suite on an isolated service", () => {
+    expect(adminCutoverConfig.use?.baseURL).toBe(
+      "http://127.0.0.1:3102",
+    );
+    expect(adminCutoverConfig.webServer).toMatchObject({
+      url: "http://127.0.0.1:3102",
+      env: {
+        ADMIN_CONSOLE_ENABLED: "1",
+        PLAYWRIGHT_APP_PORT: "3102",
+      },
+    });
+    expect(adminCutoverConfig.projects?.map(({ name }) => name)).toEqual([
+      "setup",
+      "Desktop Chrome",
+    ]);
+  });
 });

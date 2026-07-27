@@ -20,7 +20,7 @@ export async function POST(request: Request) {
     const selectedPaths = form.getAll("paths").map(String).filter(Boolean);
 
     if (!url || selectedPaths.length === 0) {
-      return NextResponse.redirect(redirectUrl(request, `/admin/skills/import?url=${encodeURIComponent(url)}`), { status: 303 });
+      return NextResponse.redirect(redirectUrl(request, `/admin-legacy/skills/import?url=${encodeURIComponent(url)}`), { status: 303 });
     }
 
     const env = readEnv();
@@ -71,10 +71,10 @@ export async function POST(request: Request) {
       }
     } catch {
       signal.throwIfAborted();
-      return NextResponse.redirect(redirectUrl(request, `/admin/skills/import?url=${encodeURIComponent(url)}`), { status: 303 });
+      return NextResponse.redirect(redirectUrl(request, `/admin-legacy/skills/import?url=${encodeURIComponent(url)}`), { status: 303 });
     }
 
     const query = `url=${encodeURIComponent(url)}&installed=${installed}&blocked=${blocked}`;
-    return NextResponse.redirect(redirectUrl(request, `/admin/skills/import?${query}`), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, `/admin-legacy/skills/import?${query}`), { status: 303 });
   }, { signal: request.signal, timeoutCode: "skill_import_timeout" });
 }

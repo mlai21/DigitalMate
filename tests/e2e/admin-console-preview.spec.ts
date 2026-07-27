@@ -161,12 +161,19 @@ test("Console 使用 DigitalMate 珊瑚色与暖白背景", async ({ page }) => 
   expect(theme.background).toBe("rgb(250, 247, 242)");
 });
 
-test("旧 /admin 仍由现有 Next 页面提供", async ({ page }) => {
+test("正式 /admin 默认回退旧后台，旧后台也可直接访问", async ({ page }) => {
   await page.goto("/admin");
 
   await expect(page.locator(".admin-shell")).toBeVisible();
   await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
-  await expect(page).toHaveURL("/admin");
+  await expect(page).toHaveURL("/admin-legacy");
+  await expect(
+    page.getByRole("link", { name: "返回新控制台" }),
+  ).toHaveAttribute("href", "/admin");
+
+  await page.goto("/admin-legacy/interjections");
+  await expect(page.locator(".admin-shell")).toBeVisible();
+  await expect(page).toHaveURL("/admin-legacy/interjections");
 });
 
 test("Console 结构截图保持稳定", async ({ page }) => {

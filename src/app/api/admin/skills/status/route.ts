@@ -12,6 +12,6 @@ export async function POST(request: Request) {
     if (skillId && (status === "enabled" || status === "disabled" || status === "rejected")) {
       await repositories.skills.setStatus(user.id, skillId, status);
     }
-    return NextResponse.redirect(redirectUrl(request, "/admin/skills"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/skills"), { status: 303 });
   });
 }

@@ -14,6 +14,6 @@ export async function POST(request: Request) {
     if (reflectionId && (status === "applied" || status === "dismissed")) {
       await repositories.reflections.setStatus(scope, reflectionId, status);
     }
-    return NextResponse.redirect(redirectUrl(request, "/admin/reflections"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/reflections"), { status: 303 });
   });
 }

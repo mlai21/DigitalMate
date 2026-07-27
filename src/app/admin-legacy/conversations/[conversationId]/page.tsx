@@ -27,7 +27,7 @@ export default async function ConversationDetailPage({
   if (!data) {
     return (
       <section className="admin-card">
-        会话不存在或已删除。<Link href="/admin/conversations">返回会话列表</Link>
+        会话不存在或已删除。<Link href="/admin-legacy/conversations">返回会话列表</Link>
       </section>
     );
   }
@@ -52,7 +52,7 @@ export default async function ConversationDetailPage({
         <h2>{conversation.title}</h2>
         <p>
           渠道 {conversation.channel} · 共 {messages.length} 条消息、{toolLogs.length} 次工具调用 ·{" "}
-          <Link href="/admin/conversations">返回会话列表</Link>
+          <Link href="/admin-legacy/conversations">返回会话列表</Link>
         </p>
       </header>
       <section className="admin-list">

@@ -6,12 +6,12 @@ import {
   type AdminSecurityOptions,
 } from "@/server/admin/compat/security";
 
-const previewPathPrefix = "/admin-preview";
+const defaultPreviewPathPrefix = "/admin-preview";
 const immutableCacheControl = "public, max-age=31536000, immutable";
 const conservativeCacheControl = "no-cache";
 const noStoreCacheControl = "no-store";
 
-type RouteContext = {
+export type AdminConsoleRouteContext = {
   params: Promise<{ path?: string[] }>;
 };
 
@@ -19,6 +19,7 @@ type StaticRequest = {
   rootDirectory: string;
   pathSegments?: string[];
   rawPathname: string;
+  pathPrefix?: string;
   testHooks?: StaticTestHooks;
 };
 
@@ -27,7 +28,7 @@ type StaticTestHooks = {
   afterOpen?: (filePath: string) => Promise<void>;
 };
 
-type PreviewHandlerOptions = {
+export type AdminConsoleHandlerOptions = {
   appSecret: string;
   appPasswordEnabled?: boolean;
   production?: boolean;
@@ -35,6 +36,7 @@ type PreviewHandlerOptions = {
   defaultUserId: string;
   loadSessionGeneration: (userId: string) => Promise<number | null>;
   rootDirectory: string;
+  pathPrefix?: string;
   now?: Date;
 };
 
@@ -63,7 +65,11 @@ const contentTypes = new Map<string, string>([
 ]);
 
 export async function serveAdminConsoleStatic(input: StaticRequest): Promise<Response> {
-  const validatedPath = validateRequestPath(input.pathSegments, input.rawPathname);
+  const validatedPath = validateRequestPath(
+    input.pathSegments,
+    input.rawPathname,
+    input.pathPrefix ?? defaultPreviewPathPrefix,
+  );
   if (!validatedPath) return errorResponse(400);
 
   const requestedSegments = validatedPath;
@@ -89,10 +95,15 @@ export async function serveAdminConsoleStatic(input: StaticRequest): Promise<Res
   return serveFile(input.rootDirectory, ["index.html"], true, input.testHooks);
 }
 
-export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions) {
+export function createAdminConsolePreviewHandler(
+  options: AdminConsoleHandlerOptions,
+) {
+  const pathPrefix = validatePathPrefix(
+    options.pathPrefix ?? defaultPreviewPathPrefix,
+  );
   return async function handleAdminConsolePreview(
     request: Request,
-    context: RouteContext,
+    context: AdminConsoleRouteContext,
   ): Promise<Response> {
     const session = await resolveAdminSession(
       request,
@@ -114,12 +125,13 @@ export function createAdminConsolePreviewHandler(options: PreviewHandlerOptions)
       rootDirectory: options.rootDirectory,
       pathSegments: params.path,
       rawPathname: url.pathname,
+      pathPrefix,
     });
   };
 }
 
 function buildPreviewSecurityOptions(
-  options: PreviewHandlerOptions,
+  options: AdminConsoleHandlerOptions,
 ): AdminSecurityOptions {
   return {
     appSecret: options.appSecret,
@@ -132,13 +144,17 @@ function buildPreviewSecurityOptions(
   };
 }
 
-function validateRequestPath(pathSegments: string[] | undefined, rawPathname: string): string[] | null {
+function validateRequestPath(
+  pathSegments: string[] | undefined,
+  rawPathname: string,
+  pathPrefix: string,
+): string[] | null {
   const frameworkSegments = pathSegments ?? [];
   if (!Array.isArray(frameworkSegments) || frameworkSegments.some((segment) => typeof segment !== "string")) {
     return null;
   }
 
-  const rawSegments = parseRawPreviewPath(rawPathname);
+  const rawSegments = parseRawConsolePath(rawPathname, pathPrefix);
   if (!rawSegments || rawSegments.length !== frameworkSegments.length) return null;
 
   for (let index = 0; index < frameworkSegments.length; index += 1) {
@@ -149,11 +165,14 @@ function validateRequestPath(pathSegments: string[] | undefined, rawPathname: st
   return [...frameworkSegments];
 }
 
-function parseRawPreviewPath(rawPathname: string): string[] | null {
-  if (rawPathname === previewPathPrefix || rawPathname === `${previewPathPrefix}/`) return [];
-  if (!rawPathname.startsWith(`${previewPathPrefix}/`)) return null;
+function parseRawConsolePath(
+  rawPathname: string,
+  pathPrefix: string,
+): string[] | null {
+  if (rawPathname === pathPrefix || rawPathname === `${pathPrefix}/`) return [];
+  if (!rawPathname.startsWith(`${pathPrefix}/`)) return null;
 
-  const rawTail = rawPathname.slice(previewPathPrefix.length + 1);
+  const rawTail = rawPathname.slice(pathPrefix.length + 1);
   if (!rawTail || rawTail.includes("?") || rawTail.includes("#")) return null;
 
   const rawSegments = rawTail.split("/");
@@ -171,6 +190,19 @@ function parseRawPreviewPath(rawPathname: string): string[] | null {
     decodedSegments.push(decoded);
   }
   return decodedSegments;
+}
+
+function validatePathPrefix(pathPrefix: string): string {
+  if (
+    !pathPrefix.startsWith("/")
+    || pathPrefix === "/"
+    || pathPrefix.endsWith("/")
+    || pathPrefix.includes("?")
+    || pathPrefix.includes("#")
+  ) {
+    throw new Error("Invalid admin Console path prefix");
+  }
+  return pathPrefix;
 }
 
 function isSafeSegment(segment: string): boolean {

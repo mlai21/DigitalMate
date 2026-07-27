@@ -46,7 +46,7 @@ export async function POST(request: Request) {
     }
     await deleteArtifactTree(defaultArtifactRoot(), user.id);
     await repositories.personalData.clear(user.id);
-    return NextResponse.redirect(redirectUrl(request, "/admin/settings?cleared=1"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/settings?cleared=1"), { status: 303 });
   } catch (error) {
     console.error("personal_data_clear_failed", {
       code: "personal_data_clear_failed",

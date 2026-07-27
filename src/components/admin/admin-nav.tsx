@@ -32,38 +32,44 @@ type NavGroup = {
 const groups: NavGroup[] = [
   {
     title: null,
-    items: [{ href: "/admin", label: "概览", icon: <Gauge size={16} /> }],
+    items: [{ href: "/admin-legacy", label: "概览", icon: <Gauge size={16} /> }],
   },
   {
     title: "对话",
     items: [
-      { href: "/admin/conversations", label: "会话日志", icon: <MessagesSquare size={16} /> },
-      { href: "/admin/interjections", label: "插话决策", icon: <MessageSquare size={16} /> },
-      { href: "/admin/reminders", label: "主动消息", icon: <Bell size={16} /> },
+      { href: "/admin-legacy/conversations", label: "会话日志", icon: <MessagesSquare size={16} /> },
+      { href: "/admin-legacy/interjections", label: "插话决策", icon: <MessageSquare size={16} /> },
+      { href: "/admin-legacy/reminders", label: "主动消息", icon: <Bell size={16} /> },
     ],
   },
   {
     title: "自进化",
     items: [
-      { href: "/admin/memories", label: "记忆", icon: <Brain size={16} /> },
-      { href: "/admin/reflections", label: "反思", icon: <Sparkles size={16} /> },
-      { href: "/admin/skills", label: "Skills", icon: <Puzzle size={16} /> },
+      { href: "/admin-legacy/memories", label: "记忆", icon: <Brain size={16} /> },
+      { href: "/admin-legacy/reflections", label: "反思", icon: <Sparkles size={16} /> },
+      { href: "/admin-legacy/skills", label: "Skills", icon: <Puzzle size={16} /> },
     ],
   },
   {
     title: "工作区",
     items: [
-      { href: "/admin/tasks", label: "任务", icon: <ListTodo size={16} /> },
-      { href: "/admin/tools", label: "工具日志", icon: <Wrench size={16} /> },
-      { href: "/admin/tool-registrations", label: "工具注册", icon: <Hammer size={16} /> },
-      { href: "/admin/usage", label: "用量", icon: <FileClock size={16} /> },
+      { href: "/admin-legacy/tasks", label: "任务", icon: <ListTodo size={16} /> },
+      { href: "/admin-legacy/tools", label: "工具日志", icon: <Wrench size={16} /> },
+      { href: "/admin-legacy/tool-registrations", label: "工具注册", icon: <Hammer size={16} /> },
+      { href: "/admin-legacy/usage", label: "用量", icon: <FileClock size={16} /> },
     ],
   },
   {
     title: "设置",
     items: [
-      { href: "/admin/models", label: "模型", icon: <Cpu size={16} /> },
-      { href: "/admin/settings", label: "设置", icon: <Settings size={16} /> },
+      { href: "/admin-legacy/models", label: "模型", icon: <Cpu size={16} /> },
+      { href: "/admin-legacy/settings", label: "设置", icon: <Settings size={16} /> },
+    ],
+  },
+  {
+    title: "迁移",
+    items: [
+      { href: "/admin", label: "返回新控制台", icon: <Gauge size={16} /> },
     ],
   },
 ];
@@ -72,7 +78,7 @@ export function AdminNav() {
   const pathname = usePathname() ?? "";
 
   function isActive(href: string): boolean {
-    if (href === "/admin") return pathname === "/admin";
+    if (href === "/admin-legacy") return pathname === "/admin-legacy";
     return pathname === href || pathname.startsWith(`${href}/`);
   }
 

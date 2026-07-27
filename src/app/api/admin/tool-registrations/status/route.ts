@@ -12,6 +12,6 @@ export async function POST(request: Request) {
     if (toolId && (status === "enabled" || status === "disabled" || status === "rejected")) {
       await repositories.toolRegistrations.setStatus(user.id, toolId, status);
     }
-    return NextResponse.redirect(redirectUrl(request, "/admin/tool-registrations"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/tool-registrations"), { status: 303 });
   });
 }

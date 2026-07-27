@@ -97,7 +97,7 @@ export default async function SettingsPage() {
           仅当用户点亮聊天输入框的联网按钮，或在消息中明确要求搜索时，才允许当前回复联网。
         </p>
         <p className="model-picker-hint">
-          模型路由已移到<a href="/admin/models">「模型」页</a>选择。
+          模型路由已移到<a href="/admin-legacy/models">「模型」页</a>选择。
         </p>
         <button className="primary-button" type="submit">
           保存

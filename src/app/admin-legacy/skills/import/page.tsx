@@ -34,11 +34,11 @@ export default async function SkillImportPage({ searchParams }: { searchParams: 
 
   return (
     <section className="admin-list">
-      <form className="admin-card admin-form" method="get" action="/admin/skills/import">
+      <form className="admin-card admin-form" method="get" action="/admin-legacy/skills/import">
         <h2>从 GitHub 导入 Skill</h2>
         <p className="admin-hint">
           支持仓库、目录或 SKILL.md 文件链接（兼容 agentskills.io 标准）。安装前会做安全扫描，判定危险的 Skill 无法安装；安装后仍需在
-          <Link href="/admin/skills"> Skills 页</Link>确认启用。
+          <Link href="/admin-legacy/skills"> Skills 页</Link>确认启用。
         </p>
         <label>
           GitHub 链接

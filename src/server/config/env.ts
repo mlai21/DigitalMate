@@ -33,6 +33,10 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+  ADMIN_CONSOLE_ENABLED: z
+    .enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   KIE_AI_API_KEY: z.string().optional(),
   KIE_AI_BASE_URL: z.string().default("https://api.kie.ai"),
   GEMINI_3_5_FLASH_ENDPOINT: z.string().default("/gemini-3-5-flash-openai/v1/chat/completions"),
@@ -142,6 +146,7 @@ export function readEnv(source: Record<string, string | undefined> = process.env
       || path.join(process.cwd(), "data", "backups"),
     backupRetentionDays: parsed.BACKUP_RETENTION_DAYS,
     trustProxyHeaders: parsed.TRUST_PROXY_HEADERS,
+    adminConsoleEnabled: parsed.ADMIN_CONSOLE_ENABLED,
     kieAiApiKey: parsed.KIE_AI_API_KEY,
     kieAiBaseUrl: parsed.KIE_AI_BASE_URL,
     geminiEndpoint: parsed.GEMINI_3_5_FLASH_ENDPOINT,

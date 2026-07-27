@@ -20,6 +20,6 @@ export async function POST(request: Request) {
       }
     }
 
-    return NextResponse.redirect(redirectUrl(request, "/admin/skills"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/skills"), { status: 303 });
   });
 }

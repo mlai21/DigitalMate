@@ -16,7 +16,7 @@ export function ModelRoutingForm({
 }) {
   return (
     <form className="admin-card admin-form" action="/api/admin/settings" method="post">
-      <input type="hidden" name="redirectTo" value="/admin/models" />
+      <input type="hidden" name="redirectTo" value="/admin-legacy/models" />
       <ModelPicker
         label="主对话模型"
         hint="用于日常对话与复杂任务，优先选能力强的模型。"

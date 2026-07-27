@@ -25,6 +25,6 @@ export async function POST(request: Request) {
       }, signal);
     }
 
-    return NextResponse.redirect(redirectUrl(request, "/admin/memories"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/memories"), { status: 303 });
   });
 }

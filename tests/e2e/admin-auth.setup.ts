@@ -3,10 +3,13 @@ import path from "node:path";
 import { expect, test as setup } from "@playwright/test";
 
 export const ADMIN_AUTH_STATE = path.join(
-  process.cwd(),
-  "test-results",
-  ".auth",
-  "admin.json",
+  process.env.PLAYWRIGHT_AUTH_STATE_PATH
+    ?? path.join(
+      process.cwd(),
+      "test-results",
+      ".auth",
+      "admin.json",
+    ),
 );
 
 setup("建立共享管理后台会话", async ({ page }) => {

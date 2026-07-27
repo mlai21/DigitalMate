@@ -29,7 +29,7 @@ export default async function SkillsPage() {
       <form className="admin-card admin-form" action="/api/admin/skills/create" method="post">
         <h2>沉淀 Skill 草稿</h2>
         <p className="admin-hint">
-          也可以<Link href="/admin/skills/import">从 GitHub 导入社区 Skill</Link>（安装前自动安全扫描）。
+          也可以<Link href="/admin-legacy/skills/import">从 GitHub 导入社区 Skill</Link>（安装前自动安全扫描）。
         </p>
         <label>
           名称

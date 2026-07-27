@@ -13,6 +13,6 @@ export async function POST(request: Request) {
     if (memoryId) {
       await repositories.memories.delete(scope, memoryId);
     }
-    return NextResponse.redirect(redirectUrl(request, "/admin/memories"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/memories"), { status: 303 });
   });
 }

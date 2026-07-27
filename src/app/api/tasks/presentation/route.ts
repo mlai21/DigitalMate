@@ -100,7 +100,7 @@ async function processPresentationTask(
     }).catch(() => undefined);
   }
 
-  return NextResponse.redirect(redirectUrl(request, "/admin/tasks"), { status: 303 });
+  return NextResponse.redirect(redirectUrl(request, "/admin-legacy/tasks"), { status: 303 });
 }
 
 function isUploadedFile(value: FormDataEntryValue | null): value is File {

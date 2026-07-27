@@ -10,12 +10,22 @@ describe("E2E runner", () => {
       args: [],
       expected: [
         { suite: "app", args: [] },
+        { suite: "admin-cutover", args: [] },
         { suite: "scroll", args: [] },
       ],
     },
     {
       args: ["tests/e2e/chat.spec.ts"],
       expected: [{ suite: "app", args: ["tests/e2e/chat.spec.ts"] }],
+    },
+    {
+      args: ["tests/e2e/admin-console-cutover.spec.ts"],
+      expected: [
+        {
+          suite: "admin-cutover",
+          args: ["tests/e2e/admin-console-cutover.spec.ts"],
+        },
+      ],
     },
     {
       args: ["tests/e2e/chat-scroll.spec.ts"],

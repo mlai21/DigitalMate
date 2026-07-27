@@ -27,6 +27,6 @@ export async function POST(request: Request) {
       );
     }
 
-    return NextResponse.redirect(redirectUrl(request, "/admin/tool-registrations"), { status: 303 });
+    return NextResponse.redirect(redirectUrl(request, "/admin-legacy/tool-registrations"), { status: 303 });
   });
 }

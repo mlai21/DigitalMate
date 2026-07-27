@@ -49,6 +49,7 @@ services:
       BACKUP_STORAGE_DIR: /app/data/backups
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
       TRUST_PROXY_HEADERS: "true"
+      ADMIN_CONSOLE_ENABLED: ${ADMIN_CONSOLE_ENABLED:-0}
       PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?请设置对应 DOMAIN 的 HTTPS 根地址}"
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
