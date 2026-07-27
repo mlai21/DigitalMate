@@ -180,8 +180,7 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
   backup: moduleContract(
     "mapped",
     "backups",
-    disabled(
-      PENDING,
+    mapped(
       "GET /backups",
       "GET /backups/:backupId",
       "POST /backups/stream",
@@ -394,16 +393,18 @@ export const UPSTREAM_API_CONTRACT = Object.freeze({
     ),
   ),
   plugin: moduleContract(
-    "disabled",
+    "mapped",
     "plugins",
-    disabled(
-      STABLE_CAPABILITY_CODES.plugins,
+    mapped(
       "GET /plugins",
       "GET /plugins/catalog",
+      "GET /plugins/:pluginId/status",
+    ),
+    disabled(
+      STABLE_CAPABILITY_CODES.plugins,
       "POST /plugins/install",
       "POST /plugins/upload",
       "DELETE /plugins/:pluginId",
-      "GET /plugins/:pluginId/status",
     ),
   ),
   pluginMarket: moduleContract(

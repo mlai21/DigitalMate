@@ -45,6 +45,9 @@ services:
       APP_PASSWORD: ${APP_PASSWORD:-}
       APP_SECRET: "${APP_SECRET:?请设置至少32字节的高熵APP_SECRET}"
       CHANNEL_SECRETS_KEY: "${CHANNEL_SECRETS_KEY:?请设置独立的32字节base64渠道加密密钥}"
+      BACKUP_ENCRYPTION_KEY: "${BACKUP_ENCRYPTION_KEY:-}"
+      BACKUP_STORAGE_DIR: /app/data/backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
       TRUST_PROXY_HEADERS: "true"
       PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?请设置对应 DOMAIN 的 HTTPS 根地址}"
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
@@ -79,6 +82,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - digitalmate-attachments:/app/data/attachments
+      - digitalmate-backups:/app/data/backups
+      - digitalmate-matrix:/app/data/matrix
       - ${CHANNEL_NODE_ENROLLMENT_CA_DIR:-./data/channel-node-enrollment-ca}:/run/digitalmate/channel-node-enrollment-ca:ro
       - ${CHANNEL_NODE_SERVER_CA_DIR:-./data/channel-node-server-ca}:/run/digitalmate/channel-node-server-ca:ro
     depends_on:
@@ -134,6 +139,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - digitalmate-attachments:/app/data/attachments
+      - digitalmate-matrix:/app/data/matrix
       - ${CHANNEL_NODE_TLS_DIR:-./data/channel-node-tls}:/run/digitalmate/channel-node-tls:ro
     restart: unless-stopped
 
@@ -142,3 +148,5 @@ volumes:
   digitalmate-caddy-data:
   digitalmate-caddy-config:
   digitalmate-attachments:
+  digitalmate-backups:
+  digitalmate-matrix:

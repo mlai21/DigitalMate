@@ -47,6 +47,28 @@ describe("security environment contract", () => {
     ).toHaveLength(2);
   });
 
+  it("keeps the independent backup key and private archive volume in the web service only", async () => {
+    const [example, compose] = await Promise.all([
+      readFile(path.join(process.cwd(), ".env.example"), "utf8"),
+      readFile(path.join(process.cwd(), "docker-compose.yml"), "utf8"),
+    ]);
+
+    expect(example).toMatch(/^BACKUP_ENCRYPTION_KEY=/m);
+    expect(compose).not.toMatch(
+      /BACKUP_ENCRYPTION_KEY:.*(?:APP_SECRET|CHANNEL_SECRETS_KEY)/,
+    );
+    expect(
+      compose.match(
+        /BACKUP_ENCRYPTION_KEY:\s*"\$\{BACKUP_ENCRYPTION_KEY:-\}"/g,
+      ),
+    ).toHaveLength(1);
+    expect(
+      compose.match(
+        /digitalmate-backups:\/app\/data\/backups/g,
+      ),
+    ).toHaveLength(1);
+  });
+
   it("defaults proxy trust off while the controlled Caddy service fixes it on", async () => {
     const [example, compose] = await Promise.all([
       readFile(path.join(process.cwd(), ".env.example"), "utf8"),

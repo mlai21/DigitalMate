@@ -105,7 +105,7 @@ const EXPECTED_MODULE_STATUS = {
   localModel: "disabled",
   market: "disabled",
   mcp: "mapped",
-  plugin: "disabled",
+  plugin: "mapped",
   pluginMarket: "disabled",
   provider: "mapped",
   root: "mapped",
@@ -290,6 +290,14 @@ describe("QwenPaw Console upstream API contract", () => {
       securityOverview:
         {} as NonNullable<
           CoreAdminCompatDependencies["securityOverview"]
+        >,
+      backups:
+        {} as NonNullable<
+          CoreAdminCompatDependencies["backups"]
+        >,
+      plugins:
+        {} as NonNullable<
+          CoreAdminCompatDependencies["plugins"]
         >,
       verifyUpstreamContract: true,
     } satisfies CoreAdminCompatDependencies;

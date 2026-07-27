@@ -68,12 +68,18 @@ Gemini 与 Claude 接口**共用同一个 API Key**，无需为每个模型单�
 |---|---|---|
 | `APP_PASSWORD` | 生产环境必填 | Web 登录口令 |
 | `APP_SECRET` | 生产环境必填 | 会话与 CSRF 派生签名的根密钥；开发环境可使用本地默认值，生产环境必须显式配置至少 32 字节的独立高熵随机值，缺失、公开默认值或占位符会导致启动失败，且 `APP_PASSWORD` 不能替代 |
+| `CHANNEL_SECRETS_KEY` | 生产环境必填 | 渠道凭据与 Matrix crypto store 的独立 32 字节标准 base64 根密钥；不得复用 `APP_SECRET` |
+| `BACKUP_ENCRYPTION_KEY` | 使用完整备份时必填 | 灾难恢复包外层 AES-256-GCM 的另一把 32 字节标准 base64 密钥；不得复用或回退到 `APP_SECRET`/`CHANNEL_SECRETS_KEY`。缺失或无效时只阻止备份/恢复，不影响聊天和渠道 |
+| `BACKUP_STORAGE_DIR` | 否 | 加密灾难恢复包的私有目录，开发环境默认 `data/backups`；Docker Compose 中仅 Web 服务挂载 `/app/data/backups`，不得放入 `public/` |
+| `BACKUP_RETENTION_DAYS` | 否 | 备份任务保留天数，默认 `30`，允许 `1–365` |
 | `TRUST_PROXY_HEADERS` | 否 | 是否信任由受控入口代理清洗的 `X-Forwarded-Proto`、`X-Forwarded-Host` 与 `X-DigitalMate-Original-URI`，默认 `false`。Docker Compose 的 Caddy 会先删除客户端同名原始 URI 头，再注入未经 Next.js 规范化的 request URI；启用信任后该头缺失或异常会关闭请求。直接暴露 Next.js 不提供严格原始路径保证，不得作为生产入口；其他代理必须实现等价的覆盖式注入后才能设为 `true` |
 | `DATABASE_URL` | 是 | PostgreSQL 连接字符串 |
 | `DOMAIN` | Docker Compose 生产部署必填 | HTTPS 域名（如 `mate.example.com`），需先将域名 A 记录解析到服务器 IP；Caddy 自动申请/续期 Let's Encrypt 证书并将 HTTP 跳转到 HTTPS |
 | `PUBLIC_BASE_URL` | 生产环境必填 | 与 `DOMAIN` 对应的 HTTPS 根地址（如 `https://mate.example.com`），不得包含路径、查询、片段或用户信息 |
 | `TZ` | 否 | Node 运行时本地时区，默认 `Asia/Shanghai`；提醒中的「明天 9 点」「周五之前」会按该时区计算 |
 | `ATTACHMENT_STORAGE_DIR` | 否 | 聊天附件的私有存储目录，开发环境默认 `data/attachments`；Docker Compose 中 Web 与 Agent 共用持久卷 `/app/data/attachments`。该目录不得放入 `public/`，附件下载必须经过鉴权接口 |
+
+`BACKUP_ENCRYPTION_KEY` 可用 `openssl rand -base64 32` 单独生成。备份包可以包含渠道凭据的既有密文、私有附件和 Matrix crypto store，因此普通个人数据导出不能替代灾难恢复包；备份文件也只能通过鉴权后的后台接口下载。
 
 ### 最小 curl 验证
 

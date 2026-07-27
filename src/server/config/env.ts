@@ -1,6 +1,7 @@
 import path from "node:path";
 import { z } from "zod";
 import { createChannelSecretsKey } from "@/server/security/encrypted-secret";
+import { createBackupEncryptionKey } from "@/server/admin/backups/types";
 
 const LOCAL_APP_SECRET = "digitalmate-local-secret-change-me";
 const PUBLIC_APP_SECRET_PLACEHOLDERS = new Set([
@@ -20,6 +21,14 @@ const envSchema = z.object({
     .min(16)
     .default(LOCAL_APP_SECRET),
   CHANNEL_SECRETS_KEY: z.string().optional(),
+  BACKUP_ENCRYPTION_KEY: z.string().optional(),
+  BACKUP_STORAGE_DIR: z.string().optional(),
+  BACKUP_RETENTION_DAYS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .default(30),
   TRUST_PROXY_HEADERS: z
     .enum(["true", "false"])
     .default("false")
@@ -121,6 +130,17 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     channelSecretsKey: createChannelSecretsKey(
       parsed.CHANNEL_SECRETS_KEY,
     ),
+    backupEncryptionKey: createBackupEncryptionKey(
+      parsed.BACKUP_ENCRYPTION_KEY,
+      {
+        appSecret: parsed.APP_SECRET,
+        channelSecretsKey: parsed.CHANNEL_SECRETS_KEY,
+      },
+    ),
+    backupStorageDir:
+      parsed.BACKUP_STORAGE_DIR?.trim()
+      || path.join(process.cwd(), "data", "backups"),
+    backupRetentionDays: parsed.BACKUP_RETENTION_DAYS,
     trustProxyHeaders: parsed.TRUST_PROXY_HEADERS,
     kieAiApiKey: parsed.KIE_AI_API_KEY,
     kieAiBaseUrl: parsed.KIE_AI_BASE_URL,

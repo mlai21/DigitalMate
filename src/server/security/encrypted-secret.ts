@@ -191,6 +191,17 @@ export class ChannelSecretsKey {
       .digest("hex");
   }
 
+  backupKeyFingerprint(): string {
+    return `sha256:${
+      createHmac("sha256", this.#material)
+        .update(
+          "digitalmate.channel-secret-backup-key\0",
+          "utf8",
+        )
+        .digest("hex")
+    }`;
+  }
+
   runtimeStorageKey(
     purpose: string,
     context: Readonly<{

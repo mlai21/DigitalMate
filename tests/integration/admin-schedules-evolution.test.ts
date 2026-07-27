@@ -40,6 +40,9 @@ import {
   createPostgresAdminSecurityService,
 } from "@/server/admin/views/security";
 import {
+  createPostgresBackupRepository,
+} from "@/server/admin/backups/repository";
+import {
   trackEmbeddedPostgresPool,
   type EmbeddedPostgresLifecycle,
 } from "./embedded-postgres-lifecycle";
@@ -778,6 +781,140 @@ describe("admin schedules and evolution PostgreSQL mapping", () => {
     expect(deletion.rows[0]).toEqual({
       deleted: true,
       audits: "2",
+    });
+  });
+
+  it("snapshots an agent without operational secrets and restores only after second-agent isolation is resolved", async () => {
+    const repository = createPostgresBackupRepository(pool);
+    const connection = await pool.query<{ id: string }>(
+      `SELECT id::text
+       FROM channel_connections
+       WHERE user_id = $1 AND agent_id = $2
+       LIMIT 1`,
+      [scope.userId, scope.agentId],
+    );
+    const connectionId = connection.rows[0]!.id;
+    await pool.query(
+      `INSERT INTO channel_secrets (
+         connection_id, field_name, ciphertext,
+         nonce, auth_tag, key_version
+       )
+       VALUES ($1, 'bot_token', $2, $3, $4, 1)`,
+      [
+        connectionId,
+        Buffer.from("encrypted-value"),
+        Buffer.alloc(12, 1),
+        Buffer.alloc(16, 2),
+      ],
+    );
+
+    const snapshot = await repository.snapshot(scope);
+    const originalDisplayName = String(
+      snapshot.tables.digital_agents?.[0]?.display_name,
+    );
+    expect(snapshot.tables.channel_secrets).toHaveLength(1);
+    expect(
+      snapshot.tables.channel_connections?.[0],
+    ).toMatchObject({
+      enabled: false,
+      runtime_node_id: null,
+      health_status: "disabled",
+      config: {},
+    });
+    expect(
+      snapshot.tables.tool_registrations?.[0],
+    ).toMatchObject({
+      command: "",
+      status: "disabled",
+    });
+    expect(JSON.stringify(snapshot.tables)).not.toMatch(
+      /secret-runner|Bearer hidden|\/private\/file|storage_key.*private|raw input APP_SECRET/iu,
+    );
+
+    await pool.query(
+      `UPDATE digital_agents
+       SET status = 'archived'
+       WHERE user_id = $1 AND id <> $2`,
+      [scope.userId, scope.agentId],
+    );
+    await expect(
+      repository.restore(
+        scope,
+        snapshot.tables,
+        "40000000-0000-4000-8000-000000000001",
+        async () => ({
+          rollback: async () => undefined,
+          commit: async () => undefined,
+        }),
+      ),
+    ).rejects.toThrow("backup_multi_agent_restore_blocked");
+
+    await pool.query(
+      `DELETE FROM digital_agents
+       WHERE user_id = $1 AND id <> $2`,
+      [scope.userId, scope.agentId],
+    );
+    await pool.query(
+      `UPDATE digital_agents
+       SET display_name = 'Corrupted'
+       WHERE user_id = $1 AND id = $2`,
+      [scope.userId, scope.agentId],
+    );
+    let filesCommitted = false;
+    await repository.restore(
+      scope,
+      snapshot.tables,
+      "40000000-0000-4000-8000-000000000001",
+      async () => ({
+        rollback: async () => undefined,
+        commit: async () => {
+          filesCommitted = true;
+        },
+      }),
+    );
+
+    const restored = await pool.query<{
+      display_name: string;
+      enabled: boolean;
+      health_status: string;
+      config: Record<string, unknown>;
+      secret: string;
+      restore_audits: string;
+    }>(
+      `SELECT agent.display_name,
+              connection.enabled,
+              connection.health_status,
+              connection.config,
+              encode(secret.ciphertext, 'hex') AS secret,
+              (
+                SELECT count(*)::text
+                FROM admin_audit_logs
+                WHERE user_id = $1
+                  AND agent_id = $2
+                  AND action = 'backup.restore'
+                  AND resource_id = $3
+              ) AS restore_audits
+       FROM digital_agents AS agent
+       JOIN channel_connections AS connection
+         ON connection.user_id = agent.user_id
+        AND connection.agent_id = agent.id
+       JOIN channel_secrets AS secret
+         ON secret.connection_id = connection.id
+       WHERE agent.user_id = $1 AND agent.id = $2`,
+      [
+        scope.userId,
+        scope.agentId,
+        "40000000-0000-4000-8000-000000000001",
+      ],
+    );
+    expect(filesCommitted).toBe(true);
+    expect(restored.rows[0]).toEqual({
+      display_name: originalDisplayName,
+      enabled: false,
+      health_status: "disabled",
+      config: {},
+      secret: Buffer.from("encrypted-value").toString("hex"),
+      restore_audits: "1",
     });
   });
 });

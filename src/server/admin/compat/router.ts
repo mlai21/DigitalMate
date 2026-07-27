@@ -35,6 +35,7 @@ import {
 import {
   CHANNEL_MANIFESTS,
 } from "@/server/channels/manifests/catalog";
+import { BackupServiceError } from "@/server/admin/backups/service";
 
 const COMPAT_BASE_PATH = "/api/admin/compat";
 const METHODS = [
@@ -68,6 +69,7 @@ type CompatMethod = (typeof METHODS)[number];
 type RegisteredMethod = Exclude<CompatMethod, "HEAD" | "OPTIONS">;
 export type AdminCompatRouteOptions = Readonly<{
   agentHeader?: "optional" | "required";
+  userDataLease?: "shared" | "exclusive";
   allowContractOverlap?: boolean;
   contract?:
     | Readonly<{
@@ -91,6 +93,7 @@ type RouteDefinition = Readonly<{
   staticSegments: number;
   access: "scoped" | "session" | "status";
   agentHeader: "optional" | "required";
+  userDataLease: "shared" | "exclusive";
   contractStatus: UpstreamEndpointStatus;
   disabledCode?: StableCapabilityCode;
   redirectTo?: string;
@@ -103,6 +106,13 @@ type RouteDefinition = Readonly<{
 export type AdminCompatRuntime = Readonly<{
   security: AdminSecurityOptions;
   withUserDataLease: <T>(
+    userId: string,
+    work: (
+      resources: AdminCompatResources,
+      signal: AbortSignal,
+    ) => Promise<T>,
+  ) => Promise<T>;
+  withExclusiveUserDataLease?: <T>(
     userId: string,
     work: (
       resources: AdminCompatResources,
@@ -367,6 +377,7 @@ export class AdminCompatRouter {
       staticSegments,
       access,
       agentHeader: options?.agentHeader ?? "optional",
+      userDataLease: options?.userDataLease ?? "shared",
       contractStatus: options?.contract?.status ?? "mapped",
       ...(options?.contract?.status === "disabled"
         ? { disabledCode: options.contract.disabledCode }
@@ -499,7 +510,18 @@ export class AdminCompatRouter {
       );
     }
 
-    return runtime.withUserDataLease(userId, async (resources, signal) => {
+    const withLease =
+      selected.route.userDataLease === "exclusive"
+        ? runtime.withExclusiveUserDataLease
+        : runtime.withUserDataLease;
+    if (!withLease) {
+      throw new AdminCompatError(
+        503,
+        "user_data_exclusive_lease_unavailable",
+        "user_data_exclusive_lease_unavailable",
+      );
+    }
+    return withLease(userId, async (resources, signal) => {
       signal.throwIfAborted();
       const scope = await runtime.resolveDefaultScope(
         userId,
@@ -869,6 +891,40 @@ function mapError(error: unknown): Response {
     }
     if (status === 409) {
       return errorResponse(409, error.code, error.code);
+    }
+    return errorResponse(500, "internal_error", "internal_error");
+  }
+  if (error instanceof BackupServiceError) {
+    const conflictCodes = new Set([
+      "backup_agent_mismatch",
+      "backup_scope_mismatch",
+      "channel_secret_key_mismatch",
+      "backup_restore_confirmation_required",
+      "backup_multi_agent_restore_blocked",
+    ]);
+    const invalidCodes = new Set([
+      "backup_archive_invalid",
+      "backup_attachment_invalid",
+      "backup_authentication_failed",
+      "backup_checksum_mismatch",
+    ]);
+    if (error.code === "backup_not_found") {
+      return errorResponse(404, "not_found", error.code);
+    }
+    if (conflictCodes.has(error.code)) {
+      return errorResponse(409, error.code, error.code);
+    }
+    if (invalidCodes.has(error.code)) {
+      return errorResponse(400, error.code, error.code);
+    }
+    if (
+      error.code === "backup_encryption_key_missing"
+      || error.code === "backup_encryption_key_invalid"
+      || error.code === "backup_encryption_key_reused"
+      || error.code === "channel_secrets_key_missing"
+      || error.code === "channel_secrets_key_invalid"
+    ) {
+      return errorResponse(503, error.code, error.code);
     }
     return errorResponse(500, "internal_error", "internal_error");
   }

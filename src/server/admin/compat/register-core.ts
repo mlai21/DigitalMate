@@ -1,5 +1,6 @@
 import packageJson from "../../../../package.json";
 import { readFile } from "node:fs/promises";
+import type { Pool } from "pg";
 import {
   createAdminAuthStatusResponse,
   type AdminSecurityOptions,
@@ -223,11 +224,48 @@ import {
   createPostgresAdminSecurityService,
   type AdminSecurityService,
 } from "@/server/admin/views/security";
+import {
+  createCreateBackupStreamHandler,
+  createDeleteBackupsHandler,
+  createExportBackupHandler,
+  createGetBackupHandler,
+  createImportBackupHandler,
+  createListBackupsHandler,
+  createRestoreBackupHandler,
+  type AdminBackupsService,
+} from "@/server/admin/compat/handlers/backups";
+import {
+  createGetPluginStatusHandler,
+  createListPluginsHandler,
+  createPluginCatalogHandler,
+  createPluginMutationBlockedHandler,
+  createPostgresAdminPluginsService,
+  type AdminPluginsService,
+} from "@/server/admin/compat/handlers/plugins";
+import {
+  createPostgresBackupRepository,
+} from "@/server/admin/backups/repository";
+import {
+  BackupServiceError,
+  createAdminBackupService,
+} from "@/server/admin/backups/service";
+import {
+  defaultMatrixCryptoStorageRoot,
+} from "@/server/channels/adapters/matrix/crypto-store";
+import {
+  createDisabledOnlyChannelShutdownPort,
+} from "@/server/admin/personal-data";
+import {
+  userConnectionDisconnector,
+} from "@/server/admin/user-connections";
+import type {
+  ChannelSecretsKey,
+} from "@/server/security/encrypted-secret";
 
 export const consoleUpstreamTag = "v2.0.0.post3";
 export const consoleUpstreamCommit =
   "fef7e64d984f4332d0b84a343cd209bd3ea5d316";
-export const adminCompatApiRevision = "2026-07-27.5";
+export const adminCompatApiRevision = "2026-07-27.6";
 
 export type CoreAdminCompatDependencies = Readonly<{
   createAuthStatusResponse: SharedAuthStatusReader;
@@ -252,6 +290,8 @@ export type CoreAdminCompatDependencies = Readonly<{
   models?: AdminModelsService;
   operations?: AdminOperationsService;
   securityOverview?: AdminSecurityService;
+  backups?: AdminBackupsService;
+  plugins?: AdminPluginsService;
   verifyUpstreamContract?: boolean;
 }>;
 
@@ -1122,6 +1162,95 @@ export function createCoreAdminCompatRouter(
     );
   }
 
+  if (dependencies.backups) {
+    const backupRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/backups",
+      createListBackupsHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+    router.get(
+      "/backups/:backupId",
+      createGetBackupHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+    router.post(
+      "/backups/stream",
+      createCreateBackupStreamHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+    router.post(
+      "/backups/:backupId/restore",
+      createRestoreBackupHandler(dependencies.backups),
+      {
+        ...backupRouteOptions,
+        userDataLease: "exclusive",
+      },
+    );
+    router.post(
+      "/backups/delete",
+      createDeleteBackupsHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+    router.get(
+      "/backups/:backupId/export",
+      createExportBackupHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+    router.post(
+      "/backups/import",
+      createImportBackupHandler(dependencies.backups),
+      backupRouteOptions,
+    );
+  }
+
+  if (dependencies.plugins) {
+    const pluginRouteOptions = {
+      agentHeader: "required",
+    } as const;
+    router.get(
+      "/plugins",
+      createListPluginsHandler(dependencies.plugins),
+      pluginRouteOptions,
+    );
+    router.get(
+      "/plugins/catalog",
+      createPluginCatalogHandler(),
+      pluginRouteOptions,
+    );
+    router.get(
+      "/plugins/:pluginId/status",
+      createGetPluginStatusHandler(dependencies.plugins),
+      pluginRouteOptions,
+    );
+    const blockedPluginMutation =
+      createPluginMutationBlockedHandler();
+    const blockedPluginRouteOptions = {
+      ...pluginRouteOptions,
+      contract: {
+        status: "disabled",
+        disabledCode: STABLE_CAPABILITY_CODES.plugins,
+      },
+    } as const;
+    router.post(
+      "/plugins/install",
+      blockedPluginMutation,
+      blockedPluginRouteOptions,
+    );
+    router.post(
+      "/plugins/upload",
+      blockedPluginMutation,
+      blockedPluginRouteOptions,
+    );
+    router.delete(
+      "/plugins/:pluginId",
+      blockedPluginMutation,
+      blockedPluginRouteOptions,
+    );
+  }
+
   for (const path of ["/language", "/settings/language"]) {
     router.get(path, getLanguage);
     router.put(path, putLanguage);
@@ -1271,6 +1400,12 @@ export async function dispatchAdminCompatRequest(
     operations: createPostgresAdminOperationsService(pool),
     securityOverview:
       createPostgresAdminSecurityService(pool),
+    backups: createConfiguredBackupsService({
+      env,
+      pool,
+      channelSecretKey,
+    }),
+    plugins: createPostgresAdminPluginsService(pool),
     wechatQrAuth,
     verifyUpstreamContract: true,
   });
@@ -1281,6 +1416,18 @@ export async function dispatchAdminCompatRequest(
         signal: request.signal,
         timeoutCode: "admin_compat_request_timeout",
       }),
+    withExclusiveUserDataLease: async (userId, work) => {
+      const resources = createRepositories();
+      const lease =
+        await resources.userDataMutations
+          .acquireExclusiveClearLease(userId);
+      try {
+        request.signal.throwIfAborted();
+        return await work(resources, request.signal);
+      } finally {
+        await lease.release();
+      }
+    },
     resolveDefaultScope: async (
       userId,
       resources,
@@ -1323,6 +1470,66 @@ function channelNodeServerUrl(
   url.port = port === 443 ? "" : String(port);
   url.pathname = "/channel-node";
   return url.toString();
+}
+
+function createConfiguredBackupsService(input: Readonly<{
+  env: ReturnType<typeof readEnv>;
+  pool: Pool;
+  channelSecretKey: ChannelSecretsKey | null;
+}>): AdminBackupsService {
+  if (input.env.backupEncryptionKey?.status !== "ready") {
+    return createUnavailableBackupsService(
+      input.env.backupEncryptionKey?.code
+        ?? "backup_encryption_key_missing",
+    );
+  }
+  if (!input.channelSecretKey) {
+    return createUnavailableBackupsService(
+      input.env.channelSecretsKey?.status === "blocked"
+        ? input.env.channelSecretsKey.code
+        : "channel_secrets_key_missing",
+    );
+  }
+  const repositories = createRepositories();
+  const channelShutdown =
+    createDisabledOnlyChannelShutdownPort(repositories);
+  return createAdminBackupService({
+    repository: createPostgresBackupRepository(input.pool),
+    encryptionKey: input.env.backupEncryptionKey.key,
+    channelSecretKeyFingerprint:
+      input.channelSecretKey.backupKeyFingerprint(),
+    backupStorageRoot: input.env.backupStorageDir,
+    attachmentStorageRoot:
+      input.env.attachmentStorageDir,
+    matrixStorageRoot:
+      defaultMatrixCryptoStorageRoot(),
+    retentionDays: input.env.backupRetentionDays,
+    stopConnections: async (scope) => {
+      await channelShutdown.stopAll({
+        userId: scope.userId,
+      });
+      return userConnectionDisconnector.disconnectUser(
+        scope.userId,
+      );
+    },
+  });
+}
+
+function createUnavailableBackupsService(
+  code: string,
+): AdminBackupsService {
+  const blocked = async (): Promise<never> => {
+    throw new BackupServiceError(code);
+  };
+  return {
+    list: blocked,
+    get: blocked,
+    create: blocked,
+    restore: blocked,
+    delete: blocked,
+    export: blocked,
+    import: blocked,
+  };
 }
 
 let defaultWechatQrAuth:

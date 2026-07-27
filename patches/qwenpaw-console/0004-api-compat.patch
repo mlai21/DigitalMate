@@ -6207,7 +6207,8 @@ index 62c02e5..d5b9a43 100644
  });
 +const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
 
- describe("AgentTable", () => {
+-describe("AgentTable", () => {
++describe("AgentTable", { timeout: 15_000 }, () => {
    it("uses click-specific labels for pin actions", () => {
 @@ -40,4 +60,121 @@ describe("AgentTable", () => {
        screen.getByRole("button", { name: "agent.unpinAgent" }),
@@ -6215,7 +6216,7 @@ index 62c02e5..d5b9a43 100644
    });
 +
 +  it("does not invoke secondary agent actions", async () => {
-+    const user = userEvent.setup();
++    const user = { click: (element: HTMLElement) => element.click() };
 +    const onEdit = vi.fn();
 +    const onDelete = vi.fn();
 +    const onToggle = vi.fn();

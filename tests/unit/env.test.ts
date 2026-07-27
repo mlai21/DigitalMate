@@ -16,6 +16,10 @@ describe("readEnv", () => {
       status: "blocked",
       code: "channel_secrets_key_missing",
     });
+    expect(env.backupEncryptionKey).toEqual({
+      status: "blocked",
+      code: "backup_encryption_key_missing",
+    });
     expect(env.channelImportLegacyEnabled).toBe(false);
     expect(env.channelGatewayPort).toBe(3_101);
     expect(env.channelNodePort).toBe(9_443);
@@ -59,6 +63,58 @@ describe("readEnv", () => {
 
     expect(env.channelSecretsKey.status).toBe("ready");
     expect(JSON.stringify(env)).not.toContain(encoded);
+  });
+
+  it("requires an independent 32-byte backup encryption key", () => {
+    const appSecret = "a".repeat(32);
+    const channelKey = Buffer.alloc(32, 4).toString("base64");
+    const backupKey = Buffer.alloc(32, 5).toString("base64");
+
+    expect(
+      readEnv({
+        APP_SECRET: appSecret,
+        CHANNEL_SECRETS_KEY: channelKey,
+        BACKUP_ENCRYPTION_KEY: backupKey,
+      }).backupEncryptionKey.status,
+    ).toBe("ready");
+    expect(
+      readEnv({
+        BACKUP_ENCRYPTION_KEY: Buffer.alloc(31).toString(
+          "base64",
+        ),
+      }).backupEncryptionKey,
+    ).toEqual({
+      status: "blocked",
+      code: "backup_encryption_key_invalid",
+    });
+    expect(
+      readEnv({
+        APP_SECRET: appSecret,
+        BACKUP_ENCRYPTION_KEY:
+          Buffer.from(appSecret).toString("base64"),
+      }).backupEncryptionKey,
+    ).toEqual({
+      status: "blocked",
+      code: "backup_encryption_key_reused",
+    });
+    expect(
+      readEnv({
+        CHANNEL_SECRETS_KEY: channelKey,
+        BACKUP_ENCRYPTION_KEY: channelKey,
+      }).backupEncryptionKey,
+    ).toEqual({
+      status: "blocked",
+      code: "backup_encryption_key_reused",
+    });
+    expect(
+      readEnv({
+        APP_SECRET: backupKey,
+        BACKUP_ENCRYPTION_KEY: backupKey,
+      }).backupEncryptionKey,
+    ).toEqual({
+      status: "blocked",
+      code: "backup_encryption_key_reused",
+    });
   });
 
   it("requires an explicit boolean to trust sanitized proxy headers", () => {

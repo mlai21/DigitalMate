@@ -504,6 +504,57 @@ CREATE TABLE IF NOT EXISTS agent_settings (
   ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS backup_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL,
+  name text NOT NULL
+    CONSTRAINT backup_jobs_name_check
+    CHECK (btrim(name) <> '' AND length(name) <= 120),
+  description text NOT NULL DEFAULT ''
+    CONSTRAINT backup_jobs_description_check
+    CHECK (length(description) <= 500),
+  status text NOT NULL
+    CONSTRAINT backup_jobs_status_check
+    CHECK (
+      status IN (
+        'pending', 'running', 'ready', 'failed', 'restoring'
+      )
+    ),
+  kind text NOT NULL
+    CONSTRAINT backup_jobs_kind_check
+    CHECK (kind IN ('disaster_recovery', 'imported')),
+  storage_key text UNIQUE,
+  checksum text
+    CONSTRAINT backup_jobs_checksum_check
+    CHECK (
+      checksum IS NULL
+      OR checksum ~ '^[a-f0-9]{64}$'
+    ),
+  size_bytes bigint
+    CONSTRAINT backup_jobs_size_check
+    CHECK (size_bytes IS NULL OR size_bytes > 0),
+  error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  CONSTRAINT backup_jobs_ready_check CHECK (
+    (
+      status = 'ready'
+      AND storage_key IS NOT NULL
+      AND checksum IS NOT NULL
+      AND size_bytes IS NOT NULL
+      AND error_code IS NULL
+    )
+    OR status <> 'ready'
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_jobs_scope_created
+  ON backup_jobs(user_id, agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backup_jobs_expiry
+  ON backup_jobs(expires_at)
+  WHERE status IN ('ready', 'failed');
+
 ALTER TABLE IF EXISTS agent_settings
   ADD COLUMN IF NOT EXISTS heartbeat jsonb NOT NULL
   DEFAULT '{"enabled":false,"every":"6h","target":"inbox","timeoutSeconds":300,"activeHours":null,"authorization":null}'::jsonb;
