@@ -11,7 +11,16 @@ RUN apk add --no-cache git
 ENV NODE_OPTIONS=--max-old-space-size=4096
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build
+# 内存不足以打包 Console 的部署环境可传 PREBUILT_CONSOLE=1，
+# 改用构建上下文里已有的 public/_admin-console 产物。
+ARG PREBUILT_CONSOLE=0
+RUN if [ "$PREBUILT_CONSOLE" = "1" ]; then \
+      test -f public/_admin-console/index.html \
+        || { echo "PREBUILT_CONSOLE=1 requires public/_admin-console/index.html"; exit 1; }; \
+      npm run build:next; \
+    else \
+      npm run build; \
+    fi
 
 FROM node:22-alpine AS runner
 WORKDIR /app

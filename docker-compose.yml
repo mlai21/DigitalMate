@@ -36,7 +36,10 @@ services:
       retries: 10
 
   web:
-    build: .
+    build:
+      context: .
+      args:
+        PREBUILT_CONSOLE: ${PREBUILT_CONSOLE:-0}
     restart: unless-stopped
     command: sh -c "npm run db:migrate && npm run db:seed && npm run start"
     environment:
@@ -92,7 +95,10 @@ services:
         condition: service_healthy
 
   agent:
-    build: .
+    build:
+      context: .
+      args:
+        PREBUILT_CONSOLE: ${PREBUILT_CONSOLE:-0}
     command: sh -c "npm run agent"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
