@@ -50,7 +50,7 @@ P1-14 已经交付 Alvin 的服务端能力：幂等创建固定 `slug=alvin` �
 
 ### 4.1 能力字段收敛与扩展
 
-`src/server/admin/compat/handlers/agents.ts` 目前有四处各自硬编码的 `capabilities` 字面量。收敛为单一常量源，并同时用于列表摘要、详情、创建与更新响应（当前列表摘要不返回该字段，前端因此无从判断能力）。
+`src/server/admin/compat/handlers/agents.ts` 目前有四处各自硬编码的 `capabilities` 字面量。收敛为单一常量源，用于详情、创建与更新响应，并新增到列表响应的顶层（当前列表完全不返回该字段，前端因此无从判断能力）。能力是账号级的，不按实例区分，因此放在列表顶层而不是每个摘要里。
 
 字段在上游既有的 `multi_agent`、`create`、`import`、`clone`、`delete` 之外补充 `toggle`、`pin`、`reorder` 三项。原因是这三个操作后端只接受不改变现状的请求，其余情况返回 501，前端必须知道要禁用对应控件。第一步除 `multi_agent` 为 `true` 外，其余全部为 `false`。
 

@@ -12,11 +12,11 @@ Alvin 是独立的 MaaS 售前解决方案架构师，不是 DigitalMate 的分�
 - 管理员私聊、受邀销售私聊，以及管理员与销售所在的一个群聊。
 - 私聊参与者记忆隔离；群聊与所有私聊记忆隔离。
 
-首期不交付任意智能体创建、克隆、导入、删除、多智能体协作、客户空间、自动报价、多智能体备份恢复和自动修改岗位章程。
+首期不交付任意智能体创建、克隆、导入、删除、启用停用、置顶、排序、多智能体协作、客户空间、自动报价、多智能体备份恢复和自动修改岗位章程。
 
 ## 2. 创建 Alvin
 
-调用 `POST /api/admin/compat/agents`，请求体只包含一个 UUID 格式的 `operation_id`。重复提交同一个或不同的 `operation_id` 都只会得到同一个 `slug=alvin` 的智能体。
+Alvin 实例由幂等运维脚本创建：在生产 web 容器内调用 `createAgentRepository().createAlvin(userId)`，重复执行只会得到同一个 `slug=alvin` 的智能体，且不会重复写入售前 Skill。后台不提供“新建智能体”入口（`POST /api/admin/compat/agents` 仍保留同样的幂等语义，供脚本或调试使用）。
 
 创建时会同时写入：
 
@@ -25,7 +25,7 @@ Alvin 是独立的 MaaS 售前解决方案架构师，不是 DigitalMate 的分�
 - 当前账号已配置模型路由的显式授权。
 - 六项仅属于 Alvin 的已启用售前 Skill。
 
-`GET /api/admin/compat/agents` 应同时返回默认 DigitalMate 和非默认 Alvin。后续 Alvin 后台请求使用 `x-digitalmate-agent-id: <Alvin ID>`；路径中带 Agent ID 的接口必须与该请求头一致。
+`GET /api/admin/compat/agents` 应同时返回默认 DigitalMate 和非默认 Alvin，并在顶层返回 `capabilities`。在后台侧栏切换到 Alvin 后，所有页面数据与写入都落在 Alvin 作用域，请求自动带上 `x-digitalmate-agent-id: <Alvin ID>`；路径中带 Agent ID 的接口必须与侧栏选中项一致。
 
 ## 3. 配置钉钉连接
 
