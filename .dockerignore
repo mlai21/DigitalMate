@@ -7,3 +7,6 @@ test-results
 .env.local
 .git
 .vercel
+# 独立部署的渠道节点，不属于 web/agent 镜像
+runners
+.worktrees
