@@ -7,6 +7,8 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 # console:build applies vendor patches via `git apply`
 RUN apk add --no-cache git
+# Console 的 vite 打包在默认堆上限下会 OOM
+ENV NODE_OPTIONS=--max-old-space-size=4096
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
