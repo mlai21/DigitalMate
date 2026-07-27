@@ -34,7 +34,6 @@ import {
 import { createUserPreferencesRepository } from "@/server/settings/user-preferences";
 import { SecretEncryptionError } from "@/server/security/encrypted-secret";
 import {
-  createAdminCompatRouteHandler,
   DELETE as CATCH_ALL_DELETE,
   GET as CATCH_ALL_GET,
   HEAD as CATCH_ALL_HEAD,
@@ -44,6 +43,7 @@ import {
   PUT as CATCH_ALL_PUT,
   runtime as catchAllRuntime,
 } from "@/app/api/admin/compat/[...segments]/route";
+import { createAdminCompatRouteHandler } from "@/server/admin/compat/route-handler";
 
 const userId = "user-1";
 const appSecret = "test-app-secret-that-is-not-plaintext-csrf";

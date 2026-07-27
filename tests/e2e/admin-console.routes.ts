@@ -87,14 +87,14 @@ export const QWENPAW_CONSOLE_ROUTE_BASELINES = [
     route: "/models",
     expectedPath: "/models",
     routeId: "core.models",
-    marker: "重 试",
+    marker: "模型提供商",
     caseInsensitivePath: "/MODELS",
   },
   {
     route: "/environments",
     expectedPath: "/environments",
     routeId: "core.environments",
-    marker: "环境变量",
+    marker: "渠道运行节点",
   },
   {
     route: "/agent-config",
@@ -155,4 +155,41 @@ export const QWENPAW_CONSOLE_ROUTE_BASELINES = [
 export const QWENPAW_BUILTIN_ROUTES = [
   "/chat",
   ...QWENPAW_CONSOLE_ROUTE_BASELINES.map(({ route }) => route),
+] as const;
+
+export const DIGITALMATE_PAGE_ROUTE_BASELINES = [
+  {
+    route: "/interjections",
+    expectedPath: "/interjections",
+    routeId: "digitalmate.interjections",
+    marker: "群聊插话",
+  },
+  {
+    route: "/goals",
+    expectedPath: "/goals",
+    routeId: "digitalmate.goals",
+    marker: "目标管理",
+  },
+  {
+    route: "/memory",
+    expectedPath: "/memory",
+    routeId: "digitalmate.memory",
+    marker: "记忆",
+  },
+  {
+    route: "/reflections",
+    expectedPath: "/reflections",
+    routeId: "digitalmate.reflections",
+    marker: "反思",
+  },
+] as const;
+
+export const DIGITALMATE_ADMIN_ROUTE_BASELINES = [
+  ...QWENPAW_CONSOLE_ROUTE_BASELINES,
+  ...DIGITALMATE_PAGE_ROUTE_BASELINES,
+] as const;
+
+export const DIGITALMATE_ADMIN_ROUTES = [
+  ...QWENPAW_BUILTIN_ROUTES,
+  ...DIGITALMATE_PAGE_ROUTE_BASELINES.map(({ route }) => route),
 ] as const;

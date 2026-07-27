@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { QWENPAW_CONSOLE_ROUTE_BASELINES } from "./admin-console.routes";
 
+const AGENT_ID = "00000000-0000-4000-8000-000000000011";
+
 async function expectConsoleReady(page: Page) {
   await expect(page.locator("#root")).toBeVisible();
   await expect(page.locator("#root .qwenpaw-layout").first()).toBeVisible({
@@ -26,15 +28,28 @@ async function expectConsolePage(
 }
 
 test.beforeEach(async ({ page }) => {
-  const loginResponse = await page.request.post("/api/login", {
-    form: { password: "" },
-  });
-  expect(loginResponse.ok()).toBe(true);
-
-  await page.addInitScript(() => {
+  await page.addInitScript(({ agentId }) => {
     localStorage.setItem("language", "zh");
     localStorage.setItem("qwenpaw-theme", "light");
-  });
+    localStorage.setItem(
+      "qwenpaw-agent-storage",
+      JSON.stringify({
+        state: {
+          selectedAgent: agentId,
+          agents: [
+            {
+              id: agentId,
+              name: "DigitalMate",
+              is_default: true,
+              enabled: true,
+            },
+          ],
+          lastChatIdByAgent: {},
+        },
+        version: 0,
+      }),
+    );
+  }, { agentId: AGENT_ID });
   await page.route("**/api/admin/compat/auth/status", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -44,6 +59,33 @@ test.beforeEach(async ({ page }) => {
       }),
     });
   });
+  await page.route("**/api/admin/compat/models**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname.endsWith("/models/active")) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: "{}",
+      });
+      return;
+    }
+    if (pathname.endsWith("/models")) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: "[]",
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(
+    "**/api/admin/compat/frontend_plugin",
+    async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: "[]",
+      });
+    },
+  );
 });
 
 for (const baseline of QWENPAW_CONSOLE_ROUTE_BASELINES) {
@@ -52,7 +94,24 @@ for (const baseline of QWENPAW_CONSOLE_ROUTE_BASELINES) {
 
     await expectConsolePage(page, baseline);
     await expect(page).not.toHaveURL(/\/login(?:[/?#]|$)/);
-    await expect(page.locator("body")).not.toContainText("QwenPaw");
+    await expectProductBrandIsDigitalMate(page);
+
+    if (baseline.route === "/plugin-manager") {
+      const license = page.getByTestId("upstream-license");
+      await expect(license).toContainText(
+        "QwenPaw v2.0.0.post3",
+      );
+      await expect(license).toContainText("fef7e64d");
+      await expect(license).toContainText("Apache-2.0");
+      await expect(
+        license.getByRole("link", {
+          name: "查看来源与第三方许可",
+        }),
+      ).toHaveAttribute(
+        "href",
+        /github\.com\/agentscope-ai\/QwenPaw\/tree\/fef7e64d/,
+      );
+    }
 
     if ("caseInsensitivePath" in baseline) {
       await page.goto(`/admin-preview${baseline.caseInsensitivePath}`);
@@ -114,6 +173,9 @@ test("Console 结构截图保持稳定", async ({ page }) => {
   await page.goto("/admin-preview/inbox");
   await expectConsoleReady(page);
   await expect(page.locator(".page-content")).toContainText("收件箱");
+  await page
+    .waitForLoadState("networkidle", { timeout: 5_000 })
+    .catch(() => undefined);
   await page.addStyleTag({
     content: `
       *,
@@ -131,6 +193,7 @@ test("Console 结构截图保持稳定", async ({ page }) => {
       [class*="connectionStatus"],
       [class*="statusDot"],
       [class*="agentStatus"],
+      .ant-badge-status-dot,
       .qwenpaw-message,
       .qwenpaw-notification {
         visibility: hidden !important;
@@ -144,3 +207,15 @@ test("Console 结构截图保持稳定", async ({ page }) => {
     fullPage: true,
   });
 });
+
+async function expectProductBrandIsDigitalMate(page: Page) {
+  const textOutsideLicense = await page.locator("body").evaluate((body) => {
+    const copy = body.cloneNode(true) as HTMLElement;
+    copy
+      .querySelectorAll('[data-testid="upstream-license"]')
+      .forEach((node) => node.remove());
+    return copy.innerText;
+  });
+
+  expect(textOutsideLicense).not.toContain("QwenPaw");
+}

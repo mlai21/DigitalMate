@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { readFile, rm, mkdtemp } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -14,6 +15,12 @@ const root = await mkdtemp(path.join(os.tmpdir(), "digitalmate-app-e2e-"));
 const appPort = Number(process.env.PLAYWRIGHT_APP_PORT ?? "3100");
 const databasePort = await findAvailablePort();
 const password = "digitalmate-e2e";
+const appPassword =
+  process.env.PLAYWRIGHT_APP_PASSWORD ??
+  randomBytes(32).toString("base64url");
+const appSecret =
+  process.env.PLAYWRIGHT_APP_SECRET ??
+  randomBytes(48).toString("base64url");
 const database = new EmbeddedPostgres({
   databaseDir: path.join(root, "postgres"),
   user: "postgres",
@@ -49,14 +56,23 @@ try {
   await once(llmServer, "listening");
 
   const nextBin = path.join(process.cwd(), "node_modules", "next", "dist", "bin", "next");
-  app = spawn(process.execPath, [nextBin, "dev", "--webpack", "-p", String(appPort)], {
+  app = spawn(process.execPath, [
+    nextBin,
+    "start",
+    "-H",
+    "127.0.0.1",
+    "-p",
+    String(appPort),
+  ], {
     cwd: process.cwd(),
     stdio: "inherit",
     env: {
       ...process.env,
       DATABASE_URL: databaseUrl,
       ATTACHMENT_STORAGE_DIR: path.join(root, "attachments"),
-      APP_PASSWORD: "",
+      APP_PASSWORD: appPassword,
+      APP_SECRET: appSecret,
+      PUBLIC_BASE_URL: "https://digitalmate-e2e.invalid",
       KIE_AI_API_KEY: "e2e-local-model",
       KIE_AI_BASE_URL: `http://127.0.0.1:${llmPort}`,
     },
@@ -94,6 +110,7 @@ async function installSchema(databasePool) {
 
 async function seedApplication(databasePool) {
   const userId = "00000000-0000-4000-8000-000000000001";
+  const agentId = "00000000-0000-4000-8000-000000000011";
   const conversationId = "10000000-0000-4000-8000-000000000001";
   await databasePool.query("INSERT INTO users (id, display_name) VALUES ($1, 'Tang')", [userId]);
   await databasePool.query(
@@ -109,8 +126,29 @@ async function seedApplication(databasePool) {
     ],
   );
   await databasePool.query(
-    "INSERT INTO conversations (id, user_id, title) VALUES ($1, $2, '附件 E2E')",
-    [conversationId, userId],
+    `INSERT INTO digital_agents (
+       id, user_id, slug, display_name, persona, is_default
+     )
+     SELECT $1, settings.user_id, 'digitalmate', 'DigitalMate',
+            settings.persona, true
+     FROM settings
+     WHERE settings.user_id = $2`,
+    [agentId, userId],
+  );
+  await databasePool.query(
+    `INSERT INTO agent_settings (
+       user_id, agent_id, persona, proactivity, cadence, search
+     )
+     SELECT settings.user_id, $2, settings.persona,
+            settings.proactivity, settings.cadence, settings.search
+     FROM settings
+     WHERE settings.user_id = $1`,
+    [userId, agentId],
+  );
+  await databasePool.query(
+    `INSERT INTO conversations (id, user_id, agent_id, title)
+     VALUES ($1, $2, $3, '附件 E2E')`,
+    [conversationId, userId, agentId],
   );
 }
 

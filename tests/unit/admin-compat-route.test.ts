@@ -45,7 +45,6 @@ vi.mock("@/server/config/env", () => ({
 }));
 
 import {
-  createAdminCompatRouteHandler,
   DELETE,
   GET,
   HEAD,
@@ -55,6 +54,7 @@ import {
   PUT,
   runtime,
 } from "@/app/api/admin/compat/[...segments]/route";
+import { createAdminCompatRouteHandler } from "@/server/admin/compat/route-handler";
 
 type RouteHandler = typeof GET;
 

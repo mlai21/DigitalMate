@@ -1308,6 +1308,255 @@ index 2f172b8..ab1aa11 100644
          "Content-Type": "application/json",
        },
        body: JSON.stringify({ url, name: name || undefined }),
+diff --git a/src/api/modules/digitalMateEvolution.ts b/src/api/modules/digitalMateEvolution.ts
+new file mode 100644
+index 0000000..ff0c088
+--- /dev/null
++++ b/src/api/modules/digitalMateEvolution.ts
+@@ -0,0 +1,243 @@
++import { request } from "../request";
++
++export type InterjectionPolicy = {
++  minIntervalMinutes: number;
++  maxPerHour: number;
++  maxPerDay: number;
++  quietStart: string;
++  quietEnd: string;
++};
++
++export type InterjectionChannelState = {
++  capability: "full" | "capability_limited";
++  limitation?: string;
++  sent_last_hour: number;
++  sent_today: number;
++  next_allowed_at: string | null;
++};
++
++export type InterjectionDecision = {
++  id: string;
++  channel: string;
++  external_conversation_id: string;
++  should_interject: boolean;
++  reason: string;
++  created_at: string;
++};
++
++export type InterjectionOverview = {
++  revision: number;
++  policy: InterjectionPolicy;
++  channels: Record<string, InterjectionChannelState>;
++  decisions: InterjectionDecision[];
++};
++
++export type GoalStatus =
++  | "draft"
++  | "confirmed"
++  | "running"
++  | "paused"
++  | "waiting_human"
++  | "completed"
++  | "failed"
++  | "cancelled";
++
++export type GoalSummary = {
++  id: string;
++  title: string;
++  status: GoalStatus;
++  revision: number;
++  objective: string;
++  network_authorized: boolean;
++  progress_summary: string;
++  budget_used: {
++    rounds: number;
++    tokens: number;
++    cost_usd: number;
++  };
++  needs_human_prompt: string | null;
++  next_run_at: string | null;
++  finished_at: string | null;
++  created_at: string;
++  updated_at: string;
++};
++
++export type GoalDetail = GoalSummary & {
++  contract: {
++    objective: string;
++    success_criteria: string[];
++    cadence: Record<string, unknown>;
++    scope: {
++      allowed_tools: string[];
++      forbidden: string[];
++    };
++    budget: Record<string, unknown>;
++    stop_conditions: string[];
++    deliverable: string;
++    network_authorized: boolean;
++  };
++  no_progress_rounds: number;
++  steps: Array<{
++    id: string;
++    round: number;
++    phase: string;
++    intent: string;
++    evidence_count: number;
++    failed_paths_count: number;
++    tokens_used: number;
++    duration_ms: number;
++    error_code: string | null;
++    created_at: string;
++  }>;
++};
++
++export type MemoryKind = "episodic" | "profile" | "agent_self";
++
++export type MemoryEntry = {
++  id: string;
++  kind: MemoryKind;
++  content: string;
++  confidence: number;
++  source: {
++    type: "message" | "system";
++    id: string | null;
++  };
++  created_at: string;
++  expires_at: string | null;
++};
++
++export type ReflectionStatus = "recorded" | "applied" | "dismissed";
++
++export type ReflectionEntry = {
++  id: string;
++  positives: string[];
++  negatives: string[];
++  suggestions: string[];
++  status: ReflectionStatus;
++  created_at: string;
++};
++
++function operationId(): string {
++  return crypto.randomUUID();
++}
++
++export const digitalMateEvolutionApi = {
++  getInterjections: () =>
++    request<InterjectionOverview>("/interjections"),
++
++  updateInterjectionPolicy: (
++    revision: number,
++    policy: InterjectionPolicy,
++  ) =>
++    request<{
++      revision: number;
++      policy: InterjectionPolicy;
++    }>("/interjections/policy", {
++      method: "PUT",
++      body: JSON.stringify({
++        revision,
++        operation_id: operationId(),
++        policy: {
++          min_interval_minutes: policy.minIntervalMinutes,
++          max_per_hour: policy.maxPerHour,
++          max_per_day: policy.maxPerDay,
++          quiet_start: policy.quietStart,
++          quiet_end: policy.quietEnd,
++        },
++      }),
++    }),
++
++  listGoals: (status?: GoalStatus) =>
++    request<GoalSummary[]>(
++      `/goals${status ? `?status=${encodeURIComponent(status)}` : ""}`,
++    ),
++
++  getGoal: (goalId: string) =>
++    request<GoalDetail>(`/goals/${encodeURIComponent(goalId)}`),
++
++  actOnGoal: (
++    goalId: string,
++    action: "confirm" | "pause" | "resume" | "cancel" | "human_replied",
++    revision: number,
++  ) =>
++    request<GoalSummary>(
++      `/goals/${encodeURIComponent(goalId)}/actions/${action}`,
++      {
++        method: "POST",
++        body: JSON.stringify({
++          revision,
++          operation_id: operationId(),
++        }),
++      },
++    ),
++
++  listMemories: (kind?: MemoryKind) =>
++    request<{
++      items: MemoryEntry[];
++      next_cursor: string | null;
++    }>(
++      `/memories?limit=100${
++        kind ? `&kind=${encodeURIComponent(kind)}` : ""
++      }`,
++    ),
++
++  updateMemory: (
++    memoryId: string,
++    input: Pick<MemoryEntry, "kind" | "content" | "confidence">,
++  ) =>
++    request<MemoryEntry>(
++      `/memories/${encodeURIComponent(memoryId)}`,
++      {
++        method: "PUT",
++        body: JSON.stringify({
++          ...input,
++          operation_id: operationId(),
++          confirmed: true,
++        }),
++      },
++    ),
++
++  deleteMemory: (memoryId: string) =>
++    request<{ id: string; deleted: boolean }>(
++      `/memories/${encodeURIComponent(memoryId)}`,
++      {
++        method: "DELETE",
++        body: JSON.stringify({
++          operation_id: operationId(),
++          confirmed: true,
++        }),
++      },
++    ),
++
++  listReflections: (status?: ReflectionStatus) =>
++    request<{
++      items: ReflectionEntry[];
++      profile_revision: number;
++      next_cursor: string | null;
++    }>(
++      `/reflections?limit=100${
++        status ? `&status=${encodeURIComponent(status)}` : ""
++      }`,
++    ),
++
++  actOnReflection: (
++    reflectionId: string,
++    action: "apply" | "dismiss",
++    revision: number,
++    suggestionIndexes: number[],
++  ) =>
++    request<ReflectionEntry & { profile_revision: number }>(
++      `/reflections/${encodeURIComponent(
++        reflectionId,
++      )}/actions/${action}`,
++      {
++        method: "POST",
++        body: JSON.stringify({
++          revision,
++          operation_id: operationId(),
++          confirmed: true,
++          suggestion_indexes: suggestionIndexes,
++        }),
++      },
++    ),
++};
 diff --git a/src/api/modules/plugin.test.ts b/src/api/modules/plugin.test.ts
 index 64e7d34..0998aca 100644
 --- a/src/api/modules/plugin.test.ts
@@ -2208,7 +2457,7 @@ index 9daaea6..56e9df5 100644
 
  export interface CreateAgentRequest {
 diff --git a/src/api/types/channel.ts b/src/api/types/channel.ts
-index b936175..1c75d0b 100644
+index b936175..d5ac1f0 100644
 --- a/src/api/types/channel.ts
 +++ b/src/api/types/channel.ts
 @@ -221,3 +221,54 @@ export type SingleChannelConfig =
@@ -2793,6 +3042,27 @@ index 2b7fac0..c28a5eb 100644
              block
              className={`${styles.authBtn} ${
                collapsed ? styles.authBtnCollapsed : ""
+diff --git a/src/layouts/registry/ACPUnavailableRoute.tsx b/src/layouts/registry/ACPUnavailableRoute.tsx
+new file mode 100644
+index 0000000..fc4562a
+--- /dev/null
++++ b/src/layouts/registry/ACPUnavailableRoute.tsx
+@@ -0,0 +1,15 @@
++import { Result } from "antd";
++import { PageHeader } from "../../components/PageHeader";
++
++export default function ACPUnavailableRoute() {
++  return (
++    <>
++      <PageHeader parent="智能体" current="ACP" />
++      <Result
++        status="info"
++        title="ACP 能力当前冻结"
++        subTitle="入口和兼容能力已保留，待 P0/P1 核心能力完成后再开放配置与执行。"
++      />
++    </>
++  );
++}
 diff --git a/src/layouts/registry/CodingCapabilityRoute.tsx b/src/layouts/registry/CodingCapabilityRoute.tsx
 new file mode 100644
 index 0000000..6057b48
@@ -2818,14 +3088,84 @@ index 0000000..6057b48
 +  }
 +  return <CodingPage />;
 +}
+diff --git a/src/layouts/registry/builtinMenu.ts b/src/layouts/registry/builtinMenu.ts
+index 0bfe5c5..f181fbc 100644
+--- a/src/layouts/registry/builtinMenu.ts
++++ b/src/layouts/registry/builtinMenu.ts
+@@ -44,7 +44,13 @@ import {
+   SparkVoiceChat01Line,
+   SparkWifiLine,
+ } from "@agentscope-ai/icons";
+-import { Package } from "lucide-react";
++import {
++  Brain,
++  MessageCircleMore,
++  Package,
++  Sparkles,
++  Target,
++} from "lucide-react";
+ import i18next from "i18next";
+ import { menuRegistry } from "../../plugins/registry/store";
+ import type { MenuItem } from "../../plugins/registry/types";
+@@ -108,6 +114,24 @@ export const BUILTIN_MENU: MenuItem[] = [
+     route: "core.heartbeat",
+     order: 40,
+   },
++  {
++    id: "digitalmate.interjections",
++    location: "primary.agentScoped",
++    parentId: "core.control-group",
++    label: () => "群聊插话",
++    icon: MessageCircleMore,
++    route: "digitalmate.interjections",
++    order: 50,
++  },
++  {
++    id: "digitalmate.goals",
++    location: "primary.agentScoped",
++    parentId: "core.control-group",
++    label: () => "目标管理",
++    icon: Target,
++    route: "digitalmate.goals",
++    order: 60,
++  },
+
+   // agent-group
+   {
+@@ -180,6 +204,24 @@ export const BUILTIN_MENU: MenuItem[] = [
+     route: "core.agent-stats",
+     order: 70,
+   },
++  {
++    id: "digitalmate.memory",
++    location: "primary.agentScoped",
++    parentId: "core.agent-group",
++    label: () => "记忆",
++    icon: Brain,
++    route: "digitalmate.memory",
++    order: 80,
++  },
++  {
++    id: "digitalmate.reflections",
++    location: "primary.agentScoped",
++    parentId: "core.agent-group",
++    label: () => "反思",
++    icon: Sparkles,
++    route: "digitalmate.reflections",
++    order: 90,
++  },
+
+   // ── Settings (Sidebar Menu #2) ───────────────────────────────────────────
+   {
 diff --git a/src/layouts/registry/builtinRoutes.tsx b/src/layouts/registry/builtinRoutes.tsx
-index bb2aea6..340582e 100644
+index bb2aea6..b44c2eb 100644
 --- a/src/layouts/registry/builtinRoutes.tsx
 +++ b/src/layouts/registry/builtinRoutes.tsx
-@@ -17,11 +17,9 @@ import { Navigate } from "react-router-dom";
+@@ -17,31 +17,37 @@ import { Navigate } from "react-router-dom";
  import { lazyImportWithRetry } from "../../utils/lazyWithRetry";
  import { routeRegistry } from "../../plugins/registry/store";
  import type { Route } from "../../plugins/registry/types";
++import ACPUnavailableRoute from "./ACPUnavailableRoute";
 +import CodingCapabilityRoute from "./CodingCapabilityRoute";
  import DigitalMateHomeRedirect from "./DigitalMateHomeRedirect";
 
@@ -2835,15 +3175,36 @@ index bb2aea6..340582e 100644
  // Lazy pages
  const ChannelsPage = lazyImportWithRetry("../../pages/Control/Channels");
  const SessionsPage = lazyImportWithRetry("../../pages/Control/Sessions");
-@@ -40,6 +38,6 @@ const ACPPage = lazyImportWithRetry("../../pages/Agent/ACP");
+ const InboxPage = lazyImportWithRetry("../../pages/Inbox");
+ const CronJobsPage = lazyImportWithRetry("../../pages/Control/CronJobs");
+ const HeartbeatPage = lazyImportWithRetry("../../pages/Control/Heartbeat");
++const InterjectionsPage = lazyImportWithRetry(
++  "../../pages/DigitalMate/Interjections",
++);
++const GoalsPage = lazyImportWithRetry("../../pages/DigitalMate/Goals");
+ const AgentConfigPage = lazyImportWithRetry("../../pages/Agent/Config");
+ const SkillsPage = lazyImportWithRetry("../../pages/Agent/Skills");
+ const SkillPoolPage = lazyImportWithRetry("../../pages/Settings/SkillPool");
+ const ToolsPage = lazyImportWithRetry("../../pages/Agent/Tools");
+ const WorkspacePage = lazyImportWithRetry("../../pages/Agent/Workspace");
+ const MCPPage = lazyImportWithRetry("../../pages/Agent/MCP");
+-const ACPPage = lazyImportWithRetry("../../pages/Agent/ACP");
  const ModelsPage = lazyImportWithRetry("../../pages/Settings/Models");
  const EnvironmentsPage = lazyImportWithRetry(
 -  "../../pages/Settings/Environments",
-+  "../../pages/Settings/Environments/ChannelNodes",
++  "../../pages/Settings/Environments/ChannelNodes.tsx",
  );
  const SecurityPage = lazyImportWithRetry("../../pages/Settings/Security");
  const TokenUsagePage = lazyImportWithRetry("../../pages/Settings/TokenUsage");
-@@ -68,7 +66,7 @@ function ACPRedirect() {
+ const AgentStatsPage = lazyImportWithRetry("../../pages/Settings/AgentStats");
++const MemoryPage = lazyImportWithRetry("../../pages/DigitalMate/Memory");
++const ReflectionsPage = lazyImportWithRetry(
++  "../../pages/DigitalMate/Reflections",
++);
+ const VoiceTranscriptionPage = lazyImportWithRetry(
+   "../../pages/Settings/VoiceTranscription",
+ );
+@@ -68,19 +74,39 @@ function ACPRedirect() {
  export const BUILTIN_ROUTES: Route[] = [
    { id: "core.root", path: "/", component: DefaultRedirect },
    { id: "core.chat", path: "/chat/*", component: DigitalMateHomeRedirect },
@@ -2852,6 +3213,39 @@ index bb2aea6..340582e 100644
    { id: "core.channels", path: "/channels", component: ChannelsPage },
    { id: "core.sessions", path: "/sessions", component: SessionsPage },
    { id: "core.inbox", path: "/inbox", component: InboxPage },
+   { id: "core.cron-jobs", path: "/cron-jobs", component: CronJobsPage },
+   { id: "core.heartbeat", path: "/heartbeat", component: HeartbeatPage },
++  {
++    id: "digitalmate.interjections",
++    path: "/interjections",
++    component: InterjectionsPage,
++  },
++  {
++    id: "digitalmate.goals",
++    path: "/goals",
++    component: GoalsPage,
++  },
+   { id: "core.skills", path: "/skills", component: SkillsPage },
+   { id: "core.skill-pool", path: "/skill-pool", component: SkillPoolPage },
+   { id: "core.tools", path: "/tools", component: ToolsPage },
+   { id: "core.mcp", path: "/mcp", component: MCPPage },
+-  { id: "core.acp", path: "/acp", component: ACPPage },
++  { id: "core.acp", path: "/acp", component: ACPUnavailableRoute },
+   { id: "core.acp-alias", path: "/ACP", component: ACPRedirect },
+   { id: "core.workspace", path: "/workspace", component: WorkspacePage },
++  {
++    id: "digitalmate.memory",
++    path: "/memory",
++    component: MemoryPage,
++  },
++  {
++    id: "digitalmate.reflections",
++    path: "/reflections",
++    component: ReflectionsPage,
++  },
+   { id: "core.agents", path: "/agents", component: AgentsPage },
+   { id: "core.models", path: "/models", component: ModelsPage },
+   {
 diff --git a/src/locales/en.json b/src/locales/en.json
 index b5f9dc4..8601b74 100644
 --- a/src/locales/en.json
@@ -4245,7 +4639,7 @@ index 764a1f2..ccd8341 100644
        <ChannelIcon channelKey={channelKey} size={24} iconUrl={iconUrl} />
        <span className={styles.availableItemName}>{label}</span>
 diff --git a/src/pages/Control/Channels/components/ChannelCard.tsx b/src/pages/Control/Channels/components/ChannelCard.tsx
-index c0bc4b1..4bba206 100644
+index c0bc4b1..b508fa5 100644
 --- a/src/pages/Control/Channels/components/ChannelCard.tsx
 +++ b/src/pages/Control/Channels/components/ChannelCard.tsx
 @@ -10,6 +10,7 @@ interface ChannelCardProps {
@@ -4264,9 +4658,7 @@ index c0bc4b1..4bba206 100644
  }: ChannelCardProps) {
    const { t } = useTranslation();
    const [isHover, setIsHover] = useState(false);
-@@ -24,9 +26,43 @@ export const ChannelCard = React.memo(function ChannelCard({
-   const isBuiltin = Boolean(config.isBuiltin);
-   const label = getChannelLabel(channelKey, t);
+@@ -26,6 +28,40 @@ export const ChannelCard = React.memo(function ChannelCard({
    const getConfigString = (key: string) =>
      typeof config[key] === "string" ? config[key] : "";
    const botPrefix = getConfigString("bot_prefix");
@@ -4307,7 +4699,6 @@ index c0bc4b1..4bba206 100644
 
    const getChannelIcon = () => (
      <ChannelIcon channelKey={channelKey} size={32} iconUrl={iconUrl} />
-   );
 @@ -39,11 +75,18 @@ export const ChannelCard = React.memo(function ChannelCard({
 
    return (
@@ -4331,7 +4722,8 @@ index c0bc4b1..4bba206 100644
        bodyStyle={{ padding: 24 }}
      >
        {/* Top section: Icon and Status */}
-@@ -53,14 +96,14 @@ export const ChannelCard = React.memo(function ChannelCard({
+@@ -52,15 +95,15 @@ export const ChannelCard = React.memo(function ChannelCard({
+         <div className={styles.statusIndicator}>
            <div
              className={`${styles.statusDot} ${
 -              enabled ? styles.enabled : styles.disabled
@@ -5567,6 +5959,1535 @@ index 8266189..fc75efc 100644
 +    invalidateChannelDetail,
    };
  }
+diff --git a/src/pages/DigitalMate/Goals/index.tsx b/src/pages/DigitalMate/Goals/index.tsx
+new file mode 100644
+index 0000000..015b44c
+--- /dev/null
++++ b/src/pages/DigitalMate/Goals/index.tsx
+@@ -0,0 +1,374 @@
++import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  Alert,
++  Button,
++  Card,
++  Descriptions,
++  Drawer,
++  Empty,
++  Modal,
++  Select,
++  Space,
++  Table,
++  Tag,
++} from "antd";
++import type { ColumnsType } from "antd/es/table";
++import { PageHeader } from "@/components/PageHeader";
++import { useAgentStore } from "../../../stores/agentStore";
++import { useAppMessage } from "../../../hooks/useAppMessage";
++import {
++  digitalMateEvolutionApi,
++  type GoalDetail,
++  type GoalStatus,
++  type GoalSummary,
++} from "../../../api/modules/digitalMateEvolution";
++import {
++  DomainError,
++  DomainLoading,
++  errorMessage,
++  formatDateTime,
++} from "../shared";
++import styles from "../shared.module.less";
++
++const STATUS_LABELS: Record<GoalStatus, string> = {
++  draft: "待确认",
++  confirmed: "已确认",
++  running: "运行中",
++  paused: "已暂停",
++  waiting_human: "等待回复",
++  completed: "已完成",
++  failed: "失败",
++  cancelled: "已取消",
++};
++
++const STATUS_COLORS: Partial<Record<GoalStatus, string>> = {
++  draft: "warning",
++  confirmed: "processing",
++  running: "success",
++  paused: "default",
++  waiting_human: "warning",
++  completed: "success",
++  failed: "error",
++};
++
++type GoalAction = "confirm" | "pause" | "resume" | "cancel" | "human_replied";
++
++const ACTIONS: Partial<
++  Record<
++    GoalStatus,
++    {
++      action: GoalAction;
++      label: string;
++      confirmTitle: string;
++      confirmText: string;
++    }
++  >
++> = {
++  draft: {
++    action: "confirm",
++    label: "确认目标",
++    confirmTitle: "确认启动目标？",
++    confirmText: "确认启动",
++  },
++  running: {
++    action: "pause",
++    label: "暂停目标",
++    confirmTitle: "确认暂停目标？",
++    confirmText: "确认暂停",
++  },
++  paused: {
++    action: "resume",
++    label: "恢复目标",
++    confirmTitle: "确认恢复目标？",
++    confirmText: "确认恢复",
++  },
++  waiting_human: {
++    action: "human_replied",
++    label: "已提供回复",
++    confirmTitle: "确认继续目标？",
++    confirmText: "确认继续",
++  },
++};
++
++export default function GoalsPage() {
++  const { selectedAgent } = useAgentStore();
++  const { message } = useAppMessage();
++  const [status, setStatus] = useState<GoalStatus | undefined>();
++  const [goals, setGoals] = useState<GoalSummary[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState(false);
++  const [drawerOpen, setDrawerOpen] = useState(false);
++  const [detailLoading, setDetailLoading] = useState(false);
++  const [detail, setDetail] = useState<GoalDetail | null>(null);
++  const [acting, setActing] = useState(false);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(false);
++    try {
++      setGoals(await digitalMateEvolutionApi.listGoals(status));
++    } catch {
++      setGoals([]);
++      setError(true);
++    } finally {
++      setLoading(false);
++    }
++  }, [status]);
++
++  useEffect(() => {
++    void load();
++  }, [load, selectedAgent]);
++
++  const openDetail = useCallback(async (goal: GoalSummary) => {
++    setDrawerOpen(true);
++    setDetailLoading(true);
++    setDetail(null);
++    try {
++      setDetail(await digitalMateEvolutionApi.getGoal(goal.id));
++    } catch (loadError) {
++      message.error(errorMessage(loadError));
++      setDrawerOpen(false);
++    } finally {
++      setDetailLoading(false);
++    }
++  }, [message]);
++
++  const runAction = useCallback(
++    (action: GoalAction) => {
++      if (!detail) return;
++      const descriptor =
++        action === "cancel"
++          ? {
++              action: "cancel" as const,
++              label: "取消目标",
++              confirmTitle: "确认取消目标？",
++              confirmText: "确认取消",
++            }
++          : ACTIONS[detail.status];
++      if (!descriptor || descriptor.action !== action) return;
++      Modal.confirm({
++        title: descriptor.confirmTitle,
++        content: "状态变更会写入审计记录，并按当前 revision 校验。",
++        okText: descriptor.confirmText,
++        cancelText: "返回",
++        onOk: async () => {
++          setActing(true);
++          try {
++            const updated =
++              await digitalMateEvolutionApi.actOnGoal(
++                detail.id,
++                action,
++                detail.revision,
++              );
++            setGoals((current) =>
++              current.map((goal) =>
++                goal.id === updated.id ? updated : goal
++              ),
++            );
++            setDetail((current) =>
++              current
++                ? {
++                    ...current,
++                    ...updated,
++                  }
++                : current,
++            );
++            message.success("目标状态已更新");
++          } catch (actionError) {
++            message.error(errorMessage(actionError));
++            throw actionError;
++          } finally {
++            setActing(false);
++          }
++        },
++      });
++    },
++    [detail, message],
++  );
++
++  const columns = useMemo<ColumnsType<GoalSummary>>(
++    () => [
++      {
++        title: "目标",
++        dataIndex: "title",
++        key: "title",
++        render: (value: string, record) => (
++          <div>
++            <strong>{value}</strong>
++            <div className={styles.meta}>{record.objective}</div>
++          </div>
++        ),
++      },
++      {
++        title: "状态",
++        dataIndex: "status",
++        key: "status",
++        render: (value: GoalStatus) => (
++          <Tag color={STATUS_COLORS[value]}>
++            {STATUS_LABELS[value]}
++          </Tag>
++        ),
++      },
++      {
++        title: "进度",
++        dataIndex: "progress_summary",
++        key: "progress_summary",
++        render: (value: string) => value || "—",
++      },
++      {
++        title: "更新于",
++        dataIndex: "updated_at",
++        key: "updated_at",
++        render: formatDateTime,
++      },
++      {
++        title: "操作",
++        key: "actions",
++        render: (_, record) => (
++          <Button
++            type="link"
++            aria-label="查看目标详情"
++            onClick={() => void openDetail(record)}
++          >
++            查看详情
++          </Button>
++        ),
++      },
++    ],
++    [openDetail],
++  );
++
++  const primaryAction = detail ? ACTIONS[detail.status] : null;
++  const terminal =
++    detail?.status === "completed"
++    || detail?.status === "failed"
++    || detail?.status === "cancelled";
++
++  return (
++    <div className={styles.page}>
++      <PageHeader
++        parent="控制"
++        current="目标管理"
++        extra={
++          <Select<GoalStatus | undefined>
++            aria-label="目标状态"
++            value={status}
++            allowClear
++            placeholder="全部状态"
++            style={{ width: 150 }}
++            onChange={setStatus}
++            options={Object.entries(STATUS_LABELS).map(
++              ([value, label]) => ({ value, label }),
++            )}
++          />
++        }
++      />
++      <div className={styles.content}>
++        <Alert
++          type="info"
++          showIcon
++          message="目标只会使用合同中明确授权的能力"
++          description="联网、工具范围、预算和停止条件均来自已确认的目标合同；不会从普通记忆推断授权。"
++        />
++        {loading && goals.length === 0 ? (
++          <DomainLoading />
++        ) : error ? (
++          <DomainError onRetry={() => void load()} />
++        ) : goals.length === 0 ? (
++          <Empty
++            description="还没有目标"
++            style={{ marginTop: 80 }}
++          />
++        ) : (
++          <Card
++            className={`${styles.section} ${styles.tableCard}`}
++          >
++            <Table<GoalSummary>
++              rowKey="id"
++              columns={columns}
++              dataSource={goals}
++              loading={loading}
++              pagination={{ pageSize: 20, hideOnSinglePage: true }}
++              scroll={{ x: 860 }}
++            />
++          </Card>
++        )}
++      </div>
++
++      <Drawer
++        open={drawerOpen}
++        title={detail?.title ?? "目标详情"}
++        width={620}
++        onClose={() => setDrawerOpen(false)}
++        extra={
++          detail ? (
++            <Space>
++              {primaryAction ? (
++                <Button
++                  type="primary"
++                  loading={acting}
++                  disabled={acting}
++                  onClick={() =>
++                    runAction(primaryAction.action)
++                  }
++                >
++                  {primaryAction.label}
++                </Button>
++              ) : (
++                <Button disabled>{terminal ? "目标已结束" : "暂无操作"}</Button>
++              )}
++              {!terminal && detail.status !== "draft" ? (
++                <Button
++                  danger
++                  disabled={acting}
++                  onClick={() => runAction("cancel")}
++                >
++                  取消目标
++                </Button>
++              ) : null}
++            </Space>
++          ) : null
++        }
++      >
++        {detailLoading ? (
++          <DomainLoading />
++        ) : detail ? (
++          <div className={styles.drawerContent}>
++            <Descriptions column={1} bordered size="small">
++              <Descriptions.Item label="状态">
++                <Tag color={STATUS_COLORS[detail.status]}>
++                  {STATUS_LABELS[detail.status]}
++                </Tag>
++              </Descriptions.Item>
++              <Descriptions.Item label="目标">
++                {detail.contract.objective}
++              </Descriptions.Item>
++              <Descriptions.Item label="进度">
++                {detail.progress_summary || "—"}
++              </Descriptions.Item>
++              <Descriptions.Item label="联网授权">
++                {detail.contract.network_authorized
++                  ? "合同已授权"
++                  : "未授权"}
++              </Descriptions.Item>
++              <Descriptions.Item label="预算使用">
++                {detail.budget_used.rounds} 轮 /{" "}
++                {detail.budget_used.tokens} tokens
++              </Descriptions.Item>
++              <Descriptions.Item label="下次运行">
++                {formatDateTime(detail.next_run_at)}
++              </Descriptions.Item>
++            </Descriptions>
++            <Card title="成功标准" size="small">
++              {detail.contract.success_criteria.length > 0
++                ? detail.contract.success_criteria.map((criterion) => (
++                    <div key={criterion}>• {criterion}</div>
++                  ))
++                : "—"}
++            </Card>
++          </div>
++        ) : null}
++      </Drawer>
++    </div>
++  );
++}
+diff --git a/src/pages/DigitalMate/Interjections/index.tsx b/src/pages/DigitalMate/Interjections/index.tsx
+new file mode 100644
+index 0000000..a4d00f0
+--- /dev/null
++++ b/src/pages/DigitalMate/Interjections/index.tsx
+@@ -0,0 +1,313 @@
++import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  Alert,
++  Button,
++  Card,
++  Form,
++  Input,
++  InputNumber,
++  Modal,
++  Table,
++  Tag,
++} from "antd";
++import type { ColumnsType } from "antd/es/table";
++import { PageHeader } from "@/components/PageHeader";
++import { useAgentStore } from "../../../stores/agentStore";
++import { useAppMessage } from "../../../hooks/useAppMessage";
++import {
++  digitalMateEvolutionApi,
++  type InterjectionChannelState,
++  type InterjectionDecision,
++  type InterjectionOverview,
++  type InterjectionPolicy,
++} from "../../../api/modules/digitalMateEvolution";
++import {
++  DomainError,
++  DomainLoading,
++  errorMessage,
++  formatDateTime,
++} from "../shared";
++import styles from "../shared.module.less";
++
++type PolicyForm = {
++  minIntervalMinutes: number;
++  maxPerHour: number;
++  maxPerDay: number;
++  quietStart: string;
++  quietEnd: string;
++};
++
++type ChannelRow = InterjectionChannelState & {
++  channel: string;
++};
++
++export default function InterjectionsPage() {
++  const { selectedAgent } = useAgentStore();
++  const { message } = useAppMessage();
++  const [form] = Form.useForm<PolicyForm>();
++  const [overview, setOverview] =
++    useState<InterjectionOverview | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState(false);
++  const [saving, setSaving] = useState(false);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(false);
++    try {
++      const next = await digitalMateEvolutionApi.getInterjections();
++      setOverview(next);
++      form.setFieldsValue(next.policy);
++    } catch {
++      setOverview(null);
++      setError(true);
++    } finally {
++      setLoading(false);
++    }
++  }, [form]);
++
++  useEffect(() => {
++    void load();
++  }, [load, selectedAgent]);
++
++  const channelRows = useMemo(
++    () =>
++      Object.entries(overview?.channels ?? {}).map(
++        ([channel, state]) => ({
++          channel,
++          ...state,
++        }),
++      ),
++    [overview?.channels],
++  );
++
++  const channelColumns: ColumnsType<ChannelRow> = [
++    {
++      title: "渠道",
++      dataIndex: "channel",
++      key: "channel",
++    },
++    {
++      title: "能力",
++      dataIndex: "capability",
++      key: "capability",
++      render: (value: ChannelRow["capability"]) =>
++        value === "full" ? (
++          <Tag color="success">完整</Tag>
++        ) : (
++          <Tag color="warning">平台能力限制</Tag>
++        ),
++    },
++    {
++      title: "近一小时",
++      dataIndex: "sent_last_hour",
++      key: "sent_last_hour",
++    },
++    {
++      title: "今日",
++      dataIndex: "sent_today",
++      key: "sent_today",
++    },
++    {
++      title: "下次允许",
++      dataIndex: "next_allowed_at",
++      key: "next_allowed_at",
++      render: (value: string | null) => formatDateTime(value),
++    },
++  ];
++
++  const decisionColumns: ColumnsType<InterjectionDecision> = [
++    {
++      title: "时间",
++      dataIndex: "created_at",
++      key: "created_at",
++      render: formatDateTime,
++    },
++    {
++      title: "渠道",
++      dataIndex: "channel",
++      key: "channel",
++    },
++    {
++      title: "决定",
++      dataIndex: "should_interject",
++      key: "should_interject",
++      render: (value: boolean) =>
++        value ? (
++          <Tag color="success">已插话</Tag>
++        ) : (
++          <Tag>未插话</Tag>
++        ),
++    },
++    {
++      title: "原因",
++      dataIndex: "reason",
++      key: "reason",
++    },
++  ];
++
++  const savePolicy = (values: PolicyForm) => {
++    if (!overview) return;
++    Modal.confirm({
++      title: "确认保存插话策略？",
++      content:
++        "新策略会立即用于后续群聊判断，已有决策记录不会改变。",
++      okText: "确认保存",
++      cancelText: "取消",
++      onOk: async () => {
++        setSaving(true);
++        try {
++          const result =
++            await digitalMateEvolutionApi.updateInterjectionPolicy(
++              overview.revision,
++              values as InterjectionPolicy,
++            );
++          setOverview((current) =>
++            current
++              ? {
++                  ...current,
++                  revision: result.revision,
++                  policy: result.policy,
++                }
++              : current,
++          );
++          form.setFieldsValue(result.policy);
++          message.success("插话策略已保存");
++        } catch (saveError) {
++          message.error(errorMessage(saveError));
++          throw saveError;
++        } finally {
++          setSaving(false);
++        }
++      },
++    });
++  };
++
++  return (
++    <div className={styles.page}>
++      <PageHeader parent="控制" current="群聊插话" />
++      <div className={styles.content}>
++        {loading && !overview ? (
++          <DomainLoading />
++        ) : error || !overview ? (
++          <DomainError onRetry={() => void load()} />
++        ) : (
++          <>
++            <Alert
++              type="info"
++              showIcon
++              message="平台能力限制"
++              description="Telegram 与 Slack 可验证非 @ 群消息；其他渠道受平台回调权限限制，只会在平台允许的事件范围内判断。"
++            />
++
++            <Card title="插话策略" className={styles.section}>
++              <Form<PolicyForm>
++                form={form}
++                layout="vertical"
++                onFinish={savePolicy}
++              >
++                <div className={styles.capabilityGrid}>
++                  <Form.Item
++                    name="minIntervalMinutes"
++                    label="最小间隔（分钟）"
++                    rules={[{ required: true }]}
++                  >
++                    <InputNumber
++                      aria-label="最小间隔（分钟）"
++                      min={1}
++                      max={1440}
++                      style={{ width: "100%" }}
++                    />
++                  </Form.Item>
++                  <Form.Item
++                    name="maxPerHour"
++                    label="每小时上限"
++                    rules={[{ required: true }]}
++                  >
++                    <InputNumber
++                      aria-label="每小时上限"
++                      min={1}
++                      max={100}
++                      style={{ width: "100%" }}
++                    />
++                  </Form.Item>
++                  <Form.Item
++                    name="maxPerDay"
++                    label="每日上限"
++                    rules={[{ required: true }]}
++                  >
++                    <InputNumber
++                      aria-label="每日上限"
++                      min={1}
++                      max={1000}
++                      style={{ width: "100%" }}
++                    />
++                  </Form.Item>
++                  <Form.Item
++                    name="quietStart"
++                    label="静默开始"
++                    rules={[
++                      {
++                        required: true,
++                        pattern: /^(?:[01]\d|2[0-3]):[0-5]\d$/,
++                      },
++                    ]}
++                  >
++                    <Input aria-label="静默开始" placeholder="23:00" />
++                  </Form.Item>
++                  <Form.Item
++                    name="quietEnd"
++                    label="静默结束"
++                    rules={[
++                      {
++                        required: true,
++                        pattern: /^(?:[01]\d|2[0-3]):[0-5]\d$/,
++                      },
++                    ]}
++                  >
++                    <Input aria-label="静默结束" placeholder="08:00" />
++                  </Form.Item>
++                </div>
++                <Button
++                  type="primary"
++                  htmlType="submit"
++                  loading={saving}
++                  disabled={saving}
++                >
++                  保存策略
++                </Button>
++              </Form>
++            </Card>
++
++            <Card
++              title="渠道状态"
++              className={`${styles.section} ${styles.tableCard}`}
++            >
++              <Table<ChannelRow>
++                rowKey="channel"
++                columns={channelColumns}
++                dataSource={channelRows}
++                pagination={false}
++                scroll={{ x: 720 }}
++              />
++            </Card>
++
++            <Card
++              title="最近决策"
++              className={`${styles.section} ${styles.tableCard}`}
++            >
++              <Table<InterjectionDecision>
++                rowKey="id"
++                columns={decisionColumns}
++                dataSource={overview.decisions}
++                locale={{ emptyText: "还没有插话决策" }}
++                pagination={{ pageSize: 20, hideOnSinglePage: true }}
++                scroll={{ x: 720 }}
++              />
++            </Card>
++          </>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/pages/DigitalMate/Memory/index.tsx b/src/pages/DigitalMate/Memory/index.tsx
+new file mode 100644
+index 0000000..756e4bb
+--- /dev/null
++++ b/src/pages/DigitalMate/Memory/index.tsx
+@@ -0,0 +1,320 @@
++import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  Button,
++  Card,
++  Drawer,
++  Empty,
++  Form,
++  Input,
++  InputNumber,
++  Modal,
++  Select,
++  Space,
++  Table,
++  Tag,
++} from "antd";
++import type { ColumnsType } from "antd/es/table";
++import { PageHeader } from "@/components/PageHeader";
++import { useAgentStore } from "../../../stores/agentStore";
++import { useAppMessage } from "../../../hooks/useAppMessage";
++import {
++  digitalMateEvolutionApi,
++  type MemoryEntry,
++  type MemoryKind,
++} from "../../../api/modules/digitalMateEvolution";
++import {
++  DomainError,
++  DomainLoading,
++  errorMessage,
++  formatDateTime,
++} from "../shared";
++import styles from "../shared.module.less";
++
++const KIND_LABELS: Record<MemoryKind, string> = {
++  episodic: "经历记忆",
++  profile: "用户画像",
++  agent_self: "分身自我认知",
++};
++
++type MemoryForm = Pick<
++  MemoryEntry,
++  "kind" | "content" | "confidence"
++>;
++
++export default function MemoryPage() {
++  const { selectedAgent } = useAgentStore();
++  const { message } = useAppMessage();
++  const [form] = Form.useForm<MemoryForm>();
++  const [kind, setKind] = useState<MemoryKind | undefined>();
++  const [items, setItems] = useState<MemoryEntry[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState(false);
++  const [editing, setEditing] = useState<MemoryEntry | null>(
++    null,
++  );
++  const [saving, setSaving] = useState(false);
++  const [deletingId, setDeletingId] = useState<string | null>(
++    null,
++  );
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(false);
++    try {
++      const response =
++        await digitalMateEvolutionApi.listMemories(kind);
++      setItems(response.items);
++    } catch {
++      setItems([]);
++      setError(true);
++    } finally {
++      setLoading(false);
++    }
++  }, [kind]);
++
++  useEffect(() => {
++    void load();
++  }, [load, selectedAgent]);
++
++  const openEditor = useCallback(
++    (entry: MemoryEntry) => {
++      setEditing(entry);
++      form.setFieldsValue({
++        kind: entry.kind,
++        content: entry.content,
++        confidence: entry.confidence,
++      });
++    },
++    [form],
++  );
++
++  const save = useCallback(
++    (values: MemoryForm) => {
++      if (!editing) return;
++      Modal.confirm({
++        title: "确认修改这条记忆？",
++        content:
++          "修改会更新检索内容并写入审计。敏感信息仍会在服务端再次过滤。",
++        okText: "确认修改",
++        cancelText: "返回",
++        onOk: async () => {
++          setSaving(true);
++          try {
++            const updated =
++              await digitalMateEvolutionApi.updateMemory(
++                editing.id,
++                values,
++              );
++            setItems((current) =>
++              current.map((item) =>
++                item.id === updated.id ? updated : item
++              ),
++            );
++            setEditing(null);
++            message.success("记忆已更新");
++          } catch (saveError) {
++            message.error(errorMessage(saveError));
++            throw saveError;
++          } finally {
++            setSaving(false);
++          }
++        },
++      });
++    },
++    [editing, message],
++  );
++
++  const remove = useCallback(
++    (entry: MemoryEntry) => {
++      Modal.confirm({
++        title: "确认删除这条记忆？",
++        content:
++          "删除后不会再用于对话检索；操作会保留安全审计。",
++        okText: "确认删除",
++        okType: "danger",
++        cancelText: "返回",
++        onOk: async () => {
++          setDeletingId(entry.id);
++          try {
++            await digitalMateEvolutionApi.deleteMemory(entry.id);
++            setItems((current) =>
++              current.filter((item) => item.id !== entry.id)
++            );
++            message.success("记忆已删除");
++          } catch (deleteError) {
++            message.error(errorMessage(deleteError));
++            throw deleteError;
++          } finally {
++            setDeletingId(null);
++          }
++        },
++      });
++    },
++    [message],
++  );
++
++  const columns = useMemo<ColumnsType<MemoryEntry>>(
++    () => [
++      {
++        title: "类型",
++        dataIndex: "kind",
++        key: "kind",
++        width: 150,
++        render: (value: MemoryKind) => (
++          <Tag>{KIND_LABELS[value]}</Tag>
++        ),
++      },
++      {
++        title: "记忆内容",
++        dataIndex: "content",
++        key: "content",
++      },
++      {
++        title: "置信度",
++        dataIndex: "confidence",
++        key: "confidence",
++        width: 100,
++        render: (value: number) =>
++          `${Math.round(value * 100)}%`,
++      },
++      {
++        title: "创建于",
++        dataIndex: "created_at",
++        key: "created_at",
++        width: 180,
++        render: formatDateTime,
++      },
++      {
++        title: "操作",
++        key: "actions",
++        width: 180,
++        render: (_, record) => (
++          <Space>
++            <Button
++              type="link"
++              aria-label="编辑记忆"
++              onClick={() => openEditor(record)}
++            >
++              编辑
++            </Button>
++            <Button
++              type="link"
++              danger
++              aria-label="删除记忆"
++              loading={deletingId === record.id}
++              onClick={() => remove(record)}
++            >
++              删除
++            </Button>
++          </Space>
++        ),
++      },
++    ],
++    [deletingId, openEditor, remove],
++  );
++
++  return (
++    <div className={styles.page}>
++      <PageHeader
++        parent="智能体"
++        current="记忆"
++        extra={
++          <Select<MemoryKind | undefined>
++            aria-label="记忆类型"
++            value={kind}
++            allowClear
++            placeholder="全部类型"
++            style={{ width: 170 }}
++            onChange={setKind}
++            options={Object.entries(KIND_LABELS).map(
++              ([value, label]) => ({ value, label }),
++            )}
++          />
++        }
++      />
++      <div className={styles.content}>
++        {loading && items.length === 0 ? (
++          <DomainLoading />
++        ) : error ? (
++          <DomainError onRetry={() => void load()} />
++        ) : items.length === 0 ? (
++          <Empty
++            description="还没有记忆"
++            style={{ marginTop: 80 }}
++          />
++        ) : (
++          <Card className={styles.tableCard}>
++            <Table<MemoryEntry>
++              rowKey="id"
++              columns={columns}
++              dataSource={items}
++              loading={loading}
++              pagination={{ pageSize: 20, hideOnSinglePage: true }}
++              scroll={{ x: 860 }}
++            />
++          </Card>
++        )}
++      </div>
++
++      <Drawer
++        title="编辑记忆"
++        open={editing !== null}
++        width={520}
++        onClose={() => setEditing(null)}
++      >
++        <Form<MemoryForm>
++          form={form}
++          layout="vertical"
++          onFinish={save}
++        >
++          <Form.Item
++            name="kind"
++            label="类型"
++            rules={[{ required: true }]}
++          >
++            <Select
++              options={Object.entries(KIND_LABELS).map(
++                ([value, label]) => ({ value, label }),
++              )}
++            />
++          </Form.Item>
++          <Form.Item
++            name="content"
++            label="记忆内容"
++            rules={[
++              { required: true },
++              { max: 8000 },
++            ]}
++          >
++            <Input.TextArea
++              aria-label="记忆内容"
++              rows={8}
++              showCount
++              maxLength={8000}
++            />
++          </Form.Item>
++          <Form.Item
++            name="confidence"
++            label="置信度"
++            rules={[{ required: true }]}
++          >
++            <InputNumber
++              min={0}
++              max={1}
++              step={0.01}
++              style={{ width: "100%" }}
++            />
++          </Form.Item>
++          <Button
++            type="primary"
++            htmlType="submit"
++            loading={saving}
++            disabled={saving}
++          >
++            保存修改
++          </Button>
++        </Form>
++      </Drawer>
++    </div>
++  );
++}
+diff --git a/src/pages/DigitalMate/Reflections/index.tsx b/src/pages/DigitalMate/Reflections/index.tsx
+new file mode 100644
+index 0000000..6dc8d78
+--- /dev/null
++++ b/src/pages/DigitalMate/Reflections/index.tsx
+@@ -0,0 +1,298 @@
++import {
++  useCallback,
++  useEffect,
++  useRef,
++  useState,
++} from "react";
++import {
++  Button,
++  Card,
++  Checkbox,
++  Empty,
++  Modal,
++  Select,
++  Space,
++  Tag,
++  Typography,
++} from "antd";
++import { PageHeader } from "@/components/PageHeader";
++import { useAgentStore } from "../../../stores/agentStore";
++import { useAppMessage } from "../../../hooks/useAppMessage";
++import {
++  digitalMateEvolutionApi,
++  type ReflectionEntry,
++  type ReflectionStatus,
++} from "../../../api/modules/digitalMateEvolution";
++import {
++  DomainError,
++  DomainLoading,
++  errorMessage,
++  formatDateTime,
++} from "../shared";
++import styles from "../shared.module.less";
++
++const { Text } = Typography;
++
++const STATUS_LABELS: Record<ReflectionStatus, string> = {
++  recorded: "待处理",
++  applied: "已应用",
++  dismissed: "已忽略",
++};
++
++export default function ReflectionsPage() {
++  const { selectedAgent } = useAgentStore();
++  const { message } = useAppMessage();
++  const [status, setStatus] =
++    useState<ReflectionStatus | undefined>();
++  const [items, setItems] = useState<ReflectionEntry[]>([]);
++  const [profileRevision, setProfileRevision] = useState(1);
++  const [selected, setSelected] = useState<
++    Record<string, number[]>
++  >({});
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState(false);
++  const [actingId, setActingId] = useState<string | null>(
++    null,
++  );
++  const selectionAgentRef = useRef(selectedAgent);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(false);
++    try {
++      const response =
++        await digitalMateEvolutionApi.listReflections(status);
++      setItems(response.items);
++      setProfileRevision(response.profile_revision);
++      setSelected((current) => {
++        const next: Record<string, number[]> = {};
++        for (const entry of response.items) {
++          const indexes = (current[entry.id] ?? []).filter(
++            (index) =>
++              Number.isInteger(index) &&
++              index >= 0 &&
++              index < entry.suggestions.length,
++          );
++          if (indexes.length > 0) next[entry.id] = indexes;
++        }
++        return next;
++      });
++    } catch {
++      setItems([]);
++      setError(true);
++    } finally {
++      setLoading(false);
++    }
++  }, [status]);
++
++  useEffect(() => {
++    if (
++      selectionAgentRef.current &&
++      selectedAgent &&
++      selectionAgentRef.current !== selectedAgent
++    ) {
++      setSelected({});
++    }
++    selectionAgentRef.current = selectedAgent;
++    void load();
++  }, [load, selectedAgent]);
++
++  const act = useCallback(
++    (
++      entry: ReflectionEntry,
++      action: "apply" | "dismiss",
++    ) => {
++      const indexes =
++        action === "apply" ? selected[entry.id] ?? [] : [];
++      if (action === "apply" && indexes.length === 0) return;
++      Modal.confirm({
++        title:
++          action === "apply"
++            ? "确认应用所选建议？"
++            : "确认忽略这次反思？",
++        content:
++          action === "apply"
++            ? "只会把你明确勾选的建议合并到人设，未勾选建议不会应用。"
++            : "忽略后这条反思会保留为审计记录，但不改变人设。",
++        okText:
++          action === "apply" ? "确认应用" : "确认忽略",
++        cancelText: "返回",
++        onOk: async () => {
++          setActingId(entry.id);
++          try {
++            const updated =
++              await digitalMateEvolutionApi.actOnReflection(
++                entry.id,
++                action,
++                profileRevision,
++                indexes,
++              );
++            setItems((current) =>
++              current.map((item) =>
++                item.id === entry.id ? updated : item
++              ),
++            );
++            setProfileRevision(updated.profile_revision);
++            setSelected((current) => ({
++              ...current,
++              [entry.id]: [],
++            }));
++            message.success(
++              action === "apply"
++                ? "所选建议已应用"
++                : "反思已忽略",
++            );
++          } catch (actionError) {
++            message.error(errorMessage(actionError));
++            throw actionError;
++          } finally {
++            setActingId(null);
++          }
++        },
++      });
++    },
++    [message, profileRevision, selected],
++  );
++
++  return (
++    <div className={styles.page}>
++      <PageHeader
++        parent="智能体"
++        current="反思"
++        extra={
++          <Select<ReflectionStatus | undefined>
++            aria-label="反思状态"
++            value={status}
++            allowClear
++            placeholder="全部状态"
++            style={{ width: 150 }}
++            onChange={setStatus}
++            options={Object.entries(STATUS_LABELS).map(
++              ([value, label]) => ({ value, label }),
++            )}
++          />
++        }
++      />
++      <div className={styles.content}>
++        {loading && items.length === 0 ? (
++          <DomainLoading />
++        ) : error ? (
++          <DomainError onRetry={() => void load()} />
++        ) : items.length === 0 ? (
++          <Empty
++            description="还没有反思记录"
++            style={{ marginTop: 80 }}
++          />
++        ) : (
++          <div className={styles.cardGrid}>
++            {items.map((entry) => {
++              const pending = entry.status === "recorded";
++              const checked = selected[entry.id] ?? [];
++              return (
++                <Card
++                  key={entry.id}
++                  className={styles.entryCard}
++                  title={
++                    <Space>
++                      <span>反思</span>
++                      <Tag
++                        color={
++                          pending
++                            ? "warning"
++                            : entry.status === "applied"
++                              ? "success"
++                              : "default"
++                        }
++                      >
++                        {STATUS_LABELS[entry.status]}
++                      </Tag>
++                    </Space>
++                  }
++                  extra={
++                    <Text type="secondary">
++                      {formatDateTime(entry.created_at)}
++                    </Text>
++                  }
++                >
++                  {entry.positives.length > 0 ? (
++                    <div>
++                      <Text strong>做得好的地方</Text>
++                      {entry.positives.map((item) => (
++                        <div key={item}>• {item}</div>
++                      ))}
++                    </div>
++                  ) : null}
++                  {entry.negatives.length > 0 ? (
++                    <div className={styles.section}>
++                      <Text strong>需要改善</Text>
++                      {entry.negatives.map((item) => (
++                        <div key={item}>• {item}</div>
++                      ))}
++                    </div>
++                  ) : null}
++                  <div className={styles.section}>
++                    <Text strong>建议</Text>
++                    <div className={styles.suggestionList}>
++                      {entry.suggestions.map(
++                        (suggestion, index) => (
++                          <Checkbox
++                            key={`${entry.id}-${index}`}
++                            value={index}
++                            checked={checked.includes(index)}
++                            disabled={!pending}
++                            onChange={(event) =>
++                              setSelected((current) => {
++                                const currentIndexes =
++                                  current[entry.id] ?? [];
++                                const indexes = event.target.checked
++                                  ? [
++                                      ...new Set([
++                                        ...currentIndexes,
++                                        index,
++                                      ]),
++                                    ]
++                                  : currentIndexes.filter(
++                                      (value) => value !== index,
++                                    );
++                                return {
++                                  ...current,
++                                  [entry.id]: indexes,
++                                };
++                              })
++                            }
++                          >
++                            {suggestion}
++                          </Checkbox>
++                        ),
++                      )}
++                    </div>
++                  </div>
++                  <div className={styles.entryActions}>
++                    <Button
++                      type="primary"
++                      disabled={
++                        !pending ||
++                        checked.length === 0 ||
++                        actingId !== null
++                      }
++                      loading={actingId === entry.id}
++                      onClick={() => act(entry, "apply")}
++                    >
++                      应用所选建议
++                    </Button>
++                    <Button
++                      disabled={!pending || actingId !== null}
++                      onClick={() => act(entry, "dismiss")}
++                    >
++                      忽略这次反思
++                    </Button>
++                  </div>
++                </Card>
++              );
++            })}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/pages/DigitalMate/shared.module.less b/src/pages/DigitalMate/shared.module.less
+new file mode 100644
+index 0000000..0348cc4
+--- /dev/null
++++ b/src/pages/DigitalMate/shared.module.less
+@@ -0,0 +1,139 @@
++.page {
++  height: 100%;
++  display: flex;
++  flex-direction: column;
++  overflow: hidden;
++}
++
++.content {
++  flex: 1;
++  overflow: auto;
++  padding: 16px 20px 24px;
++}
++
++.toolbar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  margin-bottom: 16px;
++}
++
++.toolbarGroup {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++
++.section {
++  margin-top: 16px;
++}
++
++.tableCard {
++  overflow: hidden;
++
++  :global(.qwenpaw-card-body),
++  :global(.ant-card-body) {
++    padding: 0;
++  }
++}
++
++.cardGrid {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
++  gap: 16px;
++}
++
++.entryCard {
++  border-radius: 12px;
++}
++
++.entryHeader {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++
++.entryContent {
++  color: rgba(20, 20, 19, 0.88);
++  line-height: 1.65;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++}
++
++.meta {
++  color: rgba(20, 20, 19, 0.55);
++  font-size: 12px;
++}
++
++.entryActions {
++  display: flex;
++  align-items: center;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 16px;
++  padding-top: 12px;
++  border-top: 1px solid #eae9e7;
++}
++
++.suggestionList {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  margin-top: 12px;
++}
++
++.drawerContent {
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++}
++
++.capabilityGrid {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
++  gap: 12px;
++  margin-bottom: 16px;
++}
++
++@media (max-width: 768px) {
++  .content {
++    padding: 12px 16px 20px;
++  }
++
++  .toolbar {
++    align-items: stretch;
++    flex-direction: column;
++  }
++
++  .toolbarGroup {
++    width: 100%;
++  }
++
++  .cardGrid,
++  .capabilityGrid {
++    grid-template-columns: 1fr;
++  }
++
++  .entryActions {
++    justify-content: flex-start;
++    flex-wrap: wrap;
++  }
++}
++
++:global(.dark-mode) {
++  .entryContent {
++    color: rgba(255, 255, 255, 0.85);
++  }
++
++  .meta {
++    color: rgba(255, 255, 255, 0.45);
++  }
++
++  .entryActions {
++    border-top-color: rgba(255, 255, 255, 0.12);
++  }
++}
+diff --git a/src/pages/DigitalMate/shared.tsx b/src/pages/DigitalMate/shared.tsx
+new file mode 100644
+index 0000000..7fba799
+--- /dev/null
++++ b/src/pages/DigitalMate/shared.tsx
+@@ -0,0 +1,49 @@
++import { Button, Result, Spin } from "antd";
++
++export function DomainLoading() {
++  return (
++    <div
++      data-testid="domain-loading"
++      style={{
++        minHeight: 280,
++        display: "grid",
++        placeItems: "center",
++      }}
++    >
++      <Spin size="large" />
++    </div>
++  );
++}
++
++export function DomainError({
++  onRetry,
++}: {
++  onRetry: () => void;
++}) {
++  return (
++    <Result
++      status="error"
++      title="加载失败"
++      subTitle="暂时无法读取数据，请稍后重试。"
++      extra={
++        <Button type="primary" onClick={onRetry}>
++          重新加载
++        </Button>
++      }
++    />
++  );
++}
++
++export function formatDateTime(value: string | null): string {
++  if (!value) return "—";
++  const date = new Date(value);
++  return Number.isNaN(date.getTime())
++    ? "—"
++    : date.toLocaleString("zh-CN", { hour12: false });
++}
++
++export function errorMessage(error: unknown): string {
++  return error instanceof Error && error.message
++    ? error.message
++    : "操作失败";
++}
 diff --git a/src/pages/Settings/Agents/components/AgentModal.test.tsx b/src/pages/Settings/Agents/components/AgentModal.test.tsx
 new file mode 100644
 index 0000000..cfa08b8
@@ -6168,7 +8089,7 @@ index f24930b..c53bdc9 100644
    );
  }
 diff --git a/src/pages/Settings/Agents/components/AgentTable.test.tsx b/src/pages/Settings/Agents/components/AgentTable.test.tsx
-index 62c02e5..d5b9a43 100644
+index 62c02e5..df062a4 100644
 --- a/src/pages/Settings/Agents/components/AgentTable.test.tsx
 +++ b/src/pages/Settings/Agents/components/AgentTable.test.tsx
 @@ -1,9 +1,28 @@
@@ -6201,7 +8122,7 @@ index 62c02e5..d5b9a43 100644
  vi.mock("react-i18next", () => ({
    useTranslation: () => ({ t: (key: string) => key }),
  }));
-@@ -17,6 +36,7 @@ const agent = (id: string, pinned: boolean): AgentSummary => ({
+@@ -17,8 +36,9 @@ const agent = (id: string, pinned: boolean): AgentSummary => ({
    pinned,
    startup_status: "running",
  });
@@ -6210,6 +8131,8 @@ index 62c02e5..d5b9a43 100644
 -describe("AgentTable", () => {
 +describe("AgentTable", { timeout: 15_000 }, () => {
    it("uses click-specific labels for pin actions", () => {
+     renderWithProviders(
+       <AgentTable
 @@ -40,4 +60,121 @@ describe("AgentTable", () => {
        screen.getByRole("button", { name: "agent.unpinAgent" }),
      ).toBeInTheDocument();
@@ -6875,292 +8798,9 @@ index 0000000..06cab95
 +): UpdateAgentProfileRequest {
 +  return buildAgentProfileUpdate(values, createOperationId());
 +}
-diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
-index 5607a73..de360b3 100644
---- a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
-+++ b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
-@@ -6,6 +6,7 @@ import {
-   buildMarketDownloadUrl,
-   type MarketPluginEntry,
- } from "@/api/modules/pluginMarket";
-+import { getApiUrl } from "@/api/config";
- import { installPlugin } from "@/api/modules/plugin";
-
- /**
-@@ -54,7 +55,7 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
-
-   useEffect(() => {
-     const controller = new AbortController();
--    fetch("/api/version", { signal: controller.signal })
-+    fetch(getApiUrl("/version"), { signal: controller.signal })
-       .then((res) => {
-         if (!res.ok) {
-           throw new Error(`HTTP ${res.status}`);
-diff --git a/src/plugins/hostExternals.ts b/src/plugins/hostExternals.ts
-index 0eff169..41b020a 100644
---- a/src/plugins/hostExternals.ts
-+++ b/src/plugins/hostExternals.ts
-@@ -31,8 +31,6 @@ import type {
-   QwenPawChatNamespace,
- } from "./types/qwenpaw";
-
--declare const VITE_API_BASE_URL: string;
--
- // ─────────────────────────────────────────────────────────────────────────────
- // Public types
- // ─────────────────────────────────────────────────────────────────────────────
-@@ -223,8 +221,7 @@ function ensurePluginsGroup(): void {
- }
-
- export function installHostExternals(): void {
--  const apiBaseUrl =
--    typeof VITE_API_BASE_URL !== "undefined" ? VITE_API_BASE_URL : "";
-+  const apiBaseUrl = getApiUrl("").replace(/\/$/, "");
-
-   if (!window.QwenPaw) {
-     (window as any).QwenPaw = {} as WindowNamespace;
-diff --git a/src/plugins/hostSdk/fetch.ts b/src/plugins/hostSdk/fetch.ts
-index 78bef3e..8be167c 100644
---- a/src/plugins/hostSdk/fetch.ts
-+++ b/src/plugins/hostSdk/fetch.ts
-@@ -1,19 +1,19 @@
- /**
-  * hostSdk/fetch.ts — auth-aware fetch wrapper for plugins.
-  *
-- * Reuses `buildAuthHeaders()` which already injects `Authorization`
-- * and `X-Agent-Id` from the agent store. Plugin callers pass an API path
-+ * Reuses the method-aware header helper for the selected agent and CSRF.
-+ * Plugin callers pass an API path
-  * (e.g. "/console/chat") and get back a normal Response.
-  */
- import { getApiUrl } from "../../api/config";
--import { buildAuthHeaders } from "../../api/authHeaders";
-+import { buildMutationHeaders } from "../../api/authHeaders";
-
- export async function hostFetch(
-   path: string,
-   init?: RequestInit,
- ): Promise<Response> {
-   const headers: Record<string, string> = {
--    ...buildAuthHeaders(),
-+    ...await buildMutationHeaders(init?.method ?? "GET", init?.signal),
-     ...((init?.headers as Record<string, string>) ?? {}),
-   };
-   return fetch(getApiUrl(path), { ...init, headers });
-diff --git a/src/plugins/usePluginLoader.ts b/src/plugins/usePluginLoader.ts
-index b745352..6417cc9 100644
---- a/src/plugins/usePluginLoader.ts
-+++ b/src/plugins/usePluginLoader.ts
-@@ -8,7 +8,7 @@
-  * Exports `loadAllPlugins()` — the single function PluginContext calls.
-  */
-
--import { getApiUrl, getApiToken } from "../api/config";
-+import { getApiUrl } from "../api/config";
-
- // ─────────────────────────────────────────────────────────────────────────────
- // Plugin manifest type (mirrors backend PluginInfo)
-@@ -37,11 +37,7 @@ function resolveUrl(pluginId: string, apiPath: string): string {
-  * execute it via dynamic import.  Blob URL is revoked immediately after.
-  */
- async function executePluginScript(entryUrl: string): Promise<void> {
--  const token = getApiToken();
--  const headers: Record<string, string> = {};
--  if (token) headers["Authorization"] = `Bearer ${token}`;
--
--  const response = await fetch(entryUrl, { headers });
-+  const response = await fetch(entryUrl);
-   if (!response.ok) {
-     throw new Error(`HTTP ${response.status} for ${entryUrl}`);
-   }
-@@ -76,10 +72,7 @@ export async function loadAllPlugins(): Promise<{
-
-   let plugins: PluginInfo[];
-   try {
--    const token = getApiToken();
--    const headers: Record<string, string> = {};
--    if (token) headers["Authorization"] = `Bearer ${token}`;
--    const res = await fetch(getApiUrl("/frontend_plugin"), { headers });
-+    const res = await fetch(getApiUrl("/frontend_plugin"));
-     if (!res.ok) {
-       console.warn(`[PluginLoader] /api/plugins returned ${res.status}`);
-       return { loaded: 0, failed: [] };
-diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
-index 8d5b9a3..331cf37 100644
---- a/src/stores/agentStore.test.ts
-+++ b/src/stores/agentStore.test.ts
-@@ -1,6 +1,8 @@
- import { describe, it, expect, beforeEach, vi } from "vitest";
- import { useAgentStore } from "./agentStore";
- import type { AgentSummary } from "@/api/types/agents";
-+import { buildAuthHeaders } from "@/api/authHeaders";
-+import { clearValidatedDefaultAgent } from "@/api/agentScope";
-
- const mocks = vi.hoisted(() => ({
-   listAgents: vi.fn(),
-@@ -14,10 +16,14 @@ vi.mock("../api/modules/agents", () => ({
-
- const mockAgent = (id: string): AgentSummary =>
-   ({ id, name: `Agent ${id}` }) as AgentSummary;
-+const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
-
- describe("agentStore", () => {
-   beforeEach(() => {
-     vi.clearAllMocks();
-+    clearValidatedDefaultAgent();
-+    sessionStorage.clear();
-+    localStorage.clear();
-     // Reset to initial state before each test
-     useAgentStore.setState({
-       selectedAgent: "default",
-@@ -80,6 +86,62 @@ describe("agentStore", () => {
-     expect(useAgentStore.getState().agents).toEqual([mockAgent("1")]);
-   });
-
-+  it("replaces the bootstrap placeholder with the real default UUID", async () => {
-+    const defaultAgent = {
-+      ...mockAgent(DEFAULT_AGENT_ID),
-+      is_default: true,
-+      enabled: true,
-+      pinned: true,
-+    };
-+    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
-+
-+    await useAgentStore.getState().refreshAgents();
-+
-+    expect(useAgentStore.getState().agents).toEqual([defaultAgent]);
-+    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
-+  });
-+
-+  it("replaces a stale stored UUID with the only real default agent", async () => {
-+    useAgentStore.setState({
-+      selectedAgent: "20000000-0000-4000-8000-000000000011",
-+    });
-+    const defaultAgent = {
-+      ...mockAgent(DEFAULT_AGENT_ID),
-+      is_default: true,
-+      enabled: true,
-+      pinned: true,
-+    };
-+    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
-+
-+    await useAgentStore.getState().refreshAgents();
-+
-+    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
-+  });
-+
-+  it("starts headerless, then scopes later requests to the listed default UUID", async () => {
-+    const staleId = "20000000-0000-4000-8000-000000000011";
-+    useAgentStore.setState({ selectedAgent: staleId, agents: [] });
-+    const defaultAgent = {
-+      ...mockAgent(DEFAULT_AGENT_ID),
-+      is_default: true,
-+      enabled: true,
-+      pinned: true,
-+    };
-+    let startupHeaders: Record<string, string> | undefined;
-+    mocks.listAgents.mockImplementation(async () => {
-+      startupHeaders = buildAuthHeaders();
-+      return { agents: [defaultAgent] };
-+    });
-+
-+    await useAgentStore.getState().refreshAgents();
-+
-+    expect(startupHeaders).toEqual({});
-+    expect(buildAuthHeaders()).toEqual({
-+      "X-Agent-Id": DEFAULT_AGENT_ID,
-+      "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
-+    });
-+  });
-+
-   it("allows a new refresh after the previous request settles", async () => {
-     mocks.listAgents.mockResolvedValue({ agents: [] });
-
-diff --git a/src/stores/agentStore.ts b/src/stores/agentStore.ts
-index 8249f60..92624eb 100644
---- a/src/stores/agentStore.ts
-+++ b/src/stores/agentStore.ts
-@@ -2,6 +2,10 @@ import { create } from "zustand";
- import { persist } from "zustand/middleware";
- import type { AgentSummary } from "../api/types/agents";
- import { agentsApi } from "../api/modules/agents";
-+import {
-+  clearValidatedDefaultAgent,
-+  markValidatedDefaultAgent,
-+} from "../api/agentScope";
- import { menuRegistry } from "../plugins/registry/store";
-
- /**
-@@ -83,6 +87,14 @@ export const useAgentStore = create<AgentStore>()(
-
-       setSelectedAgent: (agentId) => {
-         set({ selectedAgent: agentId });
-+        const selected = get().agents.find(
-+          (agent) => agent.id === agentId && agent.is_default === true,
-+        );
-+        if (selected) {
-+          markValidatedDefaultAgent(selected.id);
-+        } else {
-+          clearValidatedDefaultAgent();
-+        }
-         menuRegistry.refresh();
-         // Persist to localStorage so new tabs inherit this choice
-         try {
-@@ -100,6 +112,23 @@ export const useAgentStore = create<AgentStore>()(
-         }
-
-         agentRefreshPromise = agentsApi.listAgents().then((response) => {
-+          const defaultAgent = response.agents.find(
-+            (agent) => agent.is_default === true,
-+          );
-+          if (defaultAgent) {
-+            markValidatedDefaultAgent(defaultAgent.id);
-+            set({
-+              agents: response.agents,
-+              selectedAgent: defaultAgent.id,
-+            });
-+            try {
-+              localStorage.setItem(LAST_USED_AGENT_KEY, defaultAgent.id);
-+            } catch {
-+              /* ignore */
-+            }
-+            return;
-+          }
-+          clearValidatedDefaultAgent();
-           set({ agents: response.agents });
-         });
-         try {
-diff --git a/src/utils/error.ts b/src/utils/error.ts
-index 5e19f38..1744a41 100644
---- a/src/utils/error.ts
-+++ b/src/utils/error.ts
-@@ -1,5 +1,23 @@
- export function parseErrorDetail(error: unknown): Record<string, any> | null {
-   if (!(error instanceof Error)) return null;
-+  const structured = error as Error & {
-+    status?: unknown;
-+    code?: unknown;
-+    details?: unknown;
-+  };
-+  if (
-+    typeof structured.status === "number" &&
-+    typeof structured.code === "string"
-+  ) {
-+    return {
-+      status: structured.status,
-+      code: structured.code,
-+      message: structured.message,
-+      ...("details" in structured
-+        ? { details: structured.details }
-+        : {}),
-+    };
-+  }
-   const msg = error.message;
-   // Try " - " separator first (from request.ts formatted errors)
-   const idx = msg.indexOf(" - ");
 diff --git a/src/pages/Settings/Environments/ChannelNodes.module.less b/src/pages/Settings/Environments/ChannelNodes.module.less
 new file mode 100644
-index 0000000..78fdf42
+index 0000000..aa2ad30
 --- /dev/null
 +++ b/src/pages/Settings/Environments/ChannelNodes.module.less
 @@ -0,0 +1,233 @@
@@ -7399,7 +9039,7 @@ index 0000000..78fdf42
 +}
 diff --git a/src/pages/Settings/Environments/ChannelNodes.tsx b/src/pages/Settings/Environments/ChannelNodes.tsx
 new file mode 100644
-index 0000000..3cd351e
+index 0000000..ec11457
 --- /dev/null
 +++ b/src/pages/Settings/Environments/ChannelNodes.tsx
 @@ -0,0 +1,397 @@
@@ -7800,3 +9440,511 @@ index 0000000..3cd351e
 +}
 +
 +export default ChannelNodesPage;
+diff --git a/src/pages/Settings/Models/index.tsx b/src/pages/Settings/Models/index.tsx
+index 2008fc0..8d1e8f6 100644
+--- a/src/pages/Settings/Models/index.tsx
++++ b/src/pages/Settings/Models/index.tsx
+@@ -7,6 +7,7 @@ import {
+ } from "react";
+ import { useSearchParams } from "react-router-dom";
+ import { Button, Input, Modal } from "@agentscope-ai/design";
++import { Alert } from "antd";
+ import { PlusOutlined, SearchOutlined, SyncOutlined } from "@ant-design/icons";
+ import { useProviders } from "./useProviders";
+ import {
+@@ -491,47 +492,13 @@ function ModelsPage() {
+               )}
+
+               {activeTab === "local" && (
+-                <>
+-                  {/* Local Configured */}
+-                  {localConfigured.length > 0 && (
+-                    <div className={styles.panelSection}>
+-                      <div className={styles.panelTitle}>
+-                        <span className={styles.panelDotGreen} />
+-                        {t("models.configuredGroup")}
+-                      </div>
+-                      <div className={styles.providerCards}>
+-                        {renderProviderCards(localConfigured)}
+-                      </div>
+-                    </div>
+-                  )}
+-
+-                  {/* Local Available */}
+-                  {localAvailable.length > 0 && (
+-                    <div className={styles.panelSectionDashed}>
+-                      <div className={styles.panelTitle}>
+-                        <span className={styles.panelDotGray} />
+-                        {t("models.availableGroup")}
+-                      </div>
+-                      <div className={styles.availableGrid}>
+-                        {localAvailable.map((provider) => (
+-                          <div
+-                            key={provider.id}
+-                            className={styles.availableItem}
+-                            onClick={() => handleOpenConfig(provider)}
+-                          >
+-                            <ProviderIcon providerId={provider.id} size={24} />
+-                            <span className={styles.availableItemName}>
+-                              {provider.name}
+-                            </span>
+-                            <span className={styles.availableItemAction}>
+-                              {t("models.configureAction")}
+-                            </span>
+-                          </div>
+-                        ))}
+-                      </div>
+-                    </div>
+-                  )}
+-                </>
++                <Alert
++                  type="info"
++                  showIcon
++                  message="本地模型能力当前冻结"
++                  description="入口与兼容能力已保留，待 P0/P1 核心能力完成后再开放配置。"
++                  className={styles.panelSection}
++                />
+               )}
+             </div>
+
+diff --git a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
+index 5607a73..de360b3 100644
+--- a/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
++++ b/src/pages/Settings/PluginManager/hooks/useMarketPlugins.ts
+@@ -6,6 +6,7 @@ import {
+   buildMarketDownloadUrl,
+   type MarketPluginEntry,
+ } from "@/api/modules/pluginMarket";
++import { getApiUrl } from "@/api/config";
+ import { installPlugin } from "@/api/modules/plugin";
+
+ /**
+@@ -54,7 +55,7 @@ export function useMarketPlugins({ onInstalled }: UseMarketPluginsOptions) {
+
+   useEffect(() => {
+     const controller = new AbortController();
+-    fetch("/api/version", { signal: controller.signal })
++    fetch(getApiUrl("/version"), { signal: controller.signal })
+       .then((res) => {
+         if (!res.ok) {
+           throw new Error(`HTTP ${res.status}`);
+diff --git a/src/pages/Settings/PluginManager/hooks/usePluginColumns.tsx b/src/pages/Settings/PluginManager/hooks/usePluginColumns.tsx
+index 1a48b74..125ca6a 100644
+--- a/src/pages/Settings/PluginManager/hooks/usePluginColumns.tsx
++++ b/src/pages/Settings/PluginManager/hooks/usePluginColumns.tsx
+@@ -9,11 +9,13 @@ const { Text } = Typography;
+ interface UsePluginColumnsOptions {
+   uninstallingId: string | null;
+   onUninstall: (record: PluginInfo) => void;
++  mutationsDisabled?: boolean;
+ }
+
+ export function usePluginColumns({
+   uninstallingId,
+   onUninstall,
++  mutationsDisabled = false,
+ }: UsePluginColumnsOptions) {
+   const { t } = useTranslation();
+
+@@ -101,6 +103,7 @@ export function usePluginColumns({
+             size="small"
+             icon={<Trash2 size={14} />}
+             loading={uninstallingId === record.id}
++            disabled={mutationsDisabled}
+             onClick={() => onUninstall(record)}
+           />
+         </Tooltip>
+diff --git a/src/pages/Settings/PluginManager/index.tsx b/src/pages/Settings/PluginManager/index.tsx
+index f9670f9..55ba465 100644
+--- a/src/pages/Settings/PluginManager/index.tsx
++++ b/src/pages/Settings/PluginManager/index.tsx
+@@ -1,26 +1,31 @@
+ import { useTranslation } from "react-i18next";
+-import { Button, Empty, Spin, Table, Tabs } from "antd";
++import {
++  Alert,
++  Button,
++  Empty,
++  Result,
++  Space,
++  Spin,
++  Table,
++  Tabs,
++  Typography,
++} from "antd";
+ import { ExternalLink, Package, Plus } from "lucide-react";
+ import { PageHeader } from "@/components/PageHeader";
+ import { usePluginManager } from "./hooks/usePluginManager";
+ import { usePluginColumns } from "./hooks/usePluginColumns";
+-import { useInstallModal } from "./hooks/useInstallModal";
+-import { InstallPluginModal } from "./components/InstallPluginModal";
+-import { OfficialPluginList } from "./components/OfficialPluginList";
+-import { MarketPluginList } from "./components/MarketPluginList";
+ import styles from "./index.module.less";
+
+ export default function PluginManagerPage() {
+   const { t } = useTranslation();
+
+-  const { plugins, loading, refresh, uninstallingId, handleUninstall } =
++  const { plugins, loading, uninstallingId, handleUninstall } =
+     usePluginManager();
+
+-  const installModal = useInstallModal(refresh);
+-
+   const columns = usePluginColumns({
+     uninstallingId,
+     onUninstall: handleUninstall,
++    mutationsDisabled: true,
+   });
+
+   const tabItems = [
+@@ -50,12 +55,24 @@ export default function PluginManagerPage() {
+     {
+       key: "official",
+       label: t("pluginManager.officialTitle"),
+-      children: <OfficialPluginList onInstalled={refresh} />,
++      children: (
++        <Result
++          status="info"
++          title="官方插件目录当前冻结"
++          subTitle="目录能力已保留，启用任何插件前仍需单独确认。"
++        />
++      ),
+     },
+     {
+       key: "market",
+       label: t("pluginManager.marketTitle"),
+-      children: <MarketPluginList onInstalled={refresh} />,
++      children: (
++        <Result
++          status="info"
++          title="插件市场当前冻结"
++          subTitle="当前不会连接外部插件市场。"
++        />
++      ),
+     },
+   ];
+
+@@ -65,31 +82,47 @@ export default function PluginManagerPage() {
+         parent={t("nav.settings")}
+         current={t("nav.pluginManager")}
+         extra={
+-          <>
+-            <Button
+-              icon={<ExternalLink size={16} />}
+-              onClick={() =>
+-                window.open("https://platform.agentscope.io/plugins", "_blank")
+-              }
+-            >
+-              {t("pluginManager.publishBtn")}
+-            </Button>
++          <Space>
+             <Button
+               type="primary"
+               icon={<Plus size={16} />}
+-              onClick={installModal.openModal}
++              disabled
+             >
+               {t("pluginManager.installBtn")}
+             </Button>
+-          </>
++          </Space>
+         }
+       />
+
+       <div className={styles.content}>
++        <Alert
++          type="warning"
++          showIcon
++          message="插件扩展需单独确认且当前冻结"
++          description="已安装插件仅供查看；安装、卸载、发布与外部市场访问均不会执行。"
++        />
+         <Tabs items={tabItems} className={styles.tabs} />
++        <Typography.Paragraph
++          type="secondary"
++          data-testid="upstream-license"
++        >
++          Console 页面迁移自上游 QwenPaw v2.0.0.post3（提交
++          fef7e64d，Apache-2.0，
++          <Typography.Link
++            aria-label="查看来源与第三方许可"
++            href="https://github.com/agentscope-ai/QwenPaw/tree/fef7e64d984f4332d0b84a343cd209bd3ea5d316"
++            target="_blank"
++            rel="noreferrer"
++          >
++            查看来源与第三方许可
++            <ExternalLink
++              size={12}
++              style={{ marginInlineStart: 4, verticalAlign: "-2px" }}
++            />
++          </Typography.Link>
++          ）。
++        </Typography.Paragraph>
+       </div>
+-
+-      <InstallPluginModal {...installModal} />
+     </div>
+   );
+ }
+diff --git a/src/plugins/hostExternals.ts b/src/plugins/hostExternals.ts
+index 0eff169..41b020a 100644
+--- a/src/plugins/hostExternals.ts
++++ b/src/plugins/hostExternals.ts
+@@ -31,8 +31,6 @@ import type {
+   QwenPawChatNamespace,
+ } from "./types/qwenpaw";
+
+-declare const VITE_API_BASE_URL: string;
+-
+ // ─────────────────────────────────────────────────────────────────────────────
+ // Public types
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -223,8 +221,7 @@ function ensurePluginsGroup(): void {
+ }
+
+ export function installHostExternals(): void {
+-  const apiBaseUrl =
+-    typeof VITE_API_BASE_URL !== "undefined" ? VITE_API_BASE_URL : "";
++  const apiBaseUrl = getApiUrl("").replace(/\/$/, "");
+
+   if (!window.QwenPaw) {
+     (window as any).QwenPaw = {} as WindowNamespace;
+diff --git a/src/plugins/hostSdk/fetch.ts b/src/plugins/hostSdk/fetch.ts
+index 78bef3e..8be167c 100644
+--- a/src/plugins/hostSdk/fetch.ts
++++ b/src/plugins/hostSdk/fetch.ts
+@@ -1,19 +1,19 @@
+ /**
+  * hostSdk/fetch.ts — auth-aware fetch wrapper for plugins.
+  *
+- * Reuses `buildAuthHeaders()` which already injects `Authorization`
+- * and `X-Agent-Id` from the agent store. Plugin callers pass an API path
++ * Reuses the method-aware header helper for the selected agent and CSRF.
++ * Plugin callers pass an API path
+  * (e.g. "/console/chat") and get back a normal Response.
+  */
+ import { getApiUrl } from "../../api/config";
+-import { buildAuthHeaders } from "../../api/authHeaders";
++import { buildMutationHeaders } from "../../api/authHeaders";
+
+ export async function hostFetch(
+   path: string,
+   init?: RequestInit,
+ ): Promise<Response> {
+   const headers: Record<string, string> = {
+-    ...buildAuthHeaders(),
++    ...await buildMutationHeaders(init?.method ?? "GET", init?.signal),
+     ...((init?.headers as Record<string, string>) ?? {}),
+   };
+   return fetch(getApiUrl(path), { ...init, headers });
+diff --git a/src/plugins/usePluginLoader.ts b/src/plugins/usePluginLoader.ts
+index b745352..6417cc9 100644
+--- a/src/plugins/usePluginLoader.ts
++++ b/src/plugins/usePluginLoader.ts
+@@ -8,7 +8,7 @@
+  * Exports `loadAllPlugins()` — the single function PluginContext calls.
+  */
+
+-import { getApiUrl, getApiToken } from "../api/config";
++import { getApiUrl } from "../api/config";
+
+ // ─────────────────────────────────────────────────────────────────────────────
+ // Plugin manifest type (mirrors backend PluginInfo)
+@@ -37,11 +37,7 @@ function resolveUrl(pluginId: string, apiPath: string): string {
+  * execute it via dynamic import.  Blob URL is revoked immediately after.
+  */
+ async function executePluginScript(entryUrl: string): Promise<void> {
+-  const token = getApiToken();
+-  const headers: Record<string, string> = {};
+-  if (token) headers["Authorization"] = `Bearer ${token}`;
+-
+-  const response = await fetch(entryUrl, { headers });
++  const response = await fetch(entryUrl);
+   if (!response.ok) {
+     throw new Error(`HTTP ${response.status} for ${entryUrl}`);
+   }
+@@ -76,10 +72,7 @@ export async function loadAllPlugins(): Promise<{
+
+   let plugins: PluginInfo[];
+   try {
+-    const token = getApiToken();
+-    const headers: Record<string, string> = {};
+-    if (token) headers["Authorization"] = `Bearer ${token}`;
+-    const res = await fetch(getApiUrl("/frontend_plugin"), { headers });
++    const res = await fetch(getApiUrl("/frontend_plugin"));
+     if (!res.ok) {
+       console.warn(`[PluginLoader] /api/plugins returned ${res.status}`);
+       return { loaded: 0, failed: [] };
+diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
+index 8d5b9a3..331cf37 100644
+--- a/src/stores/agentStore.test.ts
++++ b/src/stores/agentStore.test.ts
+@@ -1,6 +1,8 @@
+ import { describe, it, expect, beforeEach, vi } from "vitest";
+ import { useAgentStore } from "./agentStore";
+ import type { AgentSummary } from "@/api/types/agents";
++import { buildAuthHeaders } from "@/api/authHeaders";
++import { clearValidatedDefaultAgent } from "@/api/agentScope";
+
+ const mocks = vi.hoisted(() => ({
+   listAgents: vi.fn(),
+@@ -14,10 +16,14 @@ vi.mock("../api/modules/agents", () => ({
+
+ const mockAgent = (id: string): AgentSummary =>
+   ({ id, name: `Agent ${id}` }) as AgentSummary;
++const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
+
+ describe("agentStore", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    clearValidatedDefaultAgent();
++    sessionStorage.clear();
++    localStorage.clear();
+     // Reset to initial state before each test
+     useAgentStore.setState({
+       selectedAgent: "default",
+@@ -80,6 +86,62 @@ describe("agentStore", () => {
+     expect(useAgentStore.getState().agents).toEqual([mockAgent("1")]);
+   });
+
++  it("replaces the bootstrap placeholder with the real default UUID", async () => {
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().agents).toEqual([defaultAgent]);
++    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
++  });
++
++  it("replaces a stale stored UUID with the only real default agent", async () => {
++    useAgentStore.setState({
++      selectedAgent: "20000000-0000-4000-8000-000000000011",
++    });
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    mocks.listAgents.mockResolvedValue({ agents: [defaultAgent] });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().selectedAgent).toBe(DEFAULT_AGENT_ID);
++  });
++
++  it("starts headerless, then scopes later requests to the listed default UUID", async () => {
++    const staleId = "20000000-0000-4000-8000-000000000011";
++    useAgentStore.setState({ selectedAgent: staleId, agents: [] });
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    let startupHeaders: Record<string, string> | undefined;
++    mocks.listAgents.mockImplementation(async () => {
++      startupHeaders = buildAuthHeaders();
++      return { agents: [defaultAgent] };
++    });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(startupHeaders).toEqual({});
++    expect(buildAuthHeaders()).toEqual({
++      "X-Agent-Id": DEFAULT_AGENT_ID,
++      "x-digitalmate-agent-id": DEFAULT_AGENT_ID,
++    });
++  });
++
+   it("allows a new refresh after the previous request settles", async () => {
+     mocks.listAgents.mockResolvedValue({ agents: [] });
+
+diff --git a/src/stores/agentStore.ts b/src/stores/agentStore.ts
+index 8249f60..92624eb 100644
+--- a/src/stores/agentStore.ts
++++ b/src/stores/agentStore.ts
+@@ -2,6 +2,10 @@ import { create } from "zustand";
+ import { persist } from "zustand/middleware";
+ import type { AgentSummary } from "../api/types/agents";
+ import { agentsApi } from "../api/modules/agents";
++import {
++  clearValidatedDefaultAgent,
++  markValidatedDefaultAgent,
++} from "../api/agentScope";
+ import { menuRegistry } from "../plugins/registry/store";
+
+ /**
+@@ -83,6 +87,14 @@ export const useAgentStore = create<AgentStore>()(
+
+       setSelectedAgent: (agentId) => {
+         set({ selectedAgent: agentId });
++        const selected = get().agents.find(
++          (agent) => agent.id === agentId && agent.is_default === true,
++        );
++        if (selected) {
++          markValidatedDefaultAgent(selected.id);
++        } else {
++          clearValidatedDefaultAgent();
++        }
+         menuRegistry.refresh();
+         // Persist to localStorage so new tabs inherit this choice
+         try {
+@@ -100,6 +112,23 @@ export const useAgentStore = create<AgentStore>()(
+         }
+
+         agentRefreshPromise = agentsApi.listAgents().then((response) => {
++          const defaultAgent = response.agents.find(
++            (agent) => agent.is_default === true,
++          );
++          if (defaultAgent) {
++            markValidatedDefaultAgent(defaultAgent.id);
++            set({
++              agents: response.agents,
++              selectedAgent: defaultAgent.id,
++            });
++            try {
++              localStorage.setItem(LAST_USED_AGENT_KEY, defaultAgent.id);
++            } catch {
++              /* ignore */
++            }
++            return;
++          }
++          clearValidatedDefaultAgent();
+           set({ agents: response.agents });
+         });
+         try {
+diff --git a/src/utils/error.ts b/src/utils/error.ts
+index 5e19f38..1744a41 100644
+--- a/src/utils/error.ts
++++ b/src/utils/error.ts
+@@ -1,5 +1,23 @@
+ export function parseErrorDetail(error: unknown): Record<string, any> | null {
+   if (!(error instanceof Error)) return null;
++  const structured = error as Error & {
++    status?: unknown;
++    code?: unknown;
++    details?: unknown;
++  };
++  if (
++    typeof structured.status === "number" &&
++    typeof structured.code === "string"
++  ) {
++    return {
++      status: structured.status,
++      code: structured.code,
++      message: structured.message,
++      ...("details" in structured
++        ? { details: structured.details }
++        : {}),
++    };
++  }
+   const msg = error.message;
+   // Try " - " separator first (from request.ts formatted errors)
+   const idx = msg.indexOf(" - ");
