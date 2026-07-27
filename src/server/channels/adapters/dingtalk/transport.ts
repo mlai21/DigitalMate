@@ -133,7 +133,7 @@ export function createDingTalkSdkClient(
         { type: "CALLBACK", topic: TOPIC_ROBOT },
       );
       await client.connect();
-      await registrationWaiter(input.signal, 15_000);
+      await readinessWaiter(input.signal, 15_000);
       started = true;
     },
     async stop() {
@@ -341,12 +341,7 @@ export function createDingTalkSdkClient(
       if (!message) return;
       if (message.type === "SYSTEM") {
         client.onSystem(message);
-        if (message.headers.topic === "REGISTERED") {
-          reconnectAttempts = 0;
-          if (started) {
-            runtimeCallbacks?.onReconnected?.();
-          }
-        } else if (message.headers.topic === "disconnect") {
+        if (message.headers.topic === "disconnect") {
           socket?.close();
         }
         return;
@@ -430,7 +425,7 @@ export function createDingTalkSdkClient(
       reconnectTimer = null;
       void client.connect()
         .then(() =>
-          registrationWaiter(
+          readinessWaiter(
             runtimeCallbacks?.signal
               ?? new AbortController().signal,
             15_000,
@@ -445,7 +440,17 @@ export function createDingTalkSdkClient(
     reconnectTimer.unref?.();
   }
 
-  function registrationWaiter(
+  // DingTalk only pushes the `ping` and `disconnect` system topics, so the
+  // SDK's `registered` flag can stay false on a live socket forever.
+  function socketReady(): boolean {
+    return Boolean(
+      sdk?.connected
+      && socket
+      && socket.readyState === WebSocket.OPEN,
+    );
+  }
+
+  function readinessWaiter(
     signal: AbortSignal,
     timeoutMs: number,
   ): Promise<void> {
@@ -453,8 +458,10 @@ export function createDingTalkSdkClient(
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
       const timer = setInterval(() => {
-        if (sdk?.registered) {
+        if (socketReady()) {
           cleanup();
+          reconnectAttempts = 0;
+          if (started) runtimeCallbacks?.onReconnected?.();
           resolve();
           return;
         }
