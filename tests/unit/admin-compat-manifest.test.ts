@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -117,6 +118,56 @@ const EXPECTED_MODULE_STATUS = {
   workspace: "mapped",
 } as const;
 
+const EXPECTED_MODULE_STATUS_COUNTS = {
+  mapped: 23,
+  disabled: 7,
+  redirected: 2,
+} as const;
+
+const EXPECTED_ENDPOINT_STATUS_COUNTS = {
+  mapped: 118,
+  disabled: 143,
+  redirected: 5,
+} as const;
+
+const EXPECTED_ENDPOINT_CONTRACT_SHA256 =
+  "9e1f9a7285b85b1ef062bf968a7b237a37468bfa62010174a9a0047c9a4c8420";
+
+const EXPECTED_ENDPOINT_STATUS_COUNTS_BY_MODULE = {
+  accessControl: [13, 0, 0],
+  acp: [0, 6, 0],
+  agent: [7, 10, 1],
+  agentStats: [1, 0, 0],
+  agents: [6, 2, 0],
+  auth: [1, 3, 0],
+  backup: [7, 0, 0],
+  channel: [6, 2, 0],
+  chat: [9, 0, 4],
+  codingMode: [0, 2, 0],
+  codingProject: [0, 8, 0],
+  commands: [2, 0, 0],
+  console: [5, 0, 0],
+  cronjob: [11, 0, 0],
+  debug: [1, 0, 0],
+  env: [1, 2, 0],
+  git: [0, 11, 0],
+  heartbeat: [3, 0, 0],
+  language: [2, 1, 0],
+  localModel: [0, 12, 0],
+  market: [0, 3, 0],
+  mcp: [5, 9, 0],
+  plugin: [3, 3, 0],
+  pluginMarket: [0, 1, 0],
+  provider: [3, 17, 0],
+  root: [2, 0, 0],
+  security: [7, 9, 0],
+  skill: [11, 30, 0],
+  tokenUsage: [2, 0, 0],
+  tools: [2, 3, 0],
+  userTimezone: [2, 0, 0],
+  workspace: [6, 9, 0],
+} as const;
+
 describe("QwenPaw Console upstream API contract", () => {
   it("固定版本 32 个 API 模块都有审计状态", () => {
     expect(EXPECTED_UPSTREAM_API_MODULES).toEqual(EXPECTED_MODULES);
@@ -134,6 +185,79 @@ describe("QwenPaw Console upstream API contract", () => {
       );
     }
     expect(listUpstreamEndpointContracts()).toHaveLength(266);
+  });
+
+  it("固定模块与端点状态总数及逐模块分布", () => {
+    const moduleCounts = {
+      mapped: 0,
+      disabled: 0,
+      redirected: 0,
+    };
+    const endpointCounts = {
+      mapped: 0,
+      disabled: 0,
+      redirected: 0,
+    };
+
+    for (const moduleName of EXPECTED_MODULES) {
+      const contract = UPSTREAM_API_CONTRACT[moduleName];
+      moduleCounts[contract.status] += 1;
+
+      const perModule = {
+        mapped: 0,
+        disabled: 0,
+        redirected: 0,
+      };
+      for (const endpoint of contract.endpoints) {
+        endpointCounts[endpoint.status] += 1;
+        perModule[endpoint.status] += 1;
+      }
+      expect(
+        [
+          perModule.mapped,
+          perModule.disabled,
+          perModule.redirected,
+        ],
+        moduleName,
+      ).toEqual(
+        EXPECTED_ENDPOINT_STATUS_COUNTS_BY_MODULE[moduleName],
+      );
+    }
+
+    expect(moduleCounts).toEqual(EXPECTED_MODULE_STATUS_COUNTS);
+    expect(endpointCounts).toEqual(EXPECTED_ENDPOINT_STATUS_COUNTS);
+  });
+
+  it("逐端点冻结方法、路径、状态、禁用码和跳转目标", () => {
+    const snapshot = Object.fromEntries(
+      listUpstreamEndpointContracts()
+        .map(
+          ({
+            module,
+            method,
+            path: endpointPath,
+            status,
+            disabledCode,
+            redirectTo,
+          }) =>
+            [
+              `${method} ${endpointPath}`,
+              [
+                module,
+                status,
+                disabledCode ?? null,
+                redirectTo ?? null,
+              ],
+            ] as const,
+        )
+        .sort(([left], [right]) => left.localeCompare(right)),
+    );
+    const digest = createHash("sha256")
+      .update(JSON.stringify(snapshot))
+      .digest("hex");
+
+    expect(Object.keys(snapshot)).toHaveLength(266);
+    expect(digest).toBe(EXPECTED_ENDPOINT_CONTRACT_SHA256);
   });
 
   it("固定快照包含 32 个 API 源模块和 31 个配套测试", async () => {
