@@ -154,3 +154,225 @@ index 6ee9d49..5e3f81c 100644
          headers["X-Agent-Id"] = selectedAgent;
          headers["x-digitalmate-agent-id"] = selectedAgent;
        }
+diff --git a/src/api/types/agents.ts b/src/api/types/agents.ts
+index 56e9df5..1f39ad5 100644
+--- a/src/api/types/agents.ts
++++ b/src/api/types/agents.ts
+@@ -52,10 +52,25 @@ export interface AgentCapabilities {
+   import: boolean;
+   clone: boolean;
+   delete: boolean;
++  toggle: boolean;
++  pin: boolean;
++  reorder: boolean;
+ }
+
++export const DISABLED_AGENT_CAPABILITIES: AgentCapabilities = {
++  multi_agent: false,
++  create: false,
++  import: false,
++  clone: false,
++  delete: false,
++  toggle: false,
++  pin: false,
++  reorder: false,
++};
++
+ export interface AgentListResponse {
+   agents: AgentSummary[];
++  capabilities?: AgentCapabilities;
+ }
+
+ export interface ReorderAgentsResponse {
+diff --git a/src/stores/agentStore.test.ts b/src/stores/agentStore.test.ts
+index 331cf37..e3a19b2 100644
+--- a/src/stores/agentStore.test.ts
++++ b/src/stores/agentStore.test.ts
+@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
+ import { useAgentStore } from "./agentStore";
+ import type { AgentSummary } from "@/api/types/agents";
+ import { buildAuthHeaders } from "@/api/authHeaders";
+-import { clearValidatedDefaultAgent } from "@/api/agentScope";
++import { clearValidatedAgents } from "@/api/agentScope";
+
+ const mocks = vi.hoisted(() => ({
+   listAgents: vi.fn(),
+@@ -21,7 +21,7 @@ const DEFAULT_AGENT_ID = "10000000-0000-4000-8000-000000000011";
+ describe("agentStore", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+-    clearValidatedDefaultAgent();
++    clearValidatedAgents();
+     sessionStorage.clear();
+     localStorage.clear();
+     // Reset to initial state before each test
+@@ -142,6 +142,72 @@ describe("agentStore", () => {
+     });
+   });
+
++  it("keeps a listed non-default selection across refresh", async () => {
++    const secondaryId = "10000000-0000-4000-8000-000000000012";
++    useAgentStore.setState({ selectedAgent: secondaryId, agents: [] });
++    const defaultAgent = {
++      ...mockAgent(DEFAULT_AGENT_ID),
++      is_default: true,
++      enabled: true,
++      pinned: true,
++    };
++    const secondaryAgent = {
++      ...mockAgent(secondaryId),
++      is_default: false,
++      enabled: true,
++      pinned: true,
++    };
++    mocks.listAgents.mockResolvedValue({
++      agents: [defaultAgent, secondaryAgent],
++    });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().selectedAgent).toBe(secondaryId);
++    expect(buildAuthHeaders()).toEqual({
++      "X-Agent-Id": secondaryId,
++      "x-digitalmate-agent-id": secondaryId,
++    });
++  });
++
++  it("stores the capabilities reported by the agent list", async () => {
++    mocks.listAgents.mockResolvedValue({
++      agents: [],
++      capabilities: {
++        multi_agent: true,
++        create: false,
++        import: false,
++        clone: false,
++        delete: false,
++        toggle: false,
++        pin: false,
++        reorder: false,
++      },
++    });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().capabilities.multi_agent).toBe(true);
++    expect(useAgentStore.getState().capabilities.delete).toBe(false);
++  });
++
++  it("treats a missing capabilities payload as all disabled", async () => {
++    mocks.listAgents.mockResolvedValue({ agents: [] });
++
++    await useAgentStore.getState().refreshAgents();
++
++    expect(useAgentStore.getState().capabilities).toEqual({
++      multi_agent: false,
++      create: false,
++      import: false,
++      clone: false,
++      delete: false,
++      toggle: false,
++      pin: false,
++      reorder: false,
++    });
++  });
++
+   it("allows a new refresh after the previous request settles", async () => {
+     mocks.listAgents.mockResolvedValue({ agents: [] });
+
+diff --git a/src/stores/agentStore.ts b/src/stores/agentStore.ts
+index 92624eb..d0f9318 100644
+--- a/src/stores/agentStore.ts
++++ b/src/stores/agentStore.ts
+@@ -1,10 +1,14 @@
+ import { create } from "zustand";
+ import { persist } from "zustand/middleware";
+-import type { AgentSummary } from "../api/types/agents";
++import {
++  DISABLED_AGENT_CAPABILITIES,
++  type AgentCapabilities,
++  type AgentSummary,
++} from "../api/types/agents";
+ import { agentsApi } from "../api/modules/agents";
+ import {
+-  clearValidatedDefaultAgent,
+-  markValidatedDefaultAgent,
++  clearValidatedAgents,
++  markValidatedAgents,
+ } from "../api/agentScope";
+ import { menuRegistry } from "../plugins/registry/store";
+
+@@ -25,6 +29,7 @@ let agentRefreshPromise: Promise<void> | null = null;
+ interface AgentStore {
+   selectedAgent: string;
+   agents: AgentSummary[];
++  capabilities: AgentCapabilities;
+   /** Per-agent last active chat ID for restoring on agent switch */
+   lastChatIdByAgent: Record<string, string>;
+   setSelectedAgent: (agentId: string) => void;
+@@ -83,18 +88,11 @@ export const useAgentStore = create<AgentStore>()(
+     (set, get) => ({
+       selectedAgent: getInitialSelectedAgent(),
+       agents: [],
++      capabilities: { ...DISABLED_AGENT_CAPABILITIES },
+       lastChatIdByAgent: {},
+
+       setSelectedAgent: (agentId) => {
+         set({ selectedAgent: agentId });
+-        const selected = get().agents.find(
+-          (agent) => agent.id === agentId && agent.is_default === true,
+-        );
+-        if (selected) {
+-          markValidatedDefaultAgent(selected.id);
+-        } else {
+-          clearValidatedDefaultAgent();
+-        }
+         menuRegistry.refresh();
+         // Persist to localStorage so new tabs inherit this choice
+         try {
+@@ -115,21 +113,36 @@ export const useAgentStore = create<AgentStore>()(
+           const defaultAgent = response.agents.find(
+             (agent) => agent.is_default === true,
+           );
+-          if (defaultAgent) {
+-            markValidatedDefaultAgent(defaultAgent.id);
+-            set({
+-              agents: response.agents,
+-              selectedAgent: defaultAgent.id,
+-            });
++          if (response.agents.length === 0) {
++            clearValidatedAgents();
++          } else {
++            markValidatedAgents(
++              response.agents.map((agent) => agent.id),
++              defaultAgent?.id ?? null,
++            );
++          }
++          const previousSelected = get().selectedAgent;
++          const selectionIsUsable = response.agents.some(
++            (agent) => agent.id === previousSelected && agent.enabled,
++          );
++          const nextSelected = selectionIsUsable
++            ? previousSelected
++            : defaultAgent?.id ?? previousSelected;
++          set({
++            agents: response.agents,
++            capabilities: response.capabilities ?? {
++              ...DISABLED_AGENT_CAPABILITIES,
++            },
++            selectedAgent: nextSelected,
++          });
++          if (nextSelected !== previousSelected) {
++            menuRegistry.refresh();
+             try {
+-              localStorage.setItem(LAST_USED_AGENT_KEY, defaultAgent.id);
++              localStorage.setItem(LAST_USED_AGENT_KEY, nextSelected);
+             } catch {
+               /* ignore */
+             }
+-            return;
+           }
+-          clearValidatedDefaultAgent();
+-          set({ agents: response.agents });
+         });
+         try {
+           await agentRefreshPromise;
