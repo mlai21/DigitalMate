@@ -7,19 +7,21 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 # console:build applies vendor patches via `git apply`
 RUN apk add --no-cache git
-# Console 的 vite 打包在默认堆上限下会 OOM
-ENV NODE_OPTIONS=--max-old-space-size=4096
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # 内存不足以打包 Console 的部署环境可传 PREBUILT_CONSOLE=1，
 # 改用构建上下文里已有的 public/_admin-console 产物。
 ARG PREBUILT_CONSOLE=0
+# 堆上限必须小于构建机物理内存：Node 在额度用尽前不会认真回收，
+# 声明得比内存还大会让整机在 GC 之前先陷入颠簸。
+# 从源码打包 Console 需要 4096，只应在内存 ≥8GB 的构建机上传入。
+ARG NODE_HEAP_MB=2048
 RUN if [ "$PREBUILT_CONSOLE" = "1" ]; then \
       test -f public/_admin-console/index.html \
         || { echo "PREBUILT_CONSOLE=1 requires public/_admin-console/index.html"; exit 1; }; \
-      npm run build:next; \
+      NODE_OPTIONS=--max-old-space-size=${NODE_HEAP_MB} npm run build:next; \
     else \
-      npm run build; \
+      NODE_OPTIONS=--max-old-space-size=${NODE_HEAP_MB} npm run build; \
     fi
 
 FROM node:22-alpine AS runner

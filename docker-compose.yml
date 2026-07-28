@@ -2,6 +2,7 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    mem_limit: ${CADDY_MEM_LIMIT:-256m}
     # 生产部署必须配置域名，由 Caddy 自动申请 HTTPS 证书。
     environment:
       DOMAIN: "${DOMAIN:?请设置解析到本服务器的 HTTPS 域名}"
@@ -20,6 +21,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    mem_limit: ${POSTGRES_MEM_LIMIT:-768m}
     environment:
       POSTGRES_DB: digitalmate
       POSTGRES_USER: digitalmate
@@ -40,7 +42,10 @@ services:
       context: .
       args:
         PREBUILT_CONSOLE: ${PREBUILT_CONSOLE:-0}
+        NODE_HEAP_MB: ${NODE_HEAP_MB:-2048}
     restart: unless-stopped
+    # 上限只用于兜住失控进程，让 OOM 只杀该杀的容器而不是拖垮整机。
+    mem_limit: ${WEB_MEM_LIMIT:-1g}
     command: sh -c "npm run db:migrate && npm run db:seed && npm run start"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
@@ -99,6 +104,8 @@ services:
       context: .
       args:
         PREBUILT_CONSOLE: ${PREBUILT_CONSOLE:-0}
+        NODE_HEAP_MB: ${NODE_HEAP_MB:-2048}
+    mem_limit: ${AGENT_MEM_LIMIT:-1g}
     command: sh -c "npm run agent"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
