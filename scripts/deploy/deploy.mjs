@@ -289,22 +289,34 @@ async function syncFiles(files) {
 
 async function rebuild() {
   log(`· 开始构建（NODE_HEAP_MB=${config.nodeHeapMb}，只 build 不停容器）`);
+  // The build appends its own exit code as the last line, so completion is read
+  // from the log instead of probed with pgrep: a pattern like "docker compose
+  // build" also matches the shell carrying the probe itself, which kept every
+  // poll reporting "still running" until the deadline.
   await ssh(
-    `cd ${config.remoteDir} && sudo sh -c "NODE_HEAP_MB=${config.nodeHeapMb} nohup nice -n 10 docker compose build > ${buildLog} 2>&1 &"`,
+    `cd ${config.remoteDir} && sudo sh -c 'NODE_HEAP_MB=${config.nodeHeapMb} nohup sh -c "nice -n 10 docker compose build > ${buildLog} 2>&1; echo BUILD_EXIT=\\$? >> ${buildLog}" > /dev/null 2>&1 &'`,
   );
   const deadline = Date.now() + 30 * 60 * 1_000;
+  let exitCode = null;
   while (Date.now() < deadline) {
     await sleep(20_000);
     const status = await ssh(
-      `if pgrep -f "docker compose build" > /dev/null; then echo RUNNING; else echo IDLE; fi; free -m | sed -n 2p; tail -n 2 ${buildLog}`,
+      `free -m | sed -n 2p; tail -n 3 ${buildLog}`,
     ).catch((error) => `PROBE_FAILED ${error.message}`);
     const mem = status.match(/Mem:\s+\d+\s+(\d+)/);
+    const finished = status.match(/BUILD_EXIT=(\d+)/);
     log(`  构建中… 已用内存 ${mem ? `${mem[1]} MB` : "未知"}`);
-    if (status.includes("IDLE")) break;
+    if (finished) {
+      exitCode = Number(finished[1]);
+      break;
+    }
   }
-  const tail = await ssh(`tail -n 30 ${buildLog}`);
-  if (/^ERROR|error:|failed to solve/m.test(tail)) {
-    fail(`构建失败，日志尾部：\n${tail}`);
+  if (exitCode === null) {
+    fail(`构建 30 分钟未结束，检查服务器上的 ${buildLog}`);
+  }
+  if (exitCode !== 0) {
+    const tail = await ssh(`tail -n 30 ${buildLog}`);
+    fail(`构建失败（退出码 ${exitCode}），日志尾部：\n${tail}`);
   }
   log("✓ 构建完成，切换容器");
   await ssh(`cd ${config.remoteDir} && sudo docker compose up -d`);

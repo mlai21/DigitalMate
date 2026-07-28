@@ -24,7 +24,7 @@ description: Use when deploying DigitalMate to the production VPS, syncing code 
 
 `~/.ssh/config` 里的 `ecs-sh`（`47.102.126.206`）**不是这台机器**，是另一台无关主机。查线上问题时别对着它敲。
 
-## 五个反复咬人的坑
+## 六个反复咬人的坑
 
 **一、ssh 秒断 = 本地代理，不是服务器。** Clash Verge 跑 TUN 模式且持久化为**全局模式**，所有流量都进代理，而节点封了 22 端口，表现为 `Connection closed by 47.88.93.94 port 22`。基于规则的绕行没用，因为全局模式下规则根本不参与匹配，而且应用会不断把模式重置回 global。唯一稳的办法是在 TUN 层排除这个 IP（`tun.route-exclude-address`），这样它不进代理，任何模式都直连。脚本每次运行都会检查并补上。另外 `verge.yaml` 里 `auto_close_connection: true` 会在配置重载时掐掉所有在途连接，所以长命令可能断在中途——重试即可。
 
@@ -35,6 +35,8 @@ description: Use when deploying DigitalMate to the production VPS, syncing code 
 **四、构建期不要停服务。** 用 `docker compose build` 先构建、成功后再 `up -d`。直接 `up -d --build` 会在构建失败时留下停机窗口。
 
 **五、macOS 打包会偷偷塞 AppleDouble。** 用 `tar` 传文件必须带 `COPYFILE_DISABLE=1`，否则服务器上会多出一堆 `._xxx.ts` 垃圾（现在 `src/` 下还残留 26 个，是历史遗留）。
+
+**六、别用 `pgrep` 判断后台构建结束。** `pgrep -f "docker compose build"` 会匹配到承载这条探测命令的 shell 自己，于是每轮都报"还在构建"，白等到 30 分钟超时才切容器。构建结束的判定改成往日志末尾追加 `BUILD_EXIT=$?`，脚本读退出码：既不会自匹配，也能拿到真实成败而不用去正则匹配日志里的 `ERROR`。
 
 ## 常规流程
 
