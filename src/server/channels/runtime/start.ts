@@ -278,6 +278,15 @@ export async function startChannelRuntime(input: Readonly<{
       );
       return getLlmClient("main", input.env, routing);
     },
+    resolveLightModel: async (scope, routing) => {
+      await assertAuthorizedModelRoutes(
+        scope,
+        ["light"],
+        routing,
+        input.repositories.agents,
+      );
+      return getLlmClient("light", input.env, routing);
+    },
     search: (query, _ignored, signal) =>
       searchWeb(query, input.env, signal),
     skillInstaller: {

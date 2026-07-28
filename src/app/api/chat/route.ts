@@ -10,6 +10,7 @@ import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
 import { runAgent } from "@/server/agent/run-agent";
 import { createSearchGate, normalizeSearchAggressiveness } from "@/server/agent/search-gate";
 import { buildExplicitSkillFallbackMessage, parseSlashCommand } from "@/server/agent/skill-command";
+import { withLlmSkillMatching } from "@/server/agent/skill-routing";
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
 import { loadAttachmentContext } from "@/server/attachments/context";
 import { readAttachment } from "@/server/attachments/storage";
@@ -24,6 +25,7 @@ import {
   type UserDataRequestFence,
 } from "@/server/db/repositories";
 import { recordEventReflection } from "@/server/evolution/event-reflection";
+import { recordSkillMismatch } from "@/server/evolution/skill-mismatch";
 import { recordTurnReview } from "@/server/evolution/turn-review";
 import { supportsImageInput } from "@/server/llm/catalog";
 import type { LlmMessage } from "@/server/llm/types";
@@ -256,6 +258,16 @@ async function handleLeasedChatRequest(
       summary: body.data.message,
       source: { conversationId, messageId: userMessage.id },
     }).catch(() => undefined);
+    // Before this turn logs its own Skill usage, so the Skill under review is
+    // the one that was auto-applied to the message being corrected.
+    await recordSkillMismatch({
+      repositories,
+      scope,
+      conversationId,
+      correction: body.data.message,
+      llm: light.client,
+      model: light.model,
+    }).catch(() => undefined);
   }
   const existingAssistant = await repositories.messages.findByClientTurn(scope, clientTurnId, "assistant");
   if (existingAssistant) {
@@ -387,7 +399,7 @@ async function handleLeasedChatRequest(
             persona: settings.persona,
             llm: client,
             model,
-            repositories,
+            repositories: withLlmSkillMatching(repositories, light),
             explicitSkillIds,
             createSkillMode,
             webSearchEnabled: body.data.searchEnabled === true,

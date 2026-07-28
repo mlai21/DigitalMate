@@ -203,6 +203,99 @@ describe("channel agent turn", () => {
       .toHaveBeenCalledWith(scope, ["skill-1"]);
   });
 
+  it("渠道私聊用自然语言即可命中已启用 Skill，并留痕匹配依据", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("按周报流程来。");
+    const runner = createRunner(
+      repositories,
+      llm.client,
+      '{"skill":1,"reason":"用户要做的正是每周复盘"}',
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "帮我把这周的进展捋一下",
+    })));
+
+    expect(repositories.skills.listEnabledIndex).toHaveBeenCalledWith(scope);
+    expect(repositories.skills.findByIds)
+      .toHaveBeenCalledWith(scope, ["skill-1"]);
+    expect(systemPrompt(llm.calls)).toContain("已启用 Skills");
+    expect(systemPrompt(llm.calls)).toContain("weekly-review");
+    expect(repositories.skills.recordUsage).toHaveBeenCalledWith(
+      scope,
+      ["skill-1"],
+      "conversation-1",
+      "auto",
+      "用户要做的正是每周复盘",
+    );
+  });
+
+  it("群聊被 @ 时同样走自然语言匹配", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("我按已批准的做法来。");
+    const runner = createRunner(
+      repositories,
+      llm.client,
+      '{"skill":1,"reason":"群里要的就是每周复盘"}',
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      chatType: "group",
+      mentioned: true,
+      text: "@Alvin 把这周的进展捋一下",
+    })));
+
+    expect(repositories.skills.listEnabledIndex).toHaveBeenCalledWith(scope);
+    expect(systemPrompt(llm.calls)).toContain("weekly-review");
+  });
+
+  it("路由模型判定都不贴合时不加载任何 Skill", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("在的，怎么了？");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({ text: "在吗" })));
+
+    expect(repositories.skills.listEnabledIndex).toHaveBeenCalledWith(scope);
+    expect(repositories.skills.findByIds).not.toHaveBeenCalled();
+    expect(systemPrompt(llm.calls)).not.toContain("已启用 Skills");
+    expect(repositories.skills.recordUsage).not.toHaveBeenCalled();
+  });
+
+  it("显式指定 Skill 时不做自动匹配", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("按 weekly-review 执行。");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "/weekly-review 整理这一周",
+      skillPermission: "explicit_slash",
+    })));
+
+    expect(repositories.skills.listEnabledIndex).not.toHaveBeenCalled();
+    expect(repositories.skills.findByIds)
+      .toHaveBeenCalledWith(scope, ["skill-1"]);
+    expect(repositories.skills.recordUsage).toHaveBeenCalledWith(
+      scope,
+      ["skill-1"],
+      "conversation-1",
+      "explicit",
+    );
+  });
+
+  it("附件在场时不自动匹配 Skill", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("我只看附件内容。");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "帮我整理周报",
+      attachmentsPresent: true,
+    })));
+
+    expect(repositories.skills.listEnabledIndex).not.toHaveBeenCalled();
+  });
+
   it("管理员私聊挂载 Skill 创建工具", async () => {
     const repositories = fakeRepositories();
     const llm = recordingLlm("我们先给它起个名字。");
@@ -270,6 +363,7 @@ describe("channel agent turn", () => {
     const runner = createChannelAgentTurnRunner({
       repositories: repositories as never,
       resolveMainModel: () => ({ client: llm, model: "mock-main" }),
+      resolveLightModel: () => ({ client: llm, model: "mock-light" }),
       search: search as never,
       now: () => now,
     });
@@ -298,6 +392,10 @@ describe("channel agent turn", () => {
       resolveMainModel: () => ({
         client: textLlm("我会只阅读已有上下文。"),
         model: "mock-main",
+      }),
+      resolveLightModel: () => ({
+        client: textLlm('{"skill":0,"reason":"不贴合"}'),
+        model: "mock-light",
       }),
       search: search as never,
       now: () => now,
@@ -334,6 +432,126 @@ describe("channel agent turn", () => {
         }),
       }),
     );
+  });
+
+  it("自动命中后被纠正会产出收紧适用场景的待确认草稿", async () => {
+    const repositories = fakeRepositories();
+    const tightened = [
+      "---",
+      "name: weekly-review",
+      "description: 用户明确要按周复盘时（不适用于临时进度同步）",
+      "---",
+      "# weekly-review",
+      "",
+      "## 步骤",
+      "1. 收集本周更新",
+    ].join("\n");
+    const runner = createRunner(
+      repositories,
+      textLlm("我重新按你的意思来。"),
+      undefined,
+      JSON.stringify({
+        mismatched: true,
+        reason: "用户只是要临时同步进度，不是周复盘",
+        content: tightened,
+      }),
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "你理解错了，我不是要周复盘",
+    })));
+
+    expect(repositories.skillUsageLogs.latestAutoMatch)
+      .toHaveBeenCalledWith(scope, "conversation-1");
+    expect(repositories.skillRevisions.create).toHaveBeenCalledWith({
+      userId: scope.userId,
+      skillId: "skill-1",
+      proposedContent: tightened,
+      reason: expect.stringContaining("以为用户要做周复盘"),
+    });
+  });
+
+  it("销售的纠正同样算误匹配信号，草稿仍需管理员确认", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("好，我换个说法。"),
+      undefined,
+      JSON.stringify({
+        mismatched: true,
+        reason: "问的是报价，不是周复盘",
+        content: [
+          "---",
+          "name: weekly-review",
+          "description: 用户明确要按周复盘时",
+          "---",
+          "# weekly-review",
+          "",
+          "## 步骤",
+          "1. 收集本周更新",
+        ].join("\n"),
+      }),
+    );
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "你答错了，我问的是报价",
+      externalSenderId: "sales-1",
+      manageGlobalAssets: false,
+    })));
+
+    expect(repositories.skillRevisions.create).toHaveBeenCalledTimes(1);
+    // The sales seat still must not write global reflections.
+    expect(repositories.reflections.create).not.toHaveBeenCalled();
+  });
+
+  it("普通消息与没有自动命中记录时都不产出草稿", async () => {
+    const plain = fakeRepositories();
+    await collect(createRunner(plain, textLlm("你好呀。")).runAgentTurn(
+      createContext({ text: "你好" }),
+    ));
+    expect(plain.skillUsageLogs.latestAutoMatch).not.toHaveBeenCalled();
+    expect(plain.skillRevisions.create).not.toHaveBeenCalled();
+
+    const noMatch = fakeRepositories({ latestAutoMatch: null });
+    await collect(createRunner(noMatch, textLlm("我改一下。")).runAgentTurn(
+      createContext({ text: "你理解错了" }),
+    ));
+    expect(noMatch.skillUsageLogs.latestAutoMatch).toHaveBeenCalled();
+    expect(noMatch.skillRevisions.create).not.toHaveBeenCalled();
+  });
+
+  it("同一条纠正重放不会产出第二份草稿", async () => {
+    const repositories = fakeRepositories();
+    const tightened = [
+      "---",
+      "name: weekly-review",
+      "description: 用户明确要按周复盘时",
+      "---",
+      "# weekly-review",
+      "",
+      "## 步骤",
+      "1. 收集本周更新",
+    ].join("\n");
+    const runner = createRunner(
+      repositories,
+      textLlm("我重新按你的意思来。"),
+      undefined,
+      JSON.stringify({
+        mismatched: true,
+        reason: "不是周复盘",
+        content: tightened,
+      }),
+    );
+    const journal = memoryJournal();
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "你理解错了，我不是要周复盘",
+    }, journal)));
+    await collect(runner.runAgentTurn(createContext({
+      text: "你理解错了，我不是要周复盘",
+    }, journal)));
+
+    expect(repositories.skillRevisions.create).toHaveBeenCalledTimes(1);
   });
 
   it("销售私聊只检索当前发送者的记忆", async () => {
@@ -460,15 +678,38 @@ describe("channel agent turn", () => {
   });
 });
 
+/**
+ * One light client serves both Skill routing and the mismatch draft in a turn,
+ * so it answers by which prompt it was handed.
+ */
+function lightLlm(skillRoute: string, mismatchReply: string): LlmClient {
+  return {
+    async *stream() {},
+    async completeText(input) {
+      const prompt = input.messages.map((message) => message.content).join("\n");
+      return prompt.includes("把适用场景改窄") ? mismatchReply : skillRoute;
+    },
+  };
+}
+
 function createRunner(
   repositories: ReturnType<typeof fakeRepositories>,
   llm: LlmClient,
+  skillRoute?: string,
+  mismatchReply?: string,
 ) {
   return createChannelAgentTurnRunner({
     repositories: repositories as never,
     resolveMainModel: () => ({
       client: llm,
       model: "mock-main",
+    }),
+    resolveLightModel: () => ({
+      client: lightLlm(
+        skillRoute ?? '{"skill":0,"reason":"不贴合"}',
+        mismatchReply ?? '{"mismatched":false,"reason":"与做法无关","content":null}',
+      ),
+      model: "mock-light",
     }),
     now: () => now,
   });
@@ -544,6 +785,7 @@ function fakeRepositories(
   overrides: {
     recentMessageCount?: number;
     historyAttachment?: boolean;
+    latestAutoMatch?: null;
   } = {},
 ) {
   return {
@@ -613,6 +855,11 @@ function fakeRepositories(
       findAppliedSuggestions: vi.fn(async () => []),
     },
     skills: {
+      listEnabledIndex: vi.fn(async () => [{
+        id: "skill-1",
+        name: "weekly-review",
+        trigger: "每周复盘",
+      }]),
       findEnabledByName: vi.fn(async () => ({
         id: "skill-1",
         name: "weekly-review",
@@ -624,6 +871,34 @@ function fakeRepositories(
         content: "按周复盘",
       }]),
       recordUsage: vi.fn(),
+      create: vi.fn(),
+    },
+    skillUsageLogs: {
+      latestAutoMatch: vi.fn(async () => (
+        overrides.latestAutoMatch === undefined
+          ? {
+            skill: {
+              id: "skill-1",
+              name: "weekly-review",
+              trigger: "每周复盘",
+              content: [
+                "---",
+                "name: weekly-review",
+                "description: 每周复盘",
+                "---",
+                "# weekly-review",
+                "",
+                "## 步骤",
+                "1. 收集本周更新",
+              ].join("\n"),
+            },
+            matchReason: "以为用户要做周复盘",
+          }
+          : overrides.latestAutoMatch
+      )),
+    },
+    skillRevisions: {
+      hasPendingForSkill: vi.fn(async () => false),
       create: vi.fn(),
     },
     conversationSummaries: {

@@ -1002,6 +1002,47 @@ describe("runAgent", () => {
       ["skill-1", "skill-2"],
       "conversation-1",
       "auto",
+      null,
+    );
+  });
+
+  it("forwards the auto-match reason to the usage log", async () => {
+    const recordUsage = vi.fn();
+    const llm = scriptedLlm([[{ type: "text", text: "按这套来。" }]]);
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我把这周进展捋一下",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: {
+          findEnabled: async () => [{
+            id: "skill-1",
+            name: "周报整理",
+            trigger: "整理周报",
+            content: "# 周报整理",
+            matchReason: "用户要做的正是整理周报",
+          }],
+          recordUsage,
+        },
+      },
+      search: { run: vi.fn() },
+    })) {
+      void chunk;
+    }
+
+    expect(recordUsage).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      ["skill-1"],
+      "conversation-1",
+      "auto",
+      "用户要做的正是整理周报",
     );
   });
 

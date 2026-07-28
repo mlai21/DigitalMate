@@ -42,6 +42,21 @@ export function parseSkillMd(raw: string): SkillDocument | null {
   };
 }
 
+/**
+ * The routing description a revision should write back to `skills.trigger`.
+ *
+ * `trigger` is what auto-matching judges against, so an approved revision that
+ * rewrote the frontmatter description has to reach that column too — otherwise
+ * the routing signal keeps the stale wording. Returns null when the document is
+ * unparseable, so callers keep the existing value instead of clearing it. The
+ * name is deliberately not synced: it doubles as the `/skill-name` identity and
+ * renaming is rejected by the admin API.
+ */
+export function routingTriggerFromSkillMd(content: string): string | null {
+  const description = parseSkillMd(content)?.description.trim();
+  return description ? description : null;
+}
+
 export function serializeSkillMd(input: { name: string; description: string; body: string }): string {
   return [
     "---",

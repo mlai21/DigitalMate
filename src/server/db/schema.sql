@@ -287,6 +287,10 @@ CREATE TABLE IF NOT EXISTS skill_usage_logs (
 
 ALTER TABLE IF EXISTS skill_usage_logs ADD COLUMN IF NOT EXISTS triggered_by text NOT NULL DEFAULT 'auto';
 
+-- Why auto-matching picked this Skill, so a wrong match can be reviewed later
+-- (PRD 6.3). Stays null for explicit /skill-name invocations.
+ALTER TABLE IF EXISTS skill_usage_logs ADD COLUMN IF NOT EXISTS match_reason text;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_user_identity
   ON skills(id, user_id);
 
@@ -2452,6 +2456,11 @@ CREATE INDEX IF NOT EXISTS idx_skills_origin_agent_status
   ON skills(user_id, origin_agent_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_revisions_user_status ON skill_revisions(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_usage_logs_skill_created ON skill_usage_logs(skill_id, created_at DESC);
+-- Serves "what did auto-matching pick last in this conversation", used to turn a
+-- user correction into a scope-tightening draft (PRD 6.3).
+CREATE INDEX IF NOT EXISTS idx_skill_usage_logs_auto_conversation
+  ON skill_usage_logs(user_id, agent_id, conversation_id, created_at DESC)
+  WHERE triggered_by = 'auto' AND conversation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_runs_user_status ON task_runs(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_artifacts_run ON task_artifacts(task_run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_artifacts_pending ON task_artifacts(agent_id, updated_at) WHERE status = 'pending';

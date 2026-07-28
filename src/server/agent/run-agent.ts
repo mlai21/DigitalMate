@@ -31,6 +31,8 @@ export type SkillContext = {
   name: string;
   trigger: string;
   content: string;
+  /** Why auto-matching picked this Skill; persisted for admin review only. */
+  matchReason?: string;
 };
 
 export type EnabledToolContext = {
@@ -59,7 +61,11 @@ export type RunAgentInput = AgentScope & {
       latest(scope: AgentScope, conversationId: string): Promise<string | null>;
     };
     skills?: {
-      findEnabled(scope: AgentScope, query: string): Promise<SkillContext[]>;
+      findEnabled(
+        scope: AgentScope,
+        query: string,
+        signal?: AbortSignal,
+      ): Promise<SkillContext[]>;
       findByIds?(scope: AgentScope, skillIds: string[]): Promise<SkillContext[]>;
       create?(scope: AgentScope, draft: SkillDraft): Promise<unknown> | unknown;
       recordUsage?(
@@ -67,6 +73,7 @@ export type RunAgentInput = AgentScope & {
         skillIds: string[],
         conversationId: string | null,
         triggeredBy?: "auto" | "explicit",
+        matchReason?: string | null,
       ): Promise<unknown> | unknown;
     };
     reflections?: {
@@ -239,7 +246,8 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
       : Promise.resolve([] as SkillContext[]),
     hasAttachmentContext || explicitSkillIds.length > 0
       ? Promise.resolve([] as SkillContext[])
-      : input.repositories.skills?.findEnabled(scope, input.message) ?? Promise.resolve([]),
+      : input.repositories.skills?.findEnabled(scope, input.message, input.signal)
+        ?? Promise.resolve([]),
     input.repositories.reflections?.findAppliedSuggestions(scope) ?? Promise.resolve([]),
     input.repositories.toolRegistrations?.listEnabled(scope) ?? Promise.resolve([]),
   ]);
@@ -271,6 +279,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
           autoIds,
           input.conversationId,
           "auto",
+          autoSkills.find((skill) => skill.matchReason)?.matchReason ?? null,
         ),
       ).catch(() => undefined);
       throwIfAborted(input.signal);

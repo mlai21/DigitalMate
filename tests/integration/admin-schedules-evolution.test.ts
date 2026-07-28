@@ -18,6 +18,10 @@ import {
   createPostgresAdminEvolutionService,
 } from "@/server/admin/views/evolution";
 import {
+  createPostgresAdminInboxService,
+} from "@/server/admin/views/inbox";
+import { createRepositories } from "@/server/db/repositories";
+import {
   createPostgresAdminAgentResourcesService,
 } from "@/server/admin/views/agent-resources";
 import {
@@ -184,6 +188,85 @@ describe("admin schedules and evolution PostgreSQL mapping", () => {
       target: "inbox",
       authorization: null,
     });
+  });
+
+  it("审批修订会把 frontmatter 的适用场景同步到自动匹配用的 trigger 列", async () => {
+    const resources = createPostgresAdminAgentResourcesService(pool);
+    const inbox = createPostgresAdminInboxService(pool);
+    await resources.createSkill(
+      scope,
+      {
+        name: "商机判断",
+        content: [
+          "---",
+          "name: 商机判断",
+          "description: 旧的适用场景",
+          "---",
+          "# 商机判断",
+        ].join("\n"),
+        enabled: true,
+      },
+      {
+        operationId: "10000000-0000-4000-8000-000000000601",
+        confirmed: true,
+      },
+    );
+    await resources.proposeSkillRevision(
+      scope,
+      "商机判断",
+      {
+        content: [
+          "---",
+          "name: 商机判断",
+          "description: 客户预算或决策链不清楚、需要判断这单值不值得推进时",
+          "---",
+          "# 商机判断",
+          "",
+          "1. 先确认决策链",
+        ].join("\n"),
+        expectedRevision: 1,
+        operationId: "10000000-0000-4000-8000-000000000602",
+        confirmed: true,
+      },
+    );
+    const pending = await pool.query<{ id: string }>(
+      `SELECT revision.id
+       FROM skill_revisions AS revision
+       JOIN skills AS skill ON skill.id = revision.skill_id
+       WHERE revision.user_id = $1
+         AND skill.name = '商机判断'
+         AND revision.status = 'pending'`,
+      [scope.userId],
+    );
+
+    await inbox.resolveApproval(
+      scope,
+      {
+        id: pending.rows[0].id,
+        action: "approve",
+        expectedRevision: 1,
+        approvalScope: null,
+        reason: null,
+        confirmationSourceId: "10000000-0000-4000-8000-000000000603",
+      },
+      new AbortController().signal,
+    );
+
+    const stored = await pool.query<{ trigger: string; content: string }>(
+      "SELECT trigger, content FROM skills WHERE user_id = $1 AND name = '商机判断'",
+      [scope.userId],
+    );
+    expect(stored.rows[0].trigger)
+      .toBe("客户预算或决策链不清楚、需要判断这单值不值得推进时");
+    expect(stored.rows[0].content).toContain("先确认决策链");
+
+    const candidates = await createRepositories(pool).skills.listEnabledIndex(scope);
+    expect(candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "商机判断",
+        trigger: "客户预算或决策链不清楚、需要判断这单值不值得推进时",
+      }),
+    ]));
   });
 
   it("confirms a goal atomically with its source-bound authorization and audit", async () => {

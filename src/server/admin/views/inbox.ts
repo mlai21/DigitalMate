@@ -1,4 +1,5 @@
 import type { AgentScope } from "@/server/agents/types";
+import { routingTriggerFromSkillMd } from "@/server/skills/skill-md";
 import type { Pool, PoolClient } from "pg";
 
 export type AdminInboxKind =
@@ -356,11 +357,17 @@ export function createPostgresAdminInboxService(
           if (input.action === "approve") {
             await client.query(
               `UPDATE skills
-               SET content = $3, version = version + 1,
+               SET content = $3, trigger = COALESCE($4, trigger),
+                   version = version + 1,
                    revision = revision + 1,
                    updated_at = now()
                WHERE user_id = $1 AND id = $2`,
-              [scope.userId, row.skill_id, row.proposed_content],
+              [
+                scope.userId,
+                row.skill_id,
+                row.proposed_content,
+                routingTriggerFromSkillMd(String(row.proposed_content)),
+              ],
             );
           }
           await client.query(

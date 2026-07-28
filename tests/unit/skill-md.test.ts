@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildSkillBody, parseSkillMd, serializeSkillMd } from "@/server/skills/skill-md";
+import {
+  buildSkillBody,
+  parseSkillMd,
+  routingTriggerFromSkillMd,
+  serializeSkillMd,
+} from "@/server/skills/skill-md";
 import { createSkillDraft } from "@/server/evolution/skills";
 
 describe("parseSkillMd", () => {
@@ -71,6 +76,32 @@ describe("serializeSkillMd", () => {
 
     expect(raw).toContain('name: "带冒号: 的名字"');
     expect(parseSkillMd(raw)?.name).toBe("带冒号: 的名字");
+  });
+});
+
+describe("routingTriggerFromSkillMd", () => {
+  it("取 frontmatter 的 description 作为路由信号", () => {
+    const content = [
+      "---",
+      "name: 商机资格判断",
+      "description: 客户预算或决策链不清楚、需要判断这单值不值得推进时",
+      "---",
+      "# 商机资格判断",
+    ].join("\n");
+
+    expect(routingTriggerFromSkillMd(content))
+      .toBe("客户预算或决策链不清楚、需要判断这单值不值得推进时");
+  });
+
+  it("没有 frontmatter 时退回首段，仍能给出路由信号", () => {
+    expect(routingTriggerFromSkillMd("# 商机资格判断\n\n判断这单值不值得推进。"))
+      .toBe("判断这单值不值得推进。");
+  });
+
+  it("内容无法解析时返回 null，让调用方保留原值而不是清空", () => {
+    expect(routingTriggerFromSkillMd("")).toBeNull();
+    expect(routingTriggerFromSkillMd("   ")).toBeNull();
+    expect(routingTriggerFromSkillMd("没有标题也没有 frontmatter")).toBeNull();
   });
 });
 

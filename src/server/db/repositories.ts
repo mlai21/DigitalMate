@@ -9,6 +9,12 @@ import {
 } from "@/server/agent/memory";
 import { embedText } from "@/server/llm/embeddings";
 import type { EnabledToolContext, SkillContext, ToolLogInput } from "@/server/agent/run-agent";
+import {
+  SKILL_ROUTING_CATALOG_LIMIT,
+  type SkillCandidate,
+} from "@/server/agent/skill-routing";
+import type { MismatchedSkill } from "@/server/evolution/skill-mismatch";
+import { routingTriggerFromSkillMd } from "@/server/skills/skill-md";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
 import {
   createChannelDeliveryRepository,
@@ -213,7 +219,8 @@ const PERSONAL_DATA_EXPORT_COLUMNS = {
     "revision", "created_at", "updated_at",
   ],
   skill_usage_logs: [
-    "id", "user_id", "agent_id", "skill_id", "conversation_id", "triggered_by", "created_at",
+    "id", "user_id", "agent_id", "skill_id", "conversation_id", "triggered_by",
+    "match_reason", "created_at",
   ],
   task_runs: [
     "id", "user_id", "agent_id", "conversation_id", "kind", "status", "input_summary",
@@ -2676,6 +2683,35 @@ export function createRepositories(
         );
         return result.rows.map(mapSkillRow);
       },
+      async listEnabledIndex(scope: AgentScope): Promise<SkillCandidate[]> {
+        const result = await pool.query<{ id: string; name: string; trigger: string }>(
+          `SELECT skill.id, skill.name, skill.trigger
+           FROM skills AS skill
+           JOIN digital_agents AS agent
+             ON agent.user_id = skill.user_id
+            AND agent.id = $2
+            AND agent.status = 'active'
+           LEFT JOIN agent_resource_grants AS resource_grant
+             ON resource_grant.user_id = skill.user_id
+            AND resource_grant.agent_id = agent.id
+            AND resource_grant.resource_type = 'skill'
+            AND resource_grant.resource_id = skill.id::text
+           WHERE skill.user_id = $1
+             AND skill.status = 'enabled'
+             AND (
+               skill.origin_agent_id = agent.id
+               OR (
+                 skill.origin_agent_id IS NULL
+                 AND agent.is_default
+               )
+             )
+             AND COALESCE(resource_grant.enabled, agent.inherits_user_resources)
+           ORDER BY skill.last_used_at DESC NULLS LAST, skill.updated_at DESC
+           LIMIT $3`,
+          [scope.userId, scope.agentId, SKILL_ROUTING_CATALOG_LIMIT],
+        );
+        return result.rows;
+      },
       async findEnabled(scope: AgentScope, query: string): Promise<SkillContext[]> {
         const result = await pool.query<{ id: string; name: string; trigger: string; content: string }>(
           `SELECT skill.id, skill.name, skill.trigger, skill.content
@@ -2782,6 +2818,7 @@ export function createRepositories(
         skillIds: string[],
         conversationId: string | null,
         triggeredBy: "auto" | "explicit" = "auto",
+        matchReason: string | null = null,
       ): Promise<void> {
         if (skillIds.length === 0) return;
         await pool.query(
@@ -2790,8 +2827,8 @@ export function createRepositories(
         );
         for (const skillId of skillIds) {
           await pool.query(
-            `INSERT INTO skill_usage_logs (user_id, agent_id, skill_id, conversation_id, triggered_by)
-             SELECT $1, $2, skill.id, $4, $5
+            `INSERT INTO skill_usage_logs (user_id, agent_id, skill_id, conversation_id, triggered_by, match_reason)
+             SELECT $1, $2, skill.id, $4, $5, $6
              FROM skills AS skill
              WHERE skill.user_id = $1 AND skill.id = $3
                AND (
@@ -2800,14 +2837,17 @@ export function createRepositories(
                    WHERE conversations.user_id = $1 AND conversations.agent_id = $2 AND conversations.id = $4
                  )
                )`,
-            [scope.userId, scope.agentId, skillId, conversationId, triggeredBy],
+            [scope.userId, scope.agentId, skillId, conversationId, triggeredBy, matchReason],
           );
         }
       },
       async applyRevision(userId: string, skillId: string, content: string): Promise<void> {
         await pool.query(
-          "UPDATE skills SET content = $3, version = version + 1, revision = revision + 1, updated_at = now() WHERE user_id = $1 AND id = $2",
-          [userId, skillId, content],
+          `UPDATE skills
+           SET content = $3, trigger = COALESCE($4, trigger),
+               version = version + 1, revision = revision + 1, updated_at = now()
+           WHERE user_id = $1 AND id = $2`,
+          [userId, skillId, content, routingTriggerFromSkillMd(content)],
         );
       },
     },
@@ -2872,6 +2912,38 @@ export function createRepositories(
               [scope.userId, scope.agentId, skillId],
             );
         return Number(result.rows[0]?.count ?? 0);
+      },
+      async latestAutoMatch(
+        scope: AgentScope,
+        conversationId: string,
+      ): Promise<{ skill: MismatchedSkill; matchReason: string | null } | null> {
+        const result = await pool.query<{
+          id: string;
+          name: string;
+          trigger: string;
+          content: string;
+          match_reason: string | null;
+        }>(
+          `SELECT skill.id, skill.name, skill.trigger, skill.content,
+                  usage_log.match_reason
+           FROM skill_usage_logs AS usage_log
+           JOIN skills AS skill
+             ON skill.id = usage_log.skill_id
+            AND skill.user_id = usage_log.user_id
+           WHERE usage_log.user_id = $1
+             AND usage_log.agent_id = $2
+             AND usage_log.conversation_id = $3
+             AND usage_log.triggered_by = 'auto'
+           ORDER BY usage_log.created_at DESC
+           LIMIT 1`,
+          [scope.userId, scope.agentId, conversationId],
+        );
+        const row = result.rows[0];
+        if (!row) return null;
+        return {
+          skill: { id: row.id, name: row.name, trigger: row.trigger, content: row.content },
+          matchReason: row.match_reason,
+        };
       },
       async recentConversationIds(scope: AgentScope, skillId: string, limit: number): Promise<string[]> {
         const result = await pool.query<{ conversation_id: string }>(

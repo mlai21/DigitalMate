@@ -1,5 +1,6 @@
 import { parseFollowUp, parseReminder } from "@/server/agent/reminders";
-import { runAgent } from "@/server/agent/run-agent";
+import { runAgent, type SkillContext } from "@/server/agent/run-agent";
+import { createLlmSkillMatcher } from "@/server/agent/skill-routing";
 import {
   createSearchGate,
   normalizeSearchAggressiveness,
@@ -12,7 +13,11 @@ import {
 import { searchWeb, summarizeSearchResults } from "@/server/agent/tools/web-search";
 import type { AgentScope } from "@/server/agents/types";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
-import { recordEventReflection } from "@/server/evolution/event-reflection";
+import {
+  recordEventReflection,
+  shouldReflectOnUserDissatisfaction,
+} from "@/server/evolution/event-reflection";
+import { recordSkillMismatch } from "@/server/evolution/skill-mismatch";
 import type { SkillInstallOutcome } from "@/server/skills/install";
 import type { LlmClient } from "@/server/llm/types";
 import type { LlmRouteConfig } from "@/server/llm/router";
@@ -38,9 +43,21 @@ type StoredInterjectionDecision = Readonly<{
   reason: string;
 }>;
 
+type SkillMatcher = (
+  scope: AgentScope,
+  query: string,
+  signal?: AbortSignal,
+) => Promise<SkillContext[]>;
+
+const noSkillMatching: SkillMatcher = async () => [];
+
 export function createChannelAgentTurnRunner(input: Readonly<{
   repositories: Repositories;
   resolveMainModel(
+    scope: AgentScope,
+    routing: LlmRouteConfig,
+  ): Promise<ResolvedModel> | ResolvedModel;
+  resolveLightModel(
     scope: AgentScope,
     routing: LlmRouteConfig,
   ): Promise<ResolvedModel> | ResolvedModel;
@@ -180,6 +197,46 @@ export function createChannelAgentTurnRunner(input: Readonly<{
           && context.claim.normalizedEvent.permission
             .manageGlobalAssets === true,
       );
+      // Resolving the light route touches the DB, so resolve it once per turn
+      // and only when something actually needs it. An unauthorized light route
+      // degrades that feature instead of failing the reply.
+      let resolvedLight: ResolvedModel | null | undefined;
+      const resolveLight = async (): Promise<ResolvedModel | null> => {
+        if (resolvedLight !== undefined) return resolvedLight;
+        try {
+          resolvedLight = await input.resolveLightModel(
+            context.claim.scope,
+            settings.modelRouting,
+          );
+        } catch {
+          resolvedLight = null;
+        }
+        return resolvedLight;
+      };
+
+      let matchSkills: SkillMatcher = noSkillMatching;
+      if (!hasAttachmentContext && invocation.explicitSkillIds.length === 0) {
+        const light = await resolveLight();
+        if (light) {
+          matchSkills = createLlmSkillMatcher({
+            llm: light.client,
+            model: light.model,
+            repositories: input.repositories,
+          });
+        }
+      }
+      context.signal?.throwIfAborted();
+
+      // Runs before this turn's own usage log, so the Skill it looks up is the
+      // one that was auto-applied to the message the user is correcting.
+      await recordSkillMismatchDraft(
+        input.repositories,
+        context,
+        message,
+        resolveLight,
+      );
+      context.signal?.throwIfAborted();
+
       const searchGate = hasAttachmentContext
         ? denyAttachmentSearch()
         : createSearchGate({
@@ -205,6 +262,7 @@ export function createChannelAgentTurnRunner(input: Readonly<{
           message.chatType === "direct"
             ? message.contextKey ?? null
             : null,
+          matchSkills,
         ),
         explicitSkillIds: invocation.explicitSkillIds,
         createSkillMode: invocation.createSkillMode,
@@ -443,6 +501,53 @@ async function recordDissatisfaction(
   }
 }
 
+/**
+ * Turns a correction that followed an auto-matched Skill into a pending
+ * scope-tightening draft.
+ *
+ * Unlike `recordDissatisfaction` this is not gated on `manageGlobalAssets`: the
+ * draft changes nothing until an admin approves it, and the sales seat is
+ * exactly where auto-matching gets used most, so its corrections are the most
+ * valuable signal. Failures stay silent — this must never affect the reply.
+ */
+async function recordSkillMismatchDraft(
+  repositories: Repositories,
+  context: ChannelAgentTurnContext,
+  message: NormalizedChannelMessage,
+  resolveLight: () => Promise<ResolvedModel | null>,
+): Promise<void> {
+  if (!shouldReflectOnUserDissatisfaction(message.text)) return;
+  const stepKey = "tool:skill_mismatch_draft";
+  const action = await context.journal.begin({
+    key: stepKey,
+    kind: "tool",
+    requestHash: hashExecutionRequest({
+      conversationId: context.conversationId,
+      text: message.text,
+    }),
+  });
+  if (action !== "run") return;
+  try {
+    const light = await resolveLight();
+    const proposed = light
+      ? await recordSkillMismatch({
+          repositories,
+          scope: context.claim.scope,
+          conversationId: context.conversationId,
+          correction: message.text,
+          llm: light.client,
+          model: light.model,
+          ...(context.signal ? { signal: context.signal } : {}),
+        })
+      : false;
+    await context.journal.complete(stepKey, { proposed });
+  } catch (error) {
+    await context.journal
+      .fail(stepKey, stableTurnErrorCode(error))
+      .catch(() => undefined);
+  }
+}
+
 const skillCapabilityDeniedNotice =
   "本轮不具备创建或安装 Skill 的能力。若用户提出这类请求，用自然语言说明你现在无法在这里创建或安装、需要由管理员处理，然后正常继续对话。";
 
@@ -527,6 +632,7 @@ function channelAgentRepositories(
   repositories: Repositories,
   allowSkillCreation: boolean,
   memoryContextKey: string | null,
+  matchSkills: SkillMatcher,
 ): Parameters<typeof runAgent>[0]["repositories"] {
   return {
     memories: memoryContextKey === null
@@ -547,7 +653,9 @@ function channelAgentRepositories(
     llmUsage: repositories.llmUsage,
     toolLogs: repositories.toolLogs,
     skills: {
-      findEnabled: async () => [],
+      // IM channels have no slash index panel to browse, so auto-matching is the
+      // main path here rather than a fallback (PRD 6.3).
+      findEnabled: matchSkills,
       findByIds: repositories.skills.findByIds,
       recordUsage: repositories.skills.recordUsage,
       ...(allowSkillCreation
