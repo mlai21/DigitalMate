@@ -260,6 +260,9 @@ async function syncFiles(files) {
       [
         "czf",
         "-",
+        // Without this, macOS tar ships xattr headers the server's tar warns
+        // about on every single file.
+        "--no-xattrs",
         "--exclude",
         "node_modules",
         "--exclude",
