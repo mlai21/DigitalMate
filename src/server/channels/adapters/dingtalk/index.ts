@@ -5,6 +5,7 @@ import {
   ChannelConnectionError,
 } from "@/server/channels/runtime/connection-manager";
 import type {
+  ChannelReaction,
   InboundContext,
   IngressResult,
   SendResult,
@@ -23,6 +24,15 @@ import {
 } from "./transport";
 
 type DingTalkAcknowledge = () => Promise<void>;
+
+// DingTalk renders text emotions as a short label, capped at four characters.
+const REACTION_LABELS: Readonly<Record<ChannelReaction, string>> = {
+  pending: "🤔思考中",
+  acknowledged: "收到",
+  good_question: "好问题",
+  agreed: "赞同",
+  done: "已完成",
+};
 
 export type DingTalkAdapterDependencies = Readonly<{
   clientFactory?: DingTalkClientFactory;
@@ -224,17 +234,17 @@ export function createDingTalkAdapter(
         cardInstanceId,
       );
     },
-    async ackReaction(input) {
+    async reaction(input) {
       const activeConfig = requireConfig(config);
-      const messageId = readInboundMessageId(input.externalEventId);
-      if (!messageId) return;
+      if (!input.platformMessageId) return;
       await withClient(
         activeConfig,
-        (active) => active.reactPending({
-          messageId,
+        (active) => active.react({
+          messageId: input.platformMessageId,
           conversationId: input.externalConversationId,
           robotCode: activeConfig.robot_code.trim()
             || activeConfig.client_id,
+          text: REACTION_LABELS[input.reaction],
           active: input.active,
         }),
       );
@@ -547,12 +557,6 @@ function messageTitle(text: string) {
 function requireRouteValue(value: string, code: string) {
   if (!value) throw new Error(code);
   return value;
-}
-
-function readInboundMessageId(externalEventId: string): string | null {
-  const prefix = "message:";
-  if (!externalEventId.startsWith(prefix)) return null;
-  return externalEventId.slice(prefix.length) || null;
 }
 
 function requireConfig(value: DingTalkConfig | null) {

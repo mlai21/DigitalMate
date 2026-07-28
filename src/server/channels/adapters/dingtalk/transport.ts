@@ -14,13 +14,13 @@ import type {
 
 import type { DingTalkConfig } from "./config";
 
-// DingTalk exposes one built-in "thinking" reaction for robots rather than a
-// generic emoji API, and `emotion/reply` is not part of the published OpenAPI
-// reference. Verified against a live app; treat failures as non-fatal.
-const PENDING_EMOTION_TYPE = 2;
-const PENDING_EMOTION_NAME = "🤔思考中";
-const PENDING_EMOTION_ID = "2659900";
-const PENDING_EMOTION_BACKGROUND_ID = "im_bg_1";
+// Robots react through DingTalk's text-emotion flow, which renders whatever
+// short label we pass on top of a fixed template. `emotion/reply` is not part
+// of the published OpenAPI reference; verified against a live app, and both
+// the label and the withdrawal are treated as non-fatal.
+const TEXT_EMOTION_TYPE = 2;
+const TEXT_EMOTION_ID = "2659900";
+const TEXT_EMOTION_BACKGROUND_ID = "im_bg_1";
 
 export class DingTalkTransportError extends Error {
   readonly code:
@@ -93,10 +93,11 @@ export type DingTalkClientPort = Readonly<{
     final: boolean;
     signal?: AbortSignal;
   }>): Promise<void>;
-  reactPending(input: Readonly<{
+  react(input: Readonly<{
     messageId: string;
     conversationId: string;
     robotCode: string;
+    text: string;
     active: boolean;
     signal?: AbortSignal;
   }>): Promise<void>;
@@ -305,7 +306,7 @@ export function createDingTalkSdkClient(
         input.signal,
       );
     },
-    async reactPending(input) {
+    async react(input) {
       const token = await tokens.get();
       await apiRequest(
         http,
@@ -319,13 +320,13 @@ export function createDingTalkSdkClient(
           robotCode: input.robotCode,
           openMsgId: input.messageId,
           openConversationId: input.conversationId,
-          emotionType: PENDING_EMOTION_TYPE,
-          emotionName: PENDING_EMOTION_NAME,
+          emotionType: TEXT_EMOTION_TYPE,
+          emotionName: input.text,
           textEmotion: {
-            emotionId: PENDING_EMOTION_ID,
-            emotionName: PENDING_EMOTION_NAME,
-            text: PENDING_EMOTION_NAME,
-            backgroundId: PENDING_EMOTION_BACKGROUND_ID,
+            emotionId: TEXT_EMOTION_ID,
+            emotionName: input.text,
+            text: input.text,
+            backgroundId: TEXT_EMOTION_BACKGROUND_ID,
           },
         },
         input.signal,

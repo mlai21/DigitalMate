@@ -55,6 +55,10 @@ export type ChannelDeliveryTransport = Readonly<{
     part: ChannelDeliveryPart,
     signal: AbortSignal,
   ): Promise<SendResult>;
+  applyReaction?(
+    delivery: ClaimedChannelDelivery,
+    signal: AbortSignal,
+  ): Promise<void>;
 }>;
 
 type DeliveryRepository = Readonly<{
@@ -479,6 +483,14 @@ async function processDelivery(input: {
         input.now(),
       ),
     );
+    if (segmentNo === 1) {
+      // The user has now seen the reply, so the busy marker gives way to the
+      // reaction the turn picked. Best-effort: never fail a sent delivery.
+      await input.transport.applyReaction?.(
+        input.claim,
+        input.signal,
+      ).catch(() => undefined);
+    }
     previousResult = result;
   }
 

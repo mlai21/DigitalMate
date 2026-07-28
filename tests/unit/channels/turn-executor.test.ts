@@ -16,6 +16,7 @@ import {
   type InboundAttachmentFetcher,
 } from "@/server/channels/runtime/attachment-ingress";
 import type {
+  ChannelReaction,
   InboundAttachmentDescriptor,
 } from "@/server/channels/runtime/types";
 import type { ClaimedChannelEvent } from "@/server/channels/runtime/event-repository";
@@ -266,6 +267,76 @@ describe("channel turn execution contract", () => {
 
     expect(result).toMatchObject({ skipped: true });
     expect(harness.typing).not.toHaveBeenCalled();
+    expect(harness.reaction).not.toHaveBeenCalled();
+  });
+
+  it("hands the busy reaction to delivery instead of withdrawing it", async () => {
+    const harness = turnHarness({ chosenReaction: "good_question" });
+
+    await harness.executor.execute(claimedEvent());
+
+    expect(harness.reaction.mock.calls.map(
+      ([, active]) => active,
+    )).toEqual([true]);
+    expect(harness.persistReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reactionPlan: {
+          platformMessageId: "platform-message-1",
+          reaction: "good_question",
+        },
+      }),
+    );
+  });
+
+  it("withdraws the busy reaction when no reply will be delivered", async () => {
+    const harness = turnHarness();
+    harness.persistReply.mockRejectedValueOnce(
+      new Error("persist_exploded"),
+    );
+
+    await expect(
+      harness.executor.execute(claimedEvent()),
+    ).rejects.toThrowError("persist_exploded");
+
+    expect(harness.reaction.mock.calls.map(
+      ([, active]) => active,
+    )).toEqual([true, false]);
+  });
+
+  it("still delivers when the reaction model is unavailable", async () => {
+    const harness = turnHarness({
+      chooseReactionError: new Error("light_model_down"),
+    });
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result).toMatchObject({ deliveryId: "delivery-1" });
+    expect(harness.persistReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reactionPlan: {
+          platformMessageId: "platform-message-1",
+          reaction: null,
+        },
+      }),
+    );
+  });
+
+  it("picks the reaction while the Agent is still working", async () => {
+    const harness = turnHarness({ chosenReaction: "acknowledged" });
+    let releaseAgent: (() => void) | undefined;
+    harness.runAgentTurn.mockImplementationOnce(
+      () => new Promise<string>((resolve) => {
+        releaseAgent = () => resolve("正常回复");
+      }),
+    );
+
+    const execution = harness.executor.execute(claimedEvent());
+    await vi.waitFor(() => {
+      expect(harness.chooseReaction).toHaveBeenCalled();
+    });
+    expect(harness.persistReply).not.toHaveBeenCalled();
+    releaseAgent?.();
+    await execution;
   });
 
   it("does not rerun the Agent after execution was already claimed", async () => {
@@ -496,7 +567,10 @@ function claimedEvent(): ClaimedChannelEvent {
         skills: "none",
         attachmentsPresent: false,
       },
-      rawSummary: { eventType: "message" },
+      rawSummary: {
+        eventType: "message",
+        platformMessageId: "platform-message-1",
+      },
     },
     clientTurnId: "30000000-0000-4000-8000-000000000001",
     payloadHash: "a".repeat(64),
@@ -513,6 +587,8 @@ function claimedEvent(): ClaimedChannelEvent {
 function turnHarness(options: {
   executionClaimed?: boolean;
   skipReason?: string;
+  chosenReaction?: ChannelReaction | null;
+  chooseReactionError?: Error;
 } = {}) {
   const releaseLock = vi.fn(async () => undefined);
   const messages = {
@@ -538,6 +614,16 @@ function turnHarness(options: {
     claim: ClaimedChannelEvent,
     active: boolean,
   ) => Promise<void>>(async () => undefined);
+  const reaction = vi.fn<(
+    claim: ClaimedChannelEvent,
+    active: boolean,
+  ) => Promise<void>>(async () => undefined);
+  const chooseReaction = vi.fn<(
+    claim: ClaimedChannelEvent,
+  ) => Promise<ChannelReaction | null>>(async () => {
+    if (options.chooseReactionError) throw options.chooseReactionError;
+    return options.chosenReaction ?? null;
+  });
   const executor = createChannelTurnExecutor({
     messages,
     resolveConversationId: vi.fn(async () => "conversation-1"),
@@ -553,6 +639,8 @@ function turnHarness(options: {
     persistReply,
     completeWithoutReply,
     typing,
+    reaction,
+    chooseReaction,
   });
   return {
     executor,
@@ -561,6 +649,8 @@ function turnHarness(options: {
     persistReply,
     completeWithoutReply,
     typing,
+    reaction,
+    chooseReaction,
     releaseLock,
   };
 }

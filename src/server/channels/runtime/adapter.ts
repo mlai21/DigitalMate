@@ -3,6 +3,7 @@ import type { ChannelManifest } from "@/server/channels/manifests/types";
 import type {
   ChannelDelivery,
   ChannelHealth,
+  ChannelReaction,
   ChannelRecipient,
   ChannelRuntimeContext,
   InboundContext,
@@ -39,12 +40,13 @@ export interface ChannelAdapter<
     recipient: ResolvedRecipient,
     active: boolean,
   ): Promise<void>;
-  // Marks the user's own message as being worked on, for platforms that offer
-  // reactions instead of a typing indicator.
-  ackReaction?(
+  // Places or withdraws a reaction on the user's own message, for platforms
+  // that offer reactions instead of a typing indicator.
+  reaction?(
     input: Readonly<{
-      externalEventId: string;
+      platformMessageId: string;
       externalConversationId: string;
+      reaction: ChannelReaction;
       active: boolean;
     }>,
   ): Promise<void>;

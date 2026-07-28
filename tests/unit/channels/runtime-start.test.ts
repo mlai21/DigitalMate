@@ -22,6 +22,7 @@ const delivery = {
   assistantMessageId: "message-1",
   replyHandleId: "reply-1",
   body: "完整回复",
+  reactionPlan: null,
   recipient: {
     externalConversationId: "conversation-1",
   },

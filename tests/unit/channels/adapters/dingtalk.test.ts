@@ -19,6 +19,9 @@ import {
   registerDingTalkChannelAdapter,
 } from "@/server/channels/runtime/registry";
 import {
+  CHANNEL_REACTIONS,
+} from "@/server/channels/runtime/types";
+import {
   assertStableExternalEventId,
   defineChannelContract,
 } from "@/server/channels/testing/contract";
@@ -305,14 +308,16 @@ describe("DingTalk Stream and AI Card", () => {
     const adapter = testAdapter(client);
     await adapter.start(runtimeContext(adapter));
 
-    await adapter.ackReaction!({
-      externalEventId: "message:msg-1001",
+    await adapter.reaction!({
+      platformMessageId: "msg-1001",
       externalConversationId: "cid-direct-1",
+      reaction: "pending",
       active: true,
     });
-    await adapter.ackReaction!({
-      externalEventId: "message:msg-1001",
+    await adapter.reaction!({
+      platformMessageId: "msg-1001",
       externalConversationId: "cid-direct-1",
+      reaction: "pending",
       active: false,
     });
 
@@ -321,15 +326,46 @@ describe("DingTalk Stream and AI Card", () => {
         messageId: "msg-1001",
         conversationId: "cid-direct-1",
         robotCode: "robot-1",
+        text: "🤔思考中",
         active: true,
       },
       {
         messageId: "msg-1001",
         conversationId: "cid-direct-1",
         robotCode: "robot-1",
+        text: "🤔思考中",
         active: false,
       },
     ]);
+    await adapter.stop("shutdown");
+  });
+
+  it("renders each reaction as its own short label", async () => {
+    const client = createFakeDingTalkClient();
+    const adapter = testAdapter(client);
+    await adapter.start(runtimeContext(adapter));
+
+    for (const reaction of CHANNEL_REACTIONS) {
+      await adapter.reaction!({
+        platformMessageId: "msg-1001",
+        externalConversationId: "cid-direct-1",
+        reaction,
+        active: true,
+      });
+    }
+
+    const labels = client.reactions.map((entry) => entry.text);
+    expect(labels).toEqual([
+      "🤔思考中",
+      "收到",
+      "好问题",
+      "赞同",
+      "已完成",
+    ]);
+    // DingTalk truncates text emotions beyond four characters.
+    for (const label of labels) {
+      expect([...label].length).toBeLessThanOrEqual(4);
+    }
     await adapter.stop("shutdown");
   });
 
@@ -340,9 +376,10 @@ describe("DingTalk Stream and AI Card", () => {
       runtimeContext(adapter, undefined, { ...CONFIG, robot_code: "  " }),
     );
 
-    await adapter.ackReaction!({
-      externalEventId: "message:msg-1001",
+    await adapter.reaction!({
+      platformMessageId: "msg-1001",
       externalConversationId: "cid-direct-1",
+      reaction: "pending",
       active: true,
     });
 
@@ -357,9 +394,10 @@ describe("DingTalk Stream and AI Card", () => {
     const adapter = testAdapter(client);
     await adapter.start(runtimeContext(adapter));
 
-    await adapter.ackReaction!({
-      externalEventId: "card-callback:abc",
+    await adapter.reaction!({
+      platformMessageId: "",
       externalConversationId: "cid-direct-1",
+      reaction: "pending",
       active: true,
     });
 
@@ -524,8 +562,8 @@ describe("DingTalk Stream and AI Card", () => {
       robotCode: "robot-1",
     };
 
-    await client.reactPending({ ...target, active: true });
-    await client.reactPending({ ...target, active: false });
+    await client.react({ ...target, text: "🤔思考中", active: true });
+    await client.react({ ...target, text: "收到", active: false });
 
     const [, attach, recall] = http.requests;
     expect(attach).toMatchObject({
@@ -536,13 +574,23 @@ describe("DingTalk Stream and AI Card", () => {
         openMsgId: "msg-1001",
         openConversationId: "cid-direct-1",
         emotionType: 2,
-        textEmotion: { emotionId: "2659900" },
+        emotionName: "🤔思考中",
+        textEmotion: {
+          emotionId: "2659900",
+          emotionName: "🤔思考中",
+          text: "🤔思考中",
+          backgroundId: "im_bg_1",
+        },
       },
     });
     expect(recall).toMatchObject({
       method: "POST",
       url: "https://api.dingtalk.com/v1.0/robot/emotion/recall",
-      body: { openMsgId: "msg-1001" },
+      body: {
+        openMsgId: "msg-1001",
+        emotionName: "收到",
+        textEmotion: { text: "收到" },
+      },
     });
   });
 
@@ -748,7 +796,7 @@ type FakeDingTalkClient = DingTalkClientPort & {
   openApiMessages: unknown[];
   cards: unknown[];
   cardUpdates: unknown[];
-  reactions: unknown[];
+  reactions: Array<Parameters<DingTalkClientPort["react"]>[0]>;
   emit(payload: unknown, order?: string[]): Promise<void>;
 };
 
@@ -794,7 +842,7 @@ function createFakeDingTalkClient(options: Readonly<{
     async updateCard(input) {
       this.cardUpdates.push(input);
     },
-    async reactPending(input) {
+    async react(input) {
       if (options.reactionError) throw options.reactionError;
       this.reactions.push(input);
     },

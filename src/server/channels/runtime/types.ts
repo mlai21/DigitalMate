@@ -58,6 +58,19 @@ export type ChannelRecipient = Readonly<{
   chatType?: ChatType;
 }>;
 
+// Reactions the Agent can place on the user's own message. Platforms render
+// them very differently, so adapters translate each one into their own
+// vocabulary instead of the runtime passing raw emoji around.
+export const CHANNEL_REACTIONS = [
+  "pending",
+  "acknowledged",
+  "good_question",
+  "agreed",
+  "done",
+] as const;
+
+export type ChannelReaction = (typeof CHANNEL_REACTIONS)[number];
+
 export type ResolvedRecipient = Readonly<{
   address: Readonly<Record<string, string>>;
   displayName?: string;

@@ -4,8 +4,10 @@ import { hostname } from "node:os";
 import type { Pool } from "pg";
 
 import { withUserDataLease } from "@/server/admin/user-data-lease";
+import { chooseReactionIntent } from "@/server/agent/reaction-intent";
 import { searchWeb } from "@/server/agent/tools/web-search";
 import { assertAuthorizedModelRoutes } from "@/server/agents/service";
+import type { AgentScope } from "@/server/agents/types";
 import {
   createDiscordAdapter,
 } from "@/server/channels/adapters/discord";
@@ -147,6 +149,7 @@ import {
 import type {
   ClaimedChannelDelivery,
 } from "./delivery-repository";
+import type { ClaimedChannelEvent } from "./event-repository";
 import {
   ChannelDeliveryDeferred,
   ChannelSendError,
@@ -167,6 +170,7 @@ import {
 } from "./turn-executor";
 import type {
   ChannelDelivery,
+  ChannelReaction,
   SendResult,
   UnsealedReplyHandle,
 } from "./types";
@@ -174,7 +178,7 @@ import type {
 type Repositories = ReturnType<typeof createRepositories>;
 type SendAdapter = Pick<
   ChannelAdapter<Record<string, unknown>>,
-  "send" | "streaming" | "validateConfig"
+  "send" | "streaming" | "validateConfig" | "reaction"
 >;
 
 const WORKER_IDLE_MS = 250;
@@ -306,6 +310,47 @@ export async function startChannelRuntime(input: Readonly<{
       },
     },
   });
+  const resolveClaimAdapter = async (claim: ClaimedChannelEvent) => {
+    const connection = await store.get(claim.connectionId);
+    if (
+      !connection
+      || !connection.enabled
+      || connection.scope.userId !== claim.scope.userId
+      || connection.scope.agentId !== claim.scope.agentId
+    ) {
+      return null;
+    }
+    return connectionManager.getAdapter(
+      connection.id,
+      connection.revision,
+    );
+  };
+  const selectChannelReaction = async (
+    scope: AgentScope,
+    text: string,
+  ): Promise<ChannelReaction | null> => {
+    try {
+      const settings = await input.repositories.settings.get(scope);
+      await assertAuthorizedModelRoutes(
+        scope,
+        ["light"],
+        settings.modelRouting,
+        input.repositories.agents,
+      );
+      const light = getLlmClient(
+        "light",
+        input.env,
+        settings.modelRouting,
+      );
+      return await chooseReactionIntent({
+        llm: light.client,
+        model: light.model,
+        text,
+      });
+    } catch {
+      return null;
+    }
+  };
   const baseExecutor = createChannelTurnExecutor({
     messages: input.repositories.messages,
     resolveConversationId: async (claim) => (
@@ -370,33 +415,9 @@ export async function startChannelRuntime(input: Readonly<{
     decideTurn: agentTurn.decideTurn,
     runAgentTurn: agentTurn.runAgentTurn,
     typing: async (claim, active) => {
-      const connection = await store.get(
-        claim.connectionId,
-      );
-      if (
-        !connection
-        || !connection.enabled
-        || connection.scope.userId
-          !== claim.scope.userId
-        || connection.scope.agentId
-          !== claim.scope.agentId
-      ) {
-        return;
-      }
-      const adapter = connectionManager.getAdapter(
-        connection.id,
-        connection.revision,
-      );
-      if (!adapter) return;
+      const adapter = await resolveClaimAdapter(claim);
+      if (!adapter?.typing) return;
       const event = claim.normalizedEvent;
-      if (adapter.ackReaction) {
-        await adapter.ackReaction({
-          externalEventId: event.externalEventId,
-          externalConversationId: event.externalConversationId,
-          active,
-        }).catch(() => undefined);
-      }
-      if (!adapter.typing) return;
       const recipient = await adapter.resolveRecipient({
         externalConversationId:
           event.externalConversationId,
@@ -411,6 +432,27 @@ export async function startChannelRuntime(input: Readonly<{
       });
       await adapter.typing(recipient, active);
     },
+    reaction: async (claim, active) => {
+      const adapter = await resolveClaimAdapter(claim);
+      if (!adapter?.reaction) return;
+      const platformMessageId =
+        claim.normalizedEvent.rawSummary.platformMessageId;
+      if (typeof platformMessageId !== "string" || !platformMessageId) {
+        return;
+      }
+      await adapter.reaction({
+        platformMessageId,
+        externalConversationId:
+          claim.normalizedEvent.externalConversationId,
+        reaction: "pending",
+        active,
+      }).catch(() => undefined);
+    },
+    chooseReaction: (claim) =>
+      selectChannelReaction(
+        claim.scope,
+        claim.normalizedEvent.text,
+      ),
     persistReply: createAtomicChannelReplyPersister(pool),
     completeWithoutReply:
       createAtomicChannelNoReplyPersister(pool),
@@ -610,6 +652,28 @@ export function createChannelDeliveryTransport(input: Readonly<{
   const now = input.now ?? (() => new Date());
 
   return {
+    async applyReaction(delivery) {
+      const plan = delivery.reactionPlan;
+      if (!plan) return;
+      const resolved = await resolveDeliveryTarget(input, delivery);
+      const react = resolved.adapter.reaction;
+      if (!react) return;
+      await react({
+        platformMessageId: plan.platformMessageId,
+        externalConversationId:
+          delivery.recipient.externalConversationId,
+        reaction: "pending",
+        active: false,
+      });
+      if (!plan.reaction) return;
+      await react({
+        platformMessageId: plan.platformMessageId,
+        externalConversationId:
+          delivery.recipient.externalConversationId,
+        reaction: plan.reaction,
+        active: true,
+      });
+    },
     async mode(delivery) {
       const nodeConnection = await resolveNodeConnection(
         input,

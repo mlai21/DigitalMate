@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type {
+  ChannelDeliveryReactionPlan,
   ClaimedChannelDelivery,
 } from "@/server/channels/runtime/delivery-repository";
 import {
@@ -59,6 +60,56 @@ describe("channel delivery retry", () => {
     expect(runAgent).toHaveBeenCalledTimes(1);
     expect(harness.state.status).toBe("sent");
     expect(harness.state.attempts).toBe(3);
+  });
+
+  it("swaps the reaction once the first message reaches the user", async () => {
+    const harness = deliveryHarness({
+      body: "第一段\n\n第二段",
+      reactionPlan: {
+        platformMessageId: "platform-message-1",
+        reaction: "acknowledged",
+      },
+    });
+    harness.transport.send
+      .mockResolvedValueOnce(sendResult("platform-1"))
+      .mockResolvedValueOnce(sendResult("platform-2"));
+
+    await harness.worker.runOne();
+
+    expect(harness.state.status).toBe("sent");
+    expect(harness.transport.send).toHaveBeenCalledTimes(2);
+    // Once only: the marker belongs to the moment the reply first shows up.
+    expect(harness.transport.applyReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the reaction alone until a message actually goes out", async () => {
+    const harness = deliveryHarness({
+      reactionPlan: {
+        platformMessageId: "platform-message-1",
+        reaction: "acknowledged",
+      },
+    });
+    harness.transport.send.mockRejectedValueOnce(new Error("socket closed"));
+
+    await harness.worker.runOne();
+
+    expect(harness.state.status).toBe("retry");
+    expect(harness.transport.applyReaction).not.toHaveBeenCalled();
+  });
+
+  it("still marks the delivery sent when the reaction call fails", async () => {
+    const harness = deliveryHarness({
+      reactionError: new Error("emotion_api_down"),
+      reactionPlan: {
+        platformMessageId: "platform-message-1",
+        reaction: "acknowledged",
+      },
+    });
+    harness.transport.send.mockResolvedValueOnce(sendResult("platform-1"));
+
+    await harness.worker.runOne();
+
+    expect(harness.state.status).toBe("sent");
   });
 
   it("dead-letters a non-retryable credential error immediately", async () => {
@@ -416,6 +467,8 @@ type FakeStatus =
 
 function deliveryHarness(options: {
   body?: string;
+  reactionPlan?: ChannelDeliveryReactionPlan | null;
+  reactionError?: Error;
   mode?: "segmented" | "streaming" | "task-streaming";
   cadence?: {
     responseDelayMs: number;
@@ -455,6 +508,7 @@ function deliveryHarness(options: {
       "40000000-0000-4000-8000-000000000001",
     replyHandleId: null,
     body: options.body ?? "已经持久化的回复",
+    reactionPlan: options.reactionPlan ?? null,
     recipient: {
       externalConversationId: "conversation-1",
     },
@@ -556,6 +610,9 @@ function deliveryHarness(options: {
         })
       : undefined,
     send: vi.fn(),
+    applyReaction: vi.fn(async () => {
+      if (options.reactionError) throw options.reactionError;
+    }),
   } satisfies ChannelDeliveryTransport;
   const worker = createChannelDeliveryWorker({
     owner: "delivery-worker-1",

@@ -6,11 +6,12 @@ import type {
   DbMessageAttachment,
 } from "@/server/db/repositories";
 
+import type { ChannelDeliveryReactionPlan } from "./delivery-repository";
 import type {
   ClaimedChannelEvent,
 } from "./event-repository";
 import type { ExecutionJournal } from "./execution-journal";
-import type { ChannelRecipient } from "./types";
+import type { ChannelReaction, ChannelRecipient } from "./types";
 
 export const CHANNEL_INTERRUPTED_REPLY =
   "刚才没能完整回复，你把那条消息再发一次，我重新接着看。";
@@ -72,6 +73,7 @@ export type PersistChannelReplyInput = Readonly<{
   body: string;
   recipient: ChannelRecipient;
   replyHandleId: string | null;
+  reactionPlan: ChannelDeliveryReactionPlan | null;
 }>;
 
 export type PersistChannelReplyResult = Readonly<{
@@ -134,6 +136,15 @@ export function createChannelTurnExecutor(input: Readonly<{
     claim: ClaimedChannelEvent,
     active: boolean,
   ): MaybePromise<void>;
+  // Puts the busy marker on the user's message. The delivery worker clears it
+  // once the reply lands, so this only withdraws it when no reply is coming.
+  reaction?(
+    claim: ClaimedChannelEvent,
+    active: boolean,
+  ): MaybePromise<void>;
+  chooseReaction?(
+    claim: ClaimedChannelEvent,
+  ): MaybePromise<ChannelReaction | null>;
   faultInjector?(
     point: ChannelTurnFaultPoint,
   ): MaybePromise<void>;
@@ -164,6 +175,8 @@ export function createChannelTurnExecutor(input: Readonly<{
         claim.clientTurnId,
         options.signal,
       );
+      let reactionAttached = false;
+      let reactionHandedOff = false;
       try {
         options.signal?.throwIfAborted();
         const existingAssistant =
@@ -239,6 +252,15 @@ export function createChannelTurnExecutor(input: Readonly<{
         await Promise.resolve(
           input.typing?.(claim, true),
         ).catch(() => undefined);
+        await Promise.resolve(
+          input.reaction?.(claim, true),
+        ).catch(() => undefined);
+        reactionAttached = input.reaction !== undefined;
+        // Runs alongside the Agent because it only reads the incoming
+        // message, so the extra model call never delays the reply.
+        const chosenReaction = Promise.resolve(
+          input.chooseReaction?.(claim) ?? null,
+        ).catch(() => null);
         try {
           try {
             body = normalizeAssistantBody(
@@ -272,12 +294,19 @@ export function createChannelTurnExecutor(input: Readonly<{
           claim,
           conversationId,
           body,
+          await chosenReaction,
         );
+        reactionHandedOff = true;
         return {
           ...persisted,
           degraded,
         };
       } finally {
+        if (reactionAttached && !reactionHandedOff) {
+          await Promise.resolve(
+            input.reaction?.(claim, false),
+          ).catch(() => undefined);
+        }
         await release();
       }
     },
@@ -433,6 +462,7 @@ async function persist(
   claim: ClaimedChannelEvent,
   conversationId: string,
   body: string,
+  reaction: ChannelReaction | null = null,
 ): Promise<PersistChannelReplyResult> {
   const threadId = claim.normalizedEvent.thread.externalThreadId;
   const recipient: ChannelRecipient = {
@@ -447,6 +477,8 @@ async function persist(
         }
       : {}),
   };
+  const platformMessageId =
+    claim.normalizedEvent.rawSummary.platformMessageId;
   return input.persistReply({
     claim,
     conversationId,
@@ -454,6 +486,10 @@ async function persist(
     recipient,
     replyHandleId:
       await input.resolveReplyHandleId?.(claim) ?? null,
+    reactionPlan: typeof platformMessageId === "string"
+      && platformMessageId.length > 0
+      ? { platformMessageId, reaction }
+      : null,
   });
 }
 
@@ -564,9 +600,10 @@ async function insertOrReadDelivery(
   const inserted = await client.query<{ id: string }>(
     `INSERT INTO channel_deliveries (
        user_id, agent_id, event_id, connection_id,
-       assistant_message_id, reply_handle_id, body, recipient
+       assistant_message_id, reply_handle_id, body, recipient,
+       reaction_plan
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
      ON CONFLICT (event_id) DO NOTHING
      RETURNING id`,
     [
@@ -578,6 +615,9 @@ async function insertOrReadDelivery(
       input.replyHandleId,
       body,
       JSON.stringify(input.recipient),
+      input.reactionPlan
+        ? JSON.stringify(input.reactionPlan)
+        : null,
     ],
   );
   if (inserted.rows[0]) return inserted.rows[0];

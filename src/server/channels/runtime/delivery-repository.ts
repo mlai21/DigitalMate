@@ -2,7 +2,9 @@ import type { Pool, PoolClient } from "pg";
 
 import type { AgentScope } from "@/server/agents/types";
 
+import { CHANNEL_REACTIONS } from "./types";
 import type {
+  ChannelReaction,
   ChannelRecipient,
   SendResult,
 } from "./types";
@@ -31,6 +33,7 @@ type DeliveryRow = {
   reply_handle_id: string | null;
   body: string;
   frozen_segments: unknown | null;
+  reaction_plan: unknown | null;
   recipient: ChannelRecipient;
   status: DeliveryStatus;
   claim_owner: string | null;
@@ -42,6 +45,13 @@ type DeliveryRow = {
   sent_at: Date | null;
 };
 
+// Carries the reaction lifecycle across workers: the turn picks what to leave
+// on the user's message, the delivery worker applies it once the reply lands.
+export type ChannelDeliveryReactionPlan = Readonly<{
+  platformMessageId: string;
+  reaction: ChannelReaction | null;
+}>;
+
 export type ChannelDeliveryRecord = Readonly<{
   id: string;
   scope: AgentScope;
@@ -51,6 +61,7 @@ export type ChannelDeliveryRecord = Readonly<{
   assistantMessageId: string;
   replyHandleId: string | null;
   body: string;
+  reactionPlan: ChannelDeliveryReactionPlan | null;
   recipient: ChannelRecipient;
   status: DeliveryStatus;
   claimOwner: string | null;
@@ -659,6 +670,7 @@ function mapDeliveryRow(row: DeliveryRow): ChannelDeliveryRecord {
     assistantMessageId: row.assistant_message_id,
     replyHandleId: row.reply_handle_id,
     body: row.body,
+    reactionPlan: readReactionPlan(row.reaction_plan),
     recipient: row.recipient,
     status: row.status,
     claimOwner: row.claim_owner,
@@ -668,6 +680,26 @@ function mapDeliveryRow(row: DeliveryRow): ChannelDeliveryRecord {
     nextAttemptAt: new Date(row.next_attempt_at),
     lastErrorCode: row.last_error_code,
     sentAt: nullableDate(row.sent_at),
+  };
+}
+
+function readReactionPlan(
+  value: unknown,
+): ChannelDeliveryReactionPlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const platformMessageId = record.platformMessageId;
+  if (typeof platformMessageId !== "string" || !platformMessageId) {
+    return null;
+  }
+  const reaction = record.reaction;
+  return {
+    platformMessageId,
+    reaction: CHANNEL_REACTIONS.includes(reaction as ChannelReaction)
+      ? reaction as ChannelReaction
+      : null,
   };
 }
 

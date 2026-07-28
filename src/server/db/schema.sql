@@ -2047,6 +2047,31 @@ END
 $channel_deliveries_frozen_segments_constraint$;
 
 ALTER TABLE IF EXISTS channel_deliveries
+  ADD COLUMN IF NOT EXISTS reaction_plan jsonb;
+
+DO $channel_deliveries_reaction_plan_constraint$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname =
+      'channel_deliveries_reaction_plan_check'
+  ) THEN
+    ALTER TABLE channel_deliveries
+      ADD CONSTRAINT
+        channel_deliveries_reaction_plan_check
+      CHECK (
+        reaction_plan IS NULL
+        OR (
+          jsonb_typeof(reaction_plan) = 'object'
+          AND pg_column_size(reaction_plan) <= 2048
+        )
+      );
+  END IF;
+END
+$channel_deliveries_reaction_plan_constraint$;
+
+ALTER TABLE IF EXISTS channel_deliveries
   ALTER COLUMN event_id DROP NOT NULL;
 
 DO $channel_delivery_source_constraints$

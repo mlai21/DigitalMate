@@ -926,6 +926,7 @@ describe("XiaoYi delivery idempotency", () => {
       assistantMessageId: baseDelivery.assistantMessageId,
       replyHandleId: null,
       body,
+      reactionPlan: null,
       recipient: baseDelivery.recipient,
       status: "running",
       claimOwner: "xiaoyi-worker",
