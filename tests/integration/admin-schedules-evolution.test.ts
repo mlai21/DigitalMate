@@ -116,7 +116,9 @@ describe("admin schedules and evolution PostgreSQL mapping", () => {
   it("persists and dispatches one scheduled source exactly once", async () => {
     const schedules =
       createPostgresAdminSchedulesService(pool);
-    const runAt = new Date("2026-07-28T01:00:00Z");
+    // createJob always normalizes against the real clock, so anchor the run time
+    // relative to now instead of a fixed date that goes stale.
+    const runAt = new Date(Date.now() + 60 * 60 * 1_000);
     const created = (await schedules.createJob(scope, {
       name: "喝水提醒",
       enabled: true,
@@ -141,12 +143,12 @@ describe("admin schedules and evolution PostgreSQL mapping", () => {
     const first = await processDueScheduledJobs({
       pool,
       scope,
-      now: new Date("2026-07-28T01:00:01Z"),
+      now: new Date(runAt.getTime() + 1_000),
     });
     const second = await processDueScheduledJobs({
       pool,
       scope,
-      now: new Date("2026-07-28T01:00:02Z"),
+      now: new Date(runAt.getTime() + 2_000),
     });
     const counts = await pool.query<{
       tasks: string;
