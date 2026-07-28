@@ -70,7 +70,12 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         },
       );
       context.signal?.throwIfAborted();
-      if (message.chatType !== "group") {
+      // Interjection is the "no @ needed" path (PRD P1-6). A direct mention is
+      // an ordinary request and must never be filtered by interjection policy.
+      if (
+        message.chatType !== "group"
+        || context.claim.normalizedEvent.mentioned
+      ) {
         return { kind: "proceed" };
       }
 

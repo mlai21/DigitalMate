@@ -70,6 +70,43 @@ describe("channel agent turn", () => {
       );
   });
 
+  it("群聊被 @ 时直接执行，不进入插话判断", async () => {
+    const repositories = fakeRepositories({
+      recentMessageCount: 8,
+    });
+    const runner = createRunner(repositories, textLlm("我在。"));
+    const context = createContext({
+      chatType: "group",
+      mentioned: true,
+      text: "@Alvin 帮我看下这个报价",
+    });
+
+    await expect(runner.decideTurn(context)).resolves.toEqual({
+      kind: "proceed",
+    });
+    expect(repositories.channels.createDecision)
+      .not.toHaveBeenCalled();
+    expect(repositories.channels.createChannelMessage)
+      .toHaveBeenCalledTimes(1);
+  });
+
+  it("群聊未被 @ 时仍按插话策略判断", async () => {
+    const repositories = fakeRepositories();
+    const runner = createRunner(
+      repositories,
+      textLlm("不应执行"),
+    );
+    const context = createContext({
+      chatType: "group",
+      text: "周末去哪爬山？",
+    });
+
+    await expect(runner.decideTurn(context)).resolves.toEqual({
+      kind: "skip",
+      reason: "not_relevant",
+    });
+  });
+
   it("群聊繁忙时记录决定并跳过 Agent", async () => {
     const repositories = fakeRepositories({
       recentMessageCount: 8,
@@ -374,6 +411,7 @@ function createContext(
     externalEventId?: string;
     text?: string;
     chatType?: "direct" | "group";
+    mentioned?: boolean;
     skillPermission?: "none" | "explicit_slash";
     attachmentsPresent?: boolean;
     rawSummary?: Record<string, string>;
@@ -397,7 +435,7 @@ function createContext(
       externalSenderId:
         overrides.externalSenderId ?? "sender-1",
       chatType: overrides.chatType ?? "direct",
-      mentioned: false,
+      mentioned: overrides.mentioned ?? false,
       text: overrides.text ?? "你好",
       thread: {},
       attachments: [],
