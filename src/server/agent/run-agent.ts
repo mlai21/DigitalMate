@@ -205,7 +205,11 @@ const saveSkillTool: LlmTool = {
     properties: {
       name: { type: "string", description: "Skill 名称（简短、可辨识）" },
       description: { type: "string", description: "一句话描述适用场景，用于以后判断何时使用" },
-      steps: { type: "array", items: { type: "string" }, description: "按顺序的执行步骤，2-8 条" },
+      steps: {
+        type: "array",
+        items: { type: "string" },
+        description: "按顺序的执行步骤，2-8 条；每条一个字符串数组元素，不要写成一整段文本",
+      },
       notes: { type: "array", items: { type: "string" }, description: "注意事项（可选）" },
     },
     required: ["name", "description", "steps"],
@@ -215,13 +219,17 @@ const saveSkillTool: LlmTool = {
 const createSkillTool: LlmTool = {
   name: "create_skill",
   description:
-    "在 /create-skill 引导流程中创建新 Skill（创建后立即启用）。只有当用户通过 /create-skill 发起创建、且已在对话中对草稿预览明确确认后才调用；未经确认绝不调用。",
+    "创建新 Skill（创建后立即启用）。用户以 /create-skill 发起、或用自然语言要求你学会一套做法都可以走这里；前提是你已在对话中给出草稿预览并得到用户明确确认，未经确认绝不调用。",
   parameters: {
     type: "object",
     properties: {
       name: { type: "string", description: "Skill 名称（简短、可辨识）" },
       description: { type: "string", description: "一句话描述适用场景，用于以后判断何时使用" },
-      steps: { type: "array", items: { type: "string" }, description: "按顺序的执行步骤，2-8 条" },
+      steps: {
+        type: "array",
+        items: { type: "string" },
+        description: "按顺序的执行步骤，2-8 条；每条一个字符串数组元素，不要写成一整段文本",
+      },
       notes: { type: "array", items: { type: "string" }, description: "注意事项（可选）" },
     },
     required: ["name", "description", "steps"],
@@ -843,6 +851,74 @@ function stableExecutionErrorCode(error: unknown): string {
   return normalized || "execution_failed";
 }
 
+/**
+ * Reads a list argument that models frequently hand over as plain text.
+ *
+ * Providers stringify array parameters often enough that rejecting anything but
+ * a real array is a dead end: the model reads back "information incomplete",
+ * believes it complied, and retries the identical call until the user gives up.
+ * A JSON-encoded array and a numbered paragraph are both unambiguous, so accept
+ * them; a lone item that still holds several lines is unpacked the same way.
+ */
+function readStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    const items = value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+    return items.length === 1 ? readStringList(items[0]) : items;
+  }
+  if (typeof value !== "string") return [];
+  const text = value.trim();
+  if (!text) return [];
+  if (text.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (Array.isArray(parsed)) return readStringList(parsed);
+    } catch {
+      // Not JSON after all; fall through to line splitting.
+    }
+  }
+  const lines = text
+    .split(/\r?\n+/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+\s*[.)、,])\s*/, "").trim())
+    .filter((line) => line.length > 0);
+  return lines;
+}
+
+/** Admin-only trace of which part of a Skill tool call was unusable. */
+function describeSkillInputGap(input: {
+  name: string;
+  description: string;
+  steps: string[];
+  args: Record<string, unknown>;
+  canCreate: boolean;
+}): string {
+  const gaps: string[] = [];
+  if (!input.name) gaps.push("name missing");
+  if (!input.description) gaps.push("description missing");
+  if (input.steps.length < 2) {
+    gaps.push(`steps=${input.steps.length} from ${describeArgShape(input.args.steps)}`);
+  }
+  if (!input.canCreate) gaps.push("creation not permitted");
+  return gaps.join(", ") || "unknown";
+}
+
+function describeArgShape(value: unknown): string {
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (value === null || value === undefined) return "absent";
+  if (typeof value === "string") return `string(${value.length})`;
+  return typeof value;
+}
+
+function skillInputGapInstruction(outcome: "未创建" | "未保存"): string {
+  return [
+    `Skill 信息不完整（需要名称、适用场景和至少 2 个步骤），本次${outcome}。`,
+    "请用自然语言接着问用户还缺哪部分内容，",
+    "不要提到工具、参数名、字段格式或任何系统细节。",
+  ].join("");
+}
+
 async function saveSkillFromToolCall(context: {
   input: RunAgentInput;
   args: Record<string, unknown>;
@@ -852,8 +928,8 @@ async function saveSkillFromToolCall(context: {
   throwIfAborted(input.signal);
   const name = typeof args.name === "string" ? args.name.trim() : "";
   const description = typeof args.description === "string" ? args.description.trim() : "";
-  const steps = Array.isArray(args.steps) ? args.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0) : [];
-  const notes = Array.isArray(args.notes) ? args.notes.filter((note): note is string => typeof note === "string" && note.trim().length > 0) : [];
+  const steps = readStringList(args.steps);
+  const notes = readStringList(args.notes);
 
   const logBase = {
     userId: input.userId,
@@ -869,10 +945,16 @@ async function saveSkillFromToolCall(context: {
       outputSummary: "Skill 草稿信息不完整，未保存",
       status: "error",
       durationMs: Date.now() - startedAt,
-      error: "Invalid skill draft input",
+      error: `Invalid skill draft input (${describeSkillInputGap({
+        name,
+        description,
+        steps,
+        args,
+        canCreate: Boolean(input.repositories.skills?.create),
+      })})`,
     });
     throwIfAborted(input.signal);
-    return "Skill 草稿信息不完整（需要名称、适用场景和至少 2 个步骤），本次未保存。";
+    return skillInputGapInstruction("未保存");
   }
 
   try {
@@ -914,12 +996,8 @@ async function createSkillFromToolCall(context: {
   throwIfAborted(input.signal);
   const name = typeof args.name === "string" ? args.name.trim() : "";
   const description = typeof args.description === "string" ? args.description.trim() : "";
-  const steps = Array.isArray(args.steps)
-    ? args.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0)
-    : [];
-  const notes = Array.isArray(args.notes)
-    ? args.notes.filter((note): note is string => typeof note === "string" && note.trim().length > 0)
-    : [];
+  const steps = readStringList(args.steps);
+  const notes = readStringList(args.notes);
 
   const logBase = {
     userId: input.userId,
@@ -935,10 +1013,16 @@ async function createSkillFromToolCall(context: {
       outputSummary: "Skill 信息不完整，未创建",
       status: "error",
       durationMs: Date.now() - startedAt,
-      error: "Invalid skill input",
+      error: `Invalid skill input (${describeSkillInputGap({
+        name,
+        description,
+        steps,
+        args,
+        canCreate: Boolean(input.repositories.skills?.create),
+      })})`,
     });
     throwIfAborted(input.signal);
-    return "Skill 信息不完整（需要名称、适用场景和至少 2 个步骤），本次未创建。请继续向用户补齐缺失的信息。";
+    return skillInputGapInstruction("未创建");
   }
 
   try {

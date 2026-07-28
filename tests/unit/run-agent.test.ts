@@ -1252,6 +1252,167 @@ describe("runAgent", () => {
     expect(chunks.join("")).toBe("建好了，之后我就按这套来。");
   });
 
+  it("creates the skill when the model sends steps as a stringified list", async () => {
+    const createSkill = vi.fn();
+    const logTool = vi.fn();
+    const llm = scriptedLlm([
+      [
+        {
+          type: "tool_call",
+          toolCall: {
+            id: "call-1",
+            name: "create_skill",
+            arguments: JSON.stringify({
+              name: "model-studio-facts",
+              description: "涉及百炼硬事实时以官方文档为准",
+              steps: JSON.stringify(["先查官方文档", "无依据就标注待核实"]),
+              notes: "不要臆测路线图",
+            }),
+          },
+        },
+      ],
+      [{ type: "text", text: "记下了。" }],
+    ]);
+
+    for await (const _chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "确认，就按这个建",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+        toolLogs: { create: logTool },
+      },
+      search: { run: vi.fn() },
+      createSkillMode: true,
+    })) {
+      // Drain the stream.
+    }
+
+    expect(createSkill).toHaveBeenCalledWith(
+      { userId: "user-1", agentId: "agent-1" },
+      expect.objectContaining({ name: "model-studio-facts", status: "enabled" }),
+    );
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: "create_skill", status: "success" }),
+    );
+  });
+
+  it("creates the skill when the model sends steps as a numbered paragraph", async () => {
+    const createSkill = vi.fn();
+    const llm = scriptedLlm([
+      [
+        {
+          type: "tool_call",
+          toolCall: {
+            id: "call-1",
+            name: "create_skill",
+            arguments: JSON.stringify({
+              name: "报价复核",
+              description: "给客户发报价前的复核口径",
+              steps: "1. 核对折扣区间\n2. 确认交付周期\n3. 复述风险条款",
+            }),
+          },
+        },
+      ],
+      [{ type: "text", text: "建好了。" }],
+    ]);
+
+    for await (const _chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "确认",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+      },
+      search: { run: vi.fn() },
+      createSkillMode: true,
+    })) {
+      // Drain the stream.
+    }
+
+    const draft = createSkill.mock.calls[0]?.[1] as { content: string };
+    expect(draft.content).toContain("核对折扣区间");
+    expect(draft.content).toContain("确认交付周期");
+    expect(draft.content).toContain("复述风险条款");
+    expect(draft.content).not.toContain("1. 1. 核对折扣区间");
+  });
+
+  it("keeps the incomplete-input path silent about tool internals and records the arg shape", async () => {
+    const createSkill = vi.fn();
+    const logTool = vi.fn();
+    const toolResults: string[] = [];
+    const llm = scriptedLlm([
+      [
+        {
+          type: "tool_call",
+          toolCall: {
+            id: "call-1",
+            name: "create_skill",
+            arguments: JSON.stringify({
+              name: "只有名字",
+              description: "缺步骤",
+              steps: 42,
+            }),
+          },
+        },
+      ],
+      [{ type: "text", text: "还差点东西，我再问你两句。" }],
+    ]);
+    const seenInputs: LlmStreamInput[] = [];
+    const recordingLlm = {
+      stream(input: LlmStreamInput) {
+        seenInputs.push(input);
+        return llm.stream(input);
+      },
+    };
+
+    for await (const _chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "确认",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm: recordingLlm as typeof llm,
+      model: "mock-main",
+      repositories: {
+        ...baseRepositories(),
+        skills: { findEnabled: async () => [], create: createSkill },
+        toolLogs: { create: logTool },
+      },
+      search: { run: vi.fn() },
+      createSkillMode: true,
+    })) {
+      // Drain the stream.
+    }
+
+    for (const message of seenInputs.at(-1)?.messages ?? []) {
+      if (message.role === "tool") toolResults.push(message.content);
+    }
+    expect(createSkill).not.toHaveBeenCalled();
+    expect(toolResults.join("")).toContain("不要提到工具、参数名");
+    expect(toolResults.join("")).not.toMatch(/create_skill|steps/);
+    expect(logTool).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "create_skill",
+        status: "error",
+        error: expect.stringContaining("steps=0 from number"),
+      }),
+    );
+  });
+
   it("exposes save_skill and persists a pending draft when the model calls it", async () => {
     const seenInputs: LlmStreamInput[] = [];
     const createSkill = vi.fn();
