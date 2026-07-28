@@ -11,7 +11,7 @@ import type {
   ExecutionStepAction,
 } from "@/server/channels/runtime/execution-journal";
 import type { ChannelAgentTurnContext } from "@/server/channels/runtime/turn-executor";
-import type { LlmClient } from "@/server/llm/types";
+import type { LlmClient, LlmStreamInput } from "@/server/llm/types";
 
 const scope = { userId: "user-1", agentId: "agent-1" };
 const now = new Date("2026-07-05T10:00:00+08:00");
@@ -25,6 +25,28 @@ function textLlm(reply: string): LlmClient {
       return reply;
     },
   };
+}
+
+function recordingLlm(reply: string) {
+  const calls: LlmStreamInput[] = [];
+  const client: LlmClient = {
+    async *stream(input) {
+      calls.push(input);
+      yield { type: "text", text: reply };
+    },
+    async completeText() {
+      return reply;
+    },
+  };
+  return { calls, client };
+}
+
+function toolNames(calls: LlmStreamInput[]): string[] {
+  return (calls[0]?.tools ?? []).map((tool) => tool.name);
+}
+
+function systemPrompt(calls: LlmStreamInput[]): string {
+  return calls[0]?.messages[0]?.content ?? "";
 }
 
 describe("channel agent turn", () => {
@@ -179,6 +201,52 @@ describe("channel agent turn", () => {
       .toHaveBeenCalledWith(scope, "weekly-review");
     expect(repositories.skills.findByIds)
       .toHaveBeenCalledWith(scope, ["skill-1"]);
+  });
+
+  it("管理员私聊挂载 Skill 创建工具", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("我们先给它起个名字。");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({
+      manageGlobalAssets: true,
+      text: "我想让你学会写周报",
+    })));
+
+    expect(toolNames(llm.calls)).toContain("create_skill");
+    expect(toolNames(llm.calls)).toContain("save_skill");
+    expect(systemPrompt(llm.calls)).toContain("create_skill");
+  });
+
+  it("非管理员私聊不挂载 Skill 创建工具也不提及它", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("这个我这边做不了。");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "我想让你学会写周报",
+    })));
+
+    expect(toolNames(llm.calls)).not.toContain("create_skill");
+    expect(toolNames(llm.calls)).not.toContain("save_skill");
+    expect(systemPrompt(llm.calls))
+      .not.toMatch(/create_skill|save_skill/);
+  });
+
+  it("非管理员发起 /create-skill 时收到中立提示而非静默失败", async () => {
+    const repositories = fakeRepositories();
+    const llm = recordingLlm("这个得让管理员来。");
+    const runner = createRunner(repositories, llm.client);
+
+    await collect(runner.runAgentTurn(createContext({
+      text: "/create-skill 报价评审",
+      skillPermission: "explicit_slash",
+    })));
+
+    expect(systemPrompt(llm.calls))
+      .toContain("本轮不具备创建或安装 Skill 的能力");
+    expect(systemPrompt(llm.calls))
+      .not.toMatch(/create_skill|save_skill/);
   });
 
   it("附件上下文禁止搜索、Skill 与其他工具", async () => {

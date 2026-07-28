@@ -176,8 +176,9 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         hasAttachmentContext
           ? "none"
           : context.claim.normalizedEvent.permission.skills,
-        context.claim.normalizedEvent.permission
-          .manageGlobalAssets === true,
+        !hasAttachmentContext
+          && context.claim.normalizedEvent.permission
+            .manageGlobalAssets === true,
       );
       const searchGate = hasAttachmentContext
         ? denyAttachmentSearch()
@@ -200,13 +201,14 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         model: model.model,
         repositories: channelAgentRepositories(
           input.repositories,
-          invocation.createSkillMode,
+          invocation.allowSkillCreation,
           message.chatType === "direct"
             ? message.contextKey ?? null
             : null,
         ),
         explicitSkillIds: invocation.explicitSkillIds,
         createSkillMode: invocation.createSkillMode,
+        capabilityNotice: invocation.capabilityNotice,
         searchGate,
         attachmentToolGuard: hasAttachmentContext,
         executionJournal: context.journal,
@@ -441,34 +443,51 @@ async function recordDissatisfaction(
   }
 }
 
+const skillCapabilityDeniedNotice =
+  "本轮不具备创建或安装 Skill 的能力。若用户提出这类请求，用自然语言说明你现在无法在这里创建或安装、需要由管理员处理，然后正常继续对话。";
+
+const skillNotFoundNotice =
+  "用户指定的 Skill 当前不存在或未启用。请直接按用户的实际意图正常回应，不要提及 Skill 索引或任何内部机制。";
+
+type SkillInvocation = {
+  message: string;
+  createSkillMode: boolean;
+  explicitSkillIds: string[];
+  allowSkillInstaller: boolean;
+  /** Admin-only: mounts the Skill mutation tools for the whole turn. */
+  allowSkillCreation: boolean;
+  capabilityNotice: string | null;
+};
+
 async function resolveSkillInvocation(
   repositories: Repositories,
   scope: AgentScope,
   text: string,
   permission: "none" | "explicit_slash",
   allowGlobalAssetMutation: boolean,
-): Promise<{
-  message: string;
-  createSkillMode: boolean;
-  explicitSkillIds: string[];
-  allowSkillInstaller: boolean;
-}> {
-  const blocked = {
+): Promise<SkillInvocation> {
+  // Tool availability follows the admin gate alone, so an admin can also start a
+  // creation flow in plain language; the slash command only drives the guided
+  // prompt. Everyone else keeps the tools closed.
+  const base = {
     message: text,
     createSkillMode: false,
-    explicitSkillIds: [],
+    explicitSkillIds: [] as string[],
     allowSkillInstaller: false,
-  };
-  if (permission !== "explicit_slash") return blocked;
+    allowSkillCreation: allowGlobalAssetMutation,
+    capabilityNotice: null,
+  } satisfies SkillInvocation;
+  if (permission !== "explicit_slash") return base;
 
   const command = parseSlashCommand(text);
   if (command?.kind === "create_skill") {
-    if (!allowGlobalAssetMutation) return blocked;
+    if (!allowGlobalAssetMutation) {
+      return { ...base, capabilityNotice: skillCapabilityDeniedNotice };
+    }
     return {
+      ...base,
       message: command.rest || text,
       createSkillMode: true,
-      explicitSkillIds: [],
-      allowSkillInstaller: false,
     };
   }
   if (command?.kind === "use_skill") {
@@ -477,11 +496,12 @@ async function resolveSkillInvocation(
         .includes(command.name.toLowerCase())
       && /^https:\/\/github\.com\//i.test(command.rest)
     ) {
-      if (!allowGlobalAssetMutation) return blocked;
+      if (!allowGlobalAssetMutation) {
+        return { ...base, capabilityNotice: skillCapabilityDeniedNotice };
+      }
       return {
+        ...base,
         message: `请安装这个 Skill：${command.rest}`,
-        createSkillMode: false,
-        explicitSkillIds: [],
         allowSkillInstaller: true,
       };
     }
@@ -491,21 +511,21 @@ async function resolveSkillInvocation(
     );
     if (skill) {
       return {
+        ...base,
         message:
           command.rest
           || buildExplicitSkillFallbackMessage(skill.name),
-        createSkillMode: false,
         explicitSkillIds: [skill.id],
-        allowSkillInstaller: false,
       };
     }
+    return { ...base, capabilityNotice: skillNotFoundNotice };
   }
-  return blocked;
+  return base;
 }
 
 function channelAgentRepositories(
   repositories: Repositories,
-  createSkillMode: boolean,
+  allowSkillCreation: boolean,
   memoryContextKey: string | null,
 ): Parameters<typeof runAgent>[0]["repositories"] {
   return {
@@ -530,7 +550,7 @@ function channelAgentRepositories(
       findEnabled: async () => [],
       findByIds: repositories.skills.findByIds,
       recordUsage: repositories.skills.recordUsage,
-      ...(createSkillMode
+      ...(allowSkillCreation
         ? { create: repositories.skills.create }
         : {}),
     },

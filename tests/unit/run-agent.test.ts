@@ -609,6 +609,79 @@ describe("runAgent", () => {
     expect(systemPrompt).toContain("不得执行任何外部动作");
   });
 
+  it("only advertises the skill tools that are available this turn", () => {
+    const withSkillTools = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "帮我记住这套做法",
+      skillTools: {
+        saveSkill: true,
+        createSkill: true,
+        installSkill: false,
+      },
+    });
+    const granted = withSkillTools[0]?.content ?? "";
+
+    expect(granted).toContain("工具使用规则");
+    expect(granted).toContain("save_skill");
+    expect(granted).toContain("create_skill");
+    expect(granted).not.toContain("install_skill");
+
+    const withoutSkillTools = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "帮我记住这套做法",
+    });
+    const denied = withoutSkillTools[0]?.content ?? "";
+
+    expect(denied).not.toContain("工具使用规则");
+    expect(denied).not.toMatch(/save_skill|create_skill|install_skill/);
+  });
+
+  it("keeps search output discipline even without skill tools", () => {
+    const messages = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "帮我查一下",
+    });
+    const system = messages[0]?.content ?? "";
+
+    expect(system).toContain("绝不向用户暴露工具调用过程");
+    expect(system).toContain(
+      "绝不把搜索结果的标题、摘要、链接原样罗列给用户",
+    );
+  });
+
+  it("forbids describing its own implementation or capability wiring", () => {
+    const messages = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "为什么创建不了 skill",
+    });
+    const system = messages[0]?.content ?? "";
+
+    expect(system).toContain("自我实现保密");
+    expect(system).toContain("通道连接状态");
+    expect(system).toContain("工具是否挂载");
+  });
+
+  it("passes a capability notice into the system prompt", () => {
+    const messages = buildMessages({
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      memories: [],
+      history: [],
+      userText: "/create-skill 报价评审",
+      capabilityNotice: "本轮不具备创建或安装 Skill 的能力。",
+    });
+
+    expect(messages[0]?.content)
+      .toContain("本轮不具备创建或安装 Skill 的能力");
+  });
+
   it("injects recalled memories and streams visible assistant text", async () => {
     const seenInputs: LlmStreamInput[] = [];
     const llm = scriptedLlm([[{ type: "text", text: "记得你喜欢爬山。" }]], seenInputs);
