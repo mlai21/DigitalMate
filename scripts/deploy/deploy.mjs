@@ -8,8 +8,9 @@
 // the server's RAM taking the whole box down.
 //
 // Usage:
-//   node scripts/deploy/deploy.mjs            # sync changed files, build, switch
+//   node scripts/deploy/deploy.mjs            # sync committed changes, build, switch
 //   node scripts/deploy/deploy.mjs --all      # ignore the marker, sync everything
+//   node scripts/deploy/deploy.mjs --dirty    # also ship uncommitted working tree
 //   node scripts/deploy/deploy.mjs --no-build # sync only, keep current images
 //   node scripts/deploy/deploy.mjs --check    # preflight + status, change nothing
 
@@ -217,16 +218,23 @@ async function resolveChangedFiles() {
     "HEAD",
   ]);
   const committed = stdout.split("\n").filter(Boolean);
+  // Deploying the working tree by default would ship whatever half-finished
+  // work happens to be open, including another agent's, so it takes --dirty.
   const { stdout: dirty } = await execFileAsync("git", [
     "status",
     "--porcelain",
   ]);
-  const uncommitted = dirty
+  const modified = dirty
     .split("\n")
     .filter((line) => line && !line.startsWith("??"))
     .map((line) => line.slice(3).trim());
-  if (uncommitted.length > 0) {
-    log(`! 工作区有未提交改动，会一起部署：${uncommitted.join(", ")}`);
+  const uncommitted = flags.has("--dirty") ? modified : [];
+  if (modified.length > 0) {
+    log(
+      flags.has("--dirty")
+        ? `! 按 --dirty 一并部署未提交改动：${modified.join(", ")}`
+        : `! 工作区有未提交改动，本次不部署（需要就加 --dirty）：${modified.join(", ")}`,
+    );
   }
   const files = [...new Set([...committed, ...uncommitted])].filter(
     (file) => existsSync(file) && syncRoots.some(
