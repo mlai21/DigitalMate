@@ -40,6 +40,7 @@ const ADAPTER_KEYS = [
   "acknowledge",
   "send",
   "typing",
+  "ackReaction",
   "streaming",
   "resolveRecipient",
 ] as const satisfies readonly (keyof ChannelAdapter<Record<string, unknown>>)[];
@@ -69,6 +70,7 @@ describe("ChannelAdapter boundary", () => {
       "acknowledge",
       "send",
       "typing",
+      "ackReaction",
       "streaming",
       "resolveRecipient",
     ]);

@@ -245,6 +245,29 @@ describe("channel turn execution contract", () => {
     )).toEqual([true, false]);
   });
 
+  it("clears the platform indicator when the Agent fails", async () => {
+    const harness = turnHarness();
+    harness.runAgentTurn.mockRejectedValueOnce(
+      new Error("agent_exploded"),
+    );
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result.degraded).toBe(true);
+    expect(harness.typing.mock.calls.map(
+      ([, active]) => active,
+    )).toEqual([true, false]);
+  });
+
+  it("leaves no platform indicator when the turn is skipped", async () => {
+    const harness = turnHarness({ skipReason: "not_mentioned" });
+
+    const result = await harness.executor.execute(claimedEvent());
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(harness.typing).not.toHaveBeenCalled();
+  });
+
   it("does not rerun the Agent after execution was already claimed", async () => {
     const harness = turnHarness({ executionClaimed: false });
 

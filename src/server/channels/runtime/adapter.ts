@@ -39,6 +39,15 @@ export interface ChannelAdapter<
     recipient: ResolvedRecipient,
     active: boolean,
   ): Promise<void>;
+  // Marks the user's own message as being worked on, for platforms that offer
+  // reactions instead of a typing indicator.
+  ackReaction?(
+    input: Readonly<{
+      externalEventId: string;
+      externalConversationId: string;
+      active: boolean;
+    }>,
+  ): Promise<void>;
   streaming?(
     delivery: ChannelDelivery,
     state: StreamingState,

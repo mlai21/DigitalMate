@@ -224,6 +224,21 @@ export function createDingTalkAdapter(
         cardInstanceId,
       );
     },
+    async ackReaction(input) {
+      const activeConfig = requireConfig(config);
+      const messageId = readInboundMessageId(input.externalEventId);
+      if (!messageId) return;
+      await withClient(
+        activeConfig,
+        (active) => active.reactPending({
+          messageId,
+          conversationId: input.externalConversationId,
+          robotCode: activeConfig.robot_code.trim()
+            || activeConfig.client_id,
+          active: input.active,
+        }),
+      );
+    },
     async resolveRecipient(target) {
       return {
         address: {
@@ -532,6 +547,12 @@ function messageTitle(text: string) {
 function requireRouteValue(value: string, code: string) {
   if (!value) throw new Error(code);
   return value;
+}
+
+function readInboundMessageId(externalEventId: string): string | null {
+  const prefix = "message:";
+  if (!externalEventId.startsWith(prefix)) return null;
+  return externalEventId.slice(prefix.length) || null;
 }
 
 function requireConfig(value: DingTalkConfig | null) {

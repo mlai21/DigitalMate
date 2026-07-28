@@ -300,6 +300,73 @@ describe("DingTalk Stream and AI Card", () => {
     }));
   });
 
+  it("marks the incoming message while the reply is being prepared", async () => {
+    const client = createFakeDingTalkClient();
+    const adapter = testAdapter(client);
+    await adapter.start(runtimeContext(adapter));
+
+    await adapter.ackReaction!({
+      externalEventId: "message:msg-1001",
+      externalConversationId: "cid-direct-1",
+      active: true,
+    });
+    await adapter.ackReaction!({
+      externalEventId: "message:msg-1001",
+      externalConversationId: "cid-direct-1",
+      active: false,
+    });
+
+    expect(client.reactions).toEqual([
+      {
+        messageId: "msg-1001",
+        conversationId: "cid-direct-1",
+        robotCode: "robot-1",
+        active: true,
+      },
+      {
+        messageId: "msg-1001",
+        conversationId: "cid-direct-1",
+        robotCode: "robot-1",
+        active: false,
+      },
+    ]);
+    await adapter.stop("shutdown");
+  });
+
+  it("falls back to the client id when no robot code is configured", async () => {
+    const client = createFakeDingTalkClient();
+    const adapter = testAdapter(client);
+    await adapter.start(
+      runtimeContext(adapter, undefined, { ...CONFIG, robot_code: "  " }),
+    );
+
+    await adapter.ackReaction!({
+      externalEventId: "message:msg-1001",
+      externalConversationId: "cid-direct-1",
+      active: true,
+    });
+
+    expect(client.reactions).toMatchObject([
+      { robotCode: CONFIG.client_id },
+    ]);
+    await adapter.stop("shutdown");
+  });
+
+  it("skips the reaction for events that carry no platform message", async () => {
+    const client = createFakeDingTalkClient();
+    const adapter = testAdapter(client);
+    await adapter.start(runtimeContext(adapter));
+
+    await adapter.ackReaction!({
+      externalEventId: "card-callback:abc",
+      externalConversationId: "cid-direct-1",
+      active: true,
+    });
+
+    expect(client.reactions).toEqual([]);
+    await adapter.stop("shutdown");
+  });
+
   it("creates and finalizes one AI Card across delivery instances", async () => {
     const client = createFakeDingTalkClient();
     const adapter = testAdapter(client);
@@ -433,6 +500,50 @@ describe("DingTalk Stream and AI Card", () => {
     const serialized = JSON.stringify(http.requests);
     expect(serialized).not.toContain(CONFIG.client_secret);
     expect(serialized).not.toContain("ding-private-token-value");
+  });
+
+  it("attaches and withdraws the pending reaction on the sender's message", async () => {
+    const http = createFakeHttpClient();
+    http.enqueue({
+      status: 200,
+      body: { accessToken: "ding-private-token-value", expireIn: 7_200 },
+    });
+    http.enqueue({ status: 200, body: { success: true } });
+    http.enqueue({ status: 200, body: { success: true } });
+    const adapter = createDingTalkAdapter({
+      clientFactory: () => createFakeDingTalkClient(),
+      autoListen: false,
+    });
+    const client = createDingTalkSdkClient(
+      adapter.validateConfig(CONFIG),
+      { http },
+    );
+    const target = {
+      messageId: "msg-1001",
+      conversationId: "cid-direct-1",
+      robotCode: "robot-1",
+    };
+
+    await client.reactPending({ ...target, active: true });
+    await client.reactPending({ ...target, active: false });
+
+    const [, attach, recall] = http.requests;
+    expect(attach).toMatchObject({
+      method: "POST",
+      url: "https://api.dingtalk.com/v1.0/robot/emotion/reply",
+      body: {
+        robotCode: "robot-1",
+        openMsgId: "msg-1001",
+        openConversationId: "cid-direct-1",
+        emotionType: 2,
+        textEmotion: { emotionId: "2659900" },
+      },
+    });
+    expect(recall).toMatchObject({
+      method: "POST",
+      url: "https://api.dingtalk.com/v1.0/robot/emotion/recall",
+      body: { openMsgId: "msg-1001" },
+    });
   });
 
   it("uses the documented Card, OpenAPI, and sessionWebhook request shapes", async () => {
@@ -637,12 +748,14 @@ type FakeDingTalkClient = DingTalkClientPort & {
   openApiMessages: unknown[];
   cards: unknown[];
   cardUpdates: unknown[];
+  reactions: unknown[];
   emit(payload: unknown, order?: string[]): Promise<void>;
 };
 
 function createFakeDingTalkClient(options: Readonly<{
   startError?: Error;
   sessionError?: Error;
+  reactionError?: Error;
 }> = {}): FakeDingTalkClient {
   let handler: Parameters<DingTalkClientPort["start"]>[0]["onEvent"]
     | null = null;
@@ -653,6 +766,7 @@ function createFakeDingTalkClient(options: Readonly<{
     openApiMessages: [],
     cards: [],
     cardUpdates: [],
+    reactions: [],
     async start(input) {
       this.starts += 1;
       if (options.startError) throw options.startError;
@@ -679,6 +793,10 @@ function createFakeDingTalkClient(options: Readonly<{
     },
     async updateCard(input) {
       this.cardUpdates.push(input);
+    },
+    async reactPending(input) {
+      if (options.reactionError) throw options.reactionError;
+      this.reactions.push(input);
     },
     async emit(payload, order = []) {
       if (!handler) throw new Error("fake_dingtalk_not_started");

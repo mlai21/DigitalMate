@@ -387,8 +387,16 @@ export async function startChannelRuntime(input: Readonly<{
         connection.id,
         connection.revision,
       );
-      if (!adapter?.typing) return;
+      if (!adapter) return;
       const event = claim.normalizedEvent;
+      if (adapter.ackReaction) {
+        await adapter.ackReaction({
+          externalEventId: event.externalEventId,
+          externalConversationId: event.externalConversationId,
+          active,
+        }).catch(() => undefined);
+      }
+      if (!adapter.typing) return;
       const recipient = await adapter.resolveRecipient({
         externalConversationId:
           event.externalConversationId,

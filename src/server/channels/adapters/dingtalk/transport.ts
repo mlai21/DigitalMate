@@ -14,6 +14,14 @@ import type {
 
 import type { DingTalkConfig } from "./config";
 
+// DingTalk exposes one built-in "thinking" reaction for robots rather than a
+// generic emoji API, and `emotion/reply` is not part of the published OpenAPI
+// reference. Verified against a live app; treat failures as non-fatal.
+const PENDING_EMOTION_TYPE = 2;
+const PENDING_EMOTION_NAME = "🤔思考中";
+const PENDING_EMOTION_ID = "2659900";
+const PENDING_EMOTION_BACKGROUND_ID = "im_bg_1";
+
 export class DingTalkTransportError extends Error {
   readonly code:
     | "credential_invalid"
@@ -83,6 +91,13 @@ export type DingTalkClientPort = Readonly<{
     templateKey: string;
     text: string;
     final: boolean;
+    signal?: AbortSignal;
+  }>): Promise<void>;
+  reactPending(input: Readonly<{
+    messageId: string;
+    conversationId: string;
+    robotCode: string;
+    active: boolean;
     signal?: AbortSignal;
   }>): Promise<void>;
 }>;
@@ -286,6 +301,32 @@ export function createDingTalkSdkClient(
           isFull: true,
           isFinalize: input.final,
           isError: false,
+        },
+        input.signal,
+      );
+    },
+    async reactPending(input) {
+      const token = await tokens.get();
+      await apiRequest(
+        http,
+        config,
+        token,
+        "POST",
+        input.active
+          ? "/v1.0/robot/emotion/reply"
+          : "/v1.0/robot/emotion/recall",
+        {
+          robotCode: input.robotCode,
+          openMsgId: input.messageId,
+          openConversationId: input.conversationId,
+          emotionType: PENDING_EMOTION_TYPE,
+          emotionName: PENDING_EMOTION_NAME,
+          textEmotion: {
+            emotionId: PENDING_EMOTION_ID,
+            emotionName: PENDING_EMOTION_NAME,
+            text: PENDING_EMOTION_NAME,
+            backgroundId: PENDING_EMOTION_BACKGROUND_ID,
+          },
         },
         input.signal,
       );

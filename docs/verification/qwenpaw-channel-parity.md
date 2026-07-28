@@ -99,7 +99,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "c3038d5d641ee0036c923bb287903614c07b97a12848e5b503e76c9dfde65f63",
+      "evidence_sha256": "76d875da05ba0ada9c94b21fed63254e1da466d29a96c82dbe4d214c0366707a",
       "adapter_files": [
         "src/server/channels/adapters/telegram/config.ts",
         "src/server/channels/adapters/telegram/index.ts",
@@ -169,7 +169,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "051e01b4e5f94be13942e3d28a5115232f3a73c26605768be3a8f7a2db45a8b9",
+      "evidence_sha256": "2571d98a2598a2e4ffe81dab56187f92d3aa7f4c105f6ce78e274ef6d34ab6fb",
       "adapter_files": [
         "src/server/channels/adapters/discord/config.ts",
         "src/server/channels/adapters/discord/index.ts",
@@ -244,7 +244,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "1d9176bd46a59b40e8578a27bf9b1ecf606d2fd5fa737d215ff76f91b52bddf4",
+      "evidence_sha256": "990b733280072039ad563368703e963d4d99f75d72631951ca21a29578ec793a",
       "adapter_files": [
         "src/server/channels/adapters/slack/config.ts",
         "src/server/channels/adapters/slack/index.ts",
@@ -314,7 +314,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "eb3e6ffc2b234d09326619c4442ea6fa8c47e7b8059d0796f2b24066a90ea512",
+      "evidence_sha256": "47cca784d8fdc9bd9eb40fabc9cadb9547902318a0739fddbc9f9260eee260b7",
       "adapter_files": [
         "src/server/channels/adapters/mattermost/config.ts",
         "src/server/channels/adapters/mattermost/index.ts",
@@ -395,7 +395,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "87905612341af282d85bcc60f25fefd12c42c75436913d4515ef6732f0935d06",
+      "evidence_sha256": "dde9ece365d510363850b68db9fb9124125e65b90c691cd859f51bfcd5b4659b",
       "adapter_files": [
         "src/server/channels/adapters/feishu/config.ts",
         "src/server/channels/adapters/feishu/index.ts",
@@ -480,7 +480,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "c2a8b929ae70dd70e1db50cb587bea59c0f84d82f6c1f887b9c0f04814dc95e2",
+      "evidence_sha256": "f6b784793e5a4486fc4380b193b8f379c91c7f699f18f514027e45d7217915fa",
       "adapter_files": [
         "src/server/channels/adapters/dingtalk/config.ts",
         "src/server/channels/adapters/dingtalk/index.ts",
@@ -555,7 +555,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "88d4bb616a5e865e0dc57c260b117e893af2ea76bd5c26b438c661bbc44418b1",
+      "evidence_sha256": "333d294f8f5bd3c5bdd49d7f5caa58d201ffc0581a281e9d173c9137d386d65d",
       "adapter_files": [
         "src/server/channels/adapters/qq/config.ts",
         "src/server/channels/adapters/qq/index.ts",
