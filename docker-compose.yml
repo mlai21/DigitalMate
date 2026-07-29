@@ -62,10 +62,13 @@ services:
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
       GEMINI_3_5_FLASH_ENDPOINT: ${GEMINI_3_5_FLASH_ENDPOINT:-/gemini-3-5-flash-openai/v1/chat/completions}
+      MODEL_STUDIO_API_KEY: ${MODEL_STUDIO_API_KEY:-}
+      MODEL_STUDIO_BASE_URL: ${MODEL_STUDIO_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       CLAUDE_MESSAGES_ENDPOINT: ${CLAUDE_MESSAGES_ENDPOINT:-/claude/v1/messages}
       ANTHROPIC_API_VERSION: ${ANTHROPIC_API_VERSION:-2023-06-01}
       LLM_MODEL_MAIN: ${LLM_MODEL_MAIN:-claude-opus-4-8}
       LLM_MODEL_LIGHT: ${LLM_MODEL_LIGHT:-gemini-3-5-flash-openai}
+      LLM_MODEL_MAIN_FALLBACKS: ${LLM_MODEL_MAIN_FALLBACKS:-}
       SEARCH_PROVIDER: ${SEARCH_PROVIDER:-duckduckgo}
       ALIYUN_IQS_API_KEY: ${ALIYUN_IQS_API_KEY:-}
       ALIYUN_IQS_BASE_URL: ${ALIYUN_IQS_BASE_URL:-https://cloud-iqs.aliyuncs.com}
@@ -115,10 +118,13 @@ services:
       KIE_AI_API_KEY: ${KIE_AI_API_KEY:-}
       KIE_AI_BASE_URL: ${KIE_AI_BASE_URL:-https://api.kie.ai}
       GEMINI_3_5_FLASH_ENDPOINT: ${GEMINI_3_5_FLASH_ENDPOINT:-/gemini-3-5-flash-openai/v1/chat/completions}
+      MODEL_STUDIO_API_KEY: ${MODEL_STUDIO_API_KEY:-}
+      MODEL_STUDIO_BASE_URL: ${MODEL_STUDIO_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       CLAUDE_MESSAGES_ENDPOINT: ${CLAUDE_MESSAGES_ENDPOINT:-/claude/v1/messages}
       ANTHROPIC_API_VERSION: ${ANTHROPIC_API_VERSION:-2023-06-01}
       LLM_MODEL_MAIN: ${LLM_MODEL_MAIN:-claude-opus-4-8}
       LLM_MODEL_LIGHT: ${LLM_MODEL_LIGHT:-gemini-3-5-flash-openai}
+      LLM_MODEL_MAIN_FALLBACKS: ${LLM_MODEL_MAIN_FALLBACKS:-}
       SEARCH_PROVIDER: ${SEARCH_PROVIDER:-duckduckgo}
       ALIYUN_IQS_API_KEY: ${ALIYUN_IQS_API_KEY:-}
       ALIYUN_IQS_BASE_URL: ${ALIYUN_IQS_BASE_URL:-https://cloud-iqs.aliyuncs.com}
