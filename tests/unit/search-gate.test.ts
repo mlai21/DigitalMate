@@ -8,9 +8,29 @@ describe("isExplicitSearchRequest", () => {
     expect(isExplicitSearchRequest("上网查下这个股票")).toBe(true);
   });
 
+  it("detects verification phrasing that names an external source", () => {
+    expect(isExplicitSearchRequest("去官网核实一下这个 SLA")).toBe(true);
+    expect(isExplicitSearchRequest("查证一下这个资质要求")).toBe(true);
+    expect(isExplicitSearchRequest("按官方文档确认下这个模型的定价")).toBe(true);
+    expect(isExplicitSearchRequest("联网核对一下最新的模型列表")).toBe(true);
+  });
+
   it("does not treat casual chat as an explicit request", () => {
     expect(isExplicitSearchRequest("你觉得人生的意义是什么")).toBe(false);
     expect(isExplicitSearchRequest("今天有点累")).toBe(false);
+    expect(isExplicitSearchRequest("在吗")).toBe(false);
+  });
+
+  it("keeps verification verbs closed when no external source is named", () => {
+    expect(isExplicitSearchRequest("你再确认一下我的理解对不对")).toBe(false);
+    expect(isExplicitSearchRequest("帮我核实一下这个报价单的算法")).toBe(false);
+    expect(isExplicitSearchRequest("确认下我们下一步做什么")).toBe(false);
+  });
+
+  it("keeps implicit realtime questions closed", () => {
+    expect(isExplicitSearchRequest("百炼现在支持哪些模型")).toBe(false);
+    expect(isExplicitSearchRequest("这个价格对吗")).toBe(false);
+    expect(isExplicitSearchRequest("最新的模型是哪个")).toBe(false);
   });
 
   it("gives explicit refusals priority over search keywords", () => {
@@ -20,6 +40,7 @@ describe("isExplicitSearchRequest", () => {
     expect(isExplicitSearchRequest("请勿搜索")).toBe(false);
     expect(isExplicitSearchRequest("不能搜索")).toBe(false);
     expect(isExplicitSearchRequest("不可以搜索")).toBe(false);
+    expect(isExplicitSearchRequest("不用去官网核实，按你已有的说")).toBe(false);
   });
 
   it("does not confuse discussion of search with an instruction to search", () => {

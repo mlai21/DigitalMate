@@ -315,6 +315,13 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       isDefault: false,
       inheritsUserResources: false,
     });
+    // The persona must describe the "default off, explicit request opens it"
+    // policy. Wording that reads as a missing capability made the model refuse
+    // outright instead of letting the search gate decide.
+    const alvinStyle = String(alvin.persona.style ?? "");
+    expect(alvinStyle).toContain("默认不主动联网");
+    expect(alvinStyle).toContain("明确要求查证或搜索时可以联网");
+    expect(alvinStyle).not.toMatch(/默认不联网|不能联网|无法联网/);
     expect(skills).toHaveLength(6);
     await expect(
       repositories.skills.findByIds(
