@@ -31,11 +31,8 @@ export function normalizeFeishuInbound(
   const type = primitiveId(message.message_type);
   const content = parseContent(message.content);
   const attachments = mediaDescriptors(type, content, messageId);
-  const text = type === "text"
-    ? readText(content.text)
-    : attachments.length > 0
-      ? "[附件]"
-      : null;
+  const text = messageText(type, content)
+    ?? (attachments.length > 0 ? "[附件]" : null);
   if (!text) return null;
   const direct = message.chat_type === "p2p";
   const mentions = Array.isArray(message.mentions)
@@ -98,11 +95,100 @@ export function normalizeFeishuInbound(
   };
 }
 
+function messageText(
+  type: string | null,
+  content: Record<string, unknown>,
+): string | null {
+  if (type === "text") return readText(content.text);
+  // Formatted content — pasted lists, links, text around an inline image —
+  // arrives as `post`, not `text`. Without this the body normalized to empty and
+  // the whole message was discarded before it reached an agent turn, which reads
+  // to the user as the bot ignoring them.
+  if (type === "post") return readPostText(content);
+  return null;
+}
+
+/**
+ * `content_v2` keeps the author's markdown (lists, quotes) that `content`
+ * flattens into plain text runs, so it wins when the platform sends both.
+ */
+function readPostText(content: Record<string, unknown>): string | null {
+  const lines = postParagraphs(
+    Array.isArray(content.content_v2) ? content.content_v2 : content.content,
+  )
+    .map((paragraph) => paragraph.map(postElementText).join(""))
+    .filter((line) => line.trim());
+  const title = readText(content.title);
+  return readText([...(title ? [title] : []), ...lines].join("\n"));
+}
+
+function postElementText(element: Record<string, unknown>): string {
+  const tag = primitiveId(element.tag);
+  if (tag === "text" || tag === "md" || tag === "code_block") {
+    return typeof element.text === "string" ? element.text : "";
+  }
+  if (tag === "a") {
+    const label = typeof element.text === "string" ? element.text : "";
+    const href = typeof element.href === "string" ? element.href : "";
+    return href ? `[${label || href}](${href})` : label;
+  }
+  if (tag === "at") {
+    // The inbound `user_id` is an opaque open_id or a `@_user_N` placeholder;
+    // only a resolved display name carries meaning in the body.
+    const name = readText(element.user_name);
+    return name ? `@${name}` : "";
+  }
+  return "";
+}
+
+function postParagraphs(value: unknown): Record<string, unknown>[][] {
+  return Array.isArray(value)
+    ? value
+        .filter((paragraph): paragraph is unknown[] => Array.isArray(paragraph))
+        .map((paragraph) => paragraph.map(asRecord))
+    : [];
+}
+
+/** Bounds the work one inbound message can queue up. */
+const POST_IMAGE_LIMIT = 9;
+
+function postImageDescriptors(
+  content: Record<string, unknown>,
+  messageId: string,
+): InboundAttachmentDescriptor[] {
+  const images = new Map<string, InboundAttachmentDescriptor>();
+  // Scanned across both renderings because the platform may carry the img tag in
+  // only one of them, and the same image_key legitimately repeats.
+  for (const source of [content.content, content.content_v2]) {
+    for (const paragraph of postParagraphs(source)) {
+      for (const element of paragraph) {
+        if (images.size >= POST_IMAGE_LIMIT) return [...images.values()];
+        if (primitiveId(element.tag) !== "img") continue;
+        const key = primitiveId(element.image_key);
+        if (!key || images.has(key)) continue;
+        images.set(key, {
+          externalAttachmentId: key,
+          fileName: "feishu-image.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: null,
+          source: {
+            messageId,
+            imageKey: key,
+            resourceType: "image",
+          },
+        });
+      }
+    }
+  }
+  return [...images.values()];
+}
+
 function mediaDescriptors(
   type: string | null,
   content: Record<string, unknown>,
   messageId: string,
 ): InboundAttachmentDescriptor[] {
+  if (type === "post") return postImageDescriptors(content, messageId);
   if (type !== "file" && type !== "image") return [];
   const key = primitiveId(
     type === "image" ? content.image_key : content.file_key,

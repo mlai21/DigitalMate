@@ -24,9 +24,17 @@
 - 群消息通过 mention 中的机器人 `open_id` 判断是否被 @，访问策略仍由统一渠道权限层执行。
 - `message_id` 只作为 reply handle 的公开路由字段保存，回复通过 `/im/v1/messages/{message_id}/reply` 回到原消息。
 
+## 可识别的入站消息类型
+
+- `text`：取 `content.text`。
+- `post`：按段落抽取正文，段落间换行；`content_v2` 与 `content` 同时存在时优先前者，因为它保留原始 markdown（列表、引用），后者会把这些压成纯文本。`text` / `md` / `code_block` 取文本，`a` 转成 markdown 链接，`at` 只在有 `user_name` 时记为 `@名字`，`hr` / `emotion` / `media` 忽略。其中 `img` 段按图片附件处理，单条最多取 9 张并按 `image_key` 去重。
+- `image` / `file`：按附件处理，正文记为 `[附件]`。
+
+飞书客户端会把**带格式粘贴的内容（列表、链接、图文混排）发成 `post` 而不是 `text`**。早期只识别 `text`，这类消息在归一化阶段就被判空丢弃，用户侧表现为"发了长文本机器人完全不回"。识别不了的类型现在会打一条 `channel_inbound_ignored` 日志（只含渠道、连接与消息类型，不含正文），不再静默消失。
+
 ## 附件与安全
 
-第一期接收 `image` 和 `file` 消息。`image_key` / `file_key` 与 `message_id` 只进入加密 locator；系统使用 `/im/v1/messages/{message_id}/resources/{key}` 下载到 DigitalMate 私有存储，全部附件绑定成功前事件不可执行。
+第一期接收 `image`、`file` 与 `post` 内嵌图片。`image_key` / `file_key` 与 `message_id` 只进入加密 locator；系统使用 `/im/v1/messages/{message_id}/resources/{key}` 下载到 DigitalMate 私有存储，全部附件绑定成功前事件不可执行。
 
 App Secret、Tenant Token、媒体 key、原始事件和下载响应不会写入对话或健康状态。带附件的消息固定关闭联网、Skill 和其他工具；附件正文不能授予联网权限。
 

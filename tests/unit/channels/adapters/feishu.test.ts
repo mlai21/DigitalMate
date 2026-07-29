@@ -118,6 +118,27 @@ defineChannelContract({
       tools: false,
       attachmentsPresent: true,
     });
+
+    // Formatted content arrives as `post`, not `text`. Dropping it made pasted
+    // lists and image-with-caption messages look like the bot ignored them.
+    const post = await adapter.normalizeInbound(
+      await fixture("message-p2p-post.json"),
+      CONTEXT,
+    );
+    expect(post).toMatchObject({
+      externalEventId: "event:9f8e7d-post",
+      chatType: "direct",
+      text: "比较价格\n1. 先从价格入手[官方文档](https://help.aliyun.com/)\n@小唐\n2. 再看缓存命中",
+      attachments: [{
+        externalAttachmentId: "img_post_1",
+        mimeType: "image/jpeg",
+        source: {
+          messageId: "om_message_3",
+          imageKey: "img_post_1",
+          resourceType: "image",
+        },
+      }],
+    });
     await adapter.stop("shutdown");
   },
   async assertStableIds() {

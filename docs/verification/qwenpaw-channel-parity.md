@@ -395,7 +395,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "035335843a1d13ad748d955975bf127637624b20533d1af277ce8fcc23e60a4e",
+      "evidence_sha256": "a7026a39ebc99e5437b367fd4380d9b61d8841b86ae9a9f0d7f6a971f047a0a9",
       "adapter_files": [
         "src/server/channels/adapters/feishu/config.ts",
         "src/server/channels/adapters/feishu/index.ts",
