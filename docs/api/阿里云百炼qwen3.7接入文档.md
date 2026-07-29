@@ -1,6 +1,17 @@
-# 阿里云百炼 Qwen3.7-Max 接入文档
+# 阿里云百炼 Qwen3.7 接入文档
 
-本文覆盖从开通百炼到在 DigitalMate 里跑通 `qwen3.7-max` 的全流程。事实以阿里云百炼官方文档为准（[模型列表](https://help.aliyun.com/zh/model-studio/models)、[OpenAI 兼容-Chat](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)、[获取 API Key](https://help.aliyun.com/zh/model-studio/get-api-key)），项目侧映射以本仓库代码为准。
+本文覆盖从开通百炼到在 DigitalMate 里跑通 `qwen3.7-max` 与 `qwen3.7-plus` 的全流程。事实以阿里云百炼官方文档为准（[模型列表](https://help.aliyun.com/zh/model-studio/models)、[OpenAI 兼容-Chat](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)、[获取 API Key](https://help.aliyun.com/zh/model-studio/get-api-key)），项目侧映射以本仓库代码为准，能力结论以线上实测为准。
+
+## 实测结论（2026-07-30，北京地域，走本项目客户端）
+
+| 模型 | 流式文本 | 流式 + tools | 图片输入 |
+|---|---|---|---|
+| `qwen3.7-max` | ✓ | ✓ | ✗ 直接拒绝：`Unexpected item type in content` |
+| `qwen3.7-plus` | ✓ | ✓ | ✓ 能正确描述真实照片内容 |
+
+两条值得记住的结论：**tools 与 stream 可以同时用**（官方兼容文档里"tools 暂时无法与 stream=True 同时使用"那句是针对老 `qwen-turbo/plus/max` 的，对 3.7 不适用），所以它们可以安全地作为带工具的主模型或降级备用；**图片能力只有 plus 有**，因此目录里 `qwen3.7-plus` 的 `supportsImageInput` 为 `true`、`qwen3.7-max` 为 `false`。
+
+另外注意图片有最小尺寸限制，1×1 的测试图会被拒（`height:1 or width:1 must be larger`），排查时别把它误判成"不支持图片"。
 
 ## 为什么单独接一个供应商
 
@@ -50,25 +61,37 @@ curl -X POST "${MODEL_STUDIO_BASE_URL}/chat/completions" \
 
 成功时 `Content-Type` 为 `text/event-stream`，每行以 `data: ` 开头，最后以 `data: [DONE]` 结束。项目里的客户端只读 `choices[0].delta.content` 与 `delta.tool_calls`。
 
+要走本项目的客户端验证（会一并覆盖 tools 与图片路径），注意**裸跑脚本不会自动加载 `.env`**（只有 Next.js 会），必须显式指定：
+
+```bash
+npx tsx --env-file=.env <你的脚本>
+```
+
+否则会得到一个很有迷惑性的 401 `You didn't provide an API key`——那是密钥根本没发出去，不是密钥错误。真正的密钥错误消息是 `Incorrect API key provided`。
+
 ## 项目侧配置
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `MODEL_STUDIO_API_KEY` | 是（用 Qwen 时） | 百炼 API Key。**未配置时 Qwen 模型会被直接跳过**，不会尝试调用也不会报错 |
 | `MODEL_STUDIO_BASE_URL` | 否 | 默认北京旧域名，按上表替换为自己地域/业务空间的地址 |
-| `LLM_MODEL_MAIN` / `LLM_MODEL_LIGHT` | 否 | 填 `qwen3.7-max` 即把它作为主/轻模型 |
-| `LLM_MODEL_MAIN_FALLBACKS` | 否 | 主模型故障时的降级链，可包含 `qwen3.7-max` |
+| `LLM_MODEL_MAIN` / `LLM_MODEL_LIGHT` | 否 | 填 `qwen3.7-max` 或 `qwen3.7-plus` 即把它作为主/轻模型 |
+| `LLM_MODEL_MAIN_FALLBACKS` | 否 | 主模型故障时的降级链 |
+
+当前生产策略是 `LLM_MODEL_MAIN=claude-opus-4-8`、`LLM_MODEL_MAIN_FALLBACKS=qwen3.7-plus,gemini-3-6-flash-openai`。两级备用刻意跨了供应商：第一级换到百炼，KIE 网关整体故障时仍能作答；第二级回到 KIE 的廉价模型，兜住百炼欠费或超限的情况。
 
 改完这三处才算生效：
 
 1. `.env`（本地）与服务器上的 `.env`；
 2. `docker-compose.yml` 的 `environment` 是**逐项白名单**传值，新变量不加进去容器里读不到（`MODEL_STUDIO_API_KEY`、`MODEL_STUDIO_BASE_URL`、`LLM_MODEL_MAIN_FALLBACKS` 已加）；
-3. **Agent 模型授权**。`qwen3.7-max` 必须在该 Agent 的 `agent_resource_grants` 里有 `model` 记录，否则主模型会抛 `model_resource_unauthorized`、备用模型会被静默忽略。默认 Agent（`inherits_user_resources = true`）自动继承，Alvin 这类不继承的必须显式补：
+3. **Agent 模型授权**。要用的模型必须在该 Agent 的 `agent_resource_grants` 里有 `model` 记录，否则主模型会抛 `model_resource_unauthorized`、备用模型会被静默忽略。默认 Agent（`inherits_user_resources = true`）自动继承，Alvin 这类不继承的必须显式补：
 
 ```sql
 INSERT INTO agent_resource_grants (user_id, agent_id, resource_type, resource_id, enabled)
-SELECT user_id, id, 'model', 'qwen3.7-max', true
-FROM digital_agents WHERE slug = 'alvin'
+SELECT a.user_id, a.id, 'model', m.model, true
+FROM digital_agents a
+CROSS JOIN (VALUES ('qwen3.7-max'), ('qwen3.7-plus')) AS m(model)
+WHERE a.status = 'active'
 ON CONFLICT (agent_id, resource_type, resource_id) DO UPDATE SET enabled = true;
 ```
 
@@ -83,15 +106,15 @@ ON CONFLICT (agent_id, resource_type, resource_id) DO UPDATE SET enabled = true;
 
 ## 模型能力与同代型号
 
-`qwen3.7-max` 是纯文本推理旗舰（**不支持图片输入**，目录里 `supportsImageInput: false`），带扩展思考，长上下文。同代还有 `qwen3.7-plus`、`qwen3.7-flash`，均在上述五个地域提供 OpenAI 兼容接口，换模型 id 即可。`qwen3.8-max-preview` 目前只对 Token Plan 订阅用户开放，且 Token Plan / Coding Plan 用的是以 `sk-sp-` 开头的专属密钥。
+`qwen3.7-max` 是纯文本推理旗舰，带扩展思考、长上下文；`qwen3.7-plus` 是均衡档，能力略低但**支持图片理解**，因此更适合当降级备用（降级时不必担心多模态回合失去图片能力）。同代还有更便宜的 `qwen3.7-flash`，均在上述五个地域提供 OpenAI 兼容接口，换模型 id 即可。`qwen3.8-max-preview` 目前只对 Token Plan 订阅用户开放，且 Token Plan / Coding Plan 用的是以 `sk-sp-` 开头的专属密钥。
 
-## 三个需要注意的地方
+需要说明的是，降级到 `qwen3.7-plus` 并不会让原本不支持图片的主模型突然能读图：附件是否作为图片送入，由**配置的主模型**的 `supportsImageInput` 在更上游决定，降级发生时这个判断早已完成。
+
+## 两个需要注意的地方
 
 **一、思考内容不会进对话。** Qwen3 的思考文本走 `delta.reasoning_content`，我们的客户端只取 `delta.content`，所以推理过程天然不会出现在回复里——这正是产品红线要的（不暴露思考过程），不要"顺手"把它读出来。
 
-**二、`tools` 与 `stream` 的组合要实测。** 百炼 OpenAI 兼容文档里有一句针对老 `qwen-turbo/plus/max` 的说明称"tools 暂时无法与 stream=True 同时使用"。我们的客户端**总是**流式、且主模型回合几乎总带 `tools`（联网搜索、Skill 等）。把 `qwen3.7-max` 设为主模型前，先按上面的 curl 加上 `tools` 跑一次；若报错，它只适合放在不带工具的轻量用途上。
-
-**三、错误码语义。** 百炼直接用标准 HTTP 状态码（不像 KIE 把故障包在 HTTP 200 的 `{"code":500}` 里）：
+**二、错误码语义。** 百炼直接用标准 HTTP 状态码（不像 KIE 把故障包在 HTTP 200 的 `{"code":500}` 里）：
 
 | 状态码 | 含义 | 降级链是否重试 |
 |---|---|---|

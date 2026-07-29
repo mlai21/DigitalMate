@@ -55,6 +55,7 @@ describe("chooseLlmClientName", () => {
       "gemini-3-5-flash-openai": true,
       "gemini-3-6-flash-openai": false,
       "qwen3.7-max": false,
+      "qwen3.7-plus": true,
       "gpt-5-2-openai": false,
       "gpt-5-2-mini-openai": false,
     });

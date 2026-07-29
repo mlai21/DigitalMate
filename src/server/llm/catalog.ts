@@ -16,10 +16,14 @@ export type ModelCatalogEntry = {
  * offers these as choices but still accepts a custom model id, so the catalog
  * never blocks using a model that is not listed here.
  *
- * Image-input contract audit verified 2026-07-14. Only the exact
- * `gemini-3-5-flash-openai` endpoint currently has a matching KIE contract:
- * https://docs.kie.ai/market/gemini/gemini-3-5-flash-openai
- * Other ids stay false until KIE documents that exact endpoint/model id.
+ * Image-input contract audit verified 2026-07-14 for KIE ids: only the exact
+ * `gemini-3-5-flash-openai` endpoint has a matching contract
+ * (https://docs.kie.ai/market/gemini/gemini-3-5-flash-openai). Other KIE ids
+ * stay false until KIE documents that exact endpoint/model id.
+ *
+ * Model Studio ids verified 2026-07-30 against the live endpoint: `qwen3.7-plus`
+ * describes a real photo, `qwen3.7-max` rejects image content outright
+ * ("Unexpected item type in content").
  */
 export const MODEL_CATALOG: ModelCatalogEntry[] = [
   {
@@ -77,6 +81,14 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     description: "百炼旗舰模型（需配置 Model Studio 密钥），长上下文与工具调用能力强，仅支持文本。",
     recommendedFor: ["main"],
     supportsImageInput: false,
+  },
+  {
+    id: "qwen3.7-plus",
+    label: "Qwen3.7-Plus",
+    provider: "Alibaba",
+    description: "百炼均衡档（需配置 Model Studio 密钥），支持图片理解与工具调用，适合主对话与降级备用。",
+    recommendedFor: ["main"],
+    supportsImageInput: true,
   },
   {
     id: "gpt-5-2-openai",

@@ -293,6 +293,27 @@ describe("OpenAiCompatClient", () => {
     );
   });
 
+  it("keeps the provider explanation when the transport status already failed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { message: "Incorrect API key provided." } }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    const error = await collect(
+      client.stream({ model: "qwen3.7-plus", messages: [{ role: "user", content: "Hi" }] }),
+    ).catch((thrown: unknown) => thrown) as LlmProviderError;
+
+    expect(error.status).toBe(401);
+    expect(error.detail).toContain("Incorrect API key provided.");
+    expect(error.retriable).toBe(false);
+  });
+
   it("reads the gateway envelope code when an outage arrives as HTTP 200", async () => {
     vi.stubGlobal(
       "fetch",

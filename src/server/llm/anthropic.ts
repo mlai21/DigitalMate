@@ -41,11 +41,13 @@ export class AnthropicClient implements LlmClient {
     });
 
     if (!response.ok || !response.body) {
+      const body = await response.text().catch(() => "");
       throw new LlmProviderError({
         provider: "anthropic",
         model: input.model,
         status: response.status,
-        message: `Claude request failed with status ${response.status}`,
+        message: `Claude request failed with status ${response.status}${body ? `: ${body.slice(0, 200)}` : ""}`,
+        detail: body,
       });
     }
 

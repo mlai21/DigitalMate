@@ -66,11 +66,15 @@ export class OpenAiCompatClient implements LlmClient {
     });
 
     if (!response.ok || !response.body) {
+      // Providers put the actionable part in the body (which region rejected the
+      // key, which quota ran out), so a bare status is not enough to act on.
+      const body = await response.text().catch(() => "");
       throw new LlmProviderError({
         provider: "openai-compat",
         model: input.model,
         status: response.status,
-        message: `LLM request failed with status ${response.status}`,
+        message: `LLM request failed with status ${response.status}${body ? `: ${body.slice(0, 200)}` : ""}`,
+        detail: body,
       });
     }
 
