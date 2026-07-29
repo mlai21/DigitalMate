@@ -78,7 +78,9 @@ npx tsx --env-file=.env <你的脚本>
 | `LLM_MODEL_MAIN` / `LLM_MODEL_LIGHT` | 否 | 填 `qwen3.7-max` 或 `qwen3.7-plus` 即把它作为主/轻模型 |
 | `LLM_MODEL_MAIN_FALLBACKS` | 否 | 主模型故障时的降级链 |
 
-当前生产策略是 `LLM_MODEL_MAIN=claude-opus-4-8`、`LLM_MODEL_MAIN_FALLBACKS=qwen3.7-plus,gemini-3-6-flash-openai`。两级备用刻意跨了供应商：第一级换到百炼，KIE 网关整体故障时仍能作答；第二级回到 KIE 的廉价模型，兜住百炼欠费或超限的情况。
+当前生产策略是 `LLM_MODEL_MAIN=qwen3.7-plus`、`LLM_MODEL_MAIN_FALLBACKS=qwen3.7-max,gemini-3-6-flash-openai`。前两级都在百炼，只兜单模型故障；链尾特意留了 KIE 的 `gemini-3-6-flash-openai`，因为百炼整体不可用（欠费、限流、网关故障）时两个 qwen 会一起挂。
+
+这一档是从 `claude-opus-4-8` 换过来的：KIE 网关上的 Opus 反复返回 HTTP 500，而百炼这边稳定。换主模型顺带打开了图片附件——目录里 Opus 的 `supportsImageInput` 是 `false`，`qwen3.7-plus` 是 `true`，附件是否按图片送入由**主模型**的这个标记决定。
 
 改完这三处才算生效：
 

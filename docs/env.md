@@ -165,9 +165,9 @@ Qwen 不在 KIE 网关上（各种命名都返回 422），走百炼的 OpenAI �
 
 | 用途 | 推荐模型 | 环境变量 |
 |---|---|---|
-| 主对话 / 复杂任务 | Claude Opus 4.8 | `LLM_MODEL_MAIN=claude-opus-4-8` |
+| 主对话 / 复杂任务 | Qwen3.7-Plus | `LLM_MODEL_MAIN=qwen3.7-plus` |
 | 插话判断、记忆抽取等轻量调用 | Gemini 3.5 Flash | `LLM_MODEL_LIGHT=gemini-3-5-flash-openai` |
-| 主模型故障时降级 | Qwen3.7-Plus → Gemini 3.6 Flash | `LLM_MODEL_MAIN_FALLBACKS=qwen3.7-plus,gemini-3-6-flash-openai` |
+| 主模型故障时降级 | Qwen3.7-Max → Gemini 3.6 Flash | `LLM_MODEL_MAIN_FALLBACKS=qwen3.7-max,gemini-3-6-flash-openai` |
 
 路由策略在实现阶段作为配置读取，不硬编码。
 
@@ -175,7 +175,7 @@ Qwen 不在 KIE 网关上（各种命名都返回 422），走百炼的 OpenAI �
 
 `LLM_MODEL_MAIN_FALLBACKS` 按顺序尝试备用模型，仅在**主模型尚未输出任何内容**、且错误是供应商侧故障（5xx / 408 / 429）时才切换；4xx 说明请求本身有问题，换模型也一样失败，不重试。已经开始输出后不再切换，避免同一次回复出现两段内容。
 
-排列备用模型时建议跨供应商：当前 `qwen3.7-plus,gemini-3-6-flash-openai` 的第一级落在百炼，KIE 网关整体故障时仍能作答；第二级回到 KIE，兜住百炼欠费或限流。
+排列备用模型时注意"同网关会一起挂"：当前主模型与第一级备用（`qwen3.7-plus` → `qwen3.7-max`）都在百炼上，只能兜住单模型故障；百炼整体不可用时靠第二级 `gemini-3-6-flash-openai` 落到 KIE。所以链尾始终留一个不同供应商的模型。
 
 备用模型受 Agent 模型授权约束：`agent_resource_grants` 里没有对应 `model` 记录的会被静默忽略，因此新增备用模型时要一并补授权，否则降级链等于没开。
 
