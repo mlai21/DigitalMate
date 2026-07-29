@@ -142,17 +142,20 @@ curl -X POST "${KIE_AI_BASE_URL}${CLAUDE_MESSAGES_ENDPOINT}" \
 
 ## 阿里云百炼 Model Studio（Qwen 系列）
 
-Qwen 不在 KIE 网关上，走百炼的 OpenAI 兼容端点，密钥与 `ALIYUN_IQS_API_KEY`（智能搜索）**不通用**。
-
+- **接入文档**：[阿里云百炼qwen3.7-max接入文档.md](./api/阿里云百炼qwen3.7-max接入文档.md)
 - **完整 URL**：`{MODEL_STUDIO_BASE_URL}/chat/completions`
   - 默认：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
 - **鉴权**：请求头 `Authorization: Bearer <MODEL_STUDIO_API_KEY>`
 - **请求体**：`model` 传 `qwen3.7-max`
 
+Qwen 不在 KIE 网关上（各种命名都返回 422），走百炼的 OpenAI 兼容端点，密钥与 `ALIYUN_IQS_API_KEY`（智能搜索）**不通用**，各地域密钥之间也不通用。
+
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `MODEL_STUDIO_API_KEY` | 是（用 Qwen 时） | 百炼 API Key；未配置时 Qwen 模型不会被使用 |
-| `MODEL_STUDIO_BASE_URL` | 否 | 默认北京地域，可切 `dashscope-intl` / `dashscope-us` |
+| `MODEL_STUDIO_API_KEY` | 是（用 Qwen 时） | 百炼 API Key；未配置时 Qwen 模型会被直接跳过 |
+| `MODEL_STUDIO_BASE_URL` | 否 | 默认北京旧域名；推荐换成业务空间专属域名 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`，须与密钥地域一致 |
+
+启用 `qwen3.7-max` 还需要补 Agent 模型授权，否则主模型会抛 `model_resource_unauthorized`、备用模型会被静默忽略；SQL 见接入文档。
 
 ---
 
