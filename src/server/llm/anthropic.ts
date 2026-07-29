@@ -1,5 +1,6 @@
 import type { AppEnv } from "@/server/config/env";
 import { formatDocumentAttachments } from "@/server/llm/attachments";
+import { LlmProviderError, providerErrorStatus } from "@/server/llm/errors";
 import type { LlmClient, LlmMessage, LlmStreamEvent, LlmStreamInput, LlmTool } from "@/server/llm/types";
 import { collectStreamText } from "@/server/llm/types";
 
@@ -40,13 +41,24 @@ export class AnthropicClient implements LlmClient {
     });
 
     if (!response.ok || !response.body) {
-      throw new Error(`Claude request failed with status ${response.status}`);
+      throw new LlmProviderError({
+        provider: "anthropic",
+        model: input.model,
+        status: response.status,
+        message: `Claude request failed with status ${response.status}`,
+      });
     }
 
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("text/event-stream")) {
       const body = await response.text();
-      throw new Error(`Claude request failed with status ${response.status}: ${body.slice(0, 200)}`);
+      throw new LlmProviderError({
+        provider: "anthropic",
+        model: input.model,
+        status: providerErrorStatus(body) ?? response.status,
+        message: `Claude request failed with status ${response.status}: ${body.slice(0, 200)}`,
+        detail: body,
+      });
     }
 
     let pendingToolCall: { id: string; name: string; argumentChunks: string[] } | null = null;

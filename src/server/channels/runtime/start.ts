@@ -6,7 +6,10 @@ import type { Pool } from "pg";
 import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { chooseReactionIntent } from "@/server/agent/reaction-intent";
 import { searchWeb } from "@/server/agent/tools/web-search";
-import { assertAuthorizedModelRoutes } from "@/server/agents/service";
+import {
+  assertAuthorizedModelRoutes,
+  filterAuthorizedModels,
+} from "@/server/agents/service";
 import type { AgentScope } from "@/server/agents/types";
 import {
   createDiscordAdapter,
@@ -130,6 +133,8 @@ import {
   createRepositories,
 } from "@/server/db/repositories";
 import type { NormalizedChannelMessage } from "@/server/channels/types";
+import { LlmProviderError } from "@/server/llm/errors";
+import { getMainLlmClientWithFallbacks } from "@/server/llm/fallback";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
 import type {
@@ -140,6 +145,7 @@ import type { ChannelAdapter } from "./adapter";
 import {
   channelContextKey,
   createChannelAgentTurnRunner,
+  stableTurnErrorCode,
 } from "./agent-turn";
 import {
   createChannelConnectionManager,
@@ -157,7 +163,10 @@ import {
   type ChannelDeliveryTransport,
 } from "./delivery-worker";
 import { createChannelEventWorker } from "./event-worker";
-import { createExecutionJournal } from "./execution-journal";
+import {
+  createExecutionJournal,
+  hashExecutionRequest,
+} from "./execution-journal";
 import { importLegacyChannelEnvironment } from "./legacy-env-import";
 import {
   createChannelReplyHandleRepository,
@@ -276,7 +285,18 @@ export async function startChannelRuntime(input: Readonly<{
         routing,
         input.repositories.agents,
       );
-      return getLlmClient("main", input.env, routing);
+      return getMainLlmClientWithFallbacks({
+        env: input.env,
+        routeConfig: routing,
+        fallbackModels: await filterAuthorizedModels(
+          scope,
+          input.env.llmModelMainFallbacks,
+          input.repositories.agents,
+        ),
+        onFallback: (event) => {
+          console.warn("llm_model_fallback", event);
+        },
+      });
     },
     resolveLightModel: async (scope, routing) => {
       await assertAuthorizedModelRoutes(
@@ -465,6 +485,33 @@ export async function startChannelRuntime(input: Readonly<{
     persistReply: createAtomicChannelReplyPersister(pool),
     completeWithoutReply:
       createAtomicChannelNoReplyPersister(pool),
+    onAgentFailure: async (context, error) => {
+      const code = stableTurnErrorCode(error);
+      console.error("channel_agent_turn_failed", {
+        eventId: context.claim.id,
+        channel: context.claim.normalizedEvent.channelType,
+        code,
+        ...(error instanceof LlmProviderError
+          ? {
+              provider: error.provider,
+              model: error.model,
+              status: error.status,
+              detail: error.detail,
+            }
+          : {}),
+      });
+      await context.journal
+        .begin({
+          key: "agent_turn_failure",
+          kind: "llm",
+          requestHash: hashExecutionRequest({
+            eventId: context.claim.id,
+            code,
+          }),
+        })
+        .then(() => context.journal.fail("agent_turn_failure", code))
+        .catch(() => undefined);
+    },
   });
   const leasedExecutor = createLeasedChannelTurnExecutor(
     input.repositories,

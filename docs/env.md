@@ -140,6 +140,22 @@ curl -X POST "${KIE_AI_BASE_URL}${CLAUDE_MESSAGES_ENDPOINT}" \
 
 ---
 
+## 阿里云百炼 Model Studio（Qwen 系列）
+
+Qwen 不在 KIE 网关上，走百炼的 OpenAI 兼容端点，密钥与 `ALIYUN_IQS_API_KEY`（智能搜索）**不通用**。
+
+- **完整 URL**：`{MODEL_STUDIO_BASE_URL}/chat/completions`
+  - 默认：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+- **鉴权**：请求头 `Authorization: Bearer <MODEL_STUDIO_API_KEY>`
+- **请求体**：`model` 传 `qwen3.7-max`
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `MODEL_STUDIO_API_KEY` | 是（用 Qwen 时） | 百炼 API Key；未配置时 Qwen 模型不会被使用 |
+| `MODEL_STUDIO_BASE_URL` | 否 | 默认北京地域，可切 `dashscope-intl` / `dashscope-us` |
+
+---
+
 ## 模型路由建议
 
 按 [PRD 7.3](./prd.md#73-模型适配层) 的用途划分：
@@ -148,8 +164,19 @@ curl -X POST "${KIE_AI_BASE_URL}${CLAUDE_MESSAGES_ENDPOINT}" \
 |---|---|---|
 | 主对话 / 复杂任务 | Claude Opus 4.8 | `LLM_MODEL_MAIN=claude-opus-4-8` |
 | 插话判断、记忆抽取等轻量调用 | Gemini 3.5 Flash | `LLM_MODEL_LIGHT=gemini-3-5-flash-openai` |
+| 主模型故障时降级 | Gemini 3.6 Flash、Qwen3.7-Max | `LLM_MODEL_MAIN_FALLBACKS=gemini-3-6-flash-openai,qwen3.7-max` |
 
 路由策略在实现阶段作为配置读取，不硬编码。
+
+### 供应商故障降级
+
+`LLM_MODEL_MAIN_FALLBACKS` 按顺序尝试备用模型，仅在**主模型尚未输出任何内容**、且错误是供应商侧故障（5xx / 408 / 429）时才切换；4xx 说明请求本身有问题，换模型也一样失败，不重试。已经开始输出后不再切换，避免同一次回复出现两段内容。
+
+备用模型受 Agent 模型授权约束：`agent_resource_grants` 里没有对应 `model` 记录的会被静默忽略，因此新增备用模型时要一并补授权，否则降级链等于没开。
+
+### KIE 网关的端点规则
+
+KIE 上**一个模型一条路径**（`/<model>/v1/chat/completions`），请求体里的 `model` 字段不起作用；路径未开通时返回 HTTP 200 + `{"code":422,"msg":"The model is not supported"}`。除 `GEMINI_3_5_FLASH_ENDPOINT` 保留显式覆盖外，其余模型的路径都按模型 id 推导。同理，网关故障也是 HTTP 200 + `{"code":500}`，所以真实状态码取自响应体，日志与执行步骤里记为 `llm_http_500`。
 
 ---
 

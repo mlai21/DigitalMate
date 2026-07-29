@@ -73,6 +73,27 @@ export async function assertAuthorizedModelRoutes(
   }
 }
 
+/**
+ * Keeps only the models this agent is granted, so a configured fallback chain
+ * can never quietly widen an agent's model authorization.
+ */
+export async function filterAuthorizedModels(
+  scope: AgentScope,
+  models: readonly string[],
+  repository: AgentRepository = createAgentRepository(),
+): Promise<string[]> {
+  const candidates = [...new Set(models)];
+  if (candidates.length === 0) return [];
+  const authorized = new Set(
+    await createAgentService(repository).listAuthorizedResourceIds(
+      scope,
+      "model",
+      candidates,
+    ),
+  );
+  return candidates.filter((model) => authorized.has(model));
+}
+
 export async function resolveDefaultAgentScope(
   userId: string,
   repository: AgentRepository = createAgentRepository(),

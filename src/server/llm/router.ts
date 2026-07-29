@@ -10,20 +10,40 @@ export type LlmRouteConfig = {
   light: string;
 };
 
-export type LlmClientName = "anthropic" | "openai" | "mock";
+export type LlmClientName = "anthropic" | "openai" | "model-studio" | "mock";
 
 export function chooseLlmClientName(purpose: LlmPurpose, config: LlmRouteConfig): LlmClientName {
-  const model = purpose === "main" ? config.main : config.light;
+  return clientNameForModel(purpose === "main" ? config.main : config.light);
+}
+
+/**
+ * Qwen models are not on the KIE gateway; they are served by Alibaba Model
+ * Studio, which needs its own base URL and credential.
+ */
+export function clientNameForModel(model: string): Exclude<LlmClientName, "mock"> {
   if (/claude/i.test(model)) return "anthropic";
+  if (/^qwen/i.test(model)) return "model-studio";
   return "openai";
 }
 
 export function getLlmClient(purpose: LlmPurpose, env: AppEnv, routeConfig?: LlmRouteConfig): { client: LlmClient; model: string } {
   const config = routeConfig ?? { main: env.llmModelMain, light: env.llmModelLight };
   const model = purpose === "main" ? config.main : config.light;
-  const clientName = env.kieAiApiKey ? chooseLlmClientName(purpose, config) : "mock";
+  const client = getLlmClientForModel(model, env);
+  return client ? { client, model } : { client: new MockLlmClient(), model: `mock-${purpose}` };
+}
 
-  if (clientName === "anthropic") return { client: new AnthropicClient(env), model };
-  if (clientName === "openai") return { client: OpenAiCompatClient.fromEnv(env), model };
-  return { client: new MockLlmClient(), model: `mock-${purpose}` };
+/**
+ * Returns null when the provider this model belongs to has no credential
+ * configured, so callers can skip it instead of failing a live turn.
+ */
+export function getLlmClientForModel(model: string, env: AppEnv): LlmClient | null {
+  switch (clientNameForModel(model)) {
+    case "anthropic":
+      return env.kieAiApiKey ? new AnthropicClient(env) : null;
+    case "openai":
+      return env.kieAiApiKey ? OpenAiCompatClient.forKieModel(model, env) : null;
+    case "model-studio":
+      return env.modelStudioApiKey ? OpenAiCompatClient.forModelStudio(env) : null;
+  }
 }

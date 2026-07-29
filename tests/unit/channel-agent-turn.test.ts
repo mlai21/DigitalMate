@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createChannelAgentTurnRunner,
+  stableTurnErrorCode,
   toLegacyChannelMessage,
 } from "@/server/channels/runtime/agent-turn";
+import { LlmProviderError } from "@/server/llm/errors";
 import type { ClaimedChannelEvent } from "@/server/channels/runtime/event-repository";
 import type {
   ExecutionJournal,
@@ -48,6 +50,21 @@ function toolNames(calls: LlmStreamInput[]): string[] {
 function systemPrompt(calls: LlmStreamInput[]): string {
   return calls[0]?.messages[0]?.content ?? "";
 }
+
+describe("stableTurnErrorCode", () => {
+  it("keeps the provider status instead of one generic failure bucket", () => {
+    expect(stableTurnErrorCode(new LlmProviderError({
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+      status: 500,
+      message: "Claude request failed with status 500: {\"type\":\"error\"}",
+    }))).toBe("llm_http_500");
+    expect(stableTurnErrorCode(new Error("attachment_download_aborted")))
+      .toBe("attachment_download_aborted");
+    expect(stableTurnErrorCode(new Error("boom with spaces")))
+      .toBe("channel_turn_side_effect_failed");
+  });
+});
 
 describe("channel agent turn", () => {
   it("只生成完整回复，不直接写助手消息或发送平台消息", async () => {

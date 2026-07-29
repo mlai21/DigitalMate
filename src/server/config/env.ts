@@ -40,10 +40,16 @@ const envSchema = z.object({
   KIE_AI_API_KEY: z.string().optional(),
   KIE_AI_BASE_URL: z.string().default("https://api.kie.ai"),
   GEMINI_3_5_FLASH_ENDPOINT: z.string().default("/gemini-3-5-flash-openai/v1/chat/completions"),
+  MODEL_STUDIO_API_KEY: z.string().optional(),
+  MODEL_STUDIO_BASE_URL: z
+    .string()
+    .default("https://dashscope.aliyuncs.com/compatible-mode/v1"),
   CLAUDE_MESSAGES_ENDPOINT: z.string().default("/claude/v1/messages"),
   ANTHROPIC_API_VERSION: z.string().default("2023-06-01"),
   LLM_MODEL_MAIN: z.string().default("claude-opus-4-8"),
   LLM_MODEL_LIGHT: z.string().default("gemini-3-5-flash-openai"),
+  /** Comma-separated models tried, in order, when the main model is unavailable. */
+  LLM_MODEL_MAIN_FALLBACKS: z.string().optional(),
   EMBEDDING_BASE_URL: z.string().optional(),
   EMBEDDING_API_KEY: z.string().optional(),
   EMBEDDING_MODEL: z.string().optional(),
@@ -150,10 +156,13 @@ export function readEnv(source: Record<string, string | undefined> = process.env
     kieAiApiKey: parsed.KIE_AI_API_KEY,
     kieAiBaseUrl: parsed.KIE_AI_BASE_URL,
     geminiEndpoint: parsed.GEMINI_3_5_FLASH_ENDPOINT,
+    modelStudioApiKey: parsed.MODEL_STUDIO_API_KEY,
+    modelStudioBaseUrl: parsed.MODEL_STUDIO_BASE_URL,
     claudeEndpoint: parsed.CLAUDE_MESSAGES_ENDPOINT,
     anthropicVersion: parsed.ANTHROPIC_API_VERSION,
     llmModelMain: parsed.LLM_MODEL_MAIN,
     llmModelLight: parsed.LLM_MODEL_LIGHT,
+    llmModelMainFallbacks: parseModelList(parsed.LLM_MODEL_MAIN_FALLBACKS),
     embeddingBaseUrl: parsed.EMBEDDING_BASE_URL,
     embeddingApiKey: parsed.EMBEDDING_API_KEY,
     embeddingModel: parsed.EMBEDDING_MODEL,
@@ -191,6 +200,15 @@ function parseOptionalPath(
 ): string | null {
   const trimmed = value?.trim();
   return trimmed ? path.resolve(trimmed) : null;
+}
+
+function parseModelList(value: string | undefined): string[] {
+  const seen = new Set<string>();
+  for (const model of value?.split(",") ?? []) {
+    const trimmed = model.trim();
+    if (trimmed) seen.add(trimmed);
+  }
+  return [...seen];
 }
 
 function parseChannelNodeTls(parsed: Readonly<{

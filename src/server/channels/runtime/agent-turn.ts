@@ -19,6 +19,7 @@ import {
 } from "@/server/evolution/event-reflection";
 import { recordSkillMismatch } from "@/server/evolution/skill-mismatch";
 import type { SkillInstallOutcome } from "@/server/skills/install";
+import { LlmProviderError } from "@/server/llm/errors";
 import type { LlmClient } from "@/server/llm/types";
 import type { LlmRouteConfig } from "@/server/llm/router";
 import type { createRepositories } from "@/server/db/repositories";
@@ -710,7 +711,10 @@ function isStoredInterjectionDecision(
   );
 }
 
-function stableTurnErrorCode(error: unknown): string {
+export function stableTurnErrorCode(error: unknown): string {
+  // Provider failures carry their own status, which is the difference between
+  // "the gateway is down" and one generic bucket in the backstage trail.
+  if (error instanceof LlmProviderError) return error.code;
   if (
     error instanceof Error
     && /^[a-z0-9_:-]{1,128}$/i.test(error.message)

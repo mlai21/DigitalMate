@@ -29,10 +29,12 @@ import { recordSkillMismatch } from "@/server/evolution/skill-mismatch";
 import { recordTurnReview } from "@/server/evolution/turn-review";
 import { supportsImageInput } from "@/server/llm/catalog";
 import type { LlmMessage } from "@/server/llm/types";
+import { getMainLlmClientWithFallbacks } from "@/server/llm/fallback";
 import { getLlmClient } from "@/server/llm/router";
 import { installSkillsFromGitHub } from "@/server/skills/install";
 import {
   assertAuthorizedModelRoutes,
+  filterAuthorizedModels,
   resolveDefaultAgentScope,
 } from "@/server/agents/service";
 import type { AgentScope } from "@/server/agents/types";
@@ -159,7 +161,18 @@ async function handleLeasedChatRequest(
     settings.modelRouting,
     repositories.agents,
   );
-  const { client, model } = getLlmClient("main", env, settings.modelRouting);
+  const { client, model } = getMainLlmClientWithFallbacks({
+    env,
+    routeConfig: settings.modelRouting,
+    fallbackModels: await filterAuthorizedModels(
+      scope,
+      env.llmModelMainFallbacks,
+      repositories.agents,
+    ),
+    onFallback: (event) => {
+      console.warn("llm_model_fallback", event);
+    },
+  });
   const light = getLlmClient("light", env, settings.modelRouting);
   let currentAttachments = await loadTurnAttachments({
     repositories,

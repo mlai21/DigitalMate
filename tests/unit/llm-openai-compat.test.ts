@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readEnv } from "@/server/config/env";
 import { formatDocumentAttachments } from "@/server/llm/attachments";
+import { LlmProviderError } from "@/server/llm/errors";
 import { OpenAiCompatClient } from "@/server/llm/openai-compat";
 import type { LlmStreamEvent } from "@/server/llm/types";
 
@@ -289,6 +291,89 @@ describe("OpenAiCompatClient", () => {
     await expect(collect(client.stream({ model: "m", messages: [{ role: "user", content: "Hi" }] }))).rejects.toThrow(
       "LLM request failed",
     );
+  });
+
+  it("reads the gateway envelope code when an outage arrives as HTTP 200", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: 500, msg: "Internal error" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    const error = await collect(
+      client.stream({ model: "gemini-3-6-flash-openai", messages: [{ role: "user", content: "Hi" }] }),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(LlmProviderError);
+    expect((error as LlmProviderError).status).toBe(500);
+    expect((error as LlmProviderError).code).toBe("llm_http_500");
+    expect((error as LlmProviderError).retriable).toBe(true);
+    expect((error as LlmProviderError).model).toBe("gemini-3-6-flash-openai");
+  });
+
+  it("treats a rejected request as not worth retrying elsewhere", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: 422, msg: "The model is not supported" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new OpenAiCompatClient({ url: "https://example.com/v1/chat/completions", apiKey: "k" });
+    const error = await collect(
+      client.stream({ model: "m", messages: [{ role: "user", content: "Hi" }] }),
+    ).catch((thrown: unknown) => thrown);
+
+    expect((error as LlmProviderError).status).toBe(422);
+    expect((error as LlmProviderError).retriable).toBe(false);
+  });
+
+  it("derives one endpoint path per KIE model and keeps the legacy override", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = readEnv({
+      KIE_AI_API_KEY: "key",
+      GEMINI_3_5_FLASH_ENDPOINT: "/custom/v1/chat/completions",
+    });
+
+    for (const model of ["gemini-3-6-flash-openai", "gemini-3-5-flash-openai"]) {
+      await collect(
+        OpenAiCompatClient.forKieModel(model, env)
+          .stream({ model, messages: [{ role: "user", content: "Hi" }] }),
+      );
+    }
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://api.kie.ai/gemini-3-6-flash-openai/v1/chat/completions",
+      "https://api.kie.ai/custom/v1/chat/completions",
+    ]);
+  });
+
+  it("points Qwen models at the configured Model Studio base URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = readEnv({ MODEL_STUDIO_API_KEY: "studio-key" });
+
+    await collect(
+      OpenAiCompatClient.forModelStudio(env)
+        .stream({ model: "qwen3.7-max", messages: [{ role: "user", content: "Hi" }] }),
+    );
+
+    const [url, options] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+    expect(options.headers).toMatchObject({ authorization: "Bearer studio-key" });
   });
 
   it("passes the caller signal to fetch and cancels a half-open SSE reader on abort", async () => {

@@ -148,6 +148,12 @@ export function createChannelTurnExecutor(input: Readonly<{
   faultInjector?(
     point: ChannelTurnFaultPoint,
   ): MaybePromise<void>;
+  // The degraded reply is deliberately vague to the user, so the real cause has
+  // to be reported here or it is lost entirely.
+  onAgentFailure?(
+    context: ChannelAgentTurnContext,
+    error: unknown,
+  ): MaybePromise<void>;
 }>): ChannelTurnExecutor {
   return {
     async execute(
@@ -261,15 +267,16 @@ export function createChannelTurnExecutor(input: Readonly<{
         const chosenReaction = Promise.resolve(
           input.chooseReaction?.(claim) ?? null,
         ).catch(() => null);
+        const agentContext: ChannelAgentTurnContext = {
+          claim,
+          conversationId,
+          journal,
+          ...(options.signal ? { signal: options.signal } : {}),
+        };
         try {
           try {
             body = normalizeAssistantBody(
-              await collectReply(input.runAgentTurn({
-                claim,
-                conversationId,
-                journal,
-                signal: options.signal,
-              })),
+              await collectReply(input.runAgentTurn(agentContext)),
               CHANNEL_AGENT_FAILED_REPLY,
             );
             degraded = body === CHANNEL_AGENT_FAILED_REPLY;
@@ -280,6 +287,9 @@ export function createChannelTurnExecutor(input: Readonly<{
             ) {
               throw error;
             }
+            await Promise.resolve(
+              input.onAgentFailure?.(agentContext, error),
+            ).catch(() => undefined);
             body = CHANNEL_AGENT_FAILED_REPLY;
             degraded = true;
           }

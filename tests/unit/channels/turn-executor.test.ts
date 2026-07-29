@@ -27,6 +27,7 @@ import type {
 import {
   CHANNEL_INTERRUPTED_REPLY,
   createChannelTurnExecutor,
+  type ChannelAgentTurnContext,
 } from "@/server/channels/runtime/turn-executor";
 import type { LlmClient } from "@/server/llm/types";
 
@@ -371,6 +372,27 @@ describe("channel turn execution contract", () => {
     );
   });
 
+  it("reports the swallowed cause when the reply degrades", async () => {
+    const harness = turnHarness();
+    const cause = new Error("provider_unavailable");
+    harness.runAgentTurn.mockRejectedValueOnce(cause);
+
+    await harness.executor.execute(claimedEvent());
+
+    expect(harness.onAgentFailure).toHaveBeenCalledTimes(1);
+    const [context, reported] = harness.onAgentFailure.mock.calls[0]!;
+    expect(reported).toBe(cause);
+    expect(context).toMatchObject({ conversationId: "conversation-1" });
+  });
+
+  it("does not report a failure when the Agent replies normally", async () => {
+    const harness = turnHarness();
+
+    await harness.executor.execute(claimedEvent());
+
+    expect(harness.onAgentFailure).not.toHaveBeenCalled();
+  });
+
   it("completes a deterministic group skip before claiming Agent execution", async () => {
     const harness = turnHarness({ skipReason: "conversation_busy" });
     const claim = claimedEvent();
@@ -624,6 +646,10 @@ function turnHarness(options: {
     if (options.chooseReactionError) throw options.chooseReactionError;
     return options.chosenReaction ?? null;
   });
+  const onAgentFailure = vi.fn<(
+    context: ChannelAgentTurnContext,
+    error: unknown,
+  ) => Promise<void>>(async () => undefined);
   const executor = createChannelTurnExecutor({
     messages,
     resolveConversationId: vi.fn(async () => "conversation-1"),
@@ -641,6 +667,7 @@ function turnHarness(options: {
     typing,
     reaction,
     chooseReaction,
+    onAgentFailure,
   });
   return {
     executor,
@@ -651,6 +678,7 @@ function turnHarness(options: {
     typing,
     reaction,
     chooseReaction,
+    onAgentFailure,
     releaseLock,
   };
 }

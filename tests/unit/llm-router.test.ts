@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { readEnv } from "@/server/config/env";
 import { MODEL_CATALOG, supportsImageInput } from "@/server/llm/catalog";
-import { chooseLlmClientName, getLlmClient } from "@/server/llm/router";
+import {
+  chooseLlmClientName,
+  clientNameForModel,
+  getLlmClient,
+  getLlmClientForModel,
+} from "@/server/llm/router";
 
 describe("chooseLlmClientName", () => {
   it("routes main and light purposes from config", () => {
@@ -48,9 +53,30 @@ describe("chooseLlmClientName", () => {
       "claude-haiku-4-5": false,
       "gemini-3-5-pro-openai": false,
       "gemini-3-5-flash-openai": true,
+      "gemini-3-6-flash-openai": false,
+      "qwen3.7-max": false,
       "gpt-5-2-openai": false,
       "gpt-5-2-mini-openai": false,
     });
+  });
+
+  it("sends Qwen models to Model Studio instead of the KIE gateway", () => {
+    const env = readEnv({
+      KIE_AI_API_KEY: "key",
+      MODEL_STUDIO_API_KEY: "studio-key",
+    });
+
+    expect(clientNameForModel("qwen3.7-max")).toBe("model-studio");
+    expect(
+      getLlmClientForModel("qwen3.7-max", env)?.constructor.name,
+    ).toBe("OpenAiCompatClient");
+  });
+
+  it("reports no client for a model whose provider has no credential", () => {
+    const env = readEnv({ KIE_AI_API_KEY: "key" });
+
+    expect(getLlmClientForModel("qwen3.7-max", env)).toBeNull();
+    expect(getLlmClientForModel("gemini-3-6-flash-openai", env)).not.toBeNull();
   });
 
   it("does not assume that unknown custom models support image input", () => {

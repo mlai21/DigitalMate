@@ -4,16 +4,17 @@ export type ModelCatalogEntry = {
   /** Model identifier passed to the API (and stored in settings). */
   id: string;
   label: string;
-  provider: "Anthropic" | "Google" | "OpenAI";
+  provider: "Anthropic" | "Google" | "OpenAI" | "Alibaba";
   description: string;
   recommendedFor: ModelPurposeTag[];
   supportsImageInput: boolean;
 };
 
 /**
- * Models reachable through the configured KIE.AI gateway. The admin UI offers
- * these as choices but still accepts a custom model id, so the catalog never
- * blocks using a model that is not listed here.
+ * Models reachable through the configured providers — the KIE.AI gateway for
+ * Anthropic/Google/OpenAI ids, Alibaba Model Studio for Qwen ids. The admin UI
+ * offers these as choices but still accepts a custom model id, so the catalog
+ * never blocks using a model that is not listed here.
  *
  * Image-input contract audit verified 2026-07-14. Only the exact
  * `gemini-3-5-flash-openai` endpoint currently has a matching KIE contract:
@@ -60,6 +61,22 @@ export const MODEL_CATALOG: ModelCatalogEntry[] = [
     description: "快速便宜（OpenAI 兼容端点），适合记忆抽取、复盘等轻量任务。",
     recommendedFor: ["light"],
     supportsImageInput: true,
+  },
+  {
+    id: "gemini-3-6-flash-openai",
+    label: "Gemini 3.6 Flash",
+    provider: "Google",
+    description: "更新一代的快速模型（OpenAI 兼容端点），主对话降级与轻量任务都可用。",
+    recommendedFor: ["main", "light"],
+    supportsImageInput: false,
+  },
+  {
+    id: "qwen3.7-max",
+    label: "Qwen3.7-Max",
+    provider: "Alibaba",
+    description: "百炼旗舰模型（需配置 Model Studio 密钥），长上下文与工具调用能力强，仅支持文本。",
+    recommendedFor: ["main"],
+    supportsImageInput: false,
   },
   {
     id: "gpt-5-2-openai",

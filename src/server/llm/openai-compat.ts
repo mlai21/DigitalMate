@@ -1,19 +1,51 @@
 import type { AppEnv } from "@/server/config/env";
 import { formatDocumentAttachments } from "@/server/llm/attachments";
+import { LlmProviderError, providerErrorStatus } from "@/server/llm/errors";
 import type { LlmClient, LlmMessage, LlmStreamEvent, LlmStreamInput, LlmTool } from "@/server/llm/types";
 import { collectStreamText } from "@/server/llm/types";
 
 /**
+ * On the KIE gateway the endpoint path — not the request body — decides which
+ * model answers: every model has its own `/{model}/v1/chat/completions` route,
+ * and a path that is not provisioned answers 422 "The model is not supported".
+ * Deriving the path from the model id is therefore required for anything other
+ * than the single model the legacy env var pointed at.
+ */
+export function kieOpenAiCompatPath(model: string): string {
+  return `/${model}/v1/chat/completions`;
+}
+
+
+/**
  * Generic client for OpenAI-compatible chat completions endpoints
- * (KIE.AI Gemini route today; any /v1/chat/completions provider tomorrow).
+ * (KIE.AI model routes and Alibaba Model Studio today; any
+ * /v1/chat/completions provider tomorrow).
  */
 export class OpenAiCompatClient implements LlmClient {
   constructor(private readonly config: { url: string; apiKey: string }) {}
 
-  static fromEnv(env: AppEnv): OpenAiCompatClient {
+  /**
+   * Builds a client for one KIE-hosted model.
+   *
+   * `GEMINI_3_5_FLASH_ENDPOINT` stays honoured for its own model so existing
+   * deployments that point it somewhere custom keep working; every other model
+   * resolves through {@link kieOpenAiCompatPath}.
+   */
+  static forKieModel(model: string, env: AppEnv): OpenAiCompatClient {
+    const path = model === "gemini-3-5-flash-openai" && env.geminiEndpoint
+      ? env.geminiEndpoint
+      : kieOpenAiCompatPath(model);
     return new OpenAiCompatClient({
-      url: `${env.kieAiBaseUrl}${env.geminiEndpoint}`,
+      url: `${env.kieAiBaseUrl}${path}`,
       apiKey: env.kieAiApiKey ?? "",
+    });
+  }
+
+  /** Alibaba Model Studio (DashScope) compatible-mode, used for Qwen models. */
+  static forModelStudio(env: AppEnv): OpenAiCompatClient {
+    return new OpenAiCompatClient({
+      url: `${env.modelStudioBaseUrl.replace(/\/$/, "")}/chat/completions`,
+      apiKey: env.modelStudioApiKey ?? "",
     });
   }
 
@@ -34,13 +66,24 @@ export class OpenAiCompatClient implements LlmClient {
     });
 
     if (!response.ok || !response.body) {
-      throw new Error(`LLM request failed with status ${response.status}`);
+      throw new LlmProviderError({
+        provider: "openai-compat",
+        model: input.model,
+        status: response.status,
+        message: `LLM request failed with status ${response.status}`,
+      });
     }
 
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("text/event-stream")) {
       const body = await response.text();
-      throw new Error(`LLM request failed with status ${response.status}: ${body.slice(0, 200)}`);
+      throw new LlmProviderError({
+        provider: "openai-compat",
+        model: input.model,
+        status: providerErrorStatus(body) ?? response.status,
+        message: `LLM request failed with status ${response.status}: ${body.slice(0, 200)}`,
+        detail: body,
+      });
     }
 
     const pendingToolCalls = new Map<number, { id: string; name: string; argumentChunks: string[] }>();
