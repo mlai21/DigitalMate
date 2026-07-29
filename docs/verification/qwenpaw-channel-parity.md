@@ -480,7 +480,7 @@ SIP 凭据只允许写入受限媒体节点，不属于中心密钥集合。JSON
     },
     "digitalmate": {
       "manifest": "src/server/channels/manifests/catalog.ts",
-      "evidence_sha256": "a83d12258845c6a37ed966e75fbd779a278e420ce14551e41693243e82673543",
+      "evidence_sha256": "add372888438fc3f3522d63767ff972b6e679893d8f06807535705ec17dfd27e",
       "adapter_files": [
         "src/server/channels/adapters/dingtalk/config.ts",
         "src/server/channels/adapters/dingtalk/index.ts",

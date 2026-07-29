@@ -425,6 +425,33 @@ describe("channel ingress", () => {
     expect(events.accept).not.toHaveBeenCalled();
     expect(acknowledge).toHaveBeenCalledWith({}, { kind: "ignored" });
   });
+
+  it("leaves a trace naming the dropped message type", async () => {
+    // An unsupported DingTalk type was silently discarded for hours because a
+    // dropped inbound message left no record anywhere.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await acceptInbound({
+      adapter: fakeAdapter({ normalizeInbound: vi.fn(async () => null) }),
+      payload: {
+        data: JSON.stringify({
+          msgtype: "richText",
+          content: { richText: [{ text: "机密内容" }] },
+        }),
+      },
+      context: inboundContext(),
+      scope,
+      access: fakeAccess({ kind: "allowed", allowed: true }),
+      events: { accept: vi.fn() },
+    });
+
+    expect(warn).toHaveBeenCalledWith(
+      "channel_inbound_ignored",
+      expect.objectContaining({ messageType: "richText" }),
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("机密内容");
+    warn.mockRestore();
+  });
 });
 
 describe("channel access decision order", () => {

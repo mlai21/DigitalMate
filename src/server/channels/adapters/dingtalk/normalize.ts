@@ -131,14 +131,60 @@ function readMessageText(
     return readText(markdown.text ?? markdown.content)
       ?? readText(asRecord(event.content).text);
   }
+  // DingTalk sends anything the user pasted with formatting — numbered lists,
+  // text around an inline image — as richText, not text. Without this branch the
+  // whole event normalized to null and the message was dropped before it ever
+  // reached an agent turn, which reads to the user as being ignored.
+  if (type === "richtext") {
+    return readText(richTextSegments(event)
+      .map((segment) => typeof segment.text === "string" ? segment.text : "")
+      .filter((text) => text.trim())
+      // Segments are split around non-text elements, so a newline restores the
+      // break the user saw instead of gluing paragraphs together.
+      .join("\n"));
+  }
   return null;
 }
+
+/** Shape per DingTalk docs: `{ content: { richText: [{ text }, { downloadCode, type }] } }`. */
+function richTextSegments(
+  event: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const segments = asRecord(event.content).richText;
+  return Array.isArray(segments) ? segments.map(asRecord) : [];
+}
+
+/** Bounds the work one inbound message can queue up. */
+const RICH_TEXT_IMAGE_LIMIT = 9;
 
 function attachmentDescriptors(
   type: string,
   content: Record<string, unknown>,
   robotCode: string,
 ): InboundAttachmentDescriptor[] {
+  if (type === "richtext") {
+    if (!robotCode) return [];
+    const images: InboundAttachmentDescriptor[] = [];
+    const segments = Array.isArray(content.richText)
+      ? content.richText.map(asRecord)
+      : [];
+    for (const segment of segments) {
+      if (images.length >= RICH_TEXT_IMAGE_LIMIT) break;
+      const segmentType = readId(segment.type)?.toLowerCase();
+      if (segmentType !== "picture" && segmentType !== "image") continue;
+      const downloadCode = readId(segment.downloadCode ?? segment.download_code);
+      if (!downloadCode) continue;
+      images.push({
+        externalAttachmentId: downloadCode,
+        fileName: readText(segment.fileName ?? segment.file_name)
+          ?? "dingtalk-image.jpg",
+        mimeType: "image/jpeg",
+        sizeBytes: null,
+        source: { downloadCode, robotCode },
+      });
+    }
+    return images;
+  }
   if (!["picture", "image", "file"].includes(type)) return [];
   const downloadCode = readId(
     content.downloadCode ?? content.download_code,

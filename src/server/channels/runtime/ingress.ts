@@ -83,6 +83,16 @@ export async function acceptInboundWithAcknowledgement(
     input.context,
   );
   if (!normalized) {
+    // A dropped inbound message looks exactly like being ignored to the user, and
+    // used to leave no trace anywhere — an unsupported DingTalk message type went
+    // unnoticed for hours. Content stays out of the log; the shape is enough to
+    // tell "unsupported type" from "not addressed to us".
+    console.warn("channel_inbound_ignored", {
+      channel: input.adapter.manifest.type,
+      connectionId: input.context.connectionId,
+      agentId: input.context.agentId,
+      messageType: inboundMessageType(input.payload),
+    });
     const ignored: IngressResult = { kind: "ignored" };
     const acknowledgement = await input.adapter.acknowledge(
       input.payload,
@@ -176,6 +186,36 @@ function accessOptions(
         initialStatus: "failed",
         failureCode: access.reason,
       };
+}
+
+/**
+ * Best-effort type label for the ignore log. Platforms disagree on the field
+ * name, and stream-mode payloads carry the event as a JSON string, so this only
+ * reads the shallow discriminator and never the message body.
+ */
+function inboundMessageType(payload: unknown): string {
+  const record = payload && typeof payload === "object"
+    ? payload as Record<string, unknown>
+    : {};
+  for (const candidate of [
+    record.msgtype,
+    record.msgType,
+    record.message_type,
+  ]) {
+    if (typeof candidate === "string" && candidate.length <= 64) {
+      return candidate;
+    }
+  }
+  // Stream-mode payloads wrap the event in a JSON string that can reach
+  // megabytes, so the discriminator is scanned out of the head rather than
+  // parsing the whole body for a log line.
+  if (typeof record.data === "string") {
+    const match = record.data
+      .slice(0, 512)
+      .match(/"msg[Tt]ype"\s*:\s*"([^"]{1,64})"/);
+    if (match) return match[1]!;
+  }
+  return "unknown";
 }
 
 function assertNormalizedScope(

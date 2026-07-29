@@ -155,6 +155,26 @@ defineChannelContract({
     });
     expect(JSON.stringify(group?.rawSummary))
       .not.toContain("secret-session");
+
+    // Anything the user pastes with formatting arrives as richText, not text.
+    // Dropping it made long messages look like the bot ignored them.
+    const rich = await adapter.normalizeInbound(
+      await fixture("message-direct-richtext.json"),
+      CONTEXT,
+    );
+    expect(rich).toMatchObject({
+      externalEventId: "message:msg-1003",
+      chatType: "direct",
+      text: "还有一个特别高频的场景，就是比较价格\n1. 先从价格入手对标模型\n2. 再看缓存命中的影响",
+      attachments: [{
+        externalAttachmentId: "download-code-rich-1",
+        mimeType: "image/jpeg",
+        source: {
+          downloadCode: "download-code-rich-1",
+          robotCode: "robot-1",
+        },
+      }],
+    });
     await adapter.stop("shutdown");
   },
   async assertStableIds() {

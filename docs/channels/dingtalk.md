@@ -30,6 +30,15 @@ DigitalMate 使用固定的 `dingtalk-stream-sdk-nodejs@2.0.4` 接入 Stream。�
 
 持久化前失败会返回 `LATER` 让平台重投；持久化后即使发送断线，也只恢复同一个 Delivery，不会重新执行 Agent。
 
+## 可识别的入站消息类型
+
+- `text`：取 `text.content`。
+- `markdown` / `ai_card`：取 `markdown.text`，回落到 `content.text`。
+- `richText`：把 `content.richText` 里的文本段按顺序换行拼接；其中 `type` 为 `picture` 的段按图片附件处理，单条最多取 9 张。
+- `picture` / `image` / `file`：按附件处理，正文记为 `[附件]`。
+
+钉钉客户端会把**带格式粘贴的内容（编号列表、图文混排）发成 `richText` 而不是 `text`**。早期只识别 `text`，这类消息在归一化阶段就被判空丢弃，用户侧表现为"发了长文本机器人完全不回"。识别不了的类型现在会打一条 `channel_inbound_ignored` 日志（只含渠道、连接与消息类型，不含正文），不再静默消失。
+
 ## 会话、回复与主动消息
 
 - `conversationType=1` 作为私聊，`conversationType=2` 作为群聊。

@@ -1,0 +1,9 @@
+{
+  "specVersion": "1.0",
+  "type": "CALLBACK",
+  "headers": {
+    "messageId": "stream-ack-1003",
+    "topic": "/v1.0/im/bot/messages/get"
+  },
+  "data": "{\"msgId\":\"msg-1003\",\"conversationId\":\"cid-direct-1\",\"conversationType\":\"1\",\"senderStaffId\":\"staff-1\",\"senderId\":\"ding-user-1\",\"senderNick\":\"小唐\",\"msgtype\":\"richText\",\"content\":{\"richText\":[{\"text\":\"还有一个特别高频的场景，就是比较价格\"},{\"downloadCode\":\"download-code-rich-1\",\"type\":\"picture\"},{\"text\":\"1. 先从价格入手对标模型\\n2. 再看缓存命中的影响\"}]},\"sessionWebhook\":\"https://oapi.dingtalk.com/robot/sendBySession?session=secret-session-3\",\"sessionWebhookExpiredTime\":1785031200000,\"createAt\":1785024000000,\"robotCode\":\"robot-1\",\"isInAtList\":true}"
+}
