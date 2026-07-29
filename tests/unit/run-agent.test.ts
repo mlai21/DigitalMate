@@ -318,6 +318,25 @@ describe("runAgent", () => {
     expect(messages.at(-1)).toEqual({ role: "user", content: "继续看", attachments: [currentAttachment] });
   });
 
+  it("states the search default as restraint rather than a missing capability", () => {
+    const messages = buildMessages({
+      persona: { name: "Alvin", style: "售前架构师" },
+      memories: [],
+      history: [],
+      userText: "帮我去官网核实一下定价",
+    });
+    const system = messages[0]?.content ?? "";
+
+    // Saying the tool is "forbidden this turn" made the model announce it had no
+    // network channel and ask the user to grant permission, instead of calling a
+    // tool it did have. The default must read as restraint, not incapacity.
+    expect(system).toContain("你具备 web_search 工具");
+    expect(system).toContain("默认不主动搜索");
+    expect(system).toContain("不得声称自己没有联网能力");
+    expect(system).toContain("不得让用户去开通联网权限");
+    expect(system).not.toContain("默认禁止");
+  });
+
   it("keeps the attachment system prompt consistent with deterministic tool closure", () => {
     const messages = buildMessages({
       persona: { name: "DigitalMate", style: "温暖、克制" },

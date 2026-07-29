@@ -173,7 +173,7 @@ function buildSkillToolRules(access: SkillToolAccess): string {
 const webSearchTool: LlmTool = {
   name: "web_search",
   description:
-    "联网搜索网页信息。默认禁止使用；只有用户在输入框中开启本轮搜索，或在消息中明确要求搜索/查询时才调用。天气、新闻、价格等实时问题本身不构成授权。",
+    "联网搜索网页信息。不要主动搜索：天气、新闻、价格等实时问题本身不构成授权。用户在输入框中开启了本轮搜索，或在消息中明确要求搜索、查询、去官网或官方文档核实时，直接调用本工具；是否放行由系统门控判定，不需要你先向用户要权限。",
   parameters: {
     type: "object",
     properties: {
@@ -1198,7 +1198,14 @@ export function buildMessages(input: {
       ? "当前模型上下文包含用户附件。本轮仅可分析、总结或回答附件及对话内容；不得使用或声称使用任何外部工具，不得声称已搜索或已执行外部动作。"
       : input.webSearchEnabled
         ? "用户已在输入框中显式开启本轮联网搜索：本轮可调用 web_search 获取网页信息；搜索结果仍只作内部依据，必须整理后再自然回答。"
-        : "联网搜索纪律（必须遵守）：本轮默认禁止 web_search。只有用户在文字中明确要求搜索/查询时才可调用；仅仅因为天气、新闻、价格等可能需要实时信息，也不能自行搜索。普通问候、闲聊、常识问答、观点讨论、写作、翻译、总结以及安装 Skill 等请求一律不得搜索。",
+        // Phrasing matters more than it looks: an earlier version opened with
+        // "本轮默认禁止 web_search", and the model read that as "I have no network
+        // this turn", announced its own incapacity, and asked the user to grant
+        // permission instead of ever attempting the call — even when the message
+        // did explicitly ask it to verify against the official site. The default
+        // is stated as restraint, never as a missing capability, and the
+        // authorization call stays with the hard gate.
+        : "联网搜索纪律（必须遵守）：你具备 web_search 工具，是否放行由系统门控独立判定，不由你自己猜。默认不主动搜索：仅仅因为天气、新闻、价格等可能需要实时信息，不能自行搜索；普通问候、闲聊、常识问答、观点讨论、写作、翻译、总结以及安装 Skill 等请求一律不得搜索。但用户在文字中明确要求搜索、查询，或要求去官网、官方文档、网上核实时，直接调用 web_search，不要先反问是否有权限。不得声称自己没有联网能力、没有联网通道，也不得让用户去开通联网权限；确实不该搜索时，只说这轮按已有信息回答。",
     buildSkillToolRules(skillTools),
     input.attachmentContextPresent ? "" : outputDisciplineRule,
     selfImplementationRule,
