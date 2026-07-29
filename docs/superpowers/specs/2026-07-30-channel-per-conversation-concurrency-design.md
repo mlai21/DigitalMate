@@ -33,7 +33,7 @@
 
 | 方案 | 做法 | 结论 |
 |---|---|---|
-| A. 多 worker + 会话感知 claimNext | `claimNext` 跳过"同会话已有 running"的记录，worker 循环从 1 条改为 N 条 | **采用** |
+| A. 多 worker + 会话感知 claimNext | `claimNext` 只领取每个会话未完成记录中最老的一条，worker 循环从 1 条改为 N 条 | **采用** |
 | B. 进程内调度器 + 每会话内存队列 | dispatcher 批量领取后按会话分发到内存串行队列，信号量控限 | 否决 |
 | C. 会话哈希分片 | 每个 worker 只领 `hash(会话) % N == 自己编号` 的记录 | 否决 |
 
@@ -45,48 +45,53 @@
 
 ## 4. 设计
 
-### 4.1 事件侧
+### 4.1 会话键
 
-**会话键**与既有的 `channelContextKey`（`src/server/channels/runtime/agent-turn.ts`）口径一致：
+两侧统一使用 `(connection_id, external_conversation_id)` 作为会话分区键。
 
-- `direct` 聊天：`connection_id` + `external_sender_id`
-- `group` 聊天：`connection_id` + `external_conversation_id`
-
-这三列都已存在于 `channel_inbound_events`，在 SQL 里用表达式计算即可，**不需要数据迁移**。
-
-**`claimNext` 改造**（`src/server/channels/runtime/event-repository.ts`）：
-
-1. 候选集排除"同会话已存在 `status = 'running'` 且 `claim_expires_at` 未过期"的事件；
-2. 每个会话只允许领取其最老的一条待处理事件，保证同会话 FIFO；
-3. 全局排序键保持 `received_at, id` 不变，保证跨会话公平；
-4. 整个领取语句包在事务内，先取一个全局 `pg_advisory_xact_lock`。这只串行化"领取"这一个微秒级动作，消除"两个 worker 同时判定某会话空闲、各领走该会话一条消息"的竞态；事件的实际处理完全并行。事件侧与投递侧使用**不同的**固定锁键，两条队列的领取动作互不阻塞。
-
-**worker 循环**（`src/server/channels/runtime/start.ts`）：`startWorkerLoop` 由启动 1 条改为启动 N 条 event loop。每条循环内部逻辑不变——领一条、处理完、再领下一条。
-
-**保持不变**：入站去重（`ON CONFLICT (connection_id, external_event_id)`）、`clientTurnId` 幂等、`claimClientTurnExecution`、执行 journal 的 step key、租约过期后的接管。worker 崩溃时该会话最多被租约时长（60 秒）阻塞，到期后被其他循环接管，与现状一致。
-
-### 4.2 投递侧
-
-投递侧必须一起改，否则并发不产生用户可感知的改善：`delivery-worker` 在发送每一段前会真实等待——首段等 `responseDelayMs`，后续段按文本长度模拟打字延迟（单段上限 4 秒）。这是刻意的拟人节奏，不能优化掉。但它意味着一条长回复会占住唯一的投递循环十几秒，结果是 A 群和 B 群的 Agent 确实同时算完了，回复仍在排队逐条发出。
-
-**会话键**从 `recipient` JSON 推导，与事件侧口径完全一致：
-
-- `chatType = 'direct'`：`connection_id` + `recipient->>'externalUserId'`
-- 其他：`connection_id` + `recipient->>'externalConversationId'`
-
-`recipient` 在两条入队路径（事件回复 `turn-executor.ts` 的 `persist`、主动任务 `enqueueProactiveChannelDelivery`）都必定包含 `chatType` 与 `externalConversationId`，`direct` 还包含 `externalUserId`。因此 `channel_deliveries` **同样不需要加列或做数据迁移**。`externalUserId` 缺失时回退到 `externalConversationId`，保证会话键永不为 NULL。
+不沿用既有 `channelContextKey`（单聊用发送者、群聊用会话）的口径，原因是各渠道在单聊场景都会给出与用户一一对应的会话 ID（钉钉 `conversationId`、飞书 p2p `chat_id`、Telegram chat id、QQ `c2c:<openid>`、微信 `<user>@im.wechat`），用会话 ID 已经足够细；而且它让事件侧与投递侧的键**完全同形**——投递记录的 `recipient` JSON 里必有 `externalConversationId`，不需要处理 `chatType` 分支。
 
 两侧口径必须一致：若事件侧按 A 分组、投递侧按 B 分组，会出现"同一个群的两条回复被判定为不同会话"，导致拟人分段交叉。
 
-**`claimNext` 改造**（`src/server/channels/runtime/delivery-repository.ts`）：与事件侧同构——排除同会话 running 未过期的投递、每会话只取最老一条、领取动作置于事务内的 advisory 锁下。排序键保持现有的 `next_attempt_at, created_at, id`，重试退避行为不变。
+`channel_inbound_events` 已有 `connection_id` 与 `external_conversation_id` 列，`channel_deliveries` 的 `recipient` 已含 `externalConversationId`，因此**两侧都不需要加列或做数据迁移**。
 
-**worker 循环**：delivery loop 同样从 1 条改为 N 条。
+### 4.2 事件侧
 
-**同会话顺序保证**：同一会话的下一条投递必须等前一条**所有分段发完**才会被领取，这由"同会话有 running 就跳过"直接保证。因此同一个聊天窗口内分段永不交叉，不同会话之间完全并行。
+**`claimNext` 改造**（`src/server/channels/runtime/event-repository.ts`）：在现有候选条件之外增加一条约束——同会话不存在状态属于未完成集合、且 `(received_at, id)` 更小的事件，即"我是本会话未完成事件里最老的一条"。全局排序键保持 `received_at, id` 不变，保证跨会话公平。
+
+未完成集合取 `pending_attachments`、`accepted`、`running`；`completed` 与 `failed` 是终态，不参与阻塞。
+
+**这一条约束同时提供 FIFO 与互斥，不需要 advisory 锁。** 关键在于它只依赖"更老的事件是否未完成"，而这个判断在 READ COMMITTED 快照下是安全的：
+
+设同会话事件 E1 早于 E2，两条领取语句并发执行。想领 E2 的语句在自己的快照里看 E1——若 E1 尚未终结（`accepted`、`pending_attachments`，或另一个 worker 刚改成 `running` 但未提交、快照里仍是旧值 `accepted`），E2 都因"存在更老的未完成事件"被拒；若 E1 在该快照里已是 `completed`/`failed`，说明它在快照之前就已终结，那么另一个 worker 也不可能正在领取它（领取只接受 `accepted` 或租约过期的 `running`）。两种情况都不会出现同会话双领。
+
+对比之下，advisory 锁放在同一条语句里是**无效**的：语句的快照在语句开始时就已确定，锁在扫描过程中才取到，挡不住上述竞态；要有效就必须拆成"先在事务里加锁、再用新快照查询"，而 repository 目前只接收 `Pick<Pool | PoolClient, "query">`，没有 `connect()`，为此改造接口不值得。
+
+之所以必须把 `pending_attachments` 计入未完成集合：否则一条等待附件的老事件不阻塞后续事件，而它稍后转为 `accepted` 时又会因"没有更老的未完成事件"成为可领取的头部，从而与同会话的后续事件并发执行。
+
+**附件等待的兜底**：`pending_attachments` 正常在同一次入站请求内就转为 `accepted` 或 `failed`（`ingress.ts` 紧接 `afterPersist` 调用 `markAttachmentsReady`），是秒级状态。但进程若在附件下载途中被杀，该行会永久停留在 `pending_attachments`，进而永久堵死这个会话。因此它只在 5 分钟宽限期内参与阻塞，超期后不再阻塞，让会话能自愈。宽限期远大于正常耗时，不会误放。
+
+**worker 循环**（`src/server/channels/runtime/start.ts`）：`startWorkerLoop` 由启动 1 条改为启动 N 条 event loop，每条循环内部逻辑不变——领一条、处理完、再领下一条。每条循环使用带序号后缀的独立 `claim_owner`，便于按租约排查问题。
+
+**保持不变**：入站去重（`ON CONFLICT (connection_id, external_event_id)`）、`clientTurnId` 幂等、`claimClientTurnExecution`、执行 journal 的 step key、租约过期后的接管。worker 崩溃时该会话最多被租约时长（60 秒）阻塞，到期后被其他循环接管，与现状一致。
+
+### 4.3 投递侧
+
+投递侧必须一起改，否则并发不产生用户可感知的改善：`delivery-worker` 在发送每一段前会真实等待——首段等 `responseDelayMs`，后续段按文本长度模拟打字延迟（单段上限 4 秒）。这是刻意的拟人节奏，不能优化掉。但它意味着一条长回复会占住唯一的投递循环十几秒，结果是 A 群和 B 群的 Agent 确实同时算完了，回复仍在排队逐条发出。
+
+**`claimNext` 改造**（`src/server/channels/runtime/delivery-repository.ts`）：与事件侧同构，增加"我是本会话未完成投递里最老的一条"约束。会话键取 `connection_id` 与 `recipient->>'externalConversationId'`。
+
+未完成集合取 `queued`、`running`、`retry`；`sent`、`dead_letter`、`cancelled` 是终态。
+
+**会话内比较用 `(created_at, id)`，不用 `next_attempt_at`**：全局候选排序保持现有的 `next_attempt_at, created_at, id` 以维持重试退避行为，但会话内的先后必须按创建顺序判定。否则一条进入退避重试的回复会被排到后面，导致后一条回复先发出、聊天窗口里回复顺序与提问顺序相反。代价是重试期间同会话的后续回复要等待，退避耗尽后该投递进入 `dead_letter` 终态，队列自然放行。
+
+**`waiting_node` 不参与阻塞**，保持现状语义。它表示投递已交给外部节点（微信等经节点中转的渠道），可能等待数小时；让它阻塞会话会把一个群卡死。代价是节点中转渠道的同会话顺序保证仍与今天一样弱，不属于本次改动范围。
+
+**同会话顺序保证**：同一会话的下一条投递必须等前一条所有分段发完（进入终态）才会被领取，因此同一个聊天窗口内分段永不交叉，不同会话之间完全并行。
 
 **心跳与租约**：每个 delivery claim 已有独立的 `startHeartbeat` 续租，多 worker 并行互不干扰，无需改动。
 
-### 4.3 连接池
+### 4.4 连接池
 
 `getPool()`（`src/server/db/client.ts`）目前使用 pg 默认 `max: 10`。一次 Agent 回合会占用多个连接（读设置、读历史、写消息事务、写 journal），4 个事件 worker 加 4 个投递 worker 并行时容易耗尽连接池，表现为"看起来像卡死"的排队。
 
@@ -94,7 +99,7 @@
 
 这一项必须与并发开关同批落地，否则并发化会让整体更慢。
 
-### 4.4 配置项
+### 4.5 配置项
 
 新增到 `src/server/config/env.ts`，并同步 `.env.example` 与 `docs/env.md`：
 
@@ -121,9 +126,11 @@
 
 1. 两个不同会话的事件可被两个 worker 同时领取并并行处理；
 2. 同一会话的两条连续消息，第二条在第一条完成前不被领取，处理顺序为 FIFO；
-3. worker 处理途中崩溃，租约到期后同会话事件被其他 worker 接管，`clientTurnId` 幂等保证不产生重复回复；
-4. 投递侧同构两条：不同会话分段并行、同会话分段不交叉；
-5. `CHANNEL_WORKER_CONCURRENCY=1` 时行为与改动前一致。
+3. 同会话存在 `pending_attachments` 事件时，后续事件被阻塞；该事件超过 5 分钟宽限期后不再阻塞；
+4. worker 处理途中崩溃，租约到期后同会话事件被其他 worker 接管，`clientTurnId` 幂等保证不产生重复回复；
+5. 投递侧同构三条：不同会话分段并行、同会话分段不交叉、同会话进入 `retry` 的投递会阻塞其后续投递；
+6. `waiting_node` 状态的投递不阻塞同会话后续投递；
+7. `CHANNEL_WORKER_CONCURRENCY=1` 时行为与改动前一致。
 
 本次改动落在消息写入链路上，按 AGENTS.md 约定必须执行四条固定回归用例：普通问候 0 次搜索、未授权实时问题 0 次搜索、遗留无授权分享不投递、同一主动任务重复执行只写入 1 条可见消息。
 
