@@ -43,6 +43,23 @@ describe("isExplicitSearchRequest", () => {
     expect(isExplicitSearchRequest("不用去官网核实，按你已有的说")).toBe(false);
   });
 
+  it("detects a named site as the place to search, not only to verify", () => {
+    expect(isExplicitSearchRequest("你去这个官网搜去https://help.aliyun.com/zh/model-studio/what-is-model-studio")).toBe(true);
+    expect(isExplicitSearchRequest("官网搜一下这个型号")).toBe(true);
+    expect(isExplicitSearchRequest("你能去官网搜吗")).toBe(true);
+  });
+
+  it("reads a negated ability question as a request to search", () => {
+    expect(isExplicitSearchRequest("你不能去百炼搜吗，skill不是给你了嘛")).toBe(true);
+    expect(isExplicitSearchRequest("你不可以查一下官网么")).toBe(true);
+  });
+
+  it("still refuses the same negation when it is not a question", () => {
+    expect(isExplicitSearchRequest("你不能去百炼搜")).toBe(false);
+    expect(isExplicitSearchRequest("不能去官网搜")).toBe(false);
+    expect(isExplicitSearchRequest("你不是说不用搜吗")).toBe(false);
+  });
+
   it("does not confuse discussion of search with an instruction to search", () => {
     expect(isExplicitSearchRequest("解释一下搜索算法")).toBe(false);
     expect(isExplicitSearchRequest("我在做搜索功能")).toBe(false);

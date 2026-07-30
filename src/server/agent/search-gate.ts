@@ -11,7 +11,13 @@ export type SearchGate = {
 };
 
 const explicitSearchPattern =
-  /搜一下|搜一搜|搜搜|帮我搜(?:一下)?|帮我搜索(?:一下)?|请(?:帮我)?搜索(?:一下)?|查一下|查一查|查查|帮我查(?:一下)?|帮我查询(?:一下)?|查询一下|上网查|联网查|网上查|查证|求证|(?:去|上|看)官网|官网(?:查|看|确认|核实|核对)|^\s*(?:搜索|查询)一下|^\s*(?:搜索|查询)(?:[：:\s]|$)|^\s*(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+)?(?:search|google)\s+/i;
+  /搜一下|搜一搜|搜搜|帮我搜(?:一下)?|帮我搜索(?:一下)?|请(?:帮我)?搜索(?:一下)?|查一下|查一查|查查|帮我查(?:一下)?|帮我查询(?:一下)?|查询一下|上网查|联网查|网上查|查证|求证|(?:去|上|看)官网|官网(?:搜索|搜|查|看|确认|核实|核对)|^\s*(?:搜索|查询)一下|^\s*(?:搜索|查询)(?:[：:\s]|$)|^\s*(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+)?(?:search|google)\s+/i;
+// "你不能去百炼搜吗" is a request, not a prohibition: in Chinese a negated
+// ability closed with 吗/么 asks you to go do it. Only ability negations count —
+// "你不是说不用搜吗" restates an earlier decision not to search — and dropping
+// the 吗/么 keeps "你不能去百炼搜" a refusal.
+const rhetoricalSearchRequestPattern =
+  /(?:不能|不可以|不会|没法)[^，。！？；,.!?;]{0,12}(?:搜索|搜|查询|查|核实|核对|查证)[^，。！？；,.!?;]{0,8}[吗么]/;
 // "核实/确认" alone is ambiguous — it often means "confirm my understanding" —
 // so it only authorizes a search when the same clause also names an external
 // source to check against. Keeps the red line ("only an explicit request in the
@@ -37,6 +43,7 @@ export function isExplicitSearchRequest(message: string): boolean {
     .map((clause) => clause.trim())
     .filter(Boolean)
     .some((clause) => {
+      if (rhetoricalSearchRequestPattern.test(clause)) return true;
       if (explicitSearchRefusalPattern.test(clause)) return false;
       if (explicitSearchPattern.test(clause)) return true;
       return verificationVerbPattern.test(clause) && externalSourcePattern.test(clause);
