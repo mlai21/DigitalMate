@@ -266,6 +266,75 @@ describe("channel agent turn", () => {
     expect(systemPrompt(llm.calls)).toContain("weekly-review");
   });
 
+  it("群聊被 @ 且明确要求搜索时会执行联网搜索", async () => {
+    const repositories = fakeRepositories();
+    const search = vi.fn(async () => [{
+      title: "官方定价",
+      url: "https://example.com/pricing",
+      snippet: "已核实的官方信息",
+    }]);
+    let round = 0;
+    const llm: LlmClient = {
+      async *stream() {
+        if (round === 0) {
+          round += 1;
+          yield {
+            type: "tool_call",
+            toolCall: {
+              id: "search-1",
+              name: "web_search",
+              arguments: JSON.stringify({ query: "qwen3-flash 官方定价" }),
+            },
+          };
+          return;
+        }
+        yield { type: "text", text: "官方信息已核实。" };
+      },
+      async completeText() {
+        return "";
+      },
+    };
+    const runner = createChannelAgentTurnRunner({
+      repositories: repositories as never,
+      resolveMainModel: () => ({ client: llm, model: "mock-main" }),
+      resolveLightModel: () => ({
+        client: textLlm('{"skill":0,"reason":"不贴合"}'),
+        model: "mock-light",
+      }),
+      search,
+      now: () => now,
+    });
+    const context = createContext({
+      chatType: "group",
+      mentioned: true,
+      text: "@Alvin 帮我查一下 qwen3-flash 的官方定价",
+    });
+
+    await expect(runner.decideTurn(context)).resolves.toEqual({
+      kind: "proceed",
+    });
+    await expect(collect(runner.runAgentTurn(context)))
+      .resolves.toBe("官方信息已核实。");
+
+    expect(search).toHaveBeenCalledWith(
+      "qwen3-flash 官方定价",
+      undefined,
+      undefined,
+    );
+    expect(repositories.toolLogs.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "web_search_gate",
+        outputSummary: expect.stringContaining("放行（explicit）"),
+      }),
+    );
+    expect(repositories.toolLogs.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "web_search",
+        status: "success",
+      }),
+    );
+  });
+
   it("路由模型判定都不贴合时不加载任何 Skill", async () => {
     const repositories = fakeRepositories();
     const llm = recordingLlm("在的，怎么了？");

@@ -29,6 +29,9 @@ const OTHER_AGENT_ID = "20000000-0000-4000-8000-00000000000a";
 const CHANNEL_KEY_STATE = createChannelSecretsKey(
   Buffer.alloc(32, 41).toString("base64"),
 );
+const LEGACY_ALVIN_STYLE =
+  "MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不联网，不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。";
+const CUSTOM_ALVIN_STYLE = "用户手工编辑的 Alvin 专属人设";
 const scopeA = { userId: USER_ID, agentId: AGENT_A } satisfies AgentScope;
 const scopeB = { userId: USER_ID, agentId: AGENT_B } satisfies AgentScope;
 
@@ -338,6 +341,135 @@ describe("agent-scoped repositories on PostgreSQL", () => {
       "DELETE FROM digital_agents WHERE user_id = $1 AND id = $2",
       [USER_ID, alvin.id],
     );
+  }, 30_000);
+
+  it("upgrades the untouched legacy Alvin persona in both identity and runtime settings", async () => {
+    const repositories = createRepositories(pool);
+    const alvin = await repositories.agents.createAlvin(USER_ID);
+    const legacyPersona = {
+      name: "Alvin",
+      style: LEGACY_ALVIN_STYLE,
+      emojiHabit: "不主动使用",
+    };
+
+    try {
+      await pool.query(
+        "UPDATE digital_agents SET persona = $3 WHERE user_id = $1 AND id = $2",
+        [USER_ID, alvin.id, legacyPersona],
+      );
+      await pool.query(
+        "UPDATE agent_settings SET persona = $3 WHERE user_id = $1 AND agent_id = $2",
+        [USER_ID, alvin.id, legacyPersona],
+      );
+
+      const upgraded = await repositories.agents.createAlvin(USER_ID);
+      const stored = await readAlvinPersonaStyles(pool, alvin.id);
+
+      expect(String(upgraded.persona.style ?? ""))
+        .toContain("默认不主动联网");
+      expect(stored).toEqual({
+        identityStyle: expect.stringContaining("默认不主动联网"),
+        runtimeStyle: expect.stringContaining("默认不主动联网"),
+      });
+    } finally {
+      await deleteAlvin(pool, alvin.id);
+    }
+  }, 30_000);
+
+  it("keeps a customized Alvin persona during idempotent creation", async () => {
+    const repositories = createRepositories(pool);
+    const alvin = await repositories.agents.createAlvin(USER_ID);
+    const customPersona = {
+      name: "Alvin",
+      style: CUSTOM_ALVIN_STYLE,
+      emojiHabit: "不使用",
+    };
+
+    try {
+      await pool.query(
+        "UPDATE digital_agents SET persona = $3 WHERE user_id = $1 AND id = $2",
+        [USER_ID, alvin.id, customPersona],
+      );
+      await pool.query(
+        "UPDATE agent_settings SET persona = $3 WHERE user_id = $1 AND agent_id = $2",
+        [USER_ID, alvin.id, customPersona],
+      );
+
+      await repositories.agents.createAlvin(USER_ID);
+
+      await expect(readAlvinPersonaStyles(pool, alvin.id)).resolves.toEqual({
+        identityStyle: CUSTOM_ALVIN_STYLE,
+        runtimeStyle: CUSTOM_ALVIN_STYLE,
+      });
+    } finally {
+      await deleteAlvin(pool, alvin.id);
+    }
+  }, 30_000);
+
+  it("backfills the legacy Alvin persona when the database schema is reapplied", async () => {
+    const repositories = createRepositories(pool);
+    const alvin = await repositories.agents.createAlvin(USER_ID);
+    const legacyPersona = {
+      name: "Alvin",
+      style: LEGACY_ALVIN_STYLE,
+      emojiHabit: "不主动使用",
+    };
+
+    try {
+      await pool.query(
+        "UPDATE digital_agents SET persona = $3 WHERE user_id = $1 AND id = $2",
+        [USER_ID, alvin.id, legacyPersona],
+      );
+      await pool.query(
+        "UPDATE agent_settings SET persona = $3 WHERE user_id = $1 AND agent_id = $2",
+        [USER_ID, alvin.id, legacyPersona],
+      );
+
+      const migration = await readAlvinPersonaMigration();
+      expect(migration).not.toBeNull();
+      if (!migration) return;
+      await pool.query(migration);
+
+      await expect(readAlvinPersonaStyles(pool, alvin.id)).resolves.toEqual({
+        identityStyle: expect.stringContaining("默认不主动联网"),
+        runtimeStyle: expect.stringContaining("默认不主动联网"),
+      });
+    } finally {
+      await deleteAlvin(pool, alvin.id);
+    }
+  }, 30_000);
+
+  it("leaves a customized Alvin persona unchanged when the schema is reapplied", async () => {
+    const repositories = createRepositories(pool);
+    const alvin = await repositories.agents.createAlvin(USER_ID);
+    const customPersona = {
+      name: "Alvin",
+      style: CUSTOM_ALVIN_STYLE,
+      emojiHabit: "不使用",
+    };
+
+    try {
+      await pool.query(
+        "UPDATE digital_agents SET persona = $3 WHERE user_id = $1 AND id = $2",
+        [USER_ID, alvin.id, customPersona],
+      );
+      await pool.query(
+        "UPDATE agent_settings SET persona = $3 WHERE user_id = $1 AND agent_id = $2",
+        [USER_ID, alvin.id, customPersona],
+      );
+
+      const migration = await readAlvinPersonaMigration();
+      expect(migration).not.toBeNull();
+      if (!migration) return;
+      await pool.query(migration);
+
+      await expect(readAlvinPersonaStyles(pool, alvin.id)).resolves.toEqual({
+        identityStyle: CUSTOM_ALVIN_STYLE,
+        runtimeStyle: CUSTOM_ALVIN_STYLE,
+      });
+    } finally {
+      await deleteAlvin(pool, alvin.id);
+    }
   }, 30_000);
 
   it("isolates two agents across domain APIs and converges clear to one canonical default", async () => {
@@ -879,6 +1011,57 @@ async function collectAgentOutput(
     // Exhaust the generator so the captured request covers prompt and tools.
     void chunk;
   }
+}
+
+async function readAlvinPersonaStyles(
+  databasePool: Pool,
+  agentId: string,
+): Promise<{ identityStyle: string; runtimeStyle: string }> {
+  const result = await databasePool.query<{
+    identity_style: string;
+    runtime_style: string;
+  }>(
+    `SELECT digital_agents.persona->>'style' AS identity_style,
+            agent_settings.persona->>'style' AS runtime_style
+     FROM digital_agents
+     JOIN agent_settings
+       ON agent_settings.user_id = digital_agents.user_id
+      AND agent_settings.agent_id = digital_agents.id
+     WHERE digital_agents.user_id = $1
+       AND digital_agents.id = $2`,
+    [USER_ID, agentId],
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error("alvin_persona_not_found");
+  return {
+    identityStyle: row.identity_style,
+    runtimeStyle: row.runtime_style,
+  };
+}
+
+async function readAlvinPersonaMigration(): Promise<string | null> {
+  const schema = await readFile(
+    path.join(process.cwd(), "src/server/db/schema.sql"),
+    "utf8",
+  );
+  const match = schema.match(
+    /-- BEGIN ALVIN LEGACY PERSONA MIGRATION([\s\S]*?)-- END ALVIN LEGACY PERSONA MIGRATION/,
+  );
+  return match?.[1]?.trim() || null;
+}
+
+async function deleteAlvin(
+  databasePool: Pool,
+  agentId: string,
+): Promise<void> {
+  await databasePool.query(
+    "DELETE FROM skills WHERE user_id = $1 AND origin_agent_id = $2",
+    [USER_ID, agentId],
+  );
+  await databasePool.query(
+    "DELETE FROM digital_agents WHERE user_id = $1 AND id = $2",
+    [USER_ID, agentId],
+  );
 }
 
 function goalContract(label: string) {

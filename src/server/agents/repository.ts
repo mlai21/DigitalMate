@@ -19,6 +19,9 @@ const ALVIN_PERSONA = {
   emojiHabit: "不主动使用",
 };
 
+const LEGACY_ALVIN_STYLE =
+  "MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不联网，不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。";
+
 const ALVIN_MVP_SKILLS = [
   presalesSkill(
     "客户需求发现与商机资格判断",
@@ -166,6 +169,16 @@ export function createAgentRepository(providedPool?: Pool) {
            FROM selected_user
            ON CONFLICT (user_id, slug) DO UPDATE
            SET status = 'active',
+               persona = CASE
+                 WHEN digital_agents.persona->>'style' = $7
+                 THEN jsonb_set(
+                   digital_agents.persona,
+                   '{style}',
+                   $2::jsonb->'style',
+                   true
+                 )
+                 ELSE digital_agents.persona
+               END,
                updated_at = now()
            RETURNING *
          ),
@@ -183,7 +196,16 @@ export function createAgentRepository(providedPool?: Pool) {
              $5::jsonb,
              '{}'::jsonb
            FROM selected_agent
-           ON CONFLICT (user_id, agent_id) DO NOTHING
+           ON CONFLICT (user_id, agent_id) DO UPDATE
+           SET persona = jsonb_set(
+                 agent_settings.persona,
+                 '{style}',
+                 $2::jsonb->'style',
+                 true
+               ),
+               revision = agent_settings.revision + 1,
+               updated_at = now()
+           WHERE agent_settings.persona->>'style' = $7
            RETURNING agent_id
          ),
          model_grants AS (
@@ -262,6 +284,7 @@ export function createAgentRepository(providedPool?: Pool) {
           JSON.stringify(defaultSettings.cadence),
           JSON.stringify(defaultSettings.search),
           JSON.stringify(ALVIN_MVP_SKILLS),
+          LEGACY_ALVIN_STYLE,
         ],
       );
       const row = result.rows[0];

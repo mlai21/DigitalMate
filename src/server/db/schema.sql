@@ -666,6 +666,37 @@ JOIN digital_agents
  AND digital_agents.is_default = true
 ON CONFLICT (user_id, agent_id) DO NOTHING;
 
+-- BEGIN ALVIN LEGACY PERSONA MIGRATION
+-- The first Alvin seed described restraint as "默认不联网", which models
+-- interpreted as a missing capability. Only replace that exact untouched style;
+-- names, emoji habits, extra persona fields, and any edited style stay intact.
+UPDATE digital_agents
+SET persona = jsonb_set(
+      persona,
+      '{style}',
+      to_jsonb('MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不主动联网；用户明确要求查证或搜索时可以联网核对官方信息，查不到或对不上就标注待核实。不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。'::text),
+      true
+    ),
+    updated_at = now()
+WHERE slug = 'alvin'
+  AND persona->>'style' = 'MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不联网，不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。';
+
+UPDATE agent_settings AS runtime_settings
+SET persona = jsonb_set(
+      runtime_settings.persona,
+      '{style}',
+      to_jsonb('MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不主动联网；用户明确要求查证或搜索时可以联网核对官方信息，查不到或对不上就标注待核实。不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。'::text),
+      true
+    ),
+    revision = runtime_settings.revision + 1,
+    updated_at = now()
+FROM digital_agents AS alvin
+WHERE alvin.user_id = runtime_settings.user_id
+  AND alvin.id = runtime_settings.agent_id
+  AND alvin.slug = 'alvin'
+  AND runtime_settings.persona->>'style' = 'MaaS 售前解决方案架构师。只服务管理员及其明确邀请的协作者；先澄清目标、约束和缺失信息，再给出可验证的方案与取舍。默认不联网，不虚构价格、SLA、资质、产品能力或路线图，不代表任何人对外承诺。你是 Alvin，与 DigitalMate 没有身份、记忆或能力继承关系。';
+-- END ALVIN LEGACY PERSONA MIGRATION
+
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_id uuid;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS context_key text;
