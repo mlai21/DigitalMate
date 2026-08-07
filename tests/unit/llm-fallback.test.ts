@@ -82,6 +82,78 @@ describe("createFallbackLlmClient", () => {
     }]);
   });
 
+  it("moves to the next model when the provider completes without any output", async () => {
+    const primaryStream = vi.fn(async function* (): AsyncIterable<LlmStreamEvent> {
+      return;
+    });
+    const events: LlmFallbackEvent[] = [];
+    const routed = createFallbackLlmClient({
+      candidates: [
+        {
+          client: { stream: primaryStream, completeText: async () => "" },
+          model: "claude-opus-4-8",
+        },
+        { client: textClient("备用模型给出了结论。"), model: "qwen3.7-max" },
+      ],
+      onFallback: (event) => events.push(event),
+    });
+
+    expect(await collect(routed.client.stream({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "根据搜索结果给出价格结论" }],
+    }))).toEqual([{ type: "text", text: "备用模型给出了结论。" }]);
+    expect(primaryStream).toHaveBeenCalledOnce();
+    expect(events).toEqual([{
+      from: "claude-opus-4-8",
+      to: "qwen3.7-max",
+      code: "llm_empty_response",
+      status: null,
+    }]);
+  });
+
+  it("treats a whitespace-only provider response as empty", async () => {
+    const routed = createFallbackLlmClient({
+      candidates: [
+        { client: textClient("   \n"), model: "claude-opus-4-8" },
+        { client: textClient("备用模型给出了结论。"), model: "qwen3.7-max" },
+      ],
+    });
+
+    expect(await collect(routed.client.stream({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "根据搜索结果给出价格结论" }],
+    }))).toEqual([{ type: "text", text: "备用模型给出了结论。" }]);
+  });
+
+  it("propagates an abort when the provider completes with an empty stream", async () => {
+    const controller = new AbortController();
+    const secondary = vi.fn();
+    const routed = createFallbackLlmClient({
+      candidates: [
+        {
+          client: {
+            async *stream(): AsyncIterable<LlmStreamEvent> {
+              controller.abort();
+            },
+            completeText: async () => "",
+          },
+          model: "claude-opus-4-8",
+        },
+        {
+          client: { stream: secondary as never, completeText: secondary as never },
+          model: "qwen3.7-max",
+        },
+      ],
+    });
+
+    await expect(collect(routed.client.stream({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "继续" }],
+      signal: controller.signal,
+    }))).rejects.toMatchObject({ name: "AbortError" });
+    expect(secondary).not.toHaveBeenCalled();
+  });
+
   it("asks each candidate with its own model id", async () => {
     const primary = failingClient(providerError(529));
     const secondary = failingClient(providerError(500));

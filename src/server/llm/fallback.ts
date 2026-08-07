@@ -18,9 +18,10 @@ export type LlmCandidate = Readonly<{ client: LlmClient; model: string }>;
  * the "something went wrong" reply.
  *
  * Two rules keep this from breaking the single-visible-reply contract:
- * once the primary has emitted anything the turn is committed to it and the
- * error propagates; and the choice is sticky for the rest of the turn, so a
- * tool loop does not pay for the broken model on every iteration.
+ * once the primary has emitted visible text or a tool call the turn is
+ * committed to it and the error propagates; and the choice is sticky for the
+ * rest of the turn, so a tool loop does not pay for the broken model on every
+ * iteration.
  */
 export function createFallbackLlmClient(input: Readonly<{
   candidates: readonly LlmCandidate[];
@@ -46,9 +47,23 @@ export function createFallbackLlmClient(input: Readonly<{
             ...streamInput,
             model: candidate.model,
           })) {
+            if (event.type === "text" && event.text.trim().length === 0 && !emitted) {
+              continue;
+            }
             emitted = true;
             startIndex = index;
             yield event;
+          }
+          streamInput.signal?.throwIfAborted();
+          if (!emitted && !isLast) {
+            startIndex = index + 1;
+            input.onFallback?.({
+              from: candidate.model,
+              to: candidates[index + 1]!.model,
+              code: "llm_empty_response",
+              status: null,
+            });
+            continue;
           }
           startIndex = index;
           return;
