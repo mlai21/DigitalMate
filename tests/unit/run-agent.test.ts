@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { buildMessages, runAgent } from "@/server/agent/run-agent";
 import { withUserDataLease } from "@/server/admin/user-data-lease";
 import { loadLlmAttachments } from "@/server/attachments/context";
+import type { ExecutionJournal } from "@/server/channels/runtime/execution-journal";
 import { createRepositories, type DbMessageAttachment } from "@/server/db/repositories";
 import type { LlmAttachment, LlmClient, LlmStreamEvent, LlmStreamInput } from "@/server/llm/types";
 import { estimateMessagesTokenUsage, estimateTokenCount } from "@/server/llm/usage";
@@ -1819,6 +1820,328 @@ describe("runAgent", () => {
         })),
       },
       searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).toBe(conclusion);
+  });
+
+  it("allows a natural conclusion to mention a short entity-only search title", async () => {
+    const conclusion =
+      "Seedance 2.0 国内版纯生成价格为 46 元/百万 tokens，换算后是 0.046 元/千 tokens。";
+    const evidence =
+      "Seedance 标准版在国内按 token 计价，纯生成价格为 46 元/百万 tokens，正式结算以火山引擎控制台为准。";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"Seedance 2.0 国内价格"}' } }],
+      [{ type: "text", text: conclusion }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "去火山引擎官网查 Seedance 2.0 国内价格",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: evidence,
+          results: [{ title: "Seedance", url: "https://example.com/pricing", snippet: evidence }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).toBe(conclusion);
+  });
+
+  it("replaces a short descriptive search title that the user did not supply", async () => {
+    const rawTitle = "Qwen 发布全新旗舰模型";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"Qwen 最近消息"}' } }],
+      [{ type: "text", text: rawTitle }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我搜索 Qwen 最近消息",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "媒体报道了 Qwen 的一次产品更新。",
+          results: [{ title: rawTitle, url: "https://example.com/qwen", snippet: "报道介绍了新版模型。" }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(rawTitle.replace(/[\s\p{P}\p{S}]+/gu, "")).toHaveLength(12);
+    expect(chunks.join("")).not.toContain(rawTitle);
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("keeps the eighteen-character verbatim evidence boundary blocked", async () => {
+    const rawSnippet = "abcdefghijklmnopqr";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"release details"}' } }],
+      [{ type: "text", text: rawSnippet }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "search release details",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: rawSnippet,
+          results: [{ title: "Release", url: "https://example.com/release", snippet: rawSnippet }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(rawSnippet).toHaveLength(18);
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("treats short fragments from a legacy search journal as untrusted on reuse", async () => {
+    const rawTitle = "Qwen 发布全新旗舰模型";
+    const legacySearchOutput = {
+      result: "以下是内部搜索结果：媒体报道了 Qwen 的一次产品更新。",
+      searchEvidence: [
+        "媒体报道了 Qwen 的一次产品更新。",
+        rawTitle,
+        "https://example.com/qwen",
+        "报道介绍了新版模型。",
+      ],
+    };
+    const journal: ExecutionJournal = {
+      begin: vi.fn(async (step) => step.kind === "search" ? "reuse" : "run"),
+      complete: vi.fn(async () => undefined),
+      fail: vi.fn(async () => undefined),
+      read: async <T>(stepKey: string): Promise<T | null> =>
+        stepKey.startsWith("search:") ? legacySearchOutput as T : null,
+    };
+    const llm = scriptedLlm([[{ type: "text", text: rawTitle }]]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我搜索 Qwen 最近消息",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: { run: vi.fn() },
+      searchGate: allowSearchGate,
+      requiredSearchQuery: "Qwen 最近消息",
+      executionJournal: journal,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).not.toContain(rawTitle);
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("replaces a final answer that copies a protocol-less search URL", async () => {
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"example product"}' } }],
+      [{ type: "text", text: "详情见 example.com" }],
+    ]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "search example product",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "The product is available.",
+          results: [{
+            title: "Example product",
+            url: "example.com",
+            snippet: "The product is available.",
+          }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).not.toContain("example.com");
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("does not treat a different hostname containing the source hostname as a URL leak", async () => {
+    const conclusion = "logo.com 是另一个站点，不是这次检索的来源。";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"Go product"}' } }],
+      [{ type: "text", text: conclusion }],
+    ]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "search Go product",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "The Go product is available.",
+          results: [{
+            title: "Go product",
+            url: "https://go.com",
+            snippet: "The Go product is available.",
+          }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).toBe(conclusion);
+  });
+
+  it("replaces a copied ASCII search hostname adjacent to Chinese prose", async () => {
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"Go product"}' } }],
+      [{ type: "text", text: "详情见go.com即可" }],
+    ]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "search Go product",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "The Go product is available.",
+          results: [{
+            title: "Go product",
+            url: "https://go.com",
+            snippet: "The Go product is available.",
+          }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).not.toContain("go.com");
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("replaces a final answer that copies a protocol-less Unicode search URL", async () => {
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"示例产品"}' } }],
+      [{ type: "text", text: "详情见例子.公司" }],
+    ]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "搜索示例产品",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: "示例产品已经发布。",
+          results: [{ title: "示例产品", url: "例子.公司", snippet: "示例产品已经发布。" }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).not.toContain("例子.公司");
+    expect(chunks.join("")).toContain("原始检索内容");
+  });
+
+  it("does not treat a model-like legacy fragment as a protocol-less URL", async () => {
+    const conclusion = "qwen3.8-max 的价格仍需以官方计费页为准。";
+    const legacySearchOutput = {
+      result: "以下是内部搜索结果：qwen3.8-max 的价格仍需核实。",
+      searchEvidence: ["qwen3.8-max"],
+    };
+    const journal: ExecutionJournal = {
+      begin: vi.fn(async (step) => step.kind === "search" ? "reuse" : "run"),
+      complete: vi.fn(async () => undefined),
+      fail: vi.fn(async () => undefined),
+      read: async <T>(stepKey: string): Promise<T | null> =>
+        stepKey.startsWith("search:") ? legacySearchOutput as T : null,
+    };
+    const llm = scriptedLlm([[{ type: "text", text: conclusion }]]);
+    const chunks = [];
+
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我搜 qwen3.8-max 的价格",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: { run: vi.fn() },
+      searchGate: allowSearchGate,
+      requiredSearchQuery: "qwen3.8-max 的价格",
+      executionJournal: journal,
     })) {
       chunks.push(chunk);
     }

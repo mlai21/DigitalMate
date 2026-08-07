@@ -1,3 +1,5 @@
+import { domainToUnicode } from "node:url";
+
 import { buildPersonaPrompt, type PersonaConfig } from "@/server/agent/persona";
 import type { SearchGate } from "@/server/agent/search-gate";
 import { sanitizeAssistantText } from "@/server/agent/streaming";
@@ -325,7 +327,11 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     attachments: input.attachments,
     attachmentContextPresent: hasAttachmentContext,
   });
-  const searchEvidence = new Set<string>();
+  const searchEvidence: SearchEvidence = {
+    fragments: new Set<string>(),
+    titles: new Set<string>(),
+    urlHosts: new Set<string>(),
+  };
   const requiredSearchQuery = input.requiredSearchQuery?.trim();
   if (requiredSearchQuery && !hasAttachmentContext) {
     const requiredSearchCall: LlmToolCall = {
@@ -401,7 +407,11 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     const { text, toolCalls } = await collectModelTurn(activeMessages, turnTools);
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
-      const visible = sanitizeSearchOutput(sanitizeAssistantText(text), searchEvidence);
+      const visible = sanitizeSearchOutput(
+        sanitizeAssistantText(text),
+        searchEvidence,
+        [input.message, requiredSearchQuery].filter(Boolean).join("\n"),
+      );
       if (visible) {
         yield visible;
       }
@@ -554,7 +564,7 @@ async function executeJournaledToolCall(context: {
   input: RunAgentInput;
   toolCall: LlmToolCall;
   enabledTools: EnabledToolContext[];
-  searchEvidence: Set<string>;
+  searchEvidence: SearchEvidence;
   round: number;
   toolIndex: number;
 }): Promise<string> {
@@ -589,7 +599,26 @@ async function executeJournaledToolCall(context: {
       throw new Error("channel_execution_tool_output_invalid");
     }
     for (const fragment of stored.searchEvidence) {
-      context.searchEvidence.add(fragment);
+      context.searchEvidence.fragments.add(fragment);
+      addSearchUrlHost(context.searchEvidence.urlHosts, fragment);
+    }
+    if (stored.searchEvidenceTitles) {
+      for (const title of stored.searchEvidenceTitles) {
+        context.searchEvidence.titles.add(title);
+      }
+    } else {
+      // Legacy journal rows did not retain evidence kinds. On replay, treat
+      // every short fragment as a possible title instead of weakening the
+      // leak guard after a restart.
+      for (const fragment of stored.searchEvidence) {
+        const normalizedFragment = normalizeSearchLeakText(fragment);
+        if (normalizedFragment.length > 0 && normalizedFragment.length < 18) {
+          context.searchEvidence.titles.add(fragment);
+        }
+      }
+    }
+    for (const host of stored.searchEvidenceUrlHosts ?? []) {
+      context.searchEvidence.urlHosts.add(host);
     }
     return stored.result;
   }
@@ -599,15 +628,25 @@ async function executeJournaledToolCall(context: {
       : "本次工具执行结果不确定，为避免重复产生副作用，本轮不会再次调用该工具。";
   }
 
-  const evidenceBefore = new Set(context.searchEvidence);
+  const evidenceBefore = new Set(context.searchEvidence.fragments);
+  const titlesBefore = new Set(context.searchEvidence.titles);
+  const urlHostsBefore = new Set(context.searchEvidence.urlHosts);
   try {
     const result = await executeToolCall(context);
-    const addedEvidence = [...context.searchEvidence].filter(
+    const addedEvidence = [...context.searchEvidence.fragments].filter(
       (fragment) => !evidenceBefore.has(fragment),
+    );
+    const addedTitles = [...context.searchEvidence.titles].filter(
+      (title) => !titlesBefore.has(title),
+    );
+    const addedUrlHosts = [...context.searchEvidence.urlHosts].filter(
+      (host) => !urlHostsBefore.has(host),
     );
     await journal.complete(stepKey, {
       result,
       searchEvidence: addedEvidence,
+      searchEvidenceTitles: addedTitles,
+      searchEvidenceUrlHosts: addedUrlHosts,
     } satisfies StoredToolOutput);
     return result;
   } catch (error) {
@@ -623,7 +662,7 @@ async function executeToolCall(context: {
   input: RunAgentInput;
   toolCall: LlmToolCall;
   enabledTools: EnabledToolContext[];
-  searchEvidence: Set<string>;
+  searchEvidence: SearchEvidence;
 }): Promise<string> {
   const { input, toolCall } = context;
   throwIfAborted(input.signal);
@@ -787,32 +826,93 @@ async function executeToolCall(context: {
 }
 
 function collectSearchEvidence(
-  evidence: Set<string>,
+  evidence: SearchEvidence,
   result: { summary: string; results: Array<{ title: string; url: string; snippet: string }> },
 ): void {
-  evidence.add(result.summary.trim());
-  for (const line of result.summary.split("\n")) evidence.add(line.trim());
+  evidence.fragments.add(result.summary.trim());
+  for (const line of result.summary.split("\n")) evidence.fragments.add(line.trim());
   for (const item of result.results) {
-    evidence.add(item.title.trim());
-    evidence.add(item.url.trim());
-    evidence.add(item.snippet.trim());
+    evidence.fragments.add(item.title.trim());
+    evidence.fragments.add(item.url.trim());
+    evidence.fragments.add(item.snippet.trim());
+    evidence.titles.add(item.title.trim());
+    addSearchUrlHost(evidence.urlHosts, item.url);
   }
 }
 
-function sanitizeSearchOutput(text: string, evidence: Set<string>): string {
-  if (evidence.size === 0 || !text) return text;
+function addSearchUrlHost(hosts: Set<string>, rawUrl: string): void {
+  const value = rawUrl.trim();
+  if (!value) return;
+  const candidate = /^https?:\/\//i.test(value)
+    ? value
+    : isProtocolLessWebUrl(value)
+      ? `https://${value}`
+      : null;
+  if (!candidate) return;
+  try {
+    const hostname = new URL(candidate).hostname.toLocaleLowerCase();
+    if (!hostname) return;
+    hosts.add(hostname);
+    const unicodeHostname = domainToUnicode(hostname).toLocaleLowerCase();
+    if (unicodeHostname) hosts.add(unicodeHostname);
+    if (hostname.startsWith("www.") && hostname.length > 4) {
+      hosts.add(hostname.slice(4));
+    }
+    if (unicodeHostname.startsWith("www.") && unicodeHostname.length > 4) {
+      hosts.add(unicodeHostname.slice(4));
+    }
+  } catch {
+    // Non-URL evidence is handled by the regular verbatim window.
+  }
+}
+
+function isProtocolLessWebUrl(value: string): boolean {
+  return /^(?:[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?\.)+(?:[\p{L}]{2,63}|xn--[a-z0-9-]{2,59})(?::\d{1,5})?(?:[/?#][^\s]*)?$/iu.test(value);
+}
+
+function containsSearchUrlHost(text: string, host: string): boolean {
+  if (!host) return false;
+  if (/[^\x00-\x7F]/.test(host)) {
+    return text.toLocaleLowerCase().includes(host);
+  }
+  const escapedHost = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `(^|[^a-z0-9-])${escapedHost}(?=$|[^a-z0-9.-])`,
+    "i",
+  ).test(text);
+}
+
+function sanitizeSearchOutput(
+  text: string,
+  evidence: SearchEvidence,
+  authorizedSearchText: string,
+): string {
+  if (evidence.fragments.size === 0 || !text) return text;
   if (/https?:\/\/|www\./i.test(text)) return rawSearchLeakFallback;
 
   const normalizedOutput = normalizeSearchLeakText(text);
-  for (const fragment of evidence) {
-    const normalized = fragment.trim();
-    if (normalized.length >= 8 && text.includes(normalized)) return rawSearchLeakFallback;
+  for (const host of evidence.urlHosts) {
+    if (containsSearchUrlHost(text, host)) return rawSearchLeakFallback;
+  }
+  const normalizedAuthorizedSearchText = normalizeSearchLeakText(authorizedSearchText);
+  for (const title of evidence.titles) {
+    const normalizedTitle = normalizeSearchLeakText(title);
+    if (
+      normalizedTitle.length > 0
+      && normalizedTitle.length < 18
+      && !normalizedAuthorizedSearchText.includes(normalizedTitle)
+      && normalizedOutput.includes(normalizedTitle)
+    ) {
+      return rawSearchLeakFallback;
+    }
+  }
 
+  for (const fragment of evidence.fragments) {
+    const normalized = fragment.trim();
     const normalizedEvidence = normalizeSearchLeakText(normalized);
-    // A short factual tuple (price, date, metric) can legitimately match part
-    // of a long snippet. Use a proportional window for short evidence, but cap
-    // it so a long source can never expose an arbitrarily large copied prefix.
-    // Exact titles, snippets and every URL stay blocked independently above.
+    // Short entity-only titles and factual tuples (price, date, metric) can
+    // legitimately appear in a natural answer. Require a meaningful verbatim
+    // window, while keeping every URL and long copied title/snippet blocked.
     const windowSize = Math.min(
       64,
       Math.max(18, Math.ceil(normalizedEvidence.length * 0.6)),
@@ -834,6 +934,14 @@ function normalizeSearchLeakText(text: string): string {
 type StoredToolOutput = Readonly<{
   result: string;
   searchEvidence: string[];
+  searchEvidenceTitles?: string[];
+  searchEvidenceUrlHosts?: string[];
+}>;
+
+type SearchEvidence = Readonly<{
+  fragments: Set<string>;
+  titles: Set<string>;
+  urlHosts: Set<string>;
 }>;
 
 export class AmbiguousExecutionStepError extends Error {
@@ -881,6 +989,20 @@ function isStoredToolOutput(
     && value.searchEvidence.every(
       (fragment) => typeof fragment === "string",
     )
+    && (!("searchEvidenceTitles" in value)
+      || (
+        Array.isArray(value.searchEvidenceTitles)
+        && value.searchEvidenceTitles.every(
+          (title) => typeof title === "string",
+        )
+      ))
+    && (!("searchEvidenceUrlHosts" in value)
+      || (
+        Array.isArray(value.searchEvidenceUrlHosts)
+        && value.searchEvidenceUrlHosts.every(
+          (host) => typeof host === "string",
+        )
+      ))
   );
 }
 
