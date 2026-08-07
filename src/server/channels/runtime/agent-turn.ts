@@ -3,6 +3,7 @@ import { runAgent, type SkillContext } from "@/server/agent/run-agent";
 import { createLlmSkillMatcher } from "@/server/agent/skill-routing";
 import {
   createSearchGate,
+  isExplicitSearchRequest,
   normalizeSearchAggressiveness,
   type SearchGate,
 } from "@/server/agent/search-gate";
@@ -269,6 +270,11 @@ export function createChannelAgentTurnRunner(input: Readonly<{
         createSkillMode: invocation.createSkillMode,
         capabilityNotice: invocation.capabilityNotice,
         searchGate,
+        requiredSearchQuery:
+          !hasAttachmentContext
+          && isExplicitSearchRequest(message.text)
+            ? requiredChannelSearchQuery(message.text, history)
+            : undefined,
         attachmentToolGuard: hasAttachmentContext,
         executionJournal: context.journal,
         signal: context.signal,
@@ -683,6 +689,66 @@ export function channelContextKey(
     encodeURIComponent(event.connectionId),
     encodeURIComponent(target),
   ].join(":");
+}
+
+const searchDirectiveSource =
+  "(?:(?:去|上|看)?(?:阿里云)?(?:百炼)?(?:官网|官方(?:文档)?|文档|网上|上网|联网|互联网|公开(?:资料|信息)|最新))";
+const searchDirectiveAction =
+  "(?:搜索|搜(?:一搜|搜)?|查询|查证|查实|查(?:一查|查)?|核实|核对|核查|求证|确认|看)(?:一下)?";
+const searchDirectiveLead = "(?:@\\S+\\s*)?(?:(?:请|你|能|可以|再|帮我)\\s*)*";
+const searchDirectiveBody =
+  `(?:${searchDirectiveSource}\\s*(?:${searchDirectiveAction})?|${searchDirectiveAction}(?:\\s*${searchDirectiveSource})?)`;
+const standaloneSearchDirectivePattern = new RegExp(
+  `^${searchDirectiveLead}${searchDirectiveBody}[吗么]?[？?!！。.,，:：\\s]*$`,
+  "u",
+);
+const standaloneRhetoricalSearchPattern =
+  /^(?:@\S+\s*)?(?:你)?(?:不能|不可以|不会|没法)[^，。！？,.!?;]{0,24}(?:搜|搜索|查|查询|核实|核对|查证)[^，。！？,.!?;]{0,8}[吗么][？?\s]*$/u;
+const searchDirectivePrefixPattern = new RegExp(
+  `^${searchDirectiveLead}${searchDirectiveBody}[吗么]?[：:\\s]*`,
+  "u",
+);
+
+function requiredChannelSearchQuery(
+  currentMessage: string,
+  history: Array<{ role: string; content: string }>,
+): string {
+  const current = currentMessage.trim();
+  const clauses = current
+    .replace(/^@\S+\s*/u, "")
+    .split(/[，。！？,!?;]+/u)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+  const explicitSubjects = clauses
+    .map((clause) => ({
+      clause,
+      subject: clause.replace(searchDirectivePrefixPattern, "").trim(),
+    }))
+    .filter(({ clause, subject }) =>
+      subject.length > 0
+      && subject !== clause
+      && !standaloneRhetoricalSearchPattern.test(clause)
+    )
+    .map(({ subject }) => subject)
+    .sort((left, right) => right.length - left.length);
+  if (explicitSubjects[0]) return explicitSubjects[0].slice(0, 500);
+  if (
+    !standaloneSearchDirectivePattern.test(current)
+    && !standaloneRhetoricalSearchPattern.test(current)
+  ) {
+    return current;
+  }
+  const previousUserMessage = [...history]
+    .reverse()
+    .find((entry) =>
+      entry.role === "user"
+      && entry.content.trim().length > 0
+      && entry.content.trim() !== current
+    )
+    ?.content.trim();
+  return previousUserMessage
+    ? `${previousUserMessage}\n${current}`.slice(0, 500)
+    : current;
 }
 
 function denyAttachmentSearch(): SearchGate {

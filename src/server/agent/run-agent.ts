@@ -119,6 +119,8 @@ export type RunAgentInput = AgentScope & {
   webSearchEnabled?: boolean;
   /** Hard gate consulted before every web_search execution (PRD 5.4). */
   searchGate?: SearchGate;
+  /** Explicitly requested searches run before the first model turn, so capability does not depend on model tool-call compliance. */
+  requiredSearchQuery?: string;
   /** Keeps every tool closed while a recent DB message still owns an attachment, even if its payload was cropped. */
   attachmentToolGuard?: boolean;
   /** Durable per-event journal used by channel turns to avoid replaying external side effects. */
@@ -323,10 +325,42 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     attachments: input.attachments,
     attachmentContextPresent: hasAttachmentContext,
   });
+  const searchEvidence = new Set<string>();
+  const requiredSearchQuery = input.requiredSearchQuery?.trim();
+  if (requiredSearchQuery && !hasAttachmentContext) {
+    const requiredSearchCall: LlmToolCall = {
+      id: `required-search-${hashExecutionText(requiredSearchQuery).slice(0, 12)}`,
+      name: "web_search",
+      arguments: JSON.stringify({ query: requiredSearchQuery }),
+    };
+    const result = await executeJournaledToolCall({
+      input,
+      toolCall: requiredSearchCall,
+      enabledTools,
+      searchEvidence,
+      round: -1,
+      toolIndex: 0,
+    });
+    activeMessages = [
+      ...activeMessages,
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [requiredSearchCall],
+      },
+      {
+        role: "tool",
+        content: result,
+        toolCallId: requiredSearchCall.id,
+      },
+    ];
+  }
+  const turnTools = requiredSearchQuery
+    ? tools.filter((tool) => tool.name !== "web_search")
+    : tools;
   let inputTokens = 0;
   let outputTokens = 0;
   let llmRound = 0;
-  const searchEvidence = new Set<string>();
   const collectModelTurn = async (messages: LlmMessage[], turnTools: LlmTool[]) => {
     throwIfAborted(input.signal);
     inputTokens += estimateMessagesTokenUsage(messages);
@@ -364,7 +398,7 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     yield safeVisible;
   } else for (let iteration = 0; iteration < maxToolIterations; iteration += 1) {
     throwIfAborted(input.signal);
-    const { text, toolCalls } = await collectModelTurn(activeMessages, tools);
+    const { text, toolCalls } = await collectModelTurn(activeMessages, turnTools);
 
     if (toolCalls.length === 0 || iteration === maxToolIterations - 1) {
       const visible = sanitizeSearchOutput(sanitizeAssistantText(text), searchEvidence);
@@ -377,14 +411,16 @@ export async function* runAgent(input: RunAgentInput): AsyncIterable<string> {
     const toolMessages: LlmMessage[] = [];
     for (const [toolIndex, toolCall] of toolCalls.entries()) {
       throwIfAborted(input.signal);
-      const result = await executeJournaledToolCall({
-        input,
-        toolCall,
-        enabledTools,
-        searchEvidence,
-        round: iteration,
-        toolIndex,
-      });
+      const result = requiredSearchQuery && toolCall.name === "web_search"
+        ? "本轮已完成用户明确要求的联网搜索，请直接基于已有搜索结果回答。"
+        : await executeJournaledToolCall({
+            input,
+            toolCall,
+            enabledTools,
+            searchEvidence,
+            round: iteration,
+            toolIndex,
+          });
       throwIfAborted(input.signal);
       toolMessages.push({ role: "tool", content: result, toolCallId: toolCall.id });
     }

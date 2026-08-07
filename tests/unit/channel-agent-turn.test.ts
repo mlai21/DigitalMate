@@ -316,8 +316,9 @@ describe("channel agent turn", () => {
     await expect(collect(runner.runAgentTurn(context)))
       .resolves.toBe("官方信息已核实。");
 
+    expect(search).toHaveBeenCalledOnce();
     expect(search).toHaveBeenCalledWith(
-      "qwen3-flash 官方定价",
+      expect.stringContaining("qwen3-flash"),
       undefined,
       undefined,
     );
@@ -332,6 +333,121 @@ describe("channel agent turn", () => {
         toolName: "web_search",
         status: "success",
       }),
+    );
+  });
+
+  it("明确要求搜索时不依赖模型主动调用工具", async () => {
+    const repositories = fakeRepositories();
+    const search = vi.fn(async () => [{
+      title: "Qwen3.8-Max 官方定价",
+      url: "https://help.aliyun.com/zh/model-studio/models",
+      snippet: "Qwen3.8-Max 已在百炼上线并公布定价",
+    }]);
+    const llm = recordingLlm("根据官方信息，Qwen3.8-Max 已在百炼上线。");
+    const runner = createChannelAgentTurnRunner({
+      repositories: repositories as never,
+      resolveMainModel: () => ({
+        client: llm.client,
+        model: "mock-main",
+      }),
+      resolveLightModel: () => ({
+        client: textLlm('{"skill":0,"reason":"不贴合"}'),
+        model: "mock-light",
+      }),
+      search,
+      now: () => now,
+    });
+    const context = createContext({
+      chatType: "group",
+      mentioned: true,
+      text: "@Alvin 你搜一下 qwen3.8-max 的价格",
+    });
+
+    await expect(collect(runner.runAgentTurn(context)))
+      .resolves.toBe("根据官方信息，Qwen3.8-Max 已在百炼上线。");
+
+    expect(search).toHaveBeenCalledOnce();
+    expect(search).toHaveBeenCalledWith(
+      expect.stringContaining("qwen3.8-max"),
+      undefined,
+      undefined,
+    );
+    expect(llm.calls[0]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: "tool",
+        content: expect.stringContaining("Qwen3.8-Max 已在百炼上线"),
+      }),
+    ]));
+    expect(repositories.toolLogs.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "web_search_gate",
+        outputSummary: expect.stringContaining("放行（explicit）"),
+      }),
+    );
+    expect(repositories.toolLogs.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: "web_search",
+        status: "success",
+      }),
+    );
+  });
+
+  it.each([
+    "你去百炼官网搜一下",
+    "搜一搜",
+    "查一查",
+    "请帮我搜索",
+    "上网查",
+    "联网查",
+    "网上查",
+    "求证",
+    "官网确认",
+    "查证一下",
+    "求证一下",
+    "去官网核实一下",
+    "官网确认一下",
+    "核实一下官网",
+    "确认一下官方文档",
+    "你能去官网搜吗",
+    "可以去官网查吗",
+  ])("搜索跟进消息“%s”会带上本会话上一条用户主题", async (message) => {
+    const repositories = fakeRepositories({
+      history: [{
+        id: "history-1",
+        role: "user",
+        content: "qwen3.8-max 的价格是多少",
+      }],
+    });
+    const search = vi.fn(async () => [{
+      title: "Qwen3.8-Max 官方定价",
+      url: "https://help.aliyun.com/zh/model-studio/models",
+      snippet: "官方页面列出了该型号的价格",
+    }]);
+    const llm = recordingLlm("已根据百炼官网更新结论。");
+    const runner = createChannelAgentTurnRunner({
+      repositories: repositories as never,
+      resolveMainModel: () => ({
+        client: llm.client,
+        model: "mock-main",
+      }),
+      resolveLightModel: () => ({
+        client: textLlm('{"skill":0,"reason":"不贴合"}'),
+        model: "mock-light",
+      }),
+      search,
+      now: () => now,
+    });
+
+    await collect(runner.runAgentTurn(createContext({
+      chatType: "group",
+      mentioned: true,
+      text: message,
+    })));
+
+    expect(search).toHaveBeenCalledWith(
+      expect.stringContaining("qwen3.8-max"),
+      undefined,
+      undefined,
     );
   });
 
@@ -871,6 +987,11 @@ function fakeRepositories(
   overrides: {
     recentMessageCount?: number;
     historyAttachment?: boolean;
+    history?: Array<{
+      id: string;
+      role: "user" | "assistant";
+      content: string;
+    }>;
     latestAutoMatch?: null;
   } = {},
 ) {
@@ -906,13 +1027,14 @@ function fakeRepositories(
     },
     messages: {
       recentHistory: vi.fn(async () =>
-        overrides.historyAttachment
+        overrides.history
+          ?? (overrides.historyAttachment
           ? [{
               id: "history-1",
               role: "user" as const,
               content: "附件内容",
             }]
-          : []
+          : [])
       ),
       create: vi.fn(),
     },
