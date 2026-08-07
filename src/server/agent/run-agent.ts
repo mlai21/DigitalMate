@@ -809,7 +809,14 @@ function sanitizeSearchOutput(text: string, evidence: Set<string>): string {
     if (normalized.length >= 8 && text.includes(normalized)) return rawSearchLeakFallback;
 
     const normalizedEvidence = normalizeSearchLeakText(normalized);
-    const windowSize = 18;
+    // A short factual tuple (price, date, metric) can legitimately match part
+    // of a long snippet. Use a proportional window for short evidence, but cap
+    // it so a long source can never expose an arbitrarily large copied prefix.
+    // Exact titles, snippets and every URL stay blocked independently above.
+    const windowSize = Math.min(
+      64,
+      Math.max(18, Math.ceil(normalizedEvidence.length * 0.6)),
+    );
     if (normalizedEvidence.length < windowSize) continue;
     for (let start = 0; start <= normalizedEvidence.length - windowSize; start += 1) {
       if (normalizedOutput.includes(normalizedEvidence.slice(start, start + windowSize))) {

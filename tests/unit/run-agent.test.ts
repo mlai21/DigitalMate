@@ -1788,6 +1788,44 @@ describe("runAgent", () => {
     expect(visible).toContain("原始检索内容");
   });
 
+  it("allows a natural conclusion to repeat factual price tuples from search evidence", async () => {
+    const conclusion = [
+      "关于 qwen3.8-max 的价格，我核对后可以给你一个初步结论。",
+      "第三方来源称国内标准输入 12 元/百万 token、输出 36 元/百万 token，长上下文缓存命中最低到 1.5 元/百万 token。",
+      "但这些数字还没有对上阿里云百炼官方计费页面，所以目前只能标为待核实。",
+    ].join("\n\n");
+    const evidence =
+      "媒体报道称 Qwen3.8-Max 已发布，国内标准定价：输入12元/百万token，输出36元/百万token；长上下文缓存命中场景最低至1.5元/百万token。报道还介绍了模型参数、上下文窗口和开放权重计划，实际价格应以阿里云百炼官方计费页面为准。";
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"qwen3.8-max 的价格"}' } }],
+      [{ type: "text", text: conclusion }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我搜一下 qwen3.8-max 的价格",
+      history: [],
+      persona: { name: "Alvin", style: "严谨" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: evidence,
+          results: [{ title: "Qwen3.8-Max 定价", url: "https://example.com/pricing", snippet: evidence }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).toBe(conclusion);
+  });
+
   it("replaces a final answer that copies only a long prefix of a search snippet", async () => {
     const rawSnippet = "中央气象台预计明天下午有持续降雨，晚高峰道路湿滑，请注意安全";
     const llm = scriptedLlm([
@@ -1820,5 +1858,47 @@ describe("runAgent", () => {
     const visible = chunks.join("");
     expect(visible).not.toContain("中央气象台预计");
     expect(visible).toContain("原始检索内容");
+  });
+
+  it("replaces a final answer that copies a large prefix from a long search snippet", async () => {
+    const rawSnippet = [
+      "官方公告逐项介绍了模型能力、上下文窗口、支持区域和计费方式，并提醒不同地域的价格口径可能不同。",
+      "开发者在正式接入前应核对输入输出单价、缓存命中价格、批处理折扣、免费额度和生效时间。",
+      "公告随后还列出了兼容接口、限流规则、服务等级、数据处理边界以及版本升级安排。",
+      "以上信息会随产品调整而变化，所有正式采购和成本测算都应以控制台当时展示的计费页面为准。",
+      "文档还解释了同步调用和异步任务之间的差异，并分别说明失败重试、超时处理与并发配额。",
+      "对于需要跨地域部署的企业，公告建议提前评估网络时延、合规要求和资源可用性。",
+      "示例代码只用于展示接口格式，不代表任何默认额度、性能保证或长期价格承诺。",
+      "发布说明最后给出了问题反馈渠道，方便开发者提交工单并跟踪后续处理进度。",
+    ].join("");
+    const copiedPrefix = rawSnippet.slice(0, 110);
+    const llm = scriptedLlm([
+      [{ type: "tool_call", toolCall: { id: "call-1", name: "web_search", arguments: '{"query":"模型价格"}' } }],
+      [{ type: "text", text: copiedPrefix }],
+    ]);
+
+    const chunks = [];
+    for await (const chunk of runAgent({
+      userId: "user-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      message: "帮我查一下模型价格",
+      history: [],
+      persona: { name: "DigitalMate", style: "温暖、克制" },
+      llm,
+      model: "mock-main",
+      repositories: baseRepositories(),
+      search: {
+        run: vi.fn(async () => ({
+          summary: rawSnippet,
+          results: [{ title: "官方模型公告", url: "https://example.com/model", snippet: rawSnippet }],
+        })),
+      },
+      searchGate: allowSearchGate,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.join("")).toContain("原始检索内容");
   });
 });
